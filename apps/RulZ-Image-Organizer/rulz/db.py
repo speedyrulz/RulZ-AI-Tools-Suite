@@ -74,6 +74,31 @@ CREATE INDEX IF NOT EXISTS ix_faces_photo ON faces(photo_id);
 CREATE INDEX IF NOT EXISTS ix_faces_person ON faces(person_id);
 -- Covering index: a person's photo list and counts never touch the (large) face rows.
 CREATE INDEX IF NOT EXISTS ix_faces_person_ignored_photo ON faces(person_id, ignored, photo_id);
+-- AI (vision model) results. Each row keeps the photo's fingerprint from when it was made: once the file
+-- changes, the row no longer counts (see ai_* below) and the photo is tagged or checked again.
+CREATE TABLE IF NOT EXISTS ai_tags(
+    photo_id INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+    fp TEXT,
+    tags TEXT NOT NULL,                      -- ' tag one | tag two ': padded so a LIKE '% word %' matches words
+    model TEXT,
+    at REAL
+);
+CREATE TABLE IF NOT EXISTS ai_searches(      -- things the user asked the AI to look for ("red sweater")
+    id INTEGER PRIMARY KEY,
+    text TEXT UNIQUE NOT NULL,               -- normalized: lowercase, single spaces
+    created_at REAL
+);
+CREATE TABLE IF NOT EXISTS ai_answers(
+    search_id INTEGER NOT NULL REFERENCES ai_searches(id) ON DELETE CASCADE,
+    photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+    found INTEGER NOT NULL,
+    fp TEXT,
+    model TEXT,
+    at REAL,
+    PRIMARY KEY(search_id, photo_id)
+);
+-- Deleting a photo deletes its answers: without this index each delete scanned every answer.
+CREATE INDEX IF NOT EXISTS ix_ai_answers_photo ON ai_answers(photo_id);
 """
 
 # Columns added after the first release: (name, definition). Existing faces get attrs_done=0.
@@ -482,6 +507,136 @@ class Database:
 
     def rejected_pairs(self) -> set[tuple[int, int]]:
         return {(r[0], r[1]) for r in self.q("SELECT face_id, person_id FROM rejections")}
+
+    # ---- AI tags and look-for searches ---------------------------------------
+    # A result counts only while the photo's fingerprint is the one it was made from ("x.fp IS p.fp").
+    @staticmethod
+    def norm_search(text: str) -> str:
+        """How a look-for text is stored and matched: lowercase, single spaces, no quotes around it."""
+        text = " ".join(text.replace("|", " ").lower().split())
+        return text.strip("\"'“”‘’ ")[:200]
+
+    def ai_search_id(self, text: str, create: bool = False) -> int | None:
+        text = self.norm_search(text)
+        if not text:
+            return None
+        row = self.one("SELECT id FROM ai_searches WHERE text=?", (text,))
+        if row is not None:
+            return row[0]
+        if not create:
+            return None
+        self.x("INSERT OR IGNORE INTO ai_searches(text, created_at) VALUES(?,?)", (text, time.time()))
+        return self.one("SELECT id FROM ai_searches WHERE text=?", (text,))[0]
+
+    def ai_searches(self) -> list[dict]:
+        """Saved look-for searches, newest first, with how many photos were checked and found (still current)."""
+        # An answer whose photo changed since finds no p row, so it counts in neither number.
+        return [dict(r) for r in self.q("""
+            SELECT s.id, s.text, s.created_at, COUNT(p.id) AS checked,
+                   COALESCE(SUM(CASE WHEN p.id IS NOT NULL THEN a.found END), 0) AS found
+            FROM ai_searches s
+            LEFT JOIN ai_answers a ON a.search_id=s.id
+            LEFT JOIN photos p ON p.id=a.photo_id AND a.fp IS p.fp
+            GROUP BY s.id ORDER BY s.created_at DESC, s.id DESC""")]
+
+    def ai_forget_search(self, search_id: int) -> None:
+        self.x("DELETE FROM ai_searches WHERE id=?", (search_id,))
+
+    def _ai_todo(self, join: str, params: list, photo_ids: list[int] | None, force: bool) -> list[tuple[int, str, str]]:
+        sql = f"SELECT p.id, p.path, p.fp FROM photos p {join} WHERE p.error IS NULL"
+        if not force:
+            sql += " AND (x.photo_id IS NULL OR x.fp IS NOT p.fp)"
+        if photo_ids is None:
+            return [(r[0], r[1], r[2]) for r in self.q(sql + " ORDER BY p.taken_at DESC, p.id DESC", params)]
+        rows: dict[int, tuple[int, str, str]] = {}
+        for chunk in _chunks(list(dict.fromkeys(photo_ids)), 500):
+            for r in self.q(sql + f" AND p.id IN ({','.join('?' * len(chunk))})", params + chunk):
+                rows[r[0]] = (r[0], r[1], r[2])
+        return [rows[i] for i in dict.fromkeys(photo_ids) if i in rows]  # in the order asked for
+
+    def ai_todo_tags(self, photo_ids: list[int] | None, force: bool = False) -> list[tuple[int, str, str]]:
+        """(id, path, fp) of the photos (None = all) that have no current AI tags, or all of them with force."""
+        return self._ai_todo("LEFT JOIN ai_tags x ON x.photo_id=p.id", [], photo_ids, force)
+
+    def ai_todo_search(self, search_id: int, photo_ids: list[int] | None,
+                       force: bool = False) -> list[tuple[int, str, str]]:
+        """(id, path, fp) of the photos (None = all) not yet checked for this search, or all with force."""
+        return self._ai_todo("LEFT JOIN ai_answers x ON x.photo_id=p.id AND x.search_id=?", [search_id],
+                             photo_ids, force)
+
+    def ai_save_tags(self, results: list[tuple[int, str, list[str], str]]) -> None:
+        """Save (photo id, fingerprint it was tagged from, tags, model). Photos deleted meanwhile are skipped."""
+        now = time.time()
+        with self.transaction():
+            for photo_id, fp, tags, model in results:
+                self.x("INSERT INTO ai_tags(photo_id, fp, tags, model, at) SELECT ?,?,?,?,? "
+                       "WHERE EXISTS(SELECT 1 FROM photos WHERE id=?) ON CONFLICT(photo_id) DO UPDATE SET "
+                       "fp=excluded.fp, tags=excluded.tags, model=excluded.model, at=excluded.at",
+                       (photo_id, fp, " " + " | ".join(tags) + " ", model, now, photo_id))
+
+    def ai_save_answers(self, search_id: int, results: list[tuple[int, str, bool, str]]) -> None:
+        """Save (photo id, fingerprint, found, model) for a search. Skips photos deleted and searches forgotten
+        while the AI was working."""
+        now = time.time()
+        with self.transaction():
+            for photo_id, fp, found, model in results:
+                self.x("INSERT INTO ai_answers(search_id, photo_id, found, fp, model, at) SELECT ?,?,?,?,?,? "
+                       "WHERE EXISTS(SELECT 1 FROM photos WHERE id=?) AND EXISTS(SELECT 1 FROM ai_searches WHERE id=?) "
+                       "ON CONFLICT(search_id, photo_id) DO UPDATE SET found=excluded.found, fp=excluded.fp, "
+                       "model=excluded.model, at=excluded.at",
+                       (search_id, photo_id, int(bool(found)), fp, model, now, photo_id, search_id))
+
+    def ai_found(self, search_id: int) -> set[int]:
+        """Photos the AI said show this search's thing (answers made from the current file only)."""
+        return {r[0] for r in self.q("SELECT a.photo_id FROM ai_answers a JOIN photos p ON p.id=a.photo_id "
+                                     "WHERE a.search_id=? AND a.found=1 AND a.fp IS p.fp", (search_id,))}
+
+    def ai_answered(self, search_id: int) -> tuple[set[int], set[int]]:
+        """(photos answered YES, photos answered at all) for a search, current answers only."""
+        rows = self.q("SELECT a.photo_id, a.found FROM ai_answers a JOIN photos p ON p.id=a.photo_id "
+                      "WHERE a.search_id=? AND a.fp IS p.fp", (search_id,))
+        return {r[0] for r in rows if r[1]}, {r[0] for r in rows}
+
+    def ai_tag_matches(self, phrase: str) -> set[int]:
+        """Photos with a current AI tag containing these whole words ("sweater" finds "red sweater"; a
+        trailing s is optional, so "dogs" finds "dog" and the other way round)."""
+        phrase = " ".join(phrase.replace("|", " ").lower().split())
+        if not phrase:
+            return set()
+        variants = {phrase, phrase[:-1] if phrase.endswith("s") and len(phrase) > 3 else phrase + "s"}
+        esc = [v.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") for v in variants]
+        cond = " OR ".join("t.tags LIKE ? ESCAPE '\\'" for _ in esc)
+        return {r[0] for r in self.q(f"SELECT t.photo_id FROM ai_tags t JOIN photos p ON p.id=t.photo_id "
+                                     f"WHERE t.fp IS p.fp AND ({cond})", [f"% {e} %" for e in esc])}
+
+    def ai_photo(self, photo_id: int) -> dict:
+        """What the AI said about one photo: tags (None = never tagged), whether the file changed since
+        (stale), the model and time, and the look-for answers that are still current."""
+        out = {"tags": None, "stale": False, "model": None, "at": None, "answers": []}
+        r = self.one("SELECT t.tags, t.model, t.at, (t.fp IS p.fp) AS current FROM ai_tags t "
+                     "JOIN photos p ON p.id=t.photo_id WHERE t.photo_id=?", (photo_id,))
+        if r is not None:
+            out.update(tags=[t.strip() for t in r["tags"].split("|") if t.strip()], stale=not r["current"],
+                       model=r["model"], at=r["at"])
+        out["answers"] = [(a["text"], bool(a["found"])) for a in self.q(
+            "SELECT s.text, a.found FROM ai_answers a JOIN ai_searches s ON s.id=a.search_id "
+            "JOIN photos p ON p.id=a.photo_id WHERE a.photo_id=? AND a.fp IS p.fp ORDER BY a.found DESC, s.text",
+            (photo_id,))]
+        return out
+
+    def ai_stats(self) -> dict:
+        r = self.one("""SELECT
+            (SELECT COUNT(*) FROM ai_tags t JOIN photos p ON p.id=t.photo_id WHERE t.fp IS p.fp) AS tagged,
+            (SELECT COUNT(*) FROM ai_searches) AS searches,
+            (SELECT COUNT(*) FROM ai_tags) + (SELECT COUNT(*) FROM ai_answers) AS rows""")
+        return dict(r)
+
+    def ai_clear(self) -> None:
+        """Forget every AI tag, look-for search and answer."""
+        with self.transaction():
+            self.x("DELETE FROM ai_tags")
+            self.x("DELETE FROM ai_answers")
+            self.x("DELETE FROM ai_searches")
 
 
 class _Tx:

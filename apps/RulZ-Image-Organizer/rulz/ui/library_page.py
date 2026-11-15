@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (QFileDialog, QFrame, QHBoxLayout, QListWidget, QL
 
 from .. import config
 from . import dialogs, theme
+from .ai_panel import AICard
 from .common import Segmented, button, label, plural
 
 
@@ -32,7 +33,7 @@ class LibraryPage(QWidget):
         self.setObjectName("Page")
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea()
+        self.scroll_area = scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         outer.addWidget(scroll)
@@ -123,6 +124,10 @@ class LibraryPage(QWidget):
         grp.lay.addLayout(row)
         lay.addWidget(grp)
 
+        # AI tagging and search ----------------------------------------------------
+        self.ai_card = AICard(ctx)
+        lay.addWidget(self.ai_card)
+
         # appearance -----------------------------------------------------------
         look = Card("Appearance", "Dark is the default. The sun/moon button at the bottom of the sidebar "
                                   "(or Ctrl+Shift+L) switches too.")
@@ -134,7 +139,8 @@ class LibraryPage(QWidget):
 
         about = Card("About")
         about.lay.addWidget(label(f"{config.APP_NAME} {config.APP_VERSION}. Everything runs on this PC – no photos "
-                                  "or faces ever leave your computer.", "Muted", wrap=True))
+                                  "or faces ever leave your computer, except photos you send to an AI server on "
+                                  "another computer (AI tagging and search above).", "Muted", wrap=True))
         data_row = QHBoxLayout()
         data_row.addWidget(label(f"Library data: {config.data_dir()}", "Muted"), 1)
         ob = button("Open", "open_folder", flat=True)
@@ -186,8 +192,13 @@ class LibraryPage(QWidget):
         self.slider.setValue(round(db.match_threshold() * 100))
         self.slider.blockSignals(False)
         self._slider_moved(self.slider.value(), save=False)
+        self.ai_card.refresh()
         if not self.ctx.scanner.running:
             self.status.setText(self.ctx.scanner.last_message or "Up to date.")
+
+    def show_ai_card(self):
+        """Scroll to the AI card (after the layout has settled, so its position is known)."""
+        QTimer.singleShot(0, lambda: self.scroll_area.ensureWidgetVisible(self.ai_card, 0, 40))
 
     def _sel(self):
         it = self.list.currentItem()
@@ -241,7 +252,8 @@ class LibraryPage(QWidget):
             self._save_timer.start()
 
     def flush_settings(self):
-        """Save a threshold change that is still waiting for the slider to settle."""
+        """Save a threshold change that is still waiting for the slider to settle, and AI fields being typed."""
+        self.ai_card.flush()
         if self._threshold_dirty:
             self._threshold_dirty = False
             self._save_timer.stop()

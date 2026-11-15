@@ -6,7 +6,7 @@ import subprocess
 from datetime import datetime
 
 from PySide6.QtCore import QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QImageReader, QPainter, QPainterPath, QPixmap
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QImageReader, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import QButtonGroup, QFrame, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QWidget
 
 from .. import config
@@ -88,6 +88,10 @@ class Segmented(QFrame):
             b = QPushButton(text)
             b.setCheckable(True)
             b.setCursor(Qt.PointingHandCursor)
+            # The checked segment is bold: size for that, or a longer label is clipped when picked.
+            bold = b.font()
+            bold.setWeight(QFont.DemiBold)
+            b.setMinimumWidth(QFontMetrics(bold).horizontalAdvance(text) + 40)
             self.group.addButton(b, i)
             lay.addWidget(b)
             self.buttons.append(b)

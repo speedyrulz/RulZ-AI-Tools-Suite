@@ -40,9 +40,11 @@ class PhotosPage(QWidget):
         top.addWidget(self.count, 0, Qt.AlignBottom)
         top.addStretch(1)
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Search people & expressions, e.g. “Mom smiling, Dad”")
+        self.search.setPlaceholderText("Search people, expressions & AI tags, e.g. “Mom smiling, Dad”")
         self.search.setToolTip("Words in one group describe one face; separate groups with commas.\n"
-                               "Examples:  smiling   ·   Mom facing left   ·   Mom smiling, Dad   ·   looking down")
+                               "Examples:  smiling   ·   Mom facing left   ·   Mom smiling, Dad   ·   looking down\n"
+                               "Other words search the AI results: AI tags, and what you had the AI look for "
+                               "(AI ▸ Look for something).")
         self.search.setClearButtonEnabled(True)
         search_icon = self.search.addAction(theme.icon("search", theme.C["muted"], 16), QLineEdit.LeadingPosition)
         search_icon.setProperty("_rulzThemeIcon", "search|muted|16")
@@ -57,6 +59,14 @@ class PhotosPage(QWidget):
         self.filter_btn.setCheckable(True)
         self.filter_btn.toggled.connect(self._show_filters)
         top.addWidget(self.filter_btn)
+        self.ai_btn = button("AI", "tag", tooltip="Tag photos with a vision AI model, or have it look for something")
+        self.ai_menu = QMenu(self)
+        self.ai_menu.addAction(theme.icon("search"), "Look for something…", lambda: self._ai("look"))
+        self.ai_menu.addAction(theme.icon("tag"), "Tag photos with AI…", lambda: self._ai("tag"))
+        self.ai_menu.addSeparator()
+        self.ai_menu.addAction(theme.icon("settings"), "AI settings…", self._ai_settings)
+        self.ai_btn.setMenu(self.ai_menu)
+        top.addWidget(self.ai_btn)
         lay.addLayout(top)
 
         self.filters = QWidget()
@@ -101,6 +111,10 @@ class PhotosPage(QWidget):
         self.sel_bar = SelectionBar()
         self.sel_bar.add(button("Show in folder", "open_folder")).clicked.connect(self._show_selected)
         self.sel_bar.add(button("Copy paths", "tag")).clicked.connect(self._copy_paths)
+        self.sel_bar.add(button("Look for…", "search", tooltip="Have the AI look for something in these photos")
+                         ).clicked.connect(lambda: self._ai("look"))
+        self.sel_bar.add(button("Tag with AI", "tag", tooltip="Have the AI tag these photos")
+                         ).clicked.connect(lambda: self._ai("tag"))
         bar_wrap = QHBoxLayout()
         bar_wrap.setContentsMargins(24, 0, 24, 6)
         bar_wrap.addWidget(self.sel_bar)
@@ -140,7 +154,9 @@ class PhotosPage(QWidget):
     def refresh(self):
         self.dirty = False
         db = self.ctx.db
-        self.names.setStringList(sorted({p.name for p in db.people(include_hidden=True) if p.name}, key=str.lower))
+        names = {p.name for p in db.people(include_hidden=True) if p.name}
+        names |= {s["text"] for s in db.ai_searches()}  # earlier Look for searches complete too
+        self.names.setStringList(sorted(names, key=str.lower))
         photos = db.photos()
         text = self.search.text().strip()
         phrases = self._active_phrases()
@@ -149,7 +165,10 @@ class PhotosPage(QWidget):
         wanted = result.photo_ids
         if wanted is not None:
             photos = [p for p in photos if p.id in wanted]
-        self.grid.set_sections(month_sections(photos), keep_scroll=wanted is None)
+        # A new search starts at the top; the same search refreshed (AI results coming in) stays where it was.
+        same = (text, phrases) == getattr(self, "_shown_search", None)
+        self._shown_search = (text, phrases)
+        self.grid.set_sections(month_sections(photos), keep_scroll=wanted is None or same)
         self.count.setText(plural(len(photos), "photo") if photos else "")
         if not photos:
             if result.problem:
@@ -179,7 +198,21 @@ class PhotosPage(QWidget):
         m.addAction(theme.icon("photos"), "Open with default app", lambda: open_default(tile.data.path))
         m.addSeparator()
         m.addAction(theme.icon("tag"), "Copy path", lambda: QGuiApplication.clipboard().setText(tile.data.path))
+        m.addSeparator()
+        m.addAction(theme.icon("search"), "Look for something in this photo…",
+                    lambda: self.ctx.ai_dialog("look", current=tile.key))
+        m.addAction(theme.icon("tag"), "Tag with AI…", lambda: self.ctx.ai_dialog("tag", current=tile.key))
         m.exec(pos)
+
+    # ---- AI ------------------------------------------------------------------
+    def _ai(self, kind: str):
+        selected = [t.key for t in self.grid.selected_tiles()]
+        self.ctx.ai_dialog(kind, selected=selected or None, shown=self._photo_ids(),
+                           combine_with=self.search.text().strip())
+
+    def _ai_settings(self):
+        self.ctx.navigate(self.ctx.LIBRARY)
+        self.ctx.library.show_ai_card()
 
     def _selected_paths(self) -> list[str]:
         return [t.data.path for t in self.grid.selected_tiles()]

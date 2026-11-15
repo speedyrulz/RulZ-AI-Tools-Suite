@@ -2,16 +2,20 @@
 from __future__ import annotations
 
 import os
+from urllib.parse import urlsplit
 
 from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QFrame, QHBoxLayout, QLabel, QMainWindow, QProgressBar,
-                               QPushButton, QStackedWidget, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QDialog, QFrame, QHBoxLayout, QLabel, QMainWindow,
+                               QProgressBar, QPushButton, QStackedWidget, QVBoxLayout, QWidget)
 
-from .. import config
+from .. import config, search
+from ..ai import settings as ai_settings
+from ..ai.jobs import AIController, Job
 from ..db import Database
 from ..faces import FaceEngine
-from . import theme
+from . import dialogs, theme
+from .ai_panel import AIJobDialog
 from .common import plural
 from .library_page import LibraryPage
 from .people_page import PeoplePage
@@ -23,6 +27,7 @@ from .worker import ScanController
 UI_DB_TIMEOUT = 5          # seconds a UI write waits for the scanner before saying the library is busy
 REFRESH_MS = 350           # refresh delay after a change
 SCAN_REFRESH_MS = 10_000   # at most this often while a scan is running
+AI_REFRESH_MS = 3_000      # at most this often while AI results come in
 
 
 class MainWindow(QMainWindow):
@@ -37,6 +42,9 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(980, 640)
         self.db = Database(timeout=UI_DB_TIMEOUT)
         self.scanner = ScanController(self)
+        self.ai = AIController(self)  # before the pages: they listen to it
+        self._remote_ok: set[str] = set()  # AI servers on other computers the user agreed to send photos to
+        self._ai_job: Job | None = None  # the last AI job shown in the sidebar
         self._engine: FaceEngine | None = None
         # Bumped whenever library data changes; pages use it to know when cached results are stale.
         self.data_version = 0
@@ -70,6 +78,12 @@ class MainWindow(QMainWindow):
         self.scanner.progress.connect(self._progress)
         self.scanner.started.connect(self._scan_started)
         self.scanner.finished.connect(self._scan_finished)
+        self._ai_timer = QTimer(self, singleShot=True, interval=AI_REFRESH_MS)
+        self._ai_timer.timeout.connect(self._ai_refresh)
+        self.ai.started.connect(self._ai_started)
+        self.ai.progress.connect(self._ai_progress)
+        self.ai.saved.connect(self._ai_saved)
+        self.ai.finished.connect(self._ai_finished)
 
         QShortcut(QKeySequence("Ctrl+1"), self, lambda: self.navigate(self.PHOTOS))
         QShortcut(QKeySequence("Ctrl+2"), self, lambda: self.navigate(self.PEOPLE))
@@ -125,6 +139,32 @@ class MainWindow(QMainWindow):
         self.nav.idClicked.connect(self.navigate)
         lay.addStretch(1)
 
+        # AI job status: separate from the scan's, both can run at once
+        self.ai_box = QWidget()
+        al = QVBoxLayout(self.ai_box)
+        al.setContentsMargins(0, 0, 0, 8)
+        al.setSpacing(4)
+        self.ai_status = QLabel()
+        self.ai_status.setWordWrap(True)
+        self.ai_status.setObjectName("SideStatus")
+        self.ai_status.setTextFormat(Qt.PlainText)  # messages quote model replies and server errors
+        self.ai_progress = QProgressBar()
+        self.ai_progress.setTextVisible(False)
+        arow = QHBoxLayout()
+        arow.setContentsMargins(0, 0, 0, 0)
+        arow.setSpacing(2)
+        self.ai_show_btn = self._side_button("Show results", self._ai_show_results)
+        self.ai_stop_btn = self._side_button("Stop", self._ai_stop)
+        self.ai_close_btn = self._side_button("Dismiss", self.ai_box.hide)
+        for b in (self.ai_show_btn, self.ai_stop_btn, self.ai_close_btn):
+            arow.addWidget(b)
+        arow.addStretch(1)
+        al.addWidget(self.ai_status)
+        al.addWidget(self.ai_progress)
+        al.addLayout(arow)
+        self.ai_box.hide()
+        lay.addWidget(self.ai_box)
+
         self.side_status = QLabel()
         self.side_status.setWordWrap(True)
         self.side_status.setObjectName("SideStatus")
@@ -142,6 +182,14 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.theme_btn)
         self._update_theme_button()
         return side
+
+    @staticmethod
+    def _side_button(text: str, slot) -> QPushButton:
+        b = QPushButton(text)
+        b.setObjectName("ThemeButton")  # the sidebar's quiet button look
+        b.setCursor(Qt.PointingHandCursor)
+        b.clicked.connect(slot)
+        return b
 
     def _update_logo(self):
         pm = QPixmap(theme.logo_file())
@@ -221,6 +269,139 @@ class MainWindow(QMainWindow):
         if self._engine is None:
             self._engine = FaceEngine()
         return self._engine
+
+    # ---- AI tagging and Look for -------------------------------------------------
+    def _ai_ready(self) -> ai_settings.Connection | None:
+        """The AI connection if it is set up; otherwise says what's missing and shows Library."""
+        conn = ai_settings.resolve(ai_settings.load())
+        if conn.problem:
+            dialogs.info(self, "Set up AI first", conn.problem)
+            self.navigate(self.LIBRARY)
+            self.library.show_ai_card()
+            return None
+        return conn
+
+    def run_ai(self, job: Job) -> bool:
+        """Start an AI job after the checks: one job at a time, set up, and OK to send photos off this PC."""
+        if self.ai.running:
+            dialogs.info(self, "AI is busy", f"{self.ai.job.title()} is still running. Stop it in the sidebar, or "
+                                             "wait until it's done.")
+            return False
+        conn = self._ai_ready()
+        if conn is None:
+            return False
+        # Asked per server, so a server address that changes (in the Training Captioner too) is asked again.
+        # A connection test sends only a red square, never a photo.
+        hosts = sorted({urlsplit(ep["url"]).hostname or ep["url"] for ep in conn.endpoints
+                        if not ai_settings.is_loopback(ep["url"])} - self._remote_ok)
+        if hosts and job.kind != "test":
+            if not dialogs.confirm(self, "Send photos to another computer?",
+                                   f"The AI server ({', '.join(hosts)}) isn't on this PC. The photos you tag or "
+                                   "search are sent to it over the network.\n\nRulZ asks once for each server "
+                                   "each time it starts.", ok_text="Send photos", danger=True):
+                return False
+            self._remote_ok |= set(hosts)
+        return self.ai.start(job)
+
+    def ai_dialog(self, kind: str, *, current: int | None = None, selected: list[int] | None = None,
+                  shown: list[int] | None = None, query: str = "", combine_with: str = "",
+                  force: bool = False) -> None:
+        """Ask what to look for (or confirm tagging) and for which photos, then start the job. A look for one
+        thing over all photos or the photos shown, started from the Photos page, shows its matches there as
+        they are found (combined with the current search when only the photos shown were checked)."""
+        if self.ai.running:
+            self.run_ai(Job(kind))  # says it's busy
+            return
+        if self._ai_ready() is None:
+            return
+        dlg = AIJobDialog(self, self, kind, current=current, selected=selected, shown=shown, query=query,
+                          force=force)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        job = dlg.job()
+        # Everything was checked before ("Show results"): no job, so no server start and nothing to send.
+        if not dlg.nothing_to_do and not self.run_ai(job):
+            return
+        if kind == "look":
+            for q in job.queries:  # now, so the search below knows them while the server is still starting
+                self.db.ai_search_id(q, create=True)
+            if dlg.nothing_to_do:
+                self.data_changed(quiet=True)
+        on_shown = shown is not None and job.photo_ids == shown
+        # One photo or a selection keeps the search as it is: the sidebar's Show results shows the matches.
+        if kind == "look" and len(job.queries) == 1 and self.root.currentWidget() is not self.viewer \
+                and (job.photo_ids is None or on_shown):
+            q = search.quote(job.queries[0])
+            if combine_with and on_shown:
+                q = f"{combine_with}, {q}"
+            self.navigate(self.PHOTOS)
+            self.photos.search.setText(q)
+
+    def ai_settings_changed(self):
+        self._remote_ok = set()  # another server: ask again before sending photos to it
+
+    def _ai_started(self, job: Job):
+        if job.kind == "test":
+            return  # its result shows on the Library page
+        self._ai_job = job
+        self.ai_box.show()
+        self.ai_status.setText(f"{job.title()}…")
+        self.ai_progress.setRange(0, 0)
+        self.ai_progress.show()
+        self.ai_stop_btn.show()
+        self.ai_show_btn.hide()
+        self.ai_close_btn.hide()
+
+    def _ai_progress(self, done: int, total: int, msg: str):
+        if self.ai.job is None or self.ai.job.kind == "test":
+            return
+        if self.ai.stopping:
+            msg = "Stopping… (waiting for the replies already asked for)"
+        self.ai_status.setText(msg)
+        if total:
+            self.ai_progress.setRange(0, total)
+            self.ai_progress.setValue(done)
+        else:
+            self.ai_progress.setRange(0, 0)
+
+    def _ai_stop(self):
+        self.ai.stop()
+        self.ai_status.setText("Stopping… (waiting for the replies already asked for)")
+
+    def _ai_saved(self):
+        self.data_version += 1
+        for p in (self.photos, self.people, self.library):
+            p.dirty = True
+        if not self._ai_timer.isActive():
+            self._ai_timer.start()
+
+    def _ai_refresh(self):
+        """Show new AI results, at most every few seconds: only views they can change are rebuilt."""
+        if self.root.currentWidget() is self.viewer:
+            self.viewer.refresh_ai()
+        elif self.pages.currentWidget() is self.photos and self.photos.search.text().strip():
+            self.photos.refresh()
+        elif self.pages.currentWidget() is self.library:
+            self.library.ai_card.refresh()
+
+    def _ai_finished(self, job: Job, msg: str, ok: bool):
+        self._ai_timer.stop()
+        self._ai_refresh()
+        if job.kind == "test":
+            return
+        self.ai_box.show()
+        self.ai_status.setText(msg)
+        self.ai_progress.hide()
+        self.ai_stop_btn.hide()
+        self.ai_close_btn.show()
+        self.ai_show_btn.setVisible(job.kind == "look" and bool(job.queries))
+
+    def _ai_show_results(self):
+        job = self._ai_job
+        if job is None or not job.queries:
+            return
+        self.navigate(self.PHOTOS)
+        self.photos.search.setText(search.quote(job.queries[0]))
 
     # ---- refresh -------------------------------------------------------------
     def data_changed(self, quiet: bool = False):
@@ -305,6 +486,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         self.library.flush_settings()
+        # Stop AI work and the llama-server RulZ started (its threads end with the app; nothing to wait for).
+        self.ai.shutdown()
         if self.scanner.running:
             # Destroying a running QThread crashes, and cutting a scan off mid-write helps no one: ask it to
             # stop and close once it has (usually within a second or two).

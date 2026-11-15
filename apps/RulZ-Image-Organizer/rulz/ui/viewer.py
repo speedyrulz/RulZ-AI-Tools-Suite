@@ -1,6 +1,7 @@
 """Full-window photo viewer with face boxes, face corrections and manual face tagging."""
 from __future__ import annotations
 
+import html
 import os
 from datetime import datetime
 
@@ -10,10 +11,11 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPen, Q
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QMenu, QScrollArea, QSizePolicy, QToolButton,
                                QVBoxLayout, QWidget)
 
-from .. import config, imaging
+from .. import config, imaging, search
+from ..ai import settings as ai_settings
 from ..db import Face
 from . import dialogs, theme
-from .common import circle_pixmap, face_image, show_in_explorer, open_default
+from .common import button, circle_pixmap, face_image, show_in_explorer, open_default
 from .thumbs import ThumbLoader
 
 
@@ -322,6 +324,39 @@ class ViewerPage(QWidget):
         self.details.setStyleSheet("line-height: 150%;")
         il.addWidget(self.details)
         il.addSpacing(10)
+
+        # AI tags and Look for answers (hidden while AI is off and the photo has none)
+        self.ai_section = QWidget()
+        al = QVBoxLayout(self.ai_section)
+        al.setContentsMargins(0, 0, 0, 10)
+        al.setSpacing(4)
+        ah = QLabel("AI")
+        ah.setObjectName("H2")
+        al.addWidget(ah)
+        self.ai_tags = QLabel()
+        self.ai_tags.setWordWrap(True)
+        self.ai_tags.setTextFormat(Qt.RichText)
+        self.ai_tags.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.ai_tags.setFocusPolicy(Qt.NoFocus)  # the arrow keys keep browsing photos
+        self.ai_tags.linkActivated.connect(self._search_tag)
+        al.addWidget(self.ai_tags)
+        self.ai_answers = QLabel()
+        self.ai_answers.setWordWrap(True)
+        self.ai_answers.setTextFormat(Qt.RichText)
+        al.addWidget(self.ai_answers)
+        arow = QHBoxLayout()
+        arow.setSpacing(4)
+        self.ai_tag_btn = button("Tag with AI", "tag", flat=True)
+        self.ai_tag_btn.setFocusPolicy(Qt.NoFocus)
+        self.ai_tag_btn.clicked.connect(lambda: self._ai("tag"))
+        self.ai_look_btn = button("Look for…", "search", flat=True)
+        self.ai_look_btn.setFocusPolicy(Qt.NoFocus)
+        self.ai_look_btn.clicked.connect(lambda: self._ai("look"))
+        arow.addWidget(self.ai_tag_btn)
+        arow.addWidget(self.ai_look_btn)
+        arow.addStretch(1)
+        al.addLayout(arow)
+        il.addWidget(self.ai_section)
         ph = QLabel("People")
         ph.setObjectName("H2")
         il.addWidget(ph)
@@ -398,6 +433,7 @@ class ViewerPage(QWidget):
         self._pool.start(_LoadJob(self._gen, ph.path, self._sig))
         self._load_faces()
         self._set_details(ph)
+        self.refresh_ai()
 
     def _loaded(self, gen: int, pil, img, err: str):
         if gen != self._gen:
@@ -433,6 +469,54 @@ class ViewerPage(QWidget):
         if ph is not None:
             self._set_details(ph)
             self._load_faces()
+            self.refresh_ai()
+
+    # ---- AI ------------------------------------------------------------------
+    def refresh_ai(self):
+        """Show the AI tags and Look for answers of the current photo."""
+        ph = self._photo() if self.ids else None
+        info = self.ctx.db.ai_photo(ph.id) if ph else None
+        has = bool(info and (info["tags"] is not None or info["answers"]))
+        self.ai_section.setVisible(ph is not None and (has or ai_settings.load()["mode"] != "off"))
+        if not self.ai_section.isVisibleTo(self.info):
+            return
+        accent, muted = theme.C["accent"], theme.C["muted"]
+        tags = info["tags"]
+        if tags is None:
+            self.ai_tags.setText(f"<span style='color:{muted}'>Not tagged yet.</span>")
+            self.ai_tags.setToolTip("")
+        else:
+            links = ", ".join(f"<a href='{html.escape(t, quote=True)}' style='color:{accent}; text-decoration:none'>"
+                              f"{html.escape(t)}</a>" for t in tags)
+            stale = (f"<i style='color:{muted}'>The photo changed since it was tagged; tag it again to update."
+                     "</i><br>") if info["stale"] else ""
+            self.ai_tags.setText(stale + (links or f"<span style='color:{muted}'>No tags.</span>"))
+            when = ""
+            try:
+                when = datetime.fromtimestamp(info["at"]).strftime(" on %B %d, %Y") if info["at"] else ""
+            except (OSError, OverflowError, ValueError):
+                pass
+            self.ai_tags.setToolTip(f"Tagged by {info['model'] or 'the AI'}{when}. Click a tag to search for it.")
+        answers = info["answers"]
+        if answers:
+            parts = [f"<span style='color:{accent if found else muted}'>{'✓' if found else '✗'} {html.escape(text)}"
+                     "</span>" for text, found in answers]
+            self.ai_answers.setText("Look for: " + " · ".join(parts))
+        self.ai_answers.setVisible(bool(answers))
+        self.ai_tag_btn.setText("Tag again" if tags is not None else "Tag with AI")
+
+    def _search_tag(self, tag: str):
+        self.ctx.search_photos(search.quote(html.unescape(tag)))  # the tag itself, not a name or expression
+
+    def _ai(self, kind: str):
+        ph = self._photo() if self.ids else None
+        if ph is None:
+            return
+        tagged = kind == "tag" and self.ctx.db.ai_photo(ph.id)["tags"] is not None
+        self.ctx.ai_dialog(kind, current=ph.id, shown=list(self.ids) if len(self.ids) > 1 else None,
+                           force=tagged)  # "Tag again" means again
+        if self.isVisible():
+            self.setFocus()
 
     def _load_faces(self):
         ph = self._photo()
