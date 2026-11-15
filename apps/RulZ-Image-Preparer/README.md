@@ -36,6 +36,8 @@ Open a photo and paint over a shadow to brighten it to the light level around it
 - **Paint** (`B`) and **Erase** (`E`) — left-drag on the picture; right-drag still moves it.
   **Brush** sets the size (`[` / `]`), **Undo** (`Ctrl+Z`) takes back the last stroke, **Clear**
   removes them all. **Show areas** tints what you painted red on the original.
+- **Keep lit spots** — leaves lit spots inside the painted shadow lit, such as sun through leaves
+  (see below). Set per photo, off at first.
 - **Shadow lift** — how far the shadow is brightened (100 matches its surroundings).
 - **Edge blend** — how softly the painted area fades into the rest of the picture.
 
@@ -45,9 +47,15 @@ dark and bright things in the shadow keep their difference, lit parts you brush 
 (a lit strip between two shadows, or cutting into one, too), the shadow's soft edge is brightened only as
 much as it was darkened (so brushing past it leaves no bright ring), and a blue shadow tint is matched to
 the surroundings. A lit spot with shadow all around it, like sun through leaves, looks just like a bright
-object in the shadow and is brightened too: erase it, and any lit strip that still comes out too bright
-(one in a faint shadow on busy ground such as gravel or grass, or with something bright in it). Painted
-areas are per photo and are applied by
+object in the shadow (not even its colour tells them apart), so it's brightened too unless you tick
+**Keep lit spots**: then lit spots in the painted shadow are left lit, in any light, and so is a thing in
+the shadow about as bright as sunlit ground (a much brighter one is still brightened). Some spots still come
+out too bright: with something bright in them (a pale stone, or on strongly patterned ground the pattern's
+own lighter bits), or narrower than about a fiftieth of the picture. Erase those, and any lit strip that still
+comes out too bright (one in a faint shadow on busy ground, or with something bright in it). On ground whose
+own pattern is strong (grass, gravel), **Keep lit spots** also takes some of the pattern's lighter patches for
+lit spots and leaves them a little dark: in a faint shadow, beside something dark, or where the shadow also
+covers smoother ground. Painted areas are per photo and are applied by
 **Save all** and by Auto crop's clean-up option. They aren't kept after the app closes.
 
 ## Auto crop

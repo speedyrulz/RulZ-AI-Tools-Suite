@@ -281,6 +281,31 @@ class WindowTests(unittest.TestCase):
             gate.set()
             workers.process_cached = saved
 
+    def test_keep_lit_spots_is_kept_per_picture(self):
+        w = self.win
+        w._open(0)
+        ed = w.editor
+        self.assertFalse(ed.spots.isChecked())
+        ed.spots.click()  # before any painting: kept for the strokes to come
+        self.assertTrue(w.items[0].shadow.spots)
+        self.assertIsNone(w.items[0].shadow_edit())  # nothing painted: nothing to do yet
+        ed.navigate.emit(1)
+        _wait(lambda: ed.item is w.items[1])
+        self.assertFalse(ed.spots.isChecked())  # another picture: its own setting
+        self.assertIsNone(w.items[1].shadow)
+        ed.navigate.emit(-1)
+        _wait(lambda: ed.item is w.items[0])
+        self.assertTrue(ed.spots.isChecked())
+        from rulz.shadows import Stroke
+        ed._on_stroke(Stroke(((0.3, 0.5), (0.6, 0.5)), 0.05))
+        ed._undo_stroke()  # Undo and Clear take back strokes, not the setting
+        ed._on_stroke(Stroke(((0.3, 0.5), (0.6, 0.5)), 0.05))
+        ed._clear_strokes()
+        self.assertTrue(w.items[0].shadow.spots and ed.spots.isChecked())
+        ed.spots.click()
+        self.assertFalse(w.items[0].shadow.spots)
+        w._show_library()
+
     def test_editor_reuses_the_slow_stage(self):
         w = self.win
         w._open(0)
