@@ -2825,7 +2825,15 @@ loaded with and the trunk never accumulates re-quantization error.
 - **Windows.** Planned at launch from the free VRAM after the model loads, less an activation reserve
   (`finetune_reserve_gb`, default 3 GB + 3 GB per megapixel), at 10 bytes per weight with adafactor (fp32 weight,
   gradient, bf16 copy; 18 with adamw). A component larger than a window is cut into block ranges. `finetune_window_gb`
-  sets the window size by hand. The log lists the plan.
+  sets the window size by hand. The log lists the plan. Each window change logs the GPU memory in use with no window
+  up ("window 3 of 4 (...) from step 174, 6.8 GiB in use on the GPU"): it should be about the same at every change.
+- **Fixed in 3.22.1: windows piling up on the GPU.** Up to 3.22.0 a window's optimizer was still held while the next
+  window came up, and Keel's (and Automagic 3's) gradient hooks tied it to its weights in a loop that only Python's
+  occasional full garbage collection undid. Each window change could leave the last window's weights on the card:
+  on Qwen-Image 2.1 (int8, 48 GB card, Keel) about 7.5 GiB more per change, and the fourth window ran out of memory
+  at its first step. The old optimizer is now let go first (its hooks removed, its state dropped) and only what the
+  next window takes over (Automagic's adapted lr and sensitivity reference) is kept. Checked on the same setup: 6.8
+  GiB in use at every window change over two cycles and a save, 41.4 GB peak.
 - **Measured here.** MOSS-Image int8 on a 16 GB RTX 4060 Ti at 0.25 MP, every target, adafactor: 4.76 B weights in 10
   windows (q, k, v, o whole; up-gate in 4 block ranges; down in 2), 13.1 GB peak, about 1.4 s per step. RAM: about
   2 bytes per trained weight for the deltas plus the original quantized copy (MOSS: 10 + 5 GB; Krea 2: 24 + 12 GB).

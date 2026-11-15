@@ -238,3 +238,39 @@ def test_trainer_rotation_and_save_cadence(tmp_path, monkeypatch):
     assert first == tmp_path / f"ft_{4 * n:06d}.safetensors" and (tmp_path / f"ft_{4 * n:06d}_r4.safetensors").is_file()
     assert (tmp_path / "ft_finetune.safetensors").is_file()
     assert tr.save({}, 4 * n, final=True) == tmp_path / "ft.safetensors"
+
+
+@pytest.mark.parametrize("name", ["keel", "automagic4", "automagic3", "adafactor"])
+def test_a_released_optimizer_lets_its_window_go_without_gc(name):
+    """A fine-tune window's optimizer must free the window's weights, gradients and state as soon as the trainer drops
+    it. Keel's (and Automagic 3's) gradient hooks made a parameter -> hook -> optimizer -> parameter cycle that only a
+    full garbage collection freed, so on the GPU the windows piled up and the fourth one ran out of memory."""
+    import gc
+    import weakref
+
+    from rulztrainer.trainer import build_optimizer, optimizer_carry, release_optimizer
+
+    cfg = TrainConfig(optimizer=name, learning_rate=1e-3, finetune=True, weight_decay=0.0)
+    w = nn.Parameter(torch.randn(16, 16))
+    opt = build_optimizer(cfg, [{"params": [w], "lr": 1e-3, "name": "finetune"}])
+    for _ in range(2):
+        opt.zero_grad(set_to_none=True)
+        (w ** 2).sum().backward()
+        opt.step()
+    carry = optimizer_carry(opt)
+    if hasattr(opt, "get_avg_learning_rate"):
+        assert carry.get_avg_learning_rate() == pytest.approx(float(opt.get_avg_learning_rate()))
+    gone_w, gone_opt = weakref.ref(w), weakref.ref(opt)
+    was = gc.isenabled()
+    gc.disable()  # what matters is freeing without a collection: one ran only at random times in a run
+    try:
+        release_optimizer(opt)
+        del opt, w
+        assert gone_w() is None, "the window's weight outlived its optimizer"
+        assert gone_opt() is None or not gone_opt().state
+    finally:
+        if was:
+            gc.enable()
+    nxt = build_optimizer(cfg, [{"params": [nn.Parameter(torch.zeros(4))], "lr": 1e-3, "name": "finetune"}])
+    if hasattr(nxt, "inherit_reference"):
+        nxt.inherit_reference(carry)  # the carry stands in for the old optimizer
