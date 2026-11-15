@@ -16,6 +16,16 @@ Windows desktop app for captioning image datasets with a local vision LLM.
 - Multi-GPU: **Parallel** (one model copy per GPU, images shared out) or **Split** (one model spread across GPUs with `--split-mode layer`, plus `--tensor-split` when you give ratios).
 - Works with any OpenAI-compatible server too (LM Studio, Ollama, vLLM…); list several URLs to caption in parallel.
 - Dark (default) or light theme: the first launch asks which look you want; switch any time with **View ▸ Light mode**.
+- **Caption check**: captions that look wrong get an amber **!** on their card and a short reason next to the
+  file name (hover for the whole reason). Show only those with the **Needs review** filter. It finds captions
+  cut off by the token limit or mid-sentence, refusals, chat text ("Sure, here is…"), "This image shows…",
+  markdown or leftover model tokens, repeated phrases, captions much shorter or longer than the rest,
+  duplicates, and words you flag yourself. Switch each check on or off in **Settings ▸ Caption check**.
+- **Edit ▸ Find and Replace** (Ctrl+H) and **Edit ▸ Add Text to Captions** change many captions at once, on the
+  selected images or on all images the grid shows: plain text or a regular expression, match case, whole
+  words, and a live count of what would change before you apply it.
+- **Undo and redo** (Ctrl+Z / Ctrl+Y) for caption changes: typing, bulk edits, clearing captions and captions
+  written by a captioning run, one step per edit or per run (the last 30 steps).
 
 ## Run
 
@@ -52,7 +62,13 @@ PATH. If that first run was interrupted, delete `.venv` and run it again: the pa
   unfinished thinking counts as a failure, so a caption is never just the prefix.
 - Images that share a name (`photo.png` and `photo.jpg`) share one caption file, `photo.txt`. The app warns
   when you add them: rename or remove one of each pair.
-- A caption cut off by *Max new tokens* is still saved, with a warning in the log.
+- A caption cut off by *Max new tokens* is still saved, with a warning in the log, and shows up under
+  **Needs review**.
+- The caption check uses no model: it reads the text only, so it is quick even on 20,000 captions, and it can
+  be wrong. When a flagged caption is fine, select it and use **Edit ▸ Mark Selected as Checked**; the mark
+  stays away until the caption changes.
+- Undo only covers caption changes made in the app. If another program changed a caption file since, undo
+  leaves that file alone and the status bar says so. Undo and redo are off while captioning runs.
 - "Skip images that already have a caption" applies to *Caption All*; *Caption Selected* always overwrites.
 - Big folders are added in the background, so the window stays usable while they load. Images in subfolders
   stay grouped by folder.
