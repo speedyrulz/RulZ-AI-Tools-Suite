@@ -43,7 +43,9 @@ by itself, since every try counts towards the computer's limit; **Try again** on
   computer, and keeping them open needs 0.11.0.
 - **Is this OK?**: approval requests come up as a sheet over whatever you're looking at. **Allow**, **Allow for this
   task** or **Don't allow**; the back button leaves the app rather than refusing by accident.
-- **Steps** and **Files**: each step with its command and output, and each changed file as a diff. When the task used
+- **Steps** and **Files**: each step with its command and output, and each changed file as a diff. When the agent keeps
+  a checklist for the task, a **Plan** above the steps shows each item as done, being worked on or not started, with
+  "N of M done" (needs RulZ Coding Agent 0.20.0). When the task used
   a draft model (MTP), **Drafts** above the steps shows how many drafted tokens the model accepted and the time that
   saved; tap it for the counts (needs RulZ Coding Agent 0.10.0).
 - **App**: **Run my app** on the computer and watch its output; **Fix this** when it crashes. For web apps, **Open on

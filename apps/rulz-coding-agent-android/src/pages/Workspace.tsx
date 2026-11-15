@@ -8,7 +8,7 @@ import { Markdown } from '../components/Markdown'
 import { HistorySheet, NotesSheet } from '../components/ProjectSheets'
 import { ReSheet, useReOverview, type ReTab } from '../components/ReSheet'
 import { RunView } from '../components/RunView'
-import { DraftReadout, FileCount, FileList, StepList, TaskPicker } from '../components/TaskViews'
+import { DraftReadout, FileCount, FileList, PlanList, StepList, TaskPicker } from '../components/TaskViews'
 import { Button, IconButton, Sheet, Textarea, TopBar } from '../components/ui'
 import { cn, formatTokens } from '../lib/format'
 import { activeModelId, useApp } from '../stores/app'
@@ -40,6 +40,7 @@ export function Workspace() {
               <>
                 <TaskPicker />
                 <DraftReadout />
+                <PlanList />
                 <StepList />
               </>
             )}
