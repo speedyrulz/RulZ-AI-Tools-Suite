@@ -208,6 +208,11 @@ class EditorPage(QWidget):
         self.show_areas.setChecked(str(config.settings().value(SHOW_AREAS_KEY, "false")).lower() == "true")
         self.show_areas.toggled.connect(self._show_areas_changed)
         self.view.set_show_areas(self.show_areas.isChecked())
+        self.spots = QCheckBox("Keep lit spots")
+        self.spots.setToolTip("Leave lit spots in the painted shadows lit, like sun through leaves (this picture). "
+                              "Off, they're brightened like a bright thing in the shadow. On, a thing in the shadow "
+                              "about as bright as sunlit ground isn't brightened either.")
+        self.spots.clicked.connect(self._spots_changed)
         self.undo_btn = QPushButton(theme.icon("reset"), "  Undo", clicked=self._undo_stroke)
         self.undo_btn.setToolTip("Take back the last stroke (Ctrl+Z)")
         self.clear_btn = QPushButton(theme.icon("clear"), "  Clear", clicked=self._clear_strokes)
@@ -219,6 +224,7 @@ class EditorPage(QWidget):
         row.addWidget(self.brush)
         row.addSpacing(8)
         row.addWidget(self.show_areas)
+        row.addWidget(self.spots)
         row.addStretch(1)
         row.addWidget(self.undo_btn)
         row.addWidget(self.clear_btn)
@@ -257,6 +263,10 @@ class EditorPage(QWidget):
     def _show_areas_changed(self, on: bool):
         config.settings().setValue(SHOW_AREAS_KEY, "true" if on else "false")
         self.view.set_show_areas(on)
+
+    def _spots_changed(self, on: bool):
+        if self.item is not None:
+            self._set_shadow(replace(self._shadow(), spots=on))
 
     def _shadow(self) -> ShadowEdit:
         return self.item.shadow if self.item.shadow is not None else ShadowEdit()
@@ -358,6 +368,7 @@ class EditorPage(QWidget):
         edit = self._shadow()
         for key, row in self.shadow_rows.items():
             row.set_value(getattr(edit, key))
+        self.spots.setChecked(edit.spots)  # emits no `clicked`
         self.undo_btn.setEnabled(bool(edit.strokes))
         self.clear_btn.setEnabled(bool(edit.strokes))
 
