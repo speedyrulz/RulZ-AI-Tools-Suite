@@ -45,15 +45,21 @@ class Cancelled(RuntimeError):
     """cancelled() turned true (or stop() was called) while starting."""
 
 
-def port_in_use(port: int, host: str = HOST) -> bool:
+def port_in_use(port: int, host: str = HOST, settle: float = 0.0) -> bool:
     """True when another socket already holds the port. A llama-server started there would fail to
-    bind, and its health check would be answered by whatever holds the port instead."""
-    with socket.socket() as sock:
-        try:
-            sock.bind((host, port))
-        except OSError:
+    bind, and its health check would be answered by whatever holds the port instead. `settle`: keep
+    trying this long before saying so (a process that just ended may not have let go of it yet)."""
+    deadline = time.monotonic() + settle
+    while True:
+        with socket.socket() as sock:
+            try:
+                sock.bind((host, port))
+                return False
+            except OSError:
+                pass
+        if time.monotonic() >= deadline:
             return True
-    return False
+        time.sleep(0.1)
 
 
 def build_plan(cap: dict, first_port: int) -> list[tuple[int, dict, list[str]]]:
@@ -332,7 +338,9 @@ class LlamaServers:
         if not all(0 < p < 65536 for p in ports):
             raise ServerError(f"RulZ's llama-server would need port {span}, past the last port (65535). "
                               f"Lower {PORT_HINT}.")
-        busy = [p for p in ports if port_in_use(p)]
+        # A llama-server that just died (crash, or the restart below) can hold its port for a moment
+        # after its process ends, until Windows has closed its socket: give it time to let go.
+        busy = [p for p in ports if port_in_use(p, settle=2.0)]
         if busy:
             raise ServerError(
                 f"Port {', '.join(map(str, busy))} {'is' if len(busy) == 1 else 'are'} already in use by "
