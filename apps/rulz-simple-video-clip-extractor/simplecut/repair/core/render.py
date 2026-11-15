@@ -208,29 +208,52 @@ class FrameMapper:
         # Clip Extractor change: the effect's per-frame-size data is worked out once (TiltShiftPlan)
         self.tiltshift_plan = TiltShiftPlan((out_h, out_w), self.tiltshift) if self.tiltshift is not None else None
         stages = build_stages(c, frame, focal)
+        self._stages = stages
         # pure resize (no geometry, no crop): skip the remap entirely
         self.plain = all(type(s).__name__ == "IdentityStage" for s in stages.values()) and crop == [0.0, 0.0, 1.0, 1.0]
         self.mx = self.my = None
         if self.plain:
             return
+        self.mx, self.my = self._tables(out_w, out_h, 0.5, 0.5, 1.0, 0.5, 0.5)
+
+    def _tables(self, n_x: int, n_y: int, ox: float, oy: float, step: float, sx: float, sy: float):
+        """Remap tables for a grid of n_x by n_y output samples. Output sample i sits at
+        (i * step + ox) output pixels across the cropped frame and its source position is given
+        in samples of a source grid `step` times coarser whose sample j sits at (j * step + sx)
+        source pixels; step 1 with offsets 0.5 is the full-resolution picture."""
+        w, h = self.src_size
+        ow, oh = self.out_size
+        crop = self.crop
         # Clip Extractor change: the tables are built in strips of rows, so a 4K frame needs
         # tens of MB of temporaries instead of most of a GB.
-        xs = crop[0] + (np.arange(out_w) + 0.5) / out_w * crop[2]
-        ys = crop[1] + (np.arange(out_h) + 0.5) / out_h * crop[3]
-        self.mx = np.empty((out_h, out_w), np.float32)
-        self.my = np.empty((out_h, out_w), np.float32)
-        for y0 in range(0, out_h, 256):
+        xs = crop[0] + (np.arange(n_x) * step + ox) / ow * crop[2]
+        ys = crop[1] + (np.arange(n_y) * step + oy) / oh * crop[3]
+        mx = np.empty((n_y, n_x), np.float32)
+        my = np.empty((n_y, n_x), np.float32)
+        valid = np.empty((n_y, n_x), bool)
+        for y0 in range(0, n_y, 256):
             u, v = np.meshgrid(xs, ys[y0:y0 + 256])
-            su, sv = chain_inverse(stages, u, v)
-            self.mx[y0:y0 + 256] = su * w - 0.5
-            self.my[y0:y0 + 256] = sv * h - 0.5
+            su, sv = chain_inverse(self._stages, u, v)
+            px, py = su * w, sv * h
+            valid[y0:y0 + 256] = (px >= 0) & (px <= w) & (py >= 0) & (py <= h)
+            mx[y0:y0 + 256] = (px - sx) / step
+            my[y0:y0 + 256] = (py - sy) / step
         # Clip Extractor change: output pixels that sample outside the source (the empty area) point
-        # far off the frame instead, where remap's constant border gives exactly 0, so no per-frame
-        # mask is needed (same pixels; at 4K the mask cost as much as the remap).
-        invalid = ~((self.mx >= -0.5) & (self.mx <= w - 0.5) & (self.my >= -0.5) & (self.my <= h - 0.5))
-        if invalid.any():
-            self.mx[invalid] = OFF_FRAME
-            self.my[invalid] = OFF_FRAME
+        # far off the frame instead, where remap's constant border gives exactly the border value,
+        # so no per-frame mask is needed (same pixels; at 4K the mask cost as much as the remap).
+        if not valid.all():
+            mx[~valid] = OFF_FRAME
+            my[~valid] = OFF_FRAME
+        return mx, my
+
+    def chroma_tables(self, size: tuple[int, int]):
+        """Remap tables for the half-size chroma planes of 4:2:0 video, `size` = the chroma
+        plane's (width, height). Each chroma sample is taken to sit in the middle of its 2x2
+        block of pixels, in the source and in the result: swscale reads and writes 4:2:0 that
+        way whatever the file's chroma-location tag says (measured), and the preview and every
+        other export go through swscale. (The middle also stays the middle when the frame is
+        turned, which a "left" site would not.)"""
+        return self._tables(size[0], size[1], 1.0, 1.0, 2.0, 1.0, 1.0)
 
     def apply(self, rgb: np.ndarray, effects: bool = True) -> np.ndarray:
         """RGB uint8 frame (not yet oriented) → corrected RGB uint8 frame."""

@@ -336,6 +336,10 @@ SWS_MATRIX = {"bt709": "bt709", "smpte170m": "bt601", "bt470bg": "bt601", "bt202
               "bt2020c": "bt2020", "smpte240m": "smpte240m", "fcc": "fcc"}
 
 
+# swscale matrix name -> the frame colour-space name setparams takes
+SETPARAMS_MATRIX = {"bt601": "smpte170m", "bt2020": "bt2020nc"}
+
+
 def colour_matrix(info: VideoInfo) -> str:
     """The YUV<->RGB matrix for the RGB round trip: the file's own tag, else what players
     assume for untagged video (BT.709 from 720 lines up). The preview uses the same rule."""
@@ -369,12 +373,31 @@ def colour_tags(info: VideoInfo) -> list[str]:
     return tags
 
 
-def encoder_filters(s: ExportSettings, matrix: str) -> list[str]:
-    """The piped encoder's chain on the corrected RGB frames: crop, LUT, scale, back to YUV."""
+def encoder_filters(s: ExportSettings, matrix: str, yuv: bool = False) -> list[str]:
+    """The piped encoder's chain on the corrected frames: crop, LUT, scale, to YUV 4:2:0.
+
+    yuv: the frames are already limited-range yuv420p in the source's matrix; they go to RGB
+    only for a LUT and are otherwise scaled (when asked) without any colour conversion."""
     filters = []
+    if yuv:
+        # Raw frames carry no colour metadata. An RGB -> YUV conversion would tag them with its
+        # matrix, which ends up in the file; without one, a cropped HD clip under 720 lines
+        # would play back with the SD matrix (reds ~10 levels off).
+        filters.append(f"setparams=colorspace={SETPARAMS_MATRIX.get(matrix, matrix)}:range=tv")
     if s.crop:
         x, y, w, h = s.crop
         filters.append(f"crop={w}:{h}:{x}:{y}")
+    if yuv and not s.lut_path:
+        if s.out_size:
+            w, h = s.out_size
+            filters.append(f"scale={w}:{h}:flags=lanczos+accurate_rnd+full_chroma_int"
+                           f":in_color_matrix={matrix}:out_color_matrix={matrix}:in_range=limited:out_range=limited")
+        filters.append("format=yuv420p")
+        return filters
+    if yuv:
+        filters.append(f"scale=flags=accurate_rnd+full_chroma_int:in_color_matrix={matrix}"
+                       f":in_range=limited:out_range=full")
+        filters.append("format=rgb24")
     if s.lut_path:
         from .colormatch import ffmpeg_lut_filter
         filters.append(ffmpeg_lut_filter(s.lut_path))
@@ -391,12 +414,14 @@ def encoder_filters(s: ExportSettings, matrix: str) -> list[str]:
 
 def build_piped_commands(info: VideoInfo, start: float, end: float, out_path: str, s: ExportSettings,
                          base_rotation: int, base_flip: bool, in_size: tuple[int, int],
-                         out_size: tuple[int, int]) -> list[tuple[list[str], list[str]]]:
+                         out_size: tuple[int, int], yuv: bool = False) -> list[tuple[list[str], list[str]]]:
     """(decoder, encoder) command pairs to try in order: GPU decoding first, then without.
 
     base_rotation/base_flip: the orientation the repair adjustments were made in (the decoder
     applies it; Python applies the corrections and anything rotated or flipped since).
-    in_size: the decoder's frame size; out_size: the corrected frames Python writes."""
+    in_size: the decoder's frame size; out_size: the corrected frames Python writes.
+    yuv: frames travel as limited-range yuv420p in the source's own matrix instead of RGB,
+    which spares both colour conversions and half the bytes."""
     src = os.path.abspath(info.path)
     out_path = os.path.abspath(out_path)
     duration = max(end - start, 0.0)
@@ -413,10 +438,17 @@ def build_piped_commands(info: VideoInfo, start: float, end: float, out_path: st
         dec_filters.append("hflip")
     dec_filters.append(f"fps={rate}")
     # The explicit size makes the raw frames exactly what Python expects to read.
-    dec_filters.append(f"scale={in_size[0]}:{in_size[1]}:flags=accurate_rnd+full_chroma_int"
-                       f":in_color_matrix={matrix}:in_range={'full' if full_range(info) else 'limited'}"
-                       f":out_range=full")
-    dec_filters.append("format=rgb24")
+    in_range = "full" if full_range(info) else "limited"
+    if yuv:
+        # (same matrix in and out: only a range or bit-depth change, or none, so usually a pass-through)
+        dec_filters.append(f"scale={in_size[0]}:{in_size[1]}:flags=accurate_rnd+full_chroma_int"
+                           f":in_color_matrix={matrix}:out_color_matrix={matrix}"
+                           f":in_range={in_range}:out_range=limited")
+    else:
+        dec_filters.append(f"scale={in_size[0]}:{in_size[1]}:flags=accurate_rnd+full_chroma_int"
+                           f":in_color_matrix={matrix}:in_range={in_range}:out_range=full")
+    raw_fmt = "yuv420p" if yuv else "rgb24"
+    dec_filters.append(f"format={raw_fmt}")
 
     def decoder(hwaccel: bool) -> list[str]:
         cmd = ["ffmpeg", "-hide_banner", "-nostats", "-loglevel", "error"]
@@ -424,7 +456,7 @@ def build_piped_commands(info: VideoInfo, start: float, end: float, out_path: st
             cmd += ["-hwaccel", "cuda"]
         cmd += ["-ss", f"{max(k - fmt0, 0.0):.6f}", "-i", src, "-ss", f"{offset:.6f}", "-t", f"{duration:.6f}",
                 "-map", "0:v:0", "-vf", ",".join(dec_filters), "-fps_mode", "passthrough",
-                "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+                "-f", "rawvideo", "-pix_fmt", raw_fmt, "pipe:1"]
         return cmd
 
     w, h = in_size
@@ -433,7 +465,7 @@ def build_piped_commands(info: VideoInfo, start: float, end: float, out_path: st
         raise ValueError("unknown frame size")
     audio = s.audio != "none" and info.has_audio
     enc = ["ffmpeg", "-y", "-hide_banner", "-nostats", "-loglevel", "error",
-           "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{ow}x{oh}", "-framerate", rate]
+           "-f", "rawvideo", "-pix_fmt", raw_fmt, "-s", f"{ow}x{oh}", "-framerate", rate]
     if audio:
         # The source's audio is seeked to the decoder's keyframe and trimmed on the output side,
         # like build_command does (so copied audio holds only the clip). The video already starts
@@ -448,7 +480,7 @@ def build_piped_commands(info: VideoInfo, start: float, end: float, out_path: st
             "-g", str(gop_frames(info, s))]
     if s.codec == "hevc_nvenc":
         enc += ["-tag:v", "hvc1"]
-    enc += ["-vf", ",".join(encoder_filters(s, matrix))]
+    enc += ["-vf", ",".join(encoder_filters(s, matrix, yuv))]
     enc += colour_tags(info)
     if audio:
         enc += ["-map", "1:a:0?"]

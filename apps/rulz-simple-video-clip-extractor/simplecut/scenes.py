@@ -16,9 +16,6 @@ usually not found.
 """
 from __future__ import annotations
 
-import hashlib
-import json
-import os
 import time
 import traceback
 from array import array
@@ -30,7 +27,8 @@ import av
 import numpy as np
 from PySide6.QtCore import QThread, Signal
 
-from .cliplist import STALE_DAYS, _file_stamp, _remove, store_dir, video_key
+from .cliplist import STALE_DAYS, _file_stamp  # noqa: F401  (STALE_DAYS: how long scans of gone videos stay)
+from .npzcache import cache_dir, cache_path, clean_dir, load_npz, save_npz
 
 SCORE_VERSION = 1
 THUMB_WIDTH = 96            # thumbnail width in pixels; the height follows the picture's shape
@@ -184,11 +182,11 @@ def motion_score(mafd: np.ndarray) -> np.ndarray:
 
 # ------------------------------------------------------------------ storage
 def scores_dir() -> str:
-    return os.path.join(os.path.dirname(store_dir()), "scene-cuts")
+    return cache_dir("scene-cuts")
 
 
 def scores_path(video: str) -> str:
-    return os.path.join(scores_dir(), hashlib.sha1(video_key(video).encode("utf-8")).hexdigest()[:24] + ".npz")
+    return cache_path(scores_dir(), video)
 
 
 def save_scores(video: str, s: SceneScores, stamp: tuple[int, float] | None = None) -> bool:
@@ -196,41 +194,22 @@ def save_scores(video: str, s: SceneScores, stamp: tuple[int, float] | None = No
     date, like its clip list). `stamp` is the file's size and date when the scan began: a file
     that changed meanwhile (still being written or copied) is not stored. False when nothing
     was written."""
-    now = _file_stamp(video)
-    if now is None or (stamp is not None and stamp != now):
-        return False
-    stamp = now
-    path = scores_path(video)
-    tmp = f"{path}.{os.getpid()}.tmp.npz"
-    meta = json.dumps({"version": SCORE_VERSION, "path": os.path.abspath(video),
-                       "size": stamp[0], "mtime": stamp[1]})
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        np.savez_compressed(tmp, meta=np.array(meta), times=s.times,
-                            score=s.score.astype(np.float16), settle=s.settle.astype(np.float16))
-        os.replace(tmp, path)
-        return True
-    except (OSError, ValueError):
-        _remove(tmp)
-        return False
+    return save_npz(scores_path(video), video, SCORE_VERSION,
+                    {"times": s.times, "score": s.score.astype(np.float16), "settle": s.settle.astype(np.float16)},
+                    stamp)
 
 
 def load_scores(video: str) -> SceneScores | None:
     """The stored scores of this video, or None (never scanned, another file of that name since,
     another scan version, or unreadable)."""
-    stamp = _file_stamp(video)
-    if stamp is None:
+    z = load_npz(scores_path(video), video, SCORE_VERSION, ("times", "score", "settle"))
+    if z is None:
         return None
     try:
-        with np.load(scores_path(video), allow_pickle=False) as z:
-            meta = json.loads(str(z["meta"]))
-            if (meta.get("version") != SCORE_VERSION or int(meta["size"]) != stamp[0]
-                    or abs(float(meta["mtime"]) - stamp[1]) >= 2.0):
-                return None
-            times = np.asarray(z["times"], dtype=np.float64)
-            score = np.asarray(z["score"], dtype=np.float32)
-            settle = np.asarray(z["settle"], dtype=np.float32)
-    except Exception:  # noqa: BLE001 - missing, damaged or hand-made: scan again
+        times = z["times"].astype(np.float64)
+        score = z["score"].astype(np.float32)
+        settle = z["settle"].astype(np.float32)
+    except (TypeError, ValueError):
         return None
     if not (times.ndim == score.ndim == settle.ndim == 1 and len(times) == len(score) == len(settle)):
         return None
@@ -242,28 +221,7 @@ def load_scores(video: str) -> SceneScores | None:
 def clean_scores(now: float | None = None):
     """Delete stored scores whose video no longer exists and that are older than STALE_DAYS,
     and scans that were cut off while being written."""
-    d = scores_dir()
-    now = time.time() if now is None else now
-    try:
-        names = os.listdir(d)
-    except OSError:
-        return
-    for name in names:
-        p = os.path.join(d, name)
-        try:
-            age = now - os.path.getmtime(p)
-            if ".tmp" in name:
-                if age > 86400:
-                    os.remove(p)
-                continue
-            if not name.endswith(".npz") or age < STALE_DAYS * 86400:
-                continue
-            with np.load(p, allow_pickle=False) as z:
-                video = json.loads(str(z["meta"]))["path"]
-            if not os.path.exists(video):
-                os.remove(p)
-        except Exception:  # noqa: BLE001 - leave what can't be read; it is cleaned up never or later
-            continue
+    clean_dir(scores_dir(), now)
 
 
 class SceneScanThread(QThread):

@@ -77,6 +77,25 @@ import numpy as np  # noqa: E402
 for name in ("test_pattern_10s.mp4", "skin_cast.mp4", "skin_reference.png"):
     shutil.copyfile(os.path.join(REPO, "samples", name), os.path.join(args.videos, name))
 
+# Speech-like sound for the waveform strip: syllables of a voiced buzz in phrases with pauses,
+# and a clap now and then (the samples' own steady tone would draw as a flat band).
+SPEECH = ("aevalsrc='0.7*between(mod(t,3.1),0.25,2.2)*pow(abs(sin(2*PI*2.6*t+0.6*sin(5*t))),1.5)"
+          "*(0.6*sin(2*PI*150*t)+0.3*sin(2*PI*300*t)+0.25*(random(0)-0.5))"
+          "+0.95*between(mod(t,4.3),2.6,2.62)*(random(1)-0.5)*exp(-120*(mod(t,4.3)-2.6))'"
+          ":s=48000:d=20")
+
+
+def with_speech(path: str):
+    """Swap a video's sound for SPEECH (in place)."""
+    import subprocess
+    tmp = path + ".speech.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", path, "-f", "lavfi", "-i", SPEECH, "-map", "0:v:0",
+                    "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-shortest", tmp], check=True)
+    os.replace(tmp, path)
+
+
+with_speech(os.path.join(args.videos, "test_pattern_10s.mp4"))
+
 
 def make_facade_video(path: str, w: int = 1280, h: int = 720, seconds: float = 4.0, fps: int = 30):
     """A drawn building facade seen from below: its sides lean inwards (keystone), sky around it."""
@@ -150,6 +169,7 @@ def make_scenes_video(path: str):
     graph += ";" + "".join(f"[v{i}]" for i in range(len(srcs))) + f"concat=n={len(srcs)}:v=1:a=0[out]"
     subprocess.run(cmd + ["-filter_complex", graph, "-map", "[out]", "-c:v", "libx264", "-crf", "18",
                           "-preset", "veryfast", path], check=True)
+    with_speech(path)
 
 
 SCENES = os.path.join(args.videos, "scenes.mp4")
@@ -254,6 +274,9 @@ def open_video(path, wait=4.0):
         pump(0.2)
     t0 = time.time()
     while not win.info.keyframes and time.time() - t0 < 30:  # lossless cuts wait for the keyframe scan
+        pump(0.2)
+    t0 = time.time()
+    while win._wave_thread is not None and time.time() - t0 < 30:   # the sound waveform
         pump(0.2)
     pump(wait)
 

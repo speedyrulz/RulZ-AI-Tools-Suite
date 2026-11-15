@@ -47,6 +47,7 @@ PALETTES = {
         TL_BAR="#1c1c20", TL_BAR_BORDER="#34343a", TL_TICK="#cdcdd4", TL_MARK="#ffffff",
         TL_INOUT="#be7d0a10", TL_SEL="#78e2121c",
         TL_SCENE="#f0b429",    # scene cuts
+        WAVE_BG="#121215", WAVE_PEAK="#5e5e68", WAVE_RMS="#c4c4cc",   # sound strip: soft peak, brighter RMS
         ARROW_SUFFIX="",
     ),
     LIGHT: dict(
@@ -69,6 +70,7 @@ PALETTES = {
         TL_BAR="#ebebef", TL_BAR_BORDER="#c9c9cf", TL_TICK="#5f6068", TL_MARK="#111114",
         TL_INOUT="#55ed000d", TL_SEL="#4ced000d",
         TL_SCENE="#b7791f",
+        WAVE_BG="#f3f3f6", WAVE_PEAK="#b9b9c2", WAVE_RMS="#55565e",
         ARROW_SUFFIX="_light",
     ),
 }
@@ -95,7 +97,8 @@ def set_mode(m: str):
     for k, v in PALETTES[_mode].items():
         g[k] = v
     for k in ("BG", "PANEL", "TEXT", "MUTED", "RED", "RED_HOVER", "RED_DARK", "ACCENT_TEXT",
-              "TL_BAR", "TL_BAR_BORDER", "TL_TICK", "TL_MARK", "TL_INOUT", "TL_SEL", "TL_SCENE"):
+              "TL_BAR", "TL_BAR_BORDER", "TL_TICK", "TL_MARK", "TL_INOUT", "TL_SEL", "TL_SCENE",
+              "WAVE_BG", "WAVE_PEAK", "WAVE_RMS"):
         g["Q_" + k] = QColor(PALETTES[_mode][k])
 
 

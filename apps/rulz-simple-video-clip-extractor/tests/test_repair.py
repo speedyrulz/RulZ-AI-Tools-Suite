@@ -233,24 +233,31 @@ def _wait(job, got, timeout=30):
         time.sleep(0.01)
 
 
-def test_piped_job_retries_on_the_cpu_when_gpu_decoding_fails_first(tmp_path):
+@pytest.mark.parametrize("yuv", [True, False])
+def test_piped_job_retries_on_the_cpu_when_gpu_decoding_fails_first(tmp_path, yuv):
     py = sys.executable
     w, h, n = 8, 4, 5
-    rx = _repair_export(w, h)
+    rx = _repair_export(w, h, corrections())
     job = PipedExportJob(_info(width=w, height=h), 0.0, 1.0, "unused.mp4", ExportSettings(mode="nvenc", repair=rx))
+    assert job.yuv     # (these corrections can be done on the 4:2:0 planes)
+    job.yuv = yuv
+    fb = w * h * 3 // 2 if yuv else w * h * 3
+    ow, oh = rx.out_size
     counted = tmp_path / "bytes.txt"
     enc = [py, "-c", f"import sys; open(r'{counted}', 'w').write(str(len(sys.stdin.buffer.read())))"]
     job.attempts = [([py, "-c", "import sys; sys.exit(3)"], enc),
-                    ([py, "-c", f"import sys; sys.stdout.buffer.write(bytes({w * h * 3 * n}))"], enc)]
+                    ([py, "-c", f"import sys; sys.stdout.buffer.write(bytes({fb * n}))"], enc)]
     calls = []
-    real = rx.process
-    rx.process = lambda a: (calls.append(1), real(a))[1]
+    name = "process_yuv" if yuv else "process"
+    real = getattr(rx, name)
+    setattr(rx, name, lambda *a: (calls.append(1), real(*a))[1])
     got = []
     job.finished.connect(lambda ok, log: got.append((ok, log)))
     job.start()
     _wait(job, got)
     assert got and got[0][0] is True, got
-    assert "CPU" in got[0][1] and job.frames == n and int(counted.read_text()) == w * h * 3 * n
+    assert "CPU" in got[0][1] and job.frames == n
+    assert int(counted.read_text()) == (ow * oh * 3 // 2 if yuv else ow * oh * 3) * n
     assert len(calls) == 1   # identical frames (a raised frame rate) are corrected once
 
 
@@ -290,6 +297,25 @@ def test_cancel_stops_a_decoder_that_has_not_sent_a_frame_yet():
     job.cancel()
     assert job.wait(10000) and time.time() - t < 5
     assert got == [False] and job.frames == 0
+
+
+def test_an_encoder_that_fails_is_reported_not_retried_as_a_gpu_decoding_failure():
+    """The encoder quitting at once used to get the decoder killed, whose exit code then looked
+    like a GPU-decoding failure: the CPU retry ran and its log replaced the encoder's error."""
+    py = sys.executable
+    rx = _repair_export(8, 4)
+    job = PipedExportJob(_info(width=8, height=4), 0.0, 100.0, "unused.mp4",
+                         ExportSettings(mode="nvenc", repair=rx))
+    dec = [py, "-c", "import sys, time\nwhile True:\n    sys.stdout.buffer.write(bytes(96)); "
+                     "sys.stdout.flush(); time.sleep(0.01)"]
+    enc = [py, "-c", "import sys; sys.stderr.write('encoder says no'); sys.exit(1)"]
+    job.attempts = [(dec, enc), (dec + ["second"], enc)]
+    got = []
+    job.finished.connect(lambda ok, log: got.append((ok, log)))
+    job.start()
+    _wait(job, got)
+    assert got and got[0][0] is False
+    assert job.cmd[0] == dec and "encoder says no" in got[0][1] and "CPU" not in got[0][1]
 
 
 # ------------------------------------------------------------------ real exports
@@ -371,6 +397,93 @@ def test_repaired_export_after_rotate_flip_crop_and_scale(tmp_path):
         screen = rx.state.screen_frame(frames[k], 0, 90, True, full=True)[y:y + h, x:x + w]
         small = got[k][::2, ::2].astype(np.int16)              # undo the 2x scale roughly
         assert float(np.abs(small - screen.astype(np.int16)).mean()) < 12
+
+
+def _as_rgb_path(job, info, start, end, out, s):
+    """The same job with frames sent as RGB (the only path before 1.9.0, still used for the
+    miniature effect and for rotations made after the repair)."""
+    rx = job.repair
+    job.yuv = False
+    job.attempts = build_piped_commands(info, start, end, out, s, rx.base_rotation, rx.base_flip,
+                                        rx.in_size, rx.out_size, False)
+    return job
+
+
+def _make_420_source(path, pix_fmt="yuv420p", size="640x360", extra=()):
+    r = subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                        "-i", f"testsrc2=size={size}:rate=25", "-t", "0.6", "-c:v", "libx264", "-preset", "veryfast",
+                        "-crf", "8", "-g", "10", "-pix_fmt", pix_fmt, *extra, path], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-500:]
+    return path
+
+
+YUV_CASES = {
+    "hd": dict(size="1280x720"),
+    "base rotation 90": dict(base=(90, False)),
+    "base rotation 270 + flip": dict(base=(270, True)),
+    "full range": dict(pix_fmt="yuvj420p"),
+    "10-bit": dict(pix_fmt="yuv420p10le"),
+    "4:4:4": dict(pix_fmt="yuv444p"),
+    "chroma tagged centre": dict(extra=("-chroma_sample_location", "center")),
+    "crop and scale": dict(crop=True),
+    "colour LUT": dict(lut=True),
+}
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("case", list(YUV_CASES))
+def test_yuv_frames_export_like_the_rgb_path(tmp_path, case):
+    """1.9.0 sends 4:2:0 planes through Python instead of RGB. Same picture as the RGB path,
+    within the rounding of the RGB round trip it no longer makes."""
+    from simplecut import colormatch
+    k = YUV_CASES[case]
+    src = _make_420_source(str(tmp_path / "src.mp4"), k.get("pix_fmt", "yuv420p"), k.get("size", "640x360"),
+                           k.get("extra", ()))
+    info = probe(src)
+    base = k.get("base", (0, False))
+    s = ExportSettings(mode="nvenc", fps=None, audio="none")
+    if k.get("crop"):
+        sw, sh = _repair_export(info.width, info.height, corrections(), base=base, cur=base).out_size
+        s.crop = (6, 10, sw // 2 & ~1, sh // 2 & ~1)
+        s.out_size = (s.crop[2] * 3 // 2 & ~1, s.crop[3] * 3 // 2 & ~1)
+    if k.get("lut"):
+        ramp = np.arange(256, dtype=np.float64)
+        s.lut_path = colormatch.write_cube_1d(np.stack([np.clip(ramp * 1.1, 0, 255), ramp,
+                                                        np.clip(ramp * 0.9 + 10, 0, 255)]).astype(np.uint8))
+    outs = []
+    for yuv in (True, False):
+        s.repair = _repair_export(info.width, info.height, corrections(), base=base, cur=base)
+        out = str(tmp_path / f"out{yuv}.mp4")
+        job = PipedExportJob(info, info.start_time, info.end_time, out, s)
+        assert job.yuv
+        if not yuv:
+            _as_rgb_path(job, info, info.start_time, info.end_time, out, s)
+        run_cpu(job)
+        outs.append(decode_rgb(out))
+    a, b = outs
+    assert len(a) == len(b) > 0 and a[0].shape == b[0].shape
+    for fa, fb in zip(a, b):
+        d = fa.astype(np.int16) - fb.astype(np.int16)
+        assert float(np.abs(d).mean()) < 2.5, (case, float(np.abs(d).mean()))
+        assert np.abs(d.reshape(-1, 3).mean(axis=0)).max() < 1.0, (case, d.reshape(-1, 3).mean(axis=0))
+
+
+def test_yuv_path_is_left_for_the_miniature_effect_later_turns_and_odd_crops():
+    c = corrections()
+
+    def yuv(rx, **kw):
+        return PipedExportJob(_info(), 0.0, 1.0, "o.mp4", ExportSettings(mode="nvenc", repair=rx, **kw)).yuv
+
+    assert yuv(_repair_export(1920, 1080, c))
+    ts = corrections()
+    ts.tiltshift.enabled = True
+    assert not yuv(_repair_export(1920, 1080, ts))
+    assert not yuv(_repair_export(1920, 1080, c, base=(0, False), cur=(90, False)))
+    assert not yuv(_repair_export(1920, 1080, c), crop=(3, 0, 800, 600))
+    job = PipedExportJob(_info(), 0.0, 1.0, "o.mp4", ExportSettings(mode="nvenc", repair=_repair_export(1920, 1080, c)))
+    dec, enc = job.attempts[1]
+    assert dec[dec.index("-pix_fmt") + 1] == "yuv420p" and "format=yuv420p" in dec[dec.index("-vf") + 1]
+    assert "setparams=colorspace=bt709:range=tv" in enc[enc.index("-vf") + 1]
 
 
 # ------------------------------------------------------------------ the window
