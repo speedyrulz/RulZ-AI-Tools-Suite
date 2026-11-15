@@ -6,7 +6,8 @@ A small Windows video trimmer: frame-accurate stepping, keyframe navigation,
 In/Out marks, and export either **lossless** (stream copy, when In and Out are
 on keyframes) or **re-encoded with NVIDIA NVENC** to MP4. A
 [clip list](#clip-list) collects several clips of a video and exports them in
-one go. The
+one go, and [scene cuts](#scene-cuts) finds where the shots of a video change,
+so each scene can be marked or listed with one key. The
 [Distortion repair](#distortion-repair) window brings the lens, perspective and
 horizon corrections of RulZ Image Distortion Repair to every clip and frame you
 export.
@@ -62,12 +63,14 @@ python -m venv .venv
 | ------------------- | ------ | ------------- |
 | Open a video (or drop it on the window) | | Ctrl+O |
 | Go to start         | ⏮      | Home          |
+| Previous scene cut  | ◀S     | Page Up       |
 | Previous keyframe   | ◀K     | Shift+Left    |
 | Previous frame      | ◀      | Left          |
 | Play / pause        | ▶      | Space         |
 | Mute                | 🔊     | M             |
 | Next frame          | ▶      | Right         |
 | Next keyframe       | K▶     | Shift+Right   |
+| Next scene cut      | S▶     | Page Down     |
 | Go to end           | ⏭      | End           |
 | Mark In             |        | I             |
 | Mark Out            |        | O             |
@@ -76,6 +79,9 @@ python -m venv .venv
 | Quick export        |        | Ctrl+Shift+E  |
 | Add selection to the clip list | | A        |
 | Export the clip list |       | Ctrl+Shift+A  |
+| Find scene cuts     | Scene cuts | X         |
+| Mark the scene at the playhead | | Shift+X  |
+| Add every scene to the clip list | | Ctrl+Shift+X |
 | Open last export    |        | Ctrl+Shift+O  |
 | Save frame as PNG   | 💾     | S             |
 | Rotate 90° clockwise |       | R             |
@@ -379,6 +385,51 @@ each export before marking the next.
   "finding keyframes…"): it needs them to tell which clips can be cut
   losslessly.
 
+## Scene cuts
+
+Find where the shots of a video change (the hard cuts between scenes), then
+jump between them, mark a whole scene with one key, or put every scene in the
+clip list.
+
+![Scene cuts found on a six-scene video: amber lines on the timeline at each cut, every scene in the clip list and the third scene marked](docs/screenshots/scene-cuts.png)
+
+- **Scene cuts** (X, also in the Scenes menu) reads the video once in the
+  background and draws an amber line on the timeline at the first frame of
+  each new scene. The status bar shows the progress, with **Stop**; you can
+  keep working meanwhile. It reads about 600 frames a second on 1080p H.264 on
+  a fast PC, so a 10-minute video at 30 fps takes about half a minute; 4K and
+  HEVC take longer.
+- The result is kept per video (in `%LOCALAPPDATA%\SimpleCut\scene-cuts`,
+  beside the clip lists), so the cuts are back at once when you open the video
+  again. Like a clip list, it is not used when the file has changed since.
+- **◀S / S▶** (Page Up / Page Down) move the playhead to the previous or next
+  cut. With Fixed length on they move the clip box there instead.
+- **Select this scene** (Shift+X) sets In on the first frame of the scene
+  under the playhead and Out where the next scene starts (Out is exclusive, so
+  the clip ends on the scene's last frame). With Fixed length on, the clip box
+  moves to the start of the scene.
+- **Add scenes to clip list** (Ctrl+Shift+X) adds every scene as a clip, with
+  the picture settings as they are now (as Add to list does). With In and/or
+  Out set, only the scenes between them, cut to the marks. With Fixed length
+  on, it adds one clip of that length at the start of every scene that is long
+  enough for it and leaves out the shorter ones. Scenes already in the list
+  aren't added twice, and adding more than 25 at once asks first.
+- **Sensitivity** (Scenes menu: Low, Normal, High) sets how big a change
+  counts as a cut. Normal suits most video; High also finds cuts between
+  shots that look alike (same place, same colours); Low only the clearest
+  ones. Changing it takes effect at once, without reading the video again.
+- What counts: a cut is a frame that differs clearly from the one before, and
+  still differs a couple of frames later. Steady camera movement (pans,
+  zooms) is not a cut, and neither is a camera flash or a single bad frame.
+  Two cuts less than half a second apart count once (the stronger one), and
+  there is none in the first or last half second (a fade-in, a title or a
+  broken last frame is not a scene).
+- Limits: slow fades and dissolves have no single frame where the picture
+  changes and are usually not found. Very fast motion or a sudden light
+  change can be taken for a cut; move to it with S▶ and check. A cut is
+  usually not on a keyframe unless the encoder put one there (many do), so a
+  scene clip is often re-encoded rather than cut losslessly.
+
 ## Settings
 
 The **Settings** menu sets the default output folder used for both clips and
@@ -482,6 +533,7 @@ clips exported before this fix, this repairs one without touching the video:
 - `simplecut/timeline.py` — timeline widget (marks, fixed-length box)
 - `simplecut/cropview.py` — video preview with interactive crop box
 - `simplecut/export.py` — ffmpeg command builder + async job
+- `simplecut/scenes.py` — scene-cut detection: the scan, picking cuts, storage
 - `simplecut/cliplist.py` — the clip list: entries, their per-video storage,
   the background batch export and the list panel
 - `simplecut/app.py` — main window and export dialog

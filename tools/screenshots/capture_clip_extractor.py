@@ -20,7 +20,8 @@ Run with a venv that has PySide6, av and numpy; Pillow is not needed:
   (wincap.py), composites it over QWidget.grab() of the main window at its real offset, then cancels it.
   Nothing is exported.
 * --out gets the catalog set (01-05), --readme the app README's docs/screenshots set (main-dark, main-light,
-  clip-list, choose-your-look, export-dialog, colour-match, distortion-repair).
+  clip-list, scene-cuts, choose-your-look, export-dialog, colour-match, distortion-repair). scenes.mp4 (six
+  scenes with hard cuts, from ffmpeg's test pictures and the samples) is made in --videos for scene-cuts.
 """
 from __future__ import annotations
 
@@ -130,6 +131,29 @@ def make_facade_video(path: str, w: int = 1280, h: int = 720, seconds: float = 4
 
 FACADE = os.path.join(args.videos, "facade.mp4")
 make_facade_video(FACADE)
+
+
+def make_scenes_video(path: str):
+    """Six scenes of 2.5 s with hard cuts between them: ffmpeg's test pictures and the drawn face."""
+    import subprocess
+    norm = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,setsar=1,fps=30,format=yuv420p"
+    srcs = [["-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30"],
+            ["-f", "lavfi", "-i", "mandelbrot=s=1280x720:r=30"],
+            ["-stream_loop", "-1", "-i", os.path.join(args.videos, "skin_cast.mp4")],
+            ["-f", "lavfi", "-i", "smptehdbars=s=1280x720:r=30"],
+            ["-stream_loop", "-1", "-i", os.path.join(args.videos, "test_pattern_10s.mp4")],
+            ["-f", "lavfi", "-i", "cellauto=s=1280x720:r=30:rule=110"]]
+    cmd = ["ffmpeg", "-v", "error", "-y"]
+    for s in srcs:
+        cmd += s
+    graph = ";".join(f"[{i}:v]{norm},trim=end_frame=75,setpts=PTS-STARTPTS[v{i}]" for i in range(len(srcs)))
+    graph += ";" + "".join(f"[v{i}]" for i in range(len(srcs))) + f"concat=n={len(srcs)}:v=1:a=0[out]"
+    subprocess.run(cmd + ["-filter_complex", graph, "-map", "[out]", "-c:v", "libx264", "-crf", "18",
+                          "-preset", "veryfast", path], check=True)
+
+
+SCENES = os.path.join(args.videos, "scenes.mp4")
+make_scenes_video(SCENES)
 
 from PySide6.QtCore import QEventLoop, QPoint, QRectF, QTimer  # noqa: E402
 from PySide6.QtGui import QColor, QPainter  # noqa: E402
@@ -311,6 +335,28 @@ if args.readme:
     win.b_crop.setChecked(False)
     win.aspect_combo.setCurrentText("Free")
     pump(0.5)
+
+# ---- scene cuts: found on a six-scene video, every scene added to the list, the third one marked
+if args.readme:
+    open_video(SCENES)
+    win.find_scene_cuts()
+    t0 = time.time()
+    while win.scene_scores is None and time.time() - t0 < 60:
+        pump(0.2)
+    win.add_scenes_to_list()
+    for e in win.clips.entries[:2]:
+        e.status, e.out_path = "done", os.path.join(args.videos, "scenes_clip.mp4")
+    win._refresh_clips()
+    win.seek_to(6.0)
+    win.select_scene()
+    win.seek_to(6.4)
+    win.status.showMessage(win._scene_summary())
+    pump(1.0)
+    save(win.grab().toImage(), args.readme, "scene-cuts.png")
+    win._remove_clips(list(win.clips.entries))
+    win.clear_marks()
+    pump(0.5)
+    open_video(TEST)
 
 # ---- In/Out on keyframes -> the Export dialog offers a lossless stream copy
 win.seek_to(2.0)

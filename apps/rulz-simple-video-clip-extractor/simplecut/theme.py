@@ -46,6 +46,7 @@ PALETTES = {
         # timeline (QColor accepts #AARRGGBB)
         TL_BAR="#1c1c20", TL_BAR_BORDER="#34343a", TL_TICK="#cdcdd4", TL_MARK="#ffffff",
         TL_INOUT="#be7d0a10", TL_SEL="#78e2121c",
+        TL_SCENE="#f0b429",    # scene cuts
         ARROW_SUFFIX="",
     ),
     LIGHT: dict(
@@ -67,6 +68,7 @@ PALETTES = {
         INDICATOR_BORDER="#a3a3ab",
         TL_BAR="#ebebef", TL_BAR_BORDER="#c9c9cf", TL_TICK="#5f6068", TL_MARK="#111114",
         TL_INOUT="#55ed000d", TL_SEL="#4ced000d",
+        TL_SCENE="#b7791f",
         ARROW_SUFFIX="_light",
     ),
 }
@@ -93,7 +95,7 @@ def set_mode(m: str):
     for k, v in PALETTES[_mode].items():
         g[k] = v
     for k in ("BG", "PANEL", "TEXT", "MUTED", "RED", "RED_HOVER", "RED_DARK", "ACCENT_TEXT",
-              "TL_BAR", "TL_BAR_BORDER", "TL_TICK", "TL_MARK", "TL_INOUT", "TL_SEL"):
+              "TL_BAR", "TL_BAR_BORDER", "TL_TICK", "TL_MARK", "TL_INOUT", "TL_SEL", "TL_SCENE"):
         g["Q_" + k] = QColor(PALETTES[_mode][k])
 
 
