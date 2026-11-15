@@ -131,6 +131,22 @@ export const TOOL_DEFS = [
     ['page']
   ),
   tool(
+    'set_plan',
+    'Write or update your checklist for this task: the few steps you will take, in order, in plain words the owner can read (they see it next to the conversation). ' +
+      'Send the whole list every time. Use it for tasks that need more than three or four steps: write it before you start, ' +
+      'and send it again whenever you finish a step or the plan changes. Small tasks need no checklist.',
+    {
+      // Text, like every other parameter: small models get lists of objects wrong more often.
+      steps: {
+        type: 'string',
+        description:
+          'The whole checklist: three to eight steps in order, one per line, each a few plain words. Start every line with [x] for a finished step, ' +
+          '[>] for the step you are on now, or [ ] for one you have not started. Example:\n[x] Build the main window\n[>] Add the buttons\n[ ] Check that it works'
+      }
+    },
+    ['steps']
+  ),
+  tool(
     'ask_user',
     'Ask the owner a question and wait for the answer. Only for real choices that change what you build (for example two very different designs); otherwise pick a sensible default yourself.',
     { question: { type: 'string', description: 'The question, in plain words.' } },
@@ -289,6 +305,8 @@ export function describeStep(name: string, args: Record<string, unknown>): strin
       return 'Looking at the page'
     case 'ask_user':
       return 'Asking you a question'
+    case 'set_plan':
+      return 'Updating my checklist'
     case 'find_tools':
       return `Looking for tools: "${String(args.query ?? '').slice(0, 40)}"`
     case 'load_tools':

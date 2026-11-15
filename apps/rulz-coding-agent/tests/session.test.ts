@@ -46,6 +46,7 @@ async function harness(
     checkPage?: SessionDeps['checkPage']
     timings?: MockOptions['timings']
     toolServers?: SessionDeps['toolServers']
+    checkSyntax?: SessionDeps['checkSyntax']
     /** Sees every event as it happens (to act mid-task, like the owner would). */
     onEvent?: (e: AgentEvent, session: ProjectSession) => void
   } = {}
@@ -91,7 +92,8 @@ async function harness(
       (kind === 'git' || (kind === 'auto' && useGit)) ? new GitSnapshots(store.snapshotDir(root), root) : new CopySnapshots(store.backupDir(root), root, trash),
     trash,
     checkPage: opts.checkPage,
-    toolServers: opts.toolServers
+    toolServers: opts.toolServers,
+    checkSyntax: opts.checkSyntax
   })
   return {
     session,
@@ -142,7 +144,7 @@ describe('the agent loop', () => {
       expect(results).toHaveLength(2)
       expect(results[1].content).toMatch(/^Exit code: 0/)
       expect(last[0].role).toBe('system')
-      expect(h.requests[0].body.tools).toHaveLength(13)
+      expect(h.requests[0].body.tools).toHaveLength(14)
       expect(h.events.some((e) => e.type === 'delta')).toBe(true)
 
       await h.session.undo()
@@ -589,7 +591,7 @@ describe('the agent loop', () => {
         // The model sees find/load from the start, and a loaded tool only after loading it.
         const names = (i: number) => (h.requests[i].body.tools as { function: { name: string } }[]).map((t) => t.function.name)
         expect(names(0)).toContain('find_tools')
-        expect(names(0)).toHaveLength(15)
+        expect(names(0)).toHaveLength(16)
         expect(names(2)).toContain('fake__count_letters')
         expect(names(2)).not.toContain('fake__wipe_notes')
         const system = h.requests[0].body.messages![0].content
@@ -671,7 +673,7 @@ describe('the agent loop', () => {
       const h = await harness([{ toolCalls: [call('find_tools', { query: 'x' })] }, { content: 'OK.' }], { toolServers: new ToolServers(empty) })
       try {
         await h.run('Look for tools')
-        expect(h.requests[0].body.tools).toHaveLength(13)
+        expect(h.requests[0].body.tools).toHaveLength(14)
         expect(h.requests[0].body.messages![0].content).not.toContain('find_tools')
         expect(h.requests[1].body.messages!.filter((m) => m.role === 'tool')[0].content).toMatch(/There is no tool named "find_tools"/)
       } finally {
@@ -1147,6 +1149,209 @@ describe('audit fixes (0.19.0)', () => {
       const roles = h.requests[0].body.messages!.map((m) => m.role)
       expect(roles).toEqual(['system', 'user'])
       expect(h.requests[0].body.messages![1].content).toMatch(/Make a page[\s\S]*Make it blue/)
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+})
+
+describe('the checklist and the syntax check (0.20.0)', () => {
+  /** The checklist the way the tool asks for it: one text, a line per step, a box in front. */
+  const steps = (...status: ('todo' | 'doing' | 'done')[]) =>
+    ['Build the page', 'Add the buttons', 'Check that it works'].map((text, i) => `${{ todo: '[ ]', doing: '[>]', done: '[x]' }[status[i]]} ${text}`).join('\n')
+  const stop = (p: { kind: string }) => (p.kind === 'stuck' ? ({ kind: 'stuck', decision: 'stop' } as const) : null)
+
+  it('keeps the checklist the model writes on the task, without listing it as a step', async () => {
+    const h = await harness([
+      { content: 'Here is my plan.', toolCalls: [call('set_plan', { steps: steps('doing', 'todo', 'todo') })] },
+      { toolCalls: [call('write_file', { path: 'index.html', content: '<h1>Hi</h1>\n', summary: 'Creating the page' })] },
+      { toolCalls: [call('set_plan', { steps: steps('done', 'done', 'doing') })] },
+      { content: 'Done.' }
+    ])
+    try {
+      const task = await h.run('Make a page with buttons')
+      expect(task.outcome).toBe('done')
+      expect(task.plan).toEqual([
+        { text: 'Build the page', status: 'done' },
+        { text: 'Add the buttons', status: 'done' },
+        { text: 'Check that it works', status: 'doing' }
+      ])
+      const sent = h.events.flatMap((e) => (e.type === 'plan' ? [e.plan.map((p) => p.status).join(',')] : []))
+      expect(sent).toEqual(['doing,todo,todo', 'done,done,doing'])
+      expect(task.steps.map((s) => s.title)).toEqual(['Creating the page'])
+      // The model is told where the plan stands, briefly.
+      const results = h.requests[3].body.messages!.filter((m) => m.role === 'tool').map((m) => m.content)
+      expect(results[0]).toBe('Checklist saved. 0 of 3 steps done. Now: Build the page')
+      expect(results[2]).toBe('Checklist saved. 2 of 3 steps done. Now: Check that it works')
+      // Saved with the project, so it is still there when the project is opened again.
+      await h.session.saveNow()
+      expect(h.session.data.tasks[0].plan).toHaveLength(3)
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('explains a checklist it cannot read, and does not count checklist updates as steps', async () => {
+    const turns = [
+      { toolCalls: [call('set_plan', { steps: 7 })] },
+      ...Array.from({ length: 4 }, (_, i) => ({ toolCalls: [call('set_plan', { steps: [`Step ${i}`] }), call('list_files', { depth: (i % 4) + 1 })] })),
+      { content: 'Done.' }
+    ]
+    const h = await harness(turns, { settings: { maxSteps: 5 } })
+    try {
+      const task = await h.run('Look around')
+      // Nine tool calls, but only four of them were steps of the work: the limit of five wasn't reached.
+      expect(task.outcome).toBe('done')
+      expect(h.prompts).toHaveLength(0)
+      expect(task.steps).toHaveLength(4)
+      const first = h.requests[1].body.messages!.find((m) => m.role === 'tool')!
+      expect(first.content).toMatch(/set_plan needs "steps"/)
+      expect(task.plan).toEqual([{ text: 'Step 3', status: 'todo' }])
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('still notices the same failing call when checklist updates sit between the tries', async () => {
+    const same = { toolCalls: [call('read_file', { path: 'missing.txt' })] }
+    const update = { toolCalls: [call('set_plan', { steps: steps('doing', 'todo', 'todo') })] }
+    const h = await harness([same, update, same, update, same, { content: 'never reached' }], { answer: stop })
+    try {
+      const task = await h.run('Read it')
+      expect(h.prompts).toHaveLength(1)
+      expect(h.prompts[0]).toMatchObject({ kind: 'stuck', reason: 'repeating' })
+      // It names the work that went round in circles, not the checklist.
+      expect((h.prompts[0] as { message: string }).message).not.toContain('checklist')
+      expect(task.outcome).toBe('stopped')
+      expect(h.requests).toHaveLength(5)
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('names the repeated work when a checklist update came last in the same turn', async () => {
+    const same = call('read_file', { path: 'missing.txt' })
+    const h = await harness(
+      [{ toolCalls: [same] }, { toolCalls: [same] }, { toolCalls: [same, call('set_plan', { steps: steps('doing', 'todo', 'todo') })] }, { content: 'never reached' }],
+      { answer: stop }
+    )
+    try {
+      await h.run('Read it')
+      expect(h.prompts[0]).toMatchObject({ kind: 'stuck', reason: 'repeating' })
+      expect((h.prompts[0] as { message: string }).message).not.toContain('checklist')
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('pauses when it only keeps updating the checklist', async () => {
+    const turns = Array.from({ length: 6 }, (_, i) => ({ toolCalls: [call('set_plan', { steps: `[>] Try number ${i}` })] }))
+    const h = await harness(turns, { answer: stop })
+    try {
+      const task = await h.run('Make a page')
+      expect(h.prompts).toHaveLength(1)
+      expect(h.prompts[0]).toMatchObject({ kind: 'stuck', reason: 'repeating' })
+      expect((h.prompts[0] as { message: string }).message).toContain('updating my checklist without doing any of the work')
+      expect(task.outcome).toBe('stopped')
+      expect(h.requests).toHaveLength(4)
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('gives the checklist again once tidying up has folded its call into the summary', async () => {
+    const bigOutput = (n: number) => ({ toolCalls: [call('run_command', { command: `1..${n} | ForEach-Object { 'output line number ' + $_ }` })] })
+    const h = await harness(
+      [{ toolCalls: [call('set_plan', { steps: steps('done', 'doing', 'todo') })] }, bigOutput(400), bigOutput(401), bigOutput(402), bigOutput(403), bigOutput(404), { content: 'Done.' }],
+      { nCtx: 4000, settings: { approval: 'handsoff' } }
+    )
+    try {
+      const task = await h.run('Make a page with buttons')
+      expect(task.outcome).toBe('done')
+      // The notes were tidied up during the task, taking the set_plan call with them.
+      expect(h.requests.some((r) => r.body.stream === false)).toBe(true)
+      const last = h.requests[h.requests.length - 1].body.messages!
+      expect(last.some((m) => m.role === 'assistant' && m.tool_calls?.some((c) => c.function.name === 'set_plan'))).toBe(false)
+      const notes = last.filter((m) => m.role === 'user' && m.content.includes('Your checklist for this task'))
+      expect(notes).toHaveLength(1)
+      expect(notes[0].content).toContain('[x] Build the page\n[>] Add the buttons\n[ ] Check that it works')
+      // The task's own request is still there, in front of it.
+      expect(last[1]).toMatchObject({ role: 'user' })
+      expect(last[1].content).toContain('Make a page with buttons')
+      // The note was for this task only: it isn't left in the conversation for the next one.
+      expect(JSON.stringify(h.session.data.messages)).not.toContain('Your checklist for this task')
+      expect(h.session.data.messages.every((m) => m.content.trim() || m.tool_calls?.length)).toBe(true)
+    } finally {
+      await h.close()
+    }
+  }, 90_000)
+
+  it('does not repeat a checklist that is finished', async () => {
+    const bigOutput = (n: number) => ({ toolCalls: [call('run_command', { command: `1..${n} | ForEach-Object { 'output line number ' + $_ }` })] })
+    const h = await harness(
+      [{ toolCalls: [call('set_plan', { steps: steps('done', 'done', 'done') })] }, bigOutput(400), bigOutput(401), bigOutput(402), bigOutput(403), bigOutput(404), { content: 'Done.' }],
+      { nCtx: 4000, settings: { approval: 'handsoff' } }
+    )
+    try {
+      await h.run('Make a page with buttons')
+      expect(h.requests.some((r) => r.body.stream === false)).toBe(true)
+      // The call that held the checklist is gone from the conversation, and still nothing is said.
+      const last = h.requests[h.requests.length - 1].body.messages!
+      expect(last.some((m) => m.role === 'assistant' && m.tool_calls?.some((c) => c.function.name === 'set_plan'))).toBe(false)
+      expect(JSON.stringify(last)).not.toContain('Your checklist for this task')
+    } finally {
+      await h.close()
+    }
+  }, 90_000)
+
+  it('tells the model at once when a file it wrote has a syntax error', async () => {
+    const h = await harness([
+      { toolCalls: [call('write_file', { path: 'main.js', content: 'const a = 1;\nfoo(;\n', summary: 'Creating the main file' })] },
+      { toolCalls: [call('edit_file', { path: 'main.js', old_text: 'foo(;', new_text: 'foo();', summary: 'Fixing the typo' })] },
+      { toolCalls: [call('write_file', { path: 'package.json', content: '{ "name": "app", }', summary: 'Describing the app' })] },
+      { content: 'Done.' }
+    ])
+    try {
+      const task = await h.run('Make an app')
+      const results = h.requests[3].body.messages!.filter((m) => m.role === 'tool').map((m) => m.content)
+      expect(results[0]).toMatch(/^Created main\.js \(2 lines\)\.\n\nSyntax check: main\.js has an error/)
+      expect(results[0]).toMatch(/Line 2: SyntaxError: Unexpected token ';'/)
+      // Fixed: the edit's result says nothing more.
+      expect(results[1]).toBe('Edited main.js at line 2.')
+      expect(results[2]).toMatch(/^Created package\.json[\s\S]*Syntax check: package\.json has an error/)
+      // The file was written all the same: it is in the list, and the step shows what was found.
+      expect(task.files.map((f) => f.path)).toEqual(['main.js', 'package.json'])
+      expect(task.steps.map((s) => s.status)).toEqual(['done', 'done', 'done'])
+      expect(task.steps[0].output).toContain('Syntax check')
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('uses the check it is given, and a check that fails changes nothing', async () => {
+    const seen: string[] = []
+    const h = await harness(
+      [
+        { toolCalls: [call('write_file', { path: 'a.py', content: 'x = 1\n', summary: 'Writing a' })] },
+        { toolCalls: [call('write_file', { path: 'b.py', content: 'x = 2\n', summary: 'Writing b' })] },
+        { toolCalls: [call('edit_file', { path: 'missing.py', old_text: 'x', new_text: 'y', summary: 'Changing a file that is not there' })] },
+        { content: 'Done.' }
+      ],
+      {
+        checkSyntax: async (_abs, rel) => {
+          seen.push(rel)
+          if (rel === 'b.py') throw new Error('the checker broke')
+          return `Syntax check: ${rel} has an error.`
+        }
+      }
+    )
+    try {
+      await h.run('Write two files')
+      const results = h.requests[3].body.messages!.filter((m) => m.role === 'tool').map((m) => m.content)
+      expect(results[0]).toBe('Created a.py (1 lines).\n\nSyntax check: a.py has an error.')
+      expect(results[1]).toBe('Created b.py (1 lines).')
+      // A write that failed has nothing to check.
+      expect(seen).toEqual(['a.py', 'b.py'])
     } finally {
       await h.close()
     }
