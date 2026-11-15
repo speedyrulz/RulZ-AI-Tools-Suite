@@ -1,4 +1,5 @@
 // Single source of truth for IPC channels between the renderer and the main process.
+import type { BatchRun } from './batch'
 import type {
   ApiRequestLog,
   ApiServerStatus,
@@ -116,6 +117,11 @@ export interface IpcInvoke {
     target: string,
     finalText: string
   ) => { answer: string | null; passed: boolean; expected: string }
+  /** Saved practice batch runs, newest first. */
+  're:batches': () => BatchRun[]
+  /** Adds a batch run, or replaces the saved one with its id. */
+  're:saveBatch': (run: BatchRun) => void
+  're:deleteBatch': (id: string) => void
 
   'presets:list': () => Preset[]
   'presets:save': (preset: Preset) => Preset[]

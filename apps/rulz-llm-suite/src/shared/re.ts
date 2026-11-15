@@ -172,7 +172,26 @@ export function isStaticReTool(server: string, name: string): boolean {
   return server === 'rea' && STATIC_SET.has(name)
 }
 
-const ANSWER_RE = /^\s*\**ANSWER\**\s*:\s*(.+?)\s*$/gim
+type ApprovalSettings = { confirmToolCalls: boolean; allowedTools: string[]; re: Pick<ReSettings, 'autoApproveStatic'> }
+type NamedTool = { qualifiedName: string; server: string; name: string }
+
+/** Does this tool run without asking the user? `re`: in an RE session, where static analysis may run unasked. */
+export function runsWithoutAsking(s: ApprovalSettings, tool: NamedTool, re: boolean): boolean {
+  return !s.confirmToolCalls || s.allowedTools.includes(tool.qualifiedName) || (re && s.re.autoApproveStatic && isStaticReTool(tool.server, tool.name))
+}
+
+/**
+ * Tools an RE session starts with that would ask for approval. A session nobody watches (a
+ * practice batch run) refuses those instead, so a run should not start before they are allowed.
+ */
+export function starterToolsThatAsk(s: ApprovalSettings, available: NamedTool[]): string[] {
+  return RE_STARTER_TOOLS.flatMap((n) => {
+    const t = available.find((x) => x.qualifiedName === n)
+    return t && !runsWithoutAsking(s, t, true) ? [t.qualifiedName] : []
+  })
+}
+
+const ANSWER_RE =/^\s*\**ANSWER\**\s*:\s*(.+?)\s*$/gim
 
 /** The value of the last `ANSWER: …` line, without wrapping quotes or backticks (as the kit reads it). */
 export function extractAnswer(text: string): string | null {

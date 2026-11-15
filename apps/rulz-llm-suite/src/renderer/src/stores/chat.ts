@@ -28,7 +28,7 @@ import {
   CLONE_STARTER_TOOLS,
   cloneFirstMessage,
   clonePrompt,
-  isStaticReTool,
+  runsWithoutAsking,
   RE_MIN_CONTEXT,
   RE_STARTER_TOOLS,
   RE_SYSTEM_PROMPT,
@@ -39,6 +39,7 @@ import {
 } from '@shared/re'
 import { readyInstance, useModels } from './models'
 import { META_LOAD, META_SEARCH, META_TOOLS, resolveTool, searchTools } from '@shared/tools'
+import { UNATTENDED_DENIAL, type TurnEndReason } from '@shared/batch'
 
 export const NEW_CHAT_TITLE = 'New Chat'
 
@@ -105,6 +106,11 @@ interface ChatState {
   toolApproval: ToolApproval | null
   /** Notes written while a reply streamed, sent one by one as replies end. */
   queued: QueuedNote[]
+  /**
+   * Chat that runs with nobody watching (a practice batch run): a tool call that would ask for
+   * approval there is refused at once, so the run never waits on a dialog.
+   */
+  unattendedId: string | null
 
   init: () => Promise<void>
   newChat: () => Promise<Conversation>
@@ -139,10 +145,18 @@ interface ChatState {
   dismissHandoffPrompt: () => void
   startHandoff: () => Promise<void>
   cancelHandoff: () => void
-  /** Starts a reverse-engineering session in a new chat and sends its first message. */
-  startRe: (opts: StartReOptions) => Promise<void>
+  /**
+   * Starts a reverse-engineering session in a new chat and sends its first message. Returns the
+   * chat's id, or null if nothing was started because another reply is still running.
+   */
+  startRe: (opts: StartReOptions) => Promise<string | null>
   setReOutcome: (id: string, outcome: ReOutcome, notes?: string) => Promise<void>
+  /** Grades a practice session that ran out of rounds or time as failed; a later ANSWER can still change it. */
+  failRePractice: (id: string, notes: string) => Promise<void>
   setReCollect: (id: string, collect: boolean) => Promise<void>
+  setUnattended: (id: string | null) => void
+  /** The newest copy of a chat (on screen, replying, waiting to be saved, or from disk); null if it is gone or unreadable. */
+  snapshot: (id: string) => Promise<Conversation | null>
 }
 
 export interface StartReOptions {
@@ -156,6 +170,40 @@ export interface StartReOptions {
   modelId: string | null
   practice?: ReSession['practice']
   title?: string
+  /** Started by a batch run: stay on the page the user is on. */
+  background?: boolean
+  /** With `background`: also show the new chat on the Chat page (the user was watching the one before it). */
+  follow?: boolean
+}
+
+const turnEndListeners = new Set<(conversationId: string, reason: TurnEndReason) => void>()
+
+/**
+ * Calls `fn` when a turn (the user's message, every tool round, the final reply) ends in any chat:
+ * 'done' a final reply (a practice session is graded by then), 'stopped' by the user, 'error' the
+ * request failed, 'rounds' the tool round limit, 'failed' it never started. Returns the unsubscribe.
+ */
+export function onTurnEnd(fn: (conversationId: string, reason: TurnEndReason) => void): () => void {
+  turnEndListeners.add(fn)
+  return () => void turnEndListeners.delete(fn)
+}
+
+/** Practice sessions whose final reply is being checked: the reply is over, the turn's end not yet reported. */
+const gradingIds = new Set<string>()
+
+/** True between a practice session's final reply and its grade being saved. */
+export function isGrading(conversationId: string): boolean {
+  return gradingIds.has(conversationId)
+}
+
+function turnEnded(conversationId: string, reason: TurnEndReason): void {
+  for (const fn of [...turnEndListeners]) {
+    try {
+      fn(conversationId, reason)
+    } catch (e) {
+      console.error('A turn-end listener failed:', e)
+    }
+  }
 }
 
 function makeTitle(text: string): string {
@@ -397,8 +445,19 @@ export const useChat = create<ChatState>((set, get) => {
         if (conv) void persistNow({ ...conv, updatedAt: Date.now() })
         get().refreshTokenCount()
         if (conv && e.type === 'done' && e.stats.stopReason !== 'stopped') {
-          if (conv.re?.practice) void gradePractice(conv, gen.messageId)
-          sendNextQueued(conv.id)
+          let grading: Promise<void> | null = null
+          if (conv.re?.practice) {
+            gradingIds.add(conv.id)
+            grading = gradePractice(conv, gen.messageId).finally(() => void gradingIds.delete(conv.id))
+          }
+          // A queued note carries the turn on, so it has not ended. Otherwise listeners hear of a
+          // practice session once its grade is saved.
+          const continued = sendNextQueued(conv.id)
+          if (continued) break
+          if (grading) void grading.finally(() => turnEnded(conv.id, 'done'))
+          else turnEnded(conv.id, 'done')
+        } else {
+          turnEnded(gen.conversationId, e.type === 'error' ? 'error' : 'stopped')
         }
         break
       }
@@ -510,8 +569,10 @@ export const useChat = create<ChatState>((set, get) => {
           )
         }))
         const conv = get().genConversation
+        const conversationId = get().generation?.conversationId
         set({ generation: null, genConversation: null, toolApproval: null })
         if (conv) void persistNow(conv)
+        if (conversationId) turnEnded(conversationId, 'error')
       } else {
         toast.error(`The tool round failed: ${errorMessage(e)}`)
       }
@@ -544,11 +605,13 @@ export const useChat = create<ChatState>((set, get) => {
       // Calling a tool keeps it loaded and marks it recently used.
       if (effectiveToolMode({ re: isRe, files: scope }) === 'dynamic') loadTools([target.qualifiedName])
       const s = useApp.getState().settings
-      let approved =
-        !s?.confirmToolCalls ||
-        s.allowedTools.includes(call.name) ||
-        // RE sessions make dozens of read-only analysis calls; those run without asking.
-        (isRe && s.re.autoApproveStatic && isStaticReTool(target.server, target.name))
+      // RE sessions make dozens of read-only analysis calls; those run without asking.
+      let approved = !s || runsWithoutAsking(s, target, isRe)
+      if (!approved && get().unattendedId === get().genConversation?.id) {
+        // Nobody is there to ask. The model is told why, so it can go on with what it may use.
+        updateCall(call.id, { status: 'denied', result: UNATTENDED_DENIAL })
+        continue
+      }
       if (!approved) {
         const decision = await new Promise<ToolDecision>((resolve) => set({ toolApproval: { call, resolve } }))
         set({ toolApproval: null })
@@ -587,6 +650,7 @@ export const useChat = create<ChatState>((set, get) => {
     if (rounds >= maxRounds) {
       void persistNow(conv)
       toast.warning(`Stopped after ${maxRounds} rounds of tool calls without a final answer.`)
+      turnEnded(conv.id, 'rounds')
       return
     }
     // startGeneration saves the chat with these results (on every path), so it is not saved here
@@ -605,7 +669,9 @@ export const useChat = create<ChatState>((set, get) => {
     if (!modelId) {
       void persistNow(conv)
       toast('Load a model to start chatting')
-      useApp.getState().openPicker()
+      // A batch run reports this itself; the picker would cover the page for nobody.
+      if (get().unattendedId !== conv.id) useApp.getState().openPicker()
+      turnEnded(conv.id, 'failed')
       return
     }
     if (conv.sampling.jsonSchema.trim()) {
@@ -614,6 +680,7 @@ export const useChat = create<ChatState>((set, get) => {
       } catch {
         void persistNow(conv)
         toast.error('The structured output schema is not valid JSON.')
+        turnEnded(conv.id, 'failed')
         return
       }
     }
@@ -625,7 +692,10 @@ export const useChat = create<ChatState>((set, get) => {
       // A load still running (from the picker, with its own settings) is waited for, not replaced.
       inst = (await useModels.getState().ensure(modelId)) ?? undefined
       set({ autoLoadingModelId: null })
-      if (!inst || deletedIds.has(conv.id)) return
+      if (!inst || deletedIds.has(conv.id)) {
+        turnEnded(conv.id, 'failed')
+        return
+      }
       const latest = get().current
       if (latest?.id === conv.id) conv = latest
     }
@@ -694,13 +764,41 @@ export const useChat = create<ChatState>((set, get) => {
     await startGeneration(conv, 'new')
   }
 
-  /** Sends the next note queued for a chat whose reply just ended, if the user is still in that chat. */
-  const sendNextQueued = (conversationId: string): void => {
-    if (get().current?.id !== conversationId) return
+  /**
+   * Sends the next note queued for a chat whose reply just ended, if the user is still in that chat.
+   * True if a note went out (the turn goes on).
+   */
+  const sendNextQueued = (conversationId: string): boolean => {
+    if (get().current?.id !== conversationId) return false
     const { note, rest } = takeQueued(get().queued, conversationId)
-    if (!note) return
+    if (!note) return false
     set({ queued: rest })
     void get().send(note.text, note.attachments)
+    return true
+  }
+
+  /**
+   * Stops the reply in progress. `continues`: a note follows at once in the same chat (Send now),
+   * so listeners are not told the turn ended.
+   */
+  const stopTurn = (continues: boolean): void => {
+    interject = null
+    const gen = get().generation
+    if (!gen) return
+    if (gen.phase !== 'tools') return void invoke('chat:abort', gen.requestId)
+    // Stopping during the tool phase: cancel the running call, skip the rest and end the turn here.
+    for (const key of runningToolCalls) void invoke('mcp:cancelTool', key)
+    get().toolApproval?.resolve('deny')
+    applyToGenMessage((m) => ({
+      ...m,
+      toolCalls: m.toolCalls?.map((c) =>
+        c.status === 'pending' || c.status === 'running' ? { ...c, status: 'denied', result: 'Stopped by the user.' } : c
+      )
+    }))
+    const conv = get().genConversation
+    set({ generation: null, genConversation: null, toolApproval: null })
+    if (conv) void persistNow(conv)
+    if (!continues) turnEnded(gen.conversationId, 'stopped')
   }
 
   /**
@@ -723,7 +821,7 @@ export const useChat = create<ChatState>((set, get) => {
     const practice = re?.practice
     const text = conv.messages.find((m) => m.id === messageId)?.content ?? ''
     if (!re || !practice || !shouldGradePractice(re, text)) return
-    const kitDir = useApp.getState().settings?.re.kitDir ?? ''
+    const kitDir = practice.kitDir || (useApp.getState().settings?.re.kitDir ?? '')
     try {
       const r = await invoke('re:practiceGrade', kitDir, practice.taskId, re.target, text)
       await withConversation(conv.id, (c) =>
@@ -772,6 +870,7 @@ export const useChat = create<ChatState>((set, get) => {
     handoffConfirm: null,
     toolApproval: null,
     queued: [],
+    unattendedId: null,
 
     init: once(async () => {
       on('chat:event', handleEvent)
@@ -843,7 +942,7 @@ export const useChat = create<ChatState>((set, get) => {
       if (interject) return get().queueNote(text, attachments)
       if (gen.phase === 'tools') {
         // Tool calls stop at once; the turn so far stays, and the note follows it.
-        get().stop()
+        stopTurn(true)
         const conv = get().current
         if (conv) void appendAndGenerate(markInterrupted(conv, gen.messageId), text, attachments)
         return
@@ -943,24 +1042,7 @@ export const useChat = create<ChatState>((set, get) => {
       toast.success('Branched into a new chat')
     },
 
-    stop: () => {
-      interject = null
-      const gen = get().generation
-      if (!gen) return
-      if (gen.phase !== 'tools') return void invoke('chat:abort', gen.requestId)
-      // Stopping during the tool phase: cancel the running call, skip the rest and end the turn here.
-      for (const key of runningToolCalls) void invoke('mcp:cancelTool', key)
-      get().toolApproval?.resolve('deny')
-      applyToGenMessage((m) => ({
-        ...m,
-        toolCalls: m.toolCalls?.map((c) =>
-          c.status === 'pending' || c.status === 'running' ? { ...c, status: 'denied', result: 'Stopped by the user.' } : c
-        )
-      }))
-      const conv = get().genConversation
-      set({ generation: null, genConversation: null, toolApproval: null })
-      if (conv) void persistNow(conv)
-    },
+    stop: () => stopTurn(false),
 
     rename: (id, title) => withConversation(id, (c) => ({ ...c, title: title.trim() || c.title })),
     togglePin: (id) => withConversation(id, (c) => ({ ...c, pinned: !c.pinned })),
@@ -1131,8 +1213,8 @@ export const useChat = create<ChatState>((set, get) => {
 
     startRe: async (input) => {
       if (isChatBusy(get()) || get().handoff) {
-        toast('Wait for the current reply to finish first.')
-        return
+        if (!input.background) toast('Wait for the current reply to finish first.')
+        return null
       }
       // Pasted paths may keep their quotes (Explorer's "Copy as path"); the tools need them without.
       const opts = {
@@ -1166,16 +1248,45 @@ export const useChat = create<ChatState>((set, get) => {
         re: { target: opts.target, goal: opts.goal, collect: opts.collect, outcome: 'unrated', practice: opts.practice, clone: opts.clone },
         messages: []
       }
-      set({ current: conv, tokenCount: null })
-      await persistNow(conv)
-      useApp.getState().setPage('chat')
-      await appendAndGenerate(conv, opts.clone ? cloneFirstMessage(opts.clone, opts.target) : reFirstMessage(opts.goal, opts.target), [])
+      const show = !opts.background || !!opts.follow
+      // Unattended from its first tool call on; the batch run clears this when the session ends.
+      if (opts.background) set({ unattendedId: conv.id })
+      if (show) set({ current: conv, tokenCount: null })
+      if (!opts.background) useApp.getState().setPage('chat')
+      // Nothing is awaited between the busy check above and the reply starting here, so no other
+      // reply can start in between. startGeneration saves the new chat on every path.
+      const started = appendAndGenerate(conv, opts.clone ? cloneFirstMessage(opts.clone, opts.target) : reFirstMessage(opts.goal, opts.target), [])
+      if (opts.background) {
+        // A batch run watches the session itself (time limit, stop), also while its model loads.
+        void started.catch((e) => {
+          toast.error(`Could not start the session: ${errorMessage(e)}`)
+          turnEnded(conv.id, 'failed')
+        })
+        return conv.id
+      }
+      await started
+      return conv.id
     },
 
     setReOutcome: (id, outcome, notes) =>
       withConversation(id, (c) => (c.re ? { ...c, re: { ...c.re, outcome, autoGraded: false, notes: notes ?? c.re.notes } } : c)),
 
+    failRePractice: (id, notes) =>
+      withConversation(id, (c) =>
+        // Only what nobody graded: a grade set by hand or by an ANSWER line stays.
+        c.re?.practice && c.re.outcome === 'unrated' ? { ...c, re: { ...c.re, outcome: 'failed', autoGraded: true, notes: c.re.notes ?? notes } } : c
+      ),
+
     setReCollect: (id, collect) => withConversation(id, (c) => (c.re ? { ...c, re: { ...c.re, collect } } : c)),
+
+    setUnattended: (unattendedId) => set({ unattendedId }),
+
+    snapshot: async (id) => {
+      const { current, genConversation } = get()
+      if (genConversation?.id === id) return genConversation
+      if (current?.id === id) return current
+      return (await readConversation(id)) ?? null
+    },
 
     refreshTokenCount: () => {
       if (tokenTimer) clearTimeout(tokenTimer)

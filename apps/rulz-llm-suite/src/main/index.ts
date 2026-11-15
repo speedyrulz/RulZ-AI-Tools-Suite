@@ -18,6 +18,7 @@ import { parseLoadConfig } from './settings/schema'
 import { SettingsStore } from './settings/store'
 import { FILE_TOOLS_SERVER } from './files/fileTools'
 import { API_RE_PREFIX, CLONE_FILE_TOOLS, extractAnswer } from '@shared/re'
+import { BatchStore } from './re/batches'
 import { gradePractice, listPractice, preparePractice } from './re/practice'
 import { buildOverview, MAX_OVERVIEW_SESSIONS } from './re/overview'
 import { findPython, type PythonCommand } from './re/python'
@@ -194,6 +195,7 @@ async function main(): Promise<void> {
     .finally(() => void mcp.init())
   const traces = new TraceStore(join(userData, 're-data'))
   const practiceRoot = join(userData, 're-practice')
+  const batches = new BatchStore(join(userData, 're-batches.json'))
   const apiRe = (id: string): string => API_RE_PREFIX + id
 
   const apiServer = new ApiServer({
@@ -431,6 +433,9 @@ async function main(): Promise<void> {
     const { passed, expected } = await gradePractice(kitDir, practiceRoot, taskId, target, answer)
     return { answer, passed, expected }
   })
+  handle('re:batches', () => batches.list())
+  handle('re:saveBatch', (run) => batches.save(run))
+  handle('re:deleteBatch', (id) => batches.delete(id))
 
   handle('presets:list', () => settings.listPresets())
   handle('presets:save', (p) => settings.savePreset(p))

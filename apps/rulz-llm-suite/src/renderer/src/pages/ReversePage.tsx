@@ -4,10 +4,12 @@ import { toast } from 'sonner'
 import { CLONE_LANGUAGES, CLONE_PIECES, outputInsideTarget, RE_DEFAULT_MODEL_ID, RE_GOALS } from '@shared/re'
 import type { ReClone, ReOutcome, RePracticeInfo, ReSettings, ReTraceInfo } from '@shared/types'
 import { OutcomeButtons } from '../components/chat/ReBanner'
+import { BatchResults, BatchStart } from '../components/re/BatchRuns'
 import { Badge, Button, Field, IconButton, Input, NumberInput, Select, Switch, Textarea, Tooltip } from '../components/ui'
 import { errorMessage, invoke, on } from '../lib/api'
 import { cn, formatBytes, relativeTime } from '../lib/format'
 import { useApp } from '../stores/app'
+import { useBatch } from '../stores/batch'
 import { isChatBusy, useChat } from '../stores/chat'
 import { useMcp } from '../stores/mcp'
 import { useModels } from '../stores/models'
@@ -49,6 +51,7 @@ export function ReversePage() {
         <ToolStatus />
         <NewSession re={re} />
         <Practice re={re} setRe={setRe} />
+        <BatchResults />
         <Sessions />
         <Card title="Options" icon={null}>
           <Field inline label="Record new sessions" hint="Saves exactly what the model sees and writes in each round, for training.">
@@ -340,6 +343,7 @@ function Practice({ re, setRe }: { re: ReSettings; setRe: <K extends keyof ReSet
   const summaries = useChat((s) => s.summaries)
   const startRe = useChat((s) => s.startRe)
   const busy = useChat((s) => isChatBusy(s))
+  const batchActive = useBatch((s) => !!s.activeId || s.starting)
   const [info, setInfo] = useState<RePracticeInfo | null>(null)
   const [family, setFamily] = useState('')
   const [starting, setStarting] = useState(false)
@@ -395,7 +399,7 @@ function Practice({ re, setRe }: { re: ReSettings; setRe: <K extends keyof ReSet
         collect: re.collect,
         modelId: re.modelId || null,
         title: `Practice: ${next.id}`,
-        practice: { taskId: next.id, family: p.family, tier: p.tier }
+        practice: { taskId: next.id, family: p.family, tier: p.tier, kitDir: re.kitDir }
       })
     } catch (e) {
       toast.error(errorMessage(e))
@@ -460,10 +464,11 @@ function Practice({ re, setRe }: { re: ReSettings; setRe: <K extends keyof ReSet
               {info ? `${info.tasks.length} tasks` : 'Reading tasks…'}
               {family && ` · only ${family}`}
             </div>
-            <Button variant="primary" disabled={!info?.tasks.length || busy || starting} onClick={() => void startNext()}>
+            <Button variant="primary" disabled={!info?.tasks.length || busy || starting || batchActive} onClick={() => void startNext()}>
               {starting ? <LoaderCircle size={14} className="animate-spin" /> : <Play size={14} />} Start next task
             </Button>
           </div>
+          {!!info?.tasks.length && <BatchStart tasks={info.tasks} family={family} kitDir={re.kitDir} />}
         </>
       )}
     </Card>

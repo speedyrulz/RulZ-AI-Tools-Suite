@@ -193,8 +193,11 @@ export interface ReSession {
   /** The outcome came from a practice task's automatic check, not the user. */
   autoGraded?: boolean
   notes?: string
-  /** Practice task from the RE training kit. */
-  practice?: { taskId: string; family: string; tier: string; answer?: string; expected?: string }
+  /**
+   * Practice task from the RE training kit. `kitDir` is the kit the task was copied from, so it is
+   * graded against that kit even if the kit folder setting changes later.
+   */
+  practice?: { taskId: string; family: string; tier: string; answer?: string; expected?: string; kitDir?: string }
   /** Set for a clone session. */
   clone?: ReClone
 }
