@@ -149,6 +149,9 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
           })
         }))
         break
+      case 'plan':
+        set((s) => ({ tasks: updateTask(s.tasks, e.taskId, (t) => ({ ...t, plan: e.plan })) }))
+        break
       case 'output':
         set((s) => ({
           tasks: s.tasks.map((t) =>

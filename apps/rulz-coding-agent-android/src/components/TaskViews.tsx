@@ -1,7 +1,7 @@
-import { Ban, Check, ChevronRight, Circle, Gauge, FileMinus, FilePen, FilePlus, Hourglass, LoaderCircle, Minus, X } from 'lucide-react'
+import { Ban, Check, ChevronRight, Circle, CircleDot, Gauge, FileMinus, FilePen, FilePlus, Hourglass, LoaderCircle, Minus, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { diffLines, withContext } from '@shared/diff'
-import type { ChangedFile, FileDiff, Step, TaskRecord } from '@shared/types'
+import type { ChangedFile, FileDiff, PlanItem, Step, TaskRecord } from '@shared/types'
 import { errorMessage, invoke } from '../lib/api'
 import { draftSummary } from '../lib/drafts'
 import { cn } from '../lib/format'
@@ -86,6 +86,45 @@ const STATUS_WORD: Partial<Record<Step['status'], string>> = {
   error: 'Didn’t work; I’ll look at why',
   refused: 'Not allowed',
   skipped: 'Skipped'
+}
+
+/** The agent's own checklist for the task; nothing shows when the computer's agent is older than 0.20.0 or made none. */
+export function PlanList() {
+  const tasks = useWorkspace((s) => s.tasks)
+  const selected = useWorkspace((s) => s.selectedTaskId)
+  const task = shownTask(tasks, selected)
+  const plan: PlanItem[] = task?.plan ?? []
+  if (!plan.length) return null
+  const live = task?.outcome === 'running'
+  const done = plan.filter((p) => p.status === 'done').length
+  return (
+    <section className="px-4 pt-3" aria-label="Plan">
+      <h3 className="flex items-center gap-2 pb-1.5 text-[13px] font-semibold">
+        Plan
+        <Badge>
+          {done} of {plan.length} done
+        </Badge>
+      </h3>
+      <ul>
+        {plan.map((p, i) => (
+          <li key={i} className="flex items-start gap-2.5 py-1">
+            <span className="mt-0.5 flex size-5 shrink-0 items-center justify-center">
+              {p.status === 'done' ? (
+                <Check size={15} className="text-ok" aria-label="Done" />
+              ) : p.status === 'doing' && live ? (
+                <LoaderCircle size={15} className="animate-spin text-accent" aria-label="Working on this" />
+              ) : p.status === 'doing' ? (
+                <CircleDot size={13} className="text-warn" aria-label="Started, not finished" />
+              ) : (
+                <Circle size={12} className="text-faint" aria-label="Not started" />
+              )}
+            </span>
+            <span className={cn('min-w-0 flex-1 text-[14px] leading-snug', p.status !== 'doing' && 'text-muted')}>{p.text}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  )
 }
 
 export function StepList() {
