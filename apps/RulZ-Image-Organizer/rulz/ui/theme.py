@@ -285,6 +285,29 @@ QToolTip { background: %(card)s; color: %(text)s; border: 1px solid %(border)s; 
         font-weight: 500; }
 #Chip:hover { background: %(hover)s; }
 #Chip:checked { background: %(accent)s; color: %(on_accent)s; border-color: %(accent)s; }
+QPlainTextEdit { background: %(input)s; border: 1px solid %(border)s; border-radius: 8px; padding: 4px;
+                 selection-background-color: %(accent)s; }
+QPlainTextEdit:focus { border: 1px solid %(accent)s; }
+QPlainTextEdit:disabled, QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled { color: %(muted)s; }
+QComboBox, QSpinBox, QDoubleSpinBox { background: %(input)s; border: 1px solid %(border)s; border-radius: 8px;
+                                      padding: 5px 8px; }
+QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid %(accent)s; }
+QComboBox QLineEdit, QSpinBox QLineEdit, QDoubleSpinBox QLineEdit {  /* not the search-field look above */
+    background: transparent; border: none; border-radius: 0; padding: 0; }
+QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+    width: 0; border: none; }
+QComboBox QAbstractItemView { background: %(card)s; border: 1px solid %(border)s; selection-background-color: %(select)s;
+                              selection-color: %(text)s; }
+QTabWidget::pane { border: 1px solid %(border)s; border-radius: 10px; background: %(card)s; top: -1px; }
+QTabBar::tab { background: transparent; padding: 7px 16px; border: none; color: %(muted)s; }
+QTabBar::tab:selected { color: %(accent)s; font-weight: 600; border-bottom: 2px solid %(accent)s; }
+QRadioButton { spacing: 8px; }
+QRadioButton::indicator { width: 16px; height: 16px; border: 1px solid %(muted)s; border-radius: 9px;
+                          background: %(card)s; }
+QRadioButton::indicator:hover { border-color: %(accent)s; }
+QRadioButton::indicator:checked { width: 8px; height: 8px; border: 5px solid %(accent)s; background: %(on_accent)s; }
+QPushButton[primary="true"]:disabled { background: %(placeholder)s; border-color: %(border)s; color: %(muted)s; }
+#Warning { background: %(select)s; border: 1px solid %(accent)s; border-radius: 10px; }
 #Segment { background: %(input)s; border-radius: 12px; }
 #Segment QPushButton { border: none; border-radius: 9px; padding: 6px 16px; background: transparent; }
 #Segment QPushButton:checked { background: %(card)s; color: %(accent)s; font-weight: 600; }
