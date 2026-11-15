@@ -404,7 +404,7 @@ describe('tool arguments', () => {
     expect(parseToolArgs('{"command":["npm install","npm test"]}')).toEqual({ args: { command: 'npm install; npm test' } })
   })
 
-  it('uses only plain-string parameters for paths', () => {
+  it('uses only plain text and whole numbers as parameters (no lists or objects, the checklist included)', () => {
     for (const t of TOOL_DEFS) {
       const props = t.function.parameters.properties as Record<string, { type: string }>
       for (const [name, p] of Object.entries(props)) expect(['string', 'integer'], `${t.function.name}.${name}`).toContain(p.type)

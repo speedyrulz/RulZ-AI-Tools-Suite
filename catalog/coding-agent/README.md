@@ -45,6 +45,9 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
   (its file changes are undone first), or **Delete** a request or a reply.
 - **Steps** on the right: each thing the agent does ("Installing the pieces your app needs") with a status icon.
   Click a step to see the exact command and its output.
+- **Plan**, above the steps: for a task that takes more than a few steps, the agent writes itself a short checklist
+  in plain words and ticks it off as it goes ("2 of 5 done"), so you can see what is left. Small tasks have none.
+  A step still marked as started when the task ends was never ticked off by the agent.
 - **Files changed**: every file the task created, changed or deleted. Click one to see what changed.
 - **Run my app** starts the project (`npm start` / `npm run dev`, after `npm install` when `node_modules` is missing;
   `main.py`, `app.py`, `gui.py` or `run.py` with the project's `.venv` when it has one; or opens `index.html`,
@@ -126,8 +129,8 @@ listens only on this computer's Tailscale address (port 7420), so only your own 
 needs the pairing code, 10 wrong codes lock a device out for 10 minutes (also when tried side by side), web
 pages from other sites are turned away, a device can't hold more than 8 connections waiting for the code, and
 **Make a new code** disconnects every phone using the old one. The phone can do what this window does, except change phone access, the RulZ LLM Suite
-address and API key, open dialogs, the browser or Explorer here. Notes added during a task, the buttons on messages
-and expert offload (MoE) are also only in this window.
+address and API key, open dialogs, the browser or Explorer here. Notes added during a task, the buttons on messages,
+the agent's Plan and expert offload (MoE) are also only in this window.
 
 ## Approvals
 
@@ -159,8 +162,26 @@ else is open.
   the first request ("Loading the model…").
 - **Agent loop**: streams `/v1/chat/completions` with tools (`list_files`, `find_files`, `search_text`, `read_file`,
   `write_file`, `edit_file`, `delete_path`, `run_command`, `start_background_command`, `check_background_command`,
-  `stop_background_command`, `check_page`, `ask_user`, plus `find_tools` and `load_tools` when tool servers are set up)
-  until the model answers without a tool call.
+  `stop_background_command`, `check_page`, `set_plan`, `ask_user`, plus `find_tools` and `load_tools` when tool servers
+  are set up) until the model answers without a tool call.
+- **Checklist**: with `set_plan` the model sends its whole list of steps as text, one per line, each marked `[x]`
+  done, `[>]` doing or `[ ]` to do. It is kept on the task and shown as **Plan**. Updating it isn't listed under Steps,
+  doesn't count towards the step limit and is left out of the "same call three times" and "five failures" checks
+  (so it can't hide a loop); four updates in a row with no work between them count as going round in circles.
+  When older turns are summarised and the model's last `set_plan` call goes with them, the unfinished checklist is
+  given to the model again as a note, so a long task doesn't lose track of what is left. The note is taken out again
+  when the task ends.
+- **Syntax check**: right after `write_file` or `edit_file`, a JavaScript (`.js`, `.cjs`, `.mjs`), Python (`.py`,
+  `.pyw`) or JSON file is checked for syntax errors, and an error (with its line) comes back with the result of the
+  write, so the model fixes a typo at once instead of finding it a step later when the app won't start. Files are only
+  parsed, never run: JSON and plain scripts inside this app, modules (`import` / `export`) by the computer's Node.js
+  and Python files by the computer's Python, never by a program inside the project or on a network share. Without
+  Node.js, modules aren't checked; without Python, Python files aren't. Cases that are often fine are passed over:
+  JSON with comments (except `package.json`) and known JSON-with-comments files (`tsconfig.json`, `.vscode/`,
+  `angular.json`, `biome.json` and others), JSX in a `.js` file, a web page script's own `module` or `require`,
+  import attributes an older Node.js doesn't know, Python errors when the project's own `.venv` is a newer Python than
+  the one that checked, files over 1 MB and a check that takes more than 10 seconds. Other kinds of file (TypeScript,
+  HTML, CSS) are not checked.
 - **Checking pages**: `check_page` opens a local address (`localhost`) or an HTML file in the project in a hidden,
   sandboxed window with its own throwaway storage. It reports script errors, files that failed to load, and the text,
   buttons and fields the page shows, so the agent sees a broken or empty page that a server log wouldn't reveal.

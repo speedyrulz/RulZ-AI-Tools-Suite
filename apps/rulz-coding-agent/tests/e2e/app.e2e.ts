@@ -37,11 +37,18 @@ beforeAll(async () => {
     {
       content: "I'll create a tiny app.",
       toolCalls: [
+        call('set_plan', { steps: '[>] Create the app\n[ ] Check that it runs\n[ ] Tell you how to try it' }),
         call('write_file', { path: 'package.json', content: '{\n  "name": "e2e-app",\n  "scripts": { "start": "node app.js" }\n}\n', summary: 'Setting up the project' }),
         call('write_file', { path: 'app.js', content: "console.log('Hello from the app')\n", summary: 'Creating the app' })
       ]
     },
-    { content: "Now I'll check that it runs.", toolCalls: [call('run_command', { command: 'node app.js', summary: 'Starting your app' })] },
+    {
+      content: "Now I'll check that it runs.",
+      toolCalls: [
+        call('set_plan', { steps: '[x] Create the app\n[x] Check that it runs\n[>] Tell you how to try it' }),
+        call('run_command', { command: 'node app.js', summary: 'Starting your app' })
+      ]
+    },
     { content: 'Your app is ready.\n\n**How to try it:** click **Run my app**.' },
     { content: "I'll look at the shop page.", toolCalls: [call('check_page', { page: 'shop.html', summary: 'Looking at your shop page' })] },
     { content: 'Fixed it.' },
@@ -106,6 +113,12 @@ describe('RulZ Coding Agent', () => {
     await page.getByText('Your app is ready.').waitFor()
     await expect.poll(() => page.getByText('Starting your app').count()).toBeGreaterThan(0)
     await page.getByRole('button', { name: /app\.js/ }).waitFor()
+    // The agent's checklist shows above the steps, as it last wrote it, and isn't listed as a step.
+    const plan = page.getByRole('region', { name: 'Plan' })
+    await plan.getByText('2 of 3 done').waitFor()
+    await expect.poll(() => plan.getByRole('listitem').allInnerTexts()).toEqual(['Create the app', 'Check that it runs', 'Tell you how to try it'])
+    await plan.getByLabel('Started, not finished').waitFor()
+    expect(await page.getByText('Updating my checklist').count()).toBe(0)
     await page.screenshot({ path: join(shots, '3-done.png') })
 
     await page.getByRole('button', { name: /app\.js/ }).click()

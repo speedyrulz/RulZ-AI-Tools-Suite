@@ -49,6 +49,8 @@ import { LoopGuard, type GuardTrip } from './loopGuard'
 import { cutTurnContent, NoteQueue, noteMessage } from './notes'
 import { formatPageReport, pageHasProblems, pageTarget, type PageReport, type PageTarget } from './pageCheck'
 import { resolveInProject } from './pathGuard'
+import { dropPlanNotes, parsePlan, PLAN_TOOL, planInHistory, planNote, planResult } from './plan'
+import { checkSyntax } from './syntaxCheck'
 import { backgroundNote, HOW_TO_RUN_TASK, lastBackgroundNoteIn, NO_BACKGROUND_NOTE, parseRunLine, parseShareLine, systemPrompt } from './prompt'
 import { approvalKey, classifyCommand, classifyStartCommand, needsApproval, type ActionKind } from './safety'
 import { describeStep, EXTRA_TOOL_DEFS, EXTRA_TOOL_NAMES, parseToolArgs, serverLabel, TOOL_DEFS, TOOL_NAMES } from './tools'
@@ -62,6 +64,8 @@ const MAX_STEP_OUTPUT_LIVE = 40_000
 const MAX_DIFF_BYTES = 400 * 1024
 /** How many times a reply may come back as plain-text tool calls before it counts as stuck. */
 const MAX_TEXT_CALLS = 3
+/** This many checklist updates in a row, with no work between them, is going round in circles. */
+const PLAN_ONLY_LIMIT = 4
 /** Room kept for the reply below which the notes are tidied up first (or the output cap, if smaller). */
 const MIN_REPLY_TOKENS = 1024
 /** The smallest reply asked for when nothing more can be tidied up. */
@@ -90,6 +94,8 @@ export interface SessionDeps {
   checkPage?: (target: PageTarget, waitMs: number, signal: AbortSignal) => Promise<PageReport>
   /** Tool servers set up in RulZ LLM Suite (such as REA). */
   toolServers?: Pick<ToolServers, 'configured' | 'start' | 'status' | 'find' | 'search' | 'instructions' | 'call'>
+  /** Checks a file the agent has just written for syntax errors; the real check unless a test replaces it. */
+  checkSyntax?: typeof checkSyntax
 }
 
 /** Ends the task without counting as an error (owner chose Stop in a prompt, or pressed Stop). */
@@ -140,6 +146,8 @@ export class ProjectSession {
   private busy: string | null = null
   /** The background-commands note last put into the history (it goes in only when it changes). */
   private lastBackgroundNote = ''
+  /** The running task, whose checklist is repeated to the model when the call that held it is tidied away. */
+  private current: TaskRecord | null = null
 
   constructor(
     public data: ProjectData,
@@ -415,6 +423,7 @@ export class ProjectSession {
   private async run(task: TaskRecord, text: string, howToRun: boolean, share: boolean): Promise<void> {
     const signal = this.abort!.signal
     this.allowed = new Set()
+    this.current = task
     let snap: Snapshotter | null = null
     try {
       this.setStatus({ phase: 'working', text: 'Saving a restore point…' })
@@ -473,6 +482,8 @@ export class ProjectSession {
       }
     } finally {
       this.closeOpenCalls()
+      // A checklist note was for this task only.
+      dropPlanNotes(this.data.messages)
       for (const s of task.steps) if (s.status === 'running' || s.status === 'waiting') this.updateStep(s, { status: 'skipped' })
       task.endedAt = Date.now()
       if (snap) await this.refreshFiles(task, snap, { rescan: true }).catch(() => undefined)
@@ -485,6 +496,7 @@ export class ProjectSession {
       }
       this.running = false
       this.abort = null
+      this.current = null
       this.setStatus({ phase: 'idle' })
       this.deps.activity('idle')
       this.deps.refreshModels()
@@ -576,6 +588,8 @@ export class ProjectSession {
     const settings = this.deps.settings()
     let limit = settings.maxSteps
     let steps = 0
+    /** Checklist updates in a row with no step of the work between them. */
+    let planOnly = 0
     let textCalls = 0
     let cutOffs = 0
     let overflowRetried = false
@@ -641,24 +655,37 @@ export class ProjectSession {
       cutOffs = 0
 
       let trip: GuardTrip | null = null
+      let planLoop = false
       let lastTitle = ''
       for (const call of calls) {
         if (signal.aborted) break
-        const { result, title } = await this.execute(task, call, signal, snap, turn)
+        const { result, title, quiet } = await this.execute(task, call, signal, snap, turn)
         this.data.messages.push({ role: 'tool', tool_call_id: call.id, content: result.text })
+        if (quiet) {
+          // Keeping the checklist up to date isn't a step of the work: it doesn't use up the step
+          // limit, and it is kept from the guard, where a checklist update between two tries of
+          // the same failing command would make them look like progress. Nothing but checklist
+          // updates is going round in circles too.
+          if (++planOnly >= PLAN_ONLY_LIMIT) planLoop = true
+          continue
+        }
+        planOnly = 0
         steps++
         lastTitle = title
         trip = guard.record(call.function.name, call.function.arguments, result.isError, result.text) ?? trip
       }
       if (signal.aborted) throw new StopTask()
 
-      if (trip) {
+      if (trip || planLoop) {
         const message =
           trip === 'repeating'
             ? `I seem to be going round in circles: I've done "${lastTitle}" three times in a row. Should I keep going, try a different approach, or stop?`
-            : `I've hit five problems in a row (the last one: ${guard.lastError.split('\n')[0].slice(0, 160)}). Should I keep going, try a different approach, or stop?`
-        await this.handleStuck(task, message, trip, signal)
+            : trip === 'errors'
+              ? `I've hit five problems in a row (the last one: ${guard.lastError.split('\n')[0].slice(0, 160)}). Should I keep going, try a different approach, or stop?`
+              : "I seem to be going round in circles: I keep updating my checklist without doing any of the work. Should I keep going, try a different approach, or stop?"
+        await this.handleStuck(task, message, trip ?? 'repeating', signal)
         guard.reset()
+        planOnly = 0
       }
       if (steps >= limit) {
         await this.handleStuck(task, `I've taken ${steps} steps on this task so far. Should I keep going?`, 'limit', signal)
@@ -845,6 +872,29 @@ export class ProjectSession {
     if (range.to <= this.taskStart) this.taskStart -= range.to - range.from
     // The note may have been in what was folded away; it is said again if anything still runs.
     this.lastBackgroundNote = lastBackgroundNoteIn(this.data.messages)
+    this.remindPlan()
+  }
+
+  /** Saves the checklist the model sent (set_plan) on the task and shows it. */
+  private setPlan(task: TaskRecord, args: Record<string, unknown>): ToolOutcome {
+    const parsed = parsePlan(args)
+    if ('error' in parsed) return { text: parsed.error, isError: true }
+    task.plan = parsed.plan
+    this.emit({ type: 'plan', taskId: task.id, plan: parsed.plan })
+    this.scheduleSave()
+    return { text: planResult(parsed.plan, parsed.dropped), isError: false }
+  }
+
+  /**
+   * The model's checklist lives in its last set_plan call. When tidying up has folded that call into
+   * the summary, the checklist is given again as a note, so a long task keeps its place. It goes in
+   * as a message of its own: text added to a tool result is cut away when that result is shortened.
+   */
+  private remindPlan(): void {
+    const plan = this.current?.plan
+    if (!plan?.length || plan.every((p) => p.status === 'done')) return
+    if (planInHistory(this.data.messages.slice(this.taskStart))) return
+    this.data.messages.push({ role: 'user', content: planNote(plan) })
   }
 
   /** One model turn. `cut` is set when a note cut it short: the result then holds what came so far. */
@@ -1019,11 +1069,15 @@ export class ProjectSession {
     signal: AbortSignal,
     snap: Snapshotter | null,
     turn: TurnResult
-  ): Promise<{ result: ToolOutcome; title: string }> {
+  ): Promise<{ result: ToolOutcome; title: string; quiet?: boolean }> {
     const name = call.function.name
     const parsed = parseToolArgs(call.function.arguments)
     const args = 'args' in parsed ? parsed.args : {}
     const title = describeStep(name, args)
+    // The checklist has its own place in the side panel, so updating it isn't listed as a step.
+    if (name === PLAN_TOOL) {
+      return { result: 'error' in parsed ? { text: parsed.error, isError: true } : this.setPlan(task, args), title, quiet: true }
+    }
     const step = this.addStep(task, { title, tool: name, status: 'running', detail: stepDetail(name, args) })
     this.setStatus({ phase: 'working', text: `${title}…` })
 
@@ -1141,7 +1195,11 @@ export class ProjectSession {
         const ok = await this.approve(step, { type: 'write' }, { action: `${verb} the file ${target.rel}`, detail: `${target.rel}\n\n${preview}` }, signal)
         if (!ok) return denied(`${verb.toLowerCase()} ${target.rel}`)
         await beforeChange(target.rel)
-        return name === 'write_file' ? files.writeFile(root, args) : files.editFile(root, args)
+        const outcome = await (name === 'write_file' ? files.writeFile(root, args) : files.editFile(root, args))
+        if (outcome.isError) return outcome
+        // A typo is cheapest to fix now: the model hears of it with the write, not a turn later when the app won't start.
+        const problem = await (this.deps.checkSyntax ?? checkSyntax)(target.abs, target.rel, { root, signal }).catch(() => null)
+        return problem ? { ...outcome, text: `${outcome.text}\n\n${problem}` } : outcome
       }
 
       case 'delete_path': {

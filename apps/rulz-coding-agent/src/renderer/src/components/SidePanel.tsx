@@ -1,7 +1,7 @@
-import { Ban, Check, ChevronRight, Circle, FileMinus, FilePen, FilePlus, Hourglass, LoaderCircle, Minus, X } from 'lucide-react'
+import { Ban, Check, ChevronRight, Circle, CircleDot, FileMinus, FilePen, FilePlus, Hourglass, LoaderCircle, Minus, X } from 'lucide-react'
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { diffLines, withContext } from '@shared/diff'
-import type { ChangedFile, FileDiff, Step } from '@shared/types'
+import type { ChangedFile, FileDiff, PlanItem, Step } from '@shared/types'
 import { errorMessage, invoke } from '../lib/api'
 import { cn } from '../lib/format'
 import { shownTask, useWorkspace } from '../stores/workspace'
@@ -31,6 +31,8 @@ export function SidePanel() {
           <div className="mt-0.5 truncate text-[13px]">{task?.title ?? 'No tasks yet'}</div>
         )}
       </div>
+
+      {task?.plan?.length ? <PlanList plan={task.plan} live={task.outcome === 'running'} /> : null}
 
       <section className="flex min-h-0 flex-1 flex-col">
         <h3 className="px-4 pt-3 pb-1.5 text-[13px] font-semibold">Steps</h3>
@@ -68,6 +70,39 @@ export function SidePanel() {
       </section>
       {task && <DiffDialog taskId={task.id} file={diffFile} onClose={() => setDiffFile(null)} />}
     </aside>
+  )
+}
+
+/** The agent's own checklist for the task. `live` is false once the task has ended: nothing is being worked on any more. */
+function PlanList({ plan, live }: { plan: PlanItem[]; live: boolean }) {
+  const done = plan.filter((p) => p.status === 'done').length
+  return (
+    <section className="flex max-h-[32%] shrink-0 flex-col border-b border-border" aria-label="Plan">
+      <h3 className="flex items-center gap-2 px-4 pt-3 pb-1.5 text-[13px] font-semibold">
+        Plan
+        <Badge>
+          {done} of {plan.length} done
+        </Badge>
+      </h3>
+      <ul className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
+        {plan.map((p, i) => (
+          <li key={i} className="flex items-start gap-2 px-2 py-1">
+            <span className="mt-0.5 flex size-4 shrink-0 items-center justify-center">
+              {p.status === 'done' ? (
+                <Check size={15} className="text-ok" aria-label="Done" />
+              ) : p.status === 'doing' && live ? (
+                <LoaderCircle size={15} className="animate-spin text-accent" aria-label="Working on this" />
+              ) : p.status === 'doing' ? (
+                <CircleDot size={13} className="text-warn" aria-label="Started, not finished" />
+              ) : (
+                <Circle size={12} className="text-faint" aria-label="Not started" />
+              )}
+            </span>
+            <span className={cn('min-w-0 flex-1 text-[13px] leading-snug', p.status === 'done' && 'text-muted', p.status === 'todo' && 'text-muted')}>{p.text}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
   )
 }
 

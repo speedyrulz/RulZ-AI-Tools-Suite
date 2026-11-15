@@ -245,6 +245,12 @@ export interface DraftStats {
 
 export type TaskOutcome = 'running' | 'done' | 'stopped' | 'error'
 
+/** One line of the agent's own checklist for a task (the set_plan tool). */
+export interface PlanItem {
+  text: string
+  status: 'todo' | 'doing' | 'done'
+}
+
 export interface TaskRecord {
   id: string
   title: string
@@ -261,6 +267,8 @@ export interface TaskRecord {
   steps: Step[]
   files: ChangedFile[]
   draft?: DraftStats
+  /** The agent's checklist for this task, as it last wrote it; missing when it kept none. */
+  plan?: PlanItem[]
 }
 
 /** Everything the workspace needs when a project opens. */
@@ -347,6 +355,8 @@ export type AgentEvent =
   | { type: 'context'; projectPath: string; context: ContextUsage }
   | { type: 'draft'; projectPath: string; taskId: string; draft: DraftStats }
   | { type: 'notes'; projectPath: string; notes: PendingNote[] }
+  /** The agent wrote or updated its checklist (sent since 0.20.0). */
+  | { type: 'plan'; projectPath: string; taskId: string; plan: PlanItem[] }
 
 // ---------- Tool servers (set up in RulZ LLM Suite) ----------
 
