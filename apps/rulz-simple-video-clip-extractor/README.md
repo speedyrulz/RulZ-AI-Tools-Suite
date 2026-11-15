@@ -7,7 +7,9 @@ In/Out marks, and export either **lossless** (stream copy, when In and Out are
 on keyframes) or **re-encoded with NVIDIA NVENC** to MP4. A
 [clip list](#clip-list) collects several clips of a video and exports them in
 one go, and [scene cuts](#scene-cuts) finds where the shots of a video change,
-so each scene can be marked or listed with one key. The
+so each scene can be marked or listed with one key. A
+[sound waveform](#sound-waveform) under the timeline shows speech, claps and
+silence around the playhead while you place In and Out. The
 [Distortion repair](#distortion-repair) window brings the lens, perspective and
 horizon corrections of RulZ Image Distortion Repair to every clip and frame you
 export.
@@ -82,6 +84,7 @@ python -m venv .venv
 | Find scene cuts     | Scene cuts | X         |
 | Mark the scene at the playhead | | Shift+X  |
 | Add every scene to the clip list | | Ctrl+Shift+X |
+| Show or hide the sound waveform | | W       |
 | Open last export    |        | Ctrl+Shift+O  |
 | Save frame as PNG   | 💾     | S             |
 | Rotate 90° clockwise |       | R             |
@@ -271,8 +274,16 @@ another video starts clean.
 - **Exports**: re-encode only (lossless is unavailable while the repair is
   on). ffmpeg decodes the clip, every frame is corrected in Python, and a
   second ffmpeg encodes it with NVENC; cuts, audio, crop, scale, colour match
-  and frame rate work as in any NVENC export. It is slower than a plain export
-  (about 10 frames a second for 4K on a fast CPU). The output keeps the
+  and frame rate work as in any NVENC export. It is slower than a plain export:
+  about 28 frames a second for 4K on a fast PC (12 cores), or about 16 with
+  the Miniature effect on or a rotation or flip made after the adjustments.
+  The frames go through Python as YUV 4:2:0, the form most video already has,
+  with the brightness corrected at full size and the colour at half size, so
+  there is no conversion to RGB and back (10-bit, 4:2:2 and 4:4:4 video is
+  turned into 8-bit 4:2:0 first, as the export would anyway, and a colour
+  match still goes through RGB in the encoder); reading, correcting and
+  writing run at the same time. The Miniature effect, which blurs in RGB, a
+  later rotation or flip, and odd frame sizes use the RGB route. The output keeps the
   source's colour tags. Variable-frame-rate video comes out at a constant rate
   (the source's average when the frame rate is "Same as source").
 - File names get `_repair`: `<video>_clip_1_00-3_00_repair.mp4`,
@@ -430,6 +441,30 @@ clip list.
   usually not on a keyframe unless the encoder put one there (many do), so a
   scene clip is often re-encoded rather than cut losslessly.
 
+## Sound waveform
+
+A strip under the timeline draws the sound of the few seconds around the
+playhead, so you can see where speech starts and stops, where a clap or a
+bang is, and where it goes quiet, and put In and Out there.
+
+- It shows 8 seconds at first, with the playhead in the middle (at the start
+  and end of the video the window stops and the playhead moves instead).
+  Turn the mouse wheel over the strip to zoom between 1 second and 2
+  minutes; the span is remembered.
+- Click or drag on the strip to seek, as on the timeline. The In/Out range
+  (or the fixed-length clip box), the scene cuts and the playhead are drawn
+  on it, with a ruler of seconds along the bottom.
+- The height is on a decibel scale down to -48 dB, so quiet speech still
+  shows next to a loud clap. The outline is the loudest channel's peak and
+  the brighter core its average level.
+- The sound is read in the background when a video opens: about 10 seconds
+  for a two-hour file on a fast PC, while you keep working ("Reading the
+  sound… 42 %" shows on the strip). The result is kept per video (in
+  `%LOCALAPPDATA%\SimpleCut\waveforms`, beside the clip lists, a few MB for
+  two hours of sound), so it shows at once next time, unless the file has changed.
+- **View > Show sound waveform** (W) hides the strip; then nothing is read.
+- The first audio track is drawn. A video without sound says so on the strip.
+
 ## Settings
 
 The **Settings** menu sets the default output folder used for both clips and
@@ -534,6 +569,10 @@ clips exported before this fix, this repairs one without touching the video:
 - `simplecut/cropview.py` — video preview with interactive crop box
 - `simplecut/export.py` — ffmpeg command builder + async job
 - `simplecut/scenes.py` — scene-cut detection: the scan, picking cuts, storage
+- `simplecut/waveform.py` — the sound waveform: reading the envelope, its
+  storage and the strip under the timeline
+- `simplecut/npzcache.py` — per-video result files shared by scene cuts and
+  the waveform (tied to the file's size and date)
 - `simplecut/cliplist.py` — the clip list: entries, their per-video storage,
   the background batch export and the list panel
 - `simplecut/app.py` — main window and export dialog

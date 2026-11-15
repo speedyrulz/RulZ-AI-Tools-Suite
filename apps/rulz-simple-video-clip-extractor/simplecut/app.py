@@ -32,6 +32,8 @@ from .cliplist import (BatchExport, ClipEntry, ClipList, ClipListPanel, clean_st
 from .colormatch import ColorMatchDialog, apply_tables, clean_temp, write_cube_1d
 from .scenes import (DEFAULT_SENSITIVITY, SENSITIVITY, SENSITIVITY_LABELS, SceneScanThread, SceneScores,
                      clean_scores, load_scores, scenes_between)
+from .waveform import (DEFAULT_SPAN, EMPTY, FAILED, IDLE, NO_SOUND, READY, Envelope, WaveformReadThread,
+                       WaveformStrip, clean_envelopes, load_envelope)
 try:
     from .repair.export import RepairExport
     from .repair.pipeline import RepairSettings, RepairState, describe as describe_repair, orient
@@ -426,6 +428,13 @@ class MainWindow(QMainWindow):
         self._scene_serial = 0   # numbers each scan: only _scene_thread's reports are taken
         sens = settings().value("scene_sensitivity", DEFAULT_SENSITIVITY, type=str)
         self.scene_sensitivity = sens if sens in SENSITIVITY else DEFAULT_SENSITIVITY
+        clean_envelopes()  # and stored sound envelopes
+        # The sound strip under the timeline: the open video's envelope, read in the background
+        # like the scene cuts (but by itself, as soon as a video with sound opens).
+        self.wave_shown = settings().value("show_waveform", True, type=bool)
+        self._wave_thread: WaveformReadThread | None = None   # the open video's read, while it runs
+        self._wave_threads: list[WaveformReadThread] = []     # every one still running, kept referenced
+        self._wave_serial = 0   # numbers each read: only _wave_thread's reports are taken
         self.clips: ClipList | None = None             # the open video's clip list
         # Every list opened this session, by video: a batch that is still exporting a video's
         # clips and the panel showing that video again work on the same entries.
@@ -483,6 +492,11 @@ class MainWindow(QMainWindow):
         self.timeline.selectionMoveRequested.connect(self._move_selection)
         self.timeline.scrubFinished.connect(self._scrub_finished)
         self._scrub_t: float | None = None  # exact position still owed after a fast scrub
+        self.wave = WaveformStrip(self.timeline, settings().value("waveform_span", DEFAULT_SPAN, type=float))
+        self.wave.seekRequested.connect(self.seek_to)
+        self.wave.scrubFinished.connect(self._scrub_finished)
+        self.wave.spanChanged.connect(lambda s: settings().setValue("waveform_span", s))
+        self.wave.setVisible(self.wave_shown)
 
         self.time_label = QLabel("--:--:--.--- / --:--:--.---")
         self.frame_label = QLabel("")
@@ -756,7 +770,11 @@ class MainWindow(QMainWindow):
         views.addWidget(self.end_view, 1)   # hidden outside fixed-length mode
         views.addWidget(self.clip_panel)    # hidden while the clip list is empty
         lay.addLayout(views, 1)
-        lay.addWidget(self.timeline)
+        bars = QVBoxLayout()
+        bars.setSpacing(0)   # (the strip adds its own height to the window's smallest, nothing more)
+        bars.addWidget(self.timeline)
+        bars.addWidget(self.wave)
+        lay.addLayout(bars)
         lay.addLayout(controls)
         lay.addLayout(marks)
         sel_row = QHBoxLayout()
@@ -817,6 +835,12 @@ class MainWindow(QMainWindow):
             sens_group.addAction(a)
             sens_menu.addAction(a)
             self.sens_actions[key] = a
+        vm = self.menuBar().addMenu("&View")
+        self.a_wave = QAction("Show sound &waveform", self, shortcut="W", checkable=True)
+        self.a_wave.setChecked(self.wave_shown)
+        self.a_wave.setToolTip("Draw the sound around the playhead under the timeline")
+        self.a_wave.toggled.connect(self.show_waveform)
+        vm.addAction(self.a_wave)
         sm = self.menuBar().addMenu("&Settings")
         self.a_outdir = QAction("", self, triggered=self.choose_output_dir)
         a_outdir_reset = QAction("Save next to source video", self, triggered=self.reset_output_dir)
@@ -1069,6 +1093,7 @@ class MainWindow(QMainWindow):
         if self.dec is not None and self.dec.current is not None:
             self._show_current()
         self.timeline.update()
+        self.wave.update()
         self.view.update()
         self.end_view.update()
 
@@ -1230,6 +1255,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{os.path.basename(info.path)} — {theme.APP_NAME}")
         self._open_clip_list()   # (before the status line, which mentions a list that was not loaded)
         self._open_scenes()
+        self._open_waveform()
         self._show_info_status("finding keyframes…")
         self._set_enabled(True)
         self._sync_length_boxes()
@@ -1284,6 +1310,7 @@ class MainWindow(QMainWindow):
         self.clips = None   # (a batch still exporting this video's clips keeps its own hold on them)
         self._refresh_clips()
         self._close_scenes()
+        self._close_waveform()
         self.rotation = 0
         self.flip = False
         self._set_color(None, "")
@@ -1701,7 +1728,7 @@ class MainWindow(QMainWindow):
         # Like the main view: while the mouse drags the timeline, video whose exact seeks are slow
         # (4K) shows the keyframe before the frame; _scrub_finished asks again for the exact one.
         try:
-            if self.timeline.scrubbing:
+            if self._scrubbing():
                 f, exact = self.end_dec.scrub(t)
             else:
                 f, exact = self.end_dec.seek(t), True
@@ -1962,12 +1989,16 @@ class MainWindow(QMainWindow):
     def _decoder_seek(self, t: float):
         """Seek for the timeline. While the mouse drags it, video whose exact seeks are slow (4K)
         shows the keyframe at or before t; the exact frame follows when the mouse is released."""
-        if self.timeline.scrubbing:
+        if self._scrubbing():
             _, exact = self.dec.scrub(t)
             self._scrub_t = None if exact else t
         else:
             self._scrub_t = None
             self.dec.seek(t)
+
+    def _scrubbing(self) -> bool:
+        """The mouse is dragging the playhead on the timeline or the sound strip."""
+        return self.timeline.scrubbing or self.wave.scrubbing
 
     def _scrub_finished(self):
         t, self._scrub_t = self._scrub_t, None
@@ -2297,6 +2328,91 @@ class MainWindow(QMainWindow):
             s = self.repair.settings
             entry.repair = RepairSettings(s.corrections, s.base_rotation, s.base_flip)   # (its own copy)
         return entry
+
+    # ------------------------------------------------------------- the sound strip
+    def show_waveform(self, on: bool):
+        """View > Show sound waveform. Hidden, nothing is read."""
+        self.wave_shown = on
+        settings().setValue("show_waveform", on)
+        if self.a_wave.isChecked() != on:
+            self.a_wave.blockSignals(True)
+            self.a_wave.setChecked(on)
+            self.a_wave.blockSignals(False)
+        self.wave.setVisible(on)
+        if on:
+            self._read_waveform()
+        else:
+            self._stop_waveform_read()
+
+    def _open_waveform(self):
+        """The opened video's sound: stored from an earlier read of this very file, or read now."""
+        self._close_waveform()
+        self._read_waveform()
+
+    def _read_waveform(self):
+        """Show the open video's sound if the strip is shown and it isn't there or being read yet."""
+        info = self.info
+        if (info is None or not self.wave_shown or self._wave_thread is not None
+                or self.wave.state in (READY, NO_SOUND)):
+            return
+        if not info.has_audio:
+            self.wave.set_state(NO_SOUND, "No sound in this video")
+            return
+        env = load_envelope(info.path)
+        if env is not None:
+            self.wave.set_envelope(env)
+            return
+        self._wave_serial += 1
+        t = WaveformReadThread(info.path, self._wave_serial)
+        t.progress.connect(self._wave_progress)
+        t.done.connect(self._wave_read)
+        t.failed.connect(self._wave_failed)
+        t.finished.connect(self._wave_thread_finished)
+        self._wave_thread = t
+        self._wave_threads.append(t)   # (a QThread dropped while running crashes the app)
+        self.wave.set_progress(0.0)
+        t.start()
+
+    def _stop_waveform_read(self):
+        """Stop a read that is still going; shown again, the strip starts it over."""
+        for t in self._wave_threads:
+            t.cancel()
+        if self._wave_thread is not None:
+            self._wave_thread = None
+            self.wave.set_state(IDLE)
+
+    def _close_waveform(self):
+        """Forget the sound on screen and stop a read that is still going."""
+        for t in self._wave_threads:
+            t.cancel()
+        self._wave_thread = None
+        self.wave.set_state(IDLE if self.info else EMPTY)
+
+    def _current_wave_read(self, token: int) -> bool:
+        return self._wave_thread is not None and token == self._wave_thread.token and self.info is not None
+
+    def _wave_progress(self, f: float, token: int):
+        if self._current_wave_read(token):
+            self.wave.set_progress(f)
+
+    def _wave_read(self, env: Envelope | None, token: int):
+        if not self._current_wave_read(token):
+            return
+        self._wave_thread = None
+        if env is None:
+            self.wave.set_state(NO_SOUND, "No sound in this video")
+        else:
+            self.wave.set_envelope(env)
+
+    def _wave_failed(self, msg: str, token: int):
+        if not self._current_wave_read(token):
+            return
+        self._wave_thread = None
+        first = msg.strip().splitlines()[0] if msg.strip() else "unknown error"
+        self.wave.set_state(FAILED, f"The sound could not be read: {first[:120]}")
+
+    def _wave_thread_finished(self):
+        self._wave_threads = [t for t in self._wave_threads if t.isRunning()]
 
     # ------------------------------------------------------------- scene cuts
     def _open_scenes(self):
@@ -2650,9 +2766,9 @@ class MainWindow(QMainWindow):
             self.quick_job.wait()
         self._probe_token += 1
         self._cancel_probes()
-        for t in self._scene_threads:
+        for t in list(self._scene_threads) + list(self._wave_threads):
             t.cancel()
-        for t in list(self._probe_threads) + list(self._scene_threads):
+        for t in list(self._probe_threads) + list(self._scene_threads) + list(self._wave_threads):
             t.wait()  # a QThread destroyed while running takes the process down with it
         for t in self._save_threads:
             t.join(30)  # frame PNGs still being written: finish them, don't leave half files
