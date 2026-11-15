@@ -4137,6 +4137,47 @@ stay on the GPU.
   (it planned for the frozen model alone, and a LoKr run on a 16 GB card went past its memory). **These are counts
   of tensors, not measurements:** activations and DoRA's working memory are not in them, and no run here has
   compared the plan with a card's real peak. Out-of-memory recovery's own steps are unchanged.
+- **The wizard plans from your own runs where it can (3.22.0).** Every finished run now leaves a row in a small
+  local record (`output/_vram_measured.json`): the settings that decide memory and what the run measured. When the
+  form's settings match a finished run of yours, the wizard picks the block swap count from that run instead of
+  from the count above, and its reason says so: "measured on your run 'portrait_a': a step took 11.8 GB at 8 blocks
+  swapped (its 13.6 GB peak includes the 6 blocks it kept in spare memory); adjusted for 4 fewer blocks swapped
+  (...), 4 blocks' frozen weights (1.8 GB) wait in system RAM ...". With a record but no matching run the reason
+  ends "estimated (no comparable finished run of yours yet)". With no record at all, the wizard is exactly what it
+  was.
+  - **What is measured.** Not simply the run's peak. With gradient checkpointing and *Kept blocks* on auto (the
+    default), the trainer fills the card's spare memory on purpose: at the start it measures one training step on
+    the largest picture and keeps as many blocks' activations as fit, so every run's peak ends up near the card's
+    size whatever its settings. The plan uses that start-of-run measurement itself (the step with one block kept),
+    plus whatever the run's peak later went over what the measurement expected (the identity loss, samples, probes,
+    the optimizer's state). New runs save these figures in `status.json` (`checkpoint_memory`, `gpu_total_gb`,
+    `block_gb`); for older runs they are read from the *Checkpointing* and *Block swap* lines of `train.log`, which
+    are rounded, so 0.5 GB is added. A run with a fixed number of kept blocks, or without checkpointing, did not
+    fill the card: its peak is used as it is.
+  - **Which runs count.** Runs that finished without an error, trained at least 100 steps, ran at least one
+    likeness probe if they had probes, and, with resolution step-up, reached their highest resolution. Failed runs,
+    runs that were killed, and short test runs are left out.
+  - **Which runs match.** The same model family, model source and file format, quantization, largest training
+    resolution, batch size, gradient checkpointing, clip length, and whether the identity loss, the alignment
+    losses, LoRA Isolation, activation offload and reward fine-tuning are on; one GPU, not a fine-tune. Sample and
+    probe sizes, the sampling model and the photos' aspect ratios are **not** compared.
+  - **What is adjusted, and what is still estimated.** A matching run made with another block swap count or adapter
+    is adjusted: by the weights of the blocks in between (each block's real size where the run kept it, else the
+    estimate's size, which can be well off: 0.48 GB a block for Krea 2 int8 against 0.24 GB held) and by the
+    difference of the two adapters' counted sizes (the count above). A run that would need more than 4 GB of
+    adjusting is not used. The plan is the fewest blocks that leave free what the trainer itself leaves (1.5 GB or
+    8% of the card, 1.5 GB more with the identity loss) plus 0.5 GB; blocks kept in spare memory are not planned
+    for. When several runs match, the newest five are weighed and the one that needs the most is used. The reason
+    warns when the measured run's peak came within 1 GB of its card.
+  - **Past runs.** `python -m rulztrainer.measured` adds the finished runs under `output/` to the record;
+    `--dry-run` lists what would be kept and why the others are left out, without writing; `--fresh` starts from an
+    empty record; `--card-gb 16` gives the card's size for runs that did not save it; another folder of job folders
+    can be named as the first argument. The record is per install: runs made on a rented instance are in that
+    instance's record. Deleting the file returns the wizard to the estimate.
+  - **Not yet checked on a GPU.** The lookup has only been checked against faked and saved run files (status files,
+    logs, job folders): no training run has been planned from a measurement yet, and the two figures a new run
+    saves at its start and end have not been written by a real run. Compare the first measured pick with the run's
+    own *Checkpointing* log line before relying on it.
 - **Compile with block swap (`block_swap_compile`, experimental, untested).** `block.compile()` compiles a block's
   whole call, its hooks included, so dynamo would trace block swap's streaming (CUDA streams, events, weights swapped
   in and out); that is why block swap turns compile off. With `block_swap_compile: true` the swapped blocks compile

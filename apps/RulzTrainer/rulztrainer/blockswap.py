@@ -45,6 +45,13 @@ def _frozen_tensors(block: nn.Module):
                 yield mod, name, True, b
 
 
+def frozen_block_gb(model: nn.Module) -> list[float]:
+    """GiB of frozen weights in each of model.layers, wherever they are now: what block swap moves to RAM for that
+    block. Sizes only (no tensor is read or moved); the measured record keeps them (rulztrainer.measured)."""
+    return [round(sum(t.numel() * t.element_size() for _, _, _, t in _frozen_tensors(block)) / 2 ** 30, 4)
+            for block in model.layers]
+
+
 def _set(mod: nn.Module, name: str, is_buffer: bool, t: torch.Tensor) -> None:
     if is_buffer:
         mod._buffers[name] = t
