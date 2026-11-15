@@ -4137,7 +4137,7 @@ stay on the GPU.
   (it planned for the frozen model alone, and a LoKr run on a 16 GB card went past its memory). **These are counts
   of tensors, not measurements:** activations and DoRA's working memory are not in them, and no run here has
   compared the plan with a card's real peak. Out-of-memory recovery's own steps are unchanged.
-- **The wizard plans from your own runs where it can (3.21.0).** Every finished run now leaves a row in a small
+- **The wizard plans from your own runs where it can (3.22.0).** Every finished run now leaves a row in a small
   local record (`output/_vram_measured.json`): the settings that decide memory and what the run measured. When the
   form's settings match a finished run of yours, the wizard picks the block swap count from that run instead of
   from the count above, and its reason says so: "measured on your run 'portrait_a': a step took 11.8 GB at 8 blocks
