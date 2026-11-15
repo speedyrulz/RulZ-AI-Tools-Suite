@@ -37,6 +37,20 @@ BRIGHTER = (0.25, 0.15)
 BRIGHT_PEAK = (0.5, 0.2)
 LIT_REF_BLUR = (8.0, 2.0 * CLOSE_RADIUS)
 FLOOD_STEP = 0.05  # how finely lit ground and bright things are grown, level by level
+# With Keep lit spots, a cell is a lit spot, or a soft edge sloping down to one, only if it's lighter than the plain
+# shadow around it by at least SPOT_MARGIN of the shadow's own spread (its light varies with the ground's pattern):
+# on ground whose pattern is about as strong as a faint shadow, its lighter patches reach the lit level too, and
+# they'd be left unlifted with all that slopes down to them. With 2, sun flecks on coarse ground (grass, leaf
+# litter) stay lit and a deep shadow there is lifted as with the switch off (a faint one about 0.045 too dark, its
+# pattern flatter); 3 hardly changed the faint one and left more of its flecks too bright. The plain shadow's
+# middle is followed across the painting, a Gaussian SPOT_REACH of the field's longer side wide (sigma), and its
+# spread is how far its cells are from that middle: one middle and spread for all of it was widened by light that
+# changes across the shadow, or a dark thing in a quarter of it, until it took the switch's effect away
+# everywhere. 1/16 and wider brought part of that back (a dark thing in a third of the shadow: fleck edges 0.2 too
+# bright instead of 0.1); narrower takes more of a coarse pattern for changing light.
+SPOT_MARGIN = 2.0
+SPOT_REACH = 1 / 32
+SPOT_TRIM = 4.5  # median distances (about 3 spreads) over the plain shadow's median: darker is a dark thing
 MAX_LIFT = 2.5  # natural log: at most ~12x brighter
 GAMMA = 2.2
 LUMA = np.array([0.0722, 0.7152, 0.2126], np.float32)  # B, G, R weights of luminance
@@ -57,20 +71,25 @@ class ShadowEdit:
     strokes: tuple[Stroke, ...] = field(default_factory=tuple)
     strength: int = DEFAULT_STRENGTH  # 0..100
     blend: int = DEFAULT_BLEND  # 0..100, how soft the painted area's edge is
+    # Keep lit spots: every lit spot in the painting is lit ground, left lit (sun through leaves), and so is a
+    # thing in the shadow about as bright as lit ground. Off, a lit spot that shadow encloses is lifted like a
+    # bright thing in the shadow: nothing in the picture tells the two apart (see _lit_ground).
+    spots: bool = False
 
     @property
     def active(self) -> bool:
         return self.strength > 0 and any(not s.erase for s in self.strokes)
 
     def to_dict(self) -> dict:
-        return {"strength": self.strength, "blend": self.blend,
+        return {"strength": self.strength, "blend": self.blend, "spots": self.spots,
                 "strokes": [{"p": [list(p) for p in s.points], "r": s.radius, "e": s.erase} for s in self.strokes]}
 
     @classmethod
     def from_dict(cls, d: dict) -> "ShadowEdit":
         strokes = tuple(Stroke(tuple((float(x), float(y)) for x, y in s["p"]), float(s["r"]), bool(s.get("e")))
                         for s in d.get("strokes", []) if s.get("p"))
-        return cls(strokes, int(d.get("strength", DEFAULT_STRENGTH)), int(d.get("blend", DEFAULT_BLEND)))
+        return cls(strokes, int(d.get("strength", DEFAULT_STRENGTH)), int(d.get("blend", DEFAULT_BLEND)),
+                   bool(d.get("spots", False)))
 
 
 def _draw(mask: np.ndarray, strokes) -> None:
@@ -173,11 +192,66 @@ def _lit_level(light_s: np.ndarray, outside: np.ndarray, depth: float) -> np.nda
     return (lit - light_s) / depth
 
 
-def _lit_ground(level: np.ndarray, outside: np.ndarray, depth: float) -> np.ndarray:
+def _bright_things(level: np.ndarray, depth: float) -> np.ndarray:
+    """The cells of bright things (see BRIGHTER, BRIGHT_PEAK), over the whole field, as a patch's brightest spot
+    can be far outside the painting. level: from _lit_level; depth: the shadow's depth (natural log)."""
+    brighter = np.isfinite(level) & (level < -max(BRIGHTER[0], BRIGHTER[1] / depth))
+    count, labels = cv2.connectedComponents(brighter.view(np.uint8), connectivity=8)
+    patch = np.asarray(labels, np.int32)
+    peaked = np.zeros(count, bool)
+    peaked[patch[brighter & (level < -max(BRIGHT_PEAK[0], BRIGHT_PEAK[1] / depth))]] = True
+    peaked[0] = False
+    return peaked[patch]
+
+
+def _plain_top(level: np.ndarray, free: np.ndarray) -> np.ndarray:
+    """With Keep lit spots, the level each cell must be at or under to be a lit spot or a slope down to one:
+    SPOT_MARGIN of the plain shadow's spread under the plain shadow's middle there (see SPOT_MARGIN, SPOT_REACH);
+    inf everywhere with no plain shadow. level: from _lit_level; free: bool, the painting's cells that are numbers
+    and not of a bright thing. The plain shadow is the shadier half of them (over half a depth: no lit spots in
+    it), less the cells of things much darker than it (SPOT_TRIM), whose mean would raise the middle beside
+    them (smooth ground between dark patches: fleck edges 0.1 to 0.2 too bright, now 0.03). Its spread is the
+    median distance from the middle, which holds while less than half the cells are off for some other reason
+    (a lit spot's soft edge, the cells beside a dark thing): with the upper quartile instead, dark patches in a
+    quarter of the shadow took a sun fleck among them for plain shadow. A dark thing on ground whose pattern is
+    nearly as strong as its own darkness can't be told from the pattern, and still loosens the bound beside it
+    (a faint shadow on coarse ground: up to 0.14 too dark within a few pixels of it, against 0.07 elsewhere);
+    so does one spread for a shadow over coarse and smooth ground, on the coarse part (as with one middle)."""
+    shade = free & (level > 0.5)
+    if not shade.any():
+        return np.full(level.shape, np.inf, np.float32)
+    v = level[shade]  # less a thing much darker than the shadow, which would raise the middle beside it
+    shade &= level <= np.median(v) + SPOT_TRIM * np.median(np.abs(v - np.median(v)))
+    sigma = SPOT_REACH * max(level.shape)
+    num, den = (cv2.GaussianBlur(a.astype(np.float32), (0, 0), sigma, borderType=cv2.BORDER_CONSTANT)
+                for a in (np.where(shade, level, 0.0), shade))
+    mid = np.divide(num, den, out=np.full(level.shape, np.median(level[shade]), np.float32), where=den > 1e-3)
+    off_mid = (level - mid)[shade]
+    middle = np.median(off_mid)
+    spread = 1.4826 * np.median(np.abs(off_mid - middle))  # 1.4826: a median distance in spreads
+    return mid + np.float32(middle - SPOT_MARGIN * spread)
+
+
+def _lit_ground(level: np.ndarray, outside: np.ndarray, depth: float, spots: bool = False) -> np.ndarray:
     """Which cells of the painting are lit ground joined to the lit ground outside it, or a slope down to that:
     a lit gap between two painted shadows, or one cutting into a shadow, and its soft edges. level: float32,
     from _lit_level; outside: bool, the cells outside the painting, which are taken as they are and never
-    passed through; depth: the shadow's depth (natural log), for the floors of BRIGHTER and BRIGHT_PEAK.
+    passed through; depth: the shadow's depth (natural log), for the floors of BRIGHTER and BRIGHT_PEAK; spots:
+    lit spots that shadow encloses are lit ground too (ShadowEdit.spots).
+    Such a spot (sun through leaves) and a thing in the shadow about as many times brighter than the ground as the
+    shadow is darker both sit at the lit level with shadow all round, and differ in nothing at the field size (in
+    colour neither: sunlight differs from a shadow's skylight just as a warm thing does from grey ground), so
+    which they are is the user's call. With spots, each cell of the painting at the lit level or brighter (but not
+    of a bright thing) joins the lit ground once the growing below has reached its level and no bright thing has
+    taken it, so a bright thing still gets its own soft edge first. A part of one at the lit level that something
+    darker cuts off from its bright part (a stripe) is a lit spot, as it would be on its own, while a bright
+    thing in a lit spot (a pale stone in a sun fleck, or on strongly patterned ground the pattern's lighter bits)
+    reaches all of the spot first and takes it, as it takes the near part of a lit gap. Such cells, and the slopes down to them, must be lighter than the plain shadow around
+    them by SPOT_MARGIN of its spread too (_plain_top): on ground whose pattern is as strong as the shadow fewer
+    cells are, and some of the pattern's lighter patches still pass. That never takes away lit ground found
+    without spots (a lit gap's soft edges). The cells just outside a lit spot's soft edge, fully shaded but read
+    as a little less by the smoothed lighting, get their own share as beside a lit gap (up to about a quarter of
+    a depth too little, at single pixels).
     A bright thing reaching out of the shadow (a person at its edge) is left out, as its shaded part can be at
     the lit level too (when it's about as many times brighter than the ground as the shadow is darker), and the
     lit ground beside it then reaches its shaded part through the soft edge where the shadow crosses it, all the
@@ -194,20 +268,18 @@ def _lit_ground(level: np.ndarray, outside: np.ndarray, depth: float) -> np.ndar
     and a cell that isn't a number is never passed through."""
     lo, hi = LIT_LEVEL
     finite = np.isfinite(level)
-    # bright things over the whole field, as a patch's brightest spot can be far outside the painting
-    brighter = finite & (level < -max(BRIGHTER[0], BRIGHTER[1] / depth))
-    count, labels = cv2.connectedComponents(brighter.view(np.uint8), connectivity=8)
-    patch = np.asarray(labels, np.int32)
-    peaked = np.zeros(count, bool)
-    peaked[patch[brighter & (level < -max(BRIGHT_PEAK[0], BRIGHT_PEAK[1] / depth))]] = True
-    peaked[0] = False
-    bright_all = peaked[patch]
+    bright_all = _bright_things(level, depth)
     tops = np.arange(lo - FLOOD_STEP, hi + FLOOD_STEP / 2, FLOOD_STEP)
     result = outside & finite & (level >= lo) & (level <= tops[-1]) & ~bright_all  # outside: as it is
     x, y, bw, bh = cv2.boundingRect((~outside).view(np.uint8))
     if not (bw and bh):
         return result
     box = _grow((slice(y, y + bh), slice(x, x + bw)), 1, *level.shape)
+    # with spots: never less than without (a lit gap's soft edges, which plain_top would otherwise cut off), and
+    # lighter than the plain shadow around by SPOT_MARGIN of its spread, worked out on the whole field
+    without = _lit_ground(level, outside, depth) if spots else None
+    plain_top = _plain_top(level, ~outside & finite & ~bright_all)[box] if spots else np.inf
+    spot_top = np.minimum(hi, plain_top)
     level, outside, finite, bright = level[box], outside[box], finite[box], bright_all[box]
     lit = result[box].copy()
     free = ~outside & finite & ~bright
@@ -223,6 +295,8 @@ def _lit_ground(level: np.ndarray, outside: np.ndarray, depth: float) -> np.ndar
             bright, lit = bright | to_b, lit | to_l
             open_b &= ~(to_b | to_l)
             open_l &= ~(to_b | to_l)
+        if spots:  # the cells up to this level that no bright thing has reached: lit spots (also brighter ones)
+            lit |= free & (level <= np.minimum(top, spot_top)) & ~bright
     # Each cell of the painting steps to its lowest side neighbor while that's lower: the steepest way down.
     # Going only down, it never loops, so where each way leads is found by doubling how far is looked each
     # round (a cell outside the painting or of a bright thing, or with nothing lower beside it, stays where it is).
@@ -237,8 +311,11 @@ def _lit_ground(level: np.ndarray, outside: np.ndarray, depth: float) -> np.ndar
     for _ in range(max(1, int(level.size).bit_length())):
         ends_lit = ends_lit | ends_lit[step]
         step = step[step]
-    result[box] = ends_lit.reshape(level.shape)
-    return result
+    ends_lit = ends_lit.reshape(level.shape)
+    if spots:  # a slope is a soft edge, lighter than the plain shadow: not plain shadow whose texture leads down there
+        ends_lit &= lit | (level <= plain_top)
+    result[box] = ends_lit
+    return result if without is None else result | without
 
 
 def _lighting(log_y: np.ndarray) -> np.ndarray:
@@ -401,20 +478,26 @@ def lift_shadows(bgr: np.ndarray, edit: ShadowEdit, lighting: Lighting | None = 
     #   from outside the painting, reaches without climbing).
     # As before, the less plainly a spot is shadow, the less it's filled. (Taking every neighborhood that is a
     # third shadow as all shadow gave the soft edge the full depth: a bright ring around the shadow wherever
-    # the painting ran past it.) Still lifted like a bright object: a lit spot that shadow encloses (sun through
-    # leaves), a lit gap so narrow that its middle is still mostly in the shadow's soft edge, often one in a
-    # shallow shadow on ground whose texture is about as strong as the shadow, the part of a lit gap near a bright
-    # thing in it or at its mouth, and partly one under lighting that changes a lot across the picture.
+    # the painting ran past it.) Unless edit.spots, a lit spot that shadow encloses (sun through leaves) is a dip
+    # like a bright object in the shadow, and filled; with it, the lit ground _lit_ground finds is a seed of
+    # _fill_dips as well. Still lifted like a bright object: a lit gap so narrow that its middle is still mostly
+    # in the shadow's soft edge, often one in a shallow shadow on ground whose texture is about as strong as the
+    # shadow, the part of a lit gap near a bright thing in it or at its mouth, and partly one under lighting that
+    # changes a lot across the picture.
     part_r = np.clip(gap_r / depth, 0.0, 1.0)
     part_s = cv2.resize(_pasted(part_r, reach, h, w), fs, interpolation=cv2.INTER_AREA)
     not_lit = np.clip((cv2.GaussianBlur(part_s, (0, 0), 3.0) - 0.1) / 0.25, 0.0, 1.0)
     window = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * CLOSE_RADIUS + 1,) * 2)
     closed = cv2.morphologyEx(part_s, cv2.MORPH_CLOSE, window)
     level = _lit_level(light_s, m_s < 0.02, depth)  # from the whole picture's lighting: the same in the box
+    seeds = (not_lit <= 0.0) | (m_s < 0.02)  # outside the painting: seeds, so the fill never reaches past `reach`
     if level is not None:
-        closed = np.where(_lit_ground(level, m_s < 0.02, depth), part_s, closed)
-    filled = np.maximum(closed, _fill_dips(part_s, (not_lit <= 0.0) | (m_s < 0.02)))  # outside the painting: seeds,
-    filled = part_s + (filled - part_s) * not_lit  # so the fill never reaches past `reach`
+        lit = _lit_ground(level, m_s < 0.02, depth, edit.spots)
+        closed = np.where(lit, part_s, closed)
+        if edit.spots:  # the lit spots themselves; their soft edges are slopes down to them, which it leaves as they
+            seeds |= lit & (level <= LIT_LEVEL[1])  # are (all the slopes would keep it out of noisy plain shadow)
+    filled = np.maximum(closed, _fill_dips(part_s, seeds))
+    filled = part_s + (filled - part_s) * not_lit
     # Close to the full depth counts as the full depth: in the shadow's core such small differences are the
     # measurement's wobble, so the core and anything in it are lifted by one depth, as a real light would
     # (about a twentieth of the depth more at most, on the inner side of a soft edge).

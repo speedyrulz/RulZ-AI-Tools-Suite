@@ -1,5 +1,6 @@
 """Tests for the shadow lift (python -m unittest discover tests)."""
 import unittest
+from dataclasses import replace
 
 import cv2
 import numpy as np
@@ -30,7 +31,7 @@ def _scene(h=400, w=600, soft=3.0, albedo=None):
     yy, xx = np.mgrid[:h, :w]
     e = (xx - w / 2) ** 2 / (w / 4) ** 2 + (yy - h / 2) ** 2 / (h / 4) ** 2
     soft = _strength(h, w, soft)
-    illum = 1 - soft[..., None] * (1 - np.array([0.30, 0.22, 0.18], np.float32))
+    illum = 1 - soft[..., None] * (1 - np.array(BLUE, np.float32))
     shot = np.power(lin * illum, 1 / 2.2).astype(np.float32)
     truth = np.power(lin, 1 / 2.2).astype(np.float32)
     return shot, truth, e < 0.8, e > 1.6
@@ -47,6 +48,43 @@ def _gap_scene(width, notch=False, soft=3.0, h=400, w=600):
     lin = np.power(truth, 2.2)
     illum = 1 - strength[..., None] * (1 - np.array([0.30, 0.22, 0.18], np.float32))
     return np.power(lin * illum, 1 / 2.2).astype(np.float32), truth, strength
+
+
+FLECKS = ((220, 170), (300, 150), (380, 180), (250, 240), (340, 245))
+BLUE = (0.30, 0.22, 0.18)  # how much of each channel's light (B, G, R) _scene's bluish shadow leaves
+
+
+def _fleck_scene(radius, soft=3.0, centers=FLECKS, light=BLUE, h=400, w=600, albedo=None):
+    """_scene's shadow with sunlit spots (sun through leaves) cut out of it, radius px, their edges blurred by soft
+    px; light: how much of each channel's light (B, G, R) the shadow leaves, or that for each pixel (h x w x 3);
+    albedo: as _scene's. Returns (shot, truth, shade, fleck): shade is how much of the sun each pixel misses,
+    fleck how much of a spot it's in."""
+    _, truth, _, _ = _scene(h, w, albedo=albedo)
+    yy, xx = np.mgrid[:h, :w]
+    spots = np.zeros((h, w), np.float32)
+    for cx, cy in centers:
+        spots[(xx - cx) ** 2 + (yy - cy) ** 2 < radius ** 2] = 1
+    fleck = np.clip(cv2.GaussianBlur(spots, (0, 0), soft), 0, 1)
+    shade = _strength(h, w) * (1 - fleck)
+    illum = 1 - shade[..., None] * (1 - np.array(light, np.float32))
+    return np.power(np.power(truth, 2.2) * illum, 1 / 2.2).astype(np.float32), truth, shade, fleck
+
+
+def _coarse_scene(light, flecks, h=400, w=600):
+    """_scene's shadow, leaving `light` of the light (gray), on ground with a coarse pattern (blobs ~8 px, 0.35
+    natural log), and with five sunlit spots 10 px across cut out of it if flecks. Returns (shot, truth, shade,
+    fleck) as _fleck_scene."""
+    rng = np.random.default_rng(1)
+    tex = cv2.GaussianBlur(rng.standard_normal((h, w)).astype(np.float32), (0, 0), 8.0)
+    lin = np.array([0.17, 0.27, 0.37], np.float32)[None, None] * np.exp(0.35 * tex / tex.std())[..., None]
+    yy, xx = np.mgrid[:h, :w]
+    spots = np.zeros((h, w), np.float32)
+    for cx, cy in FLECKS if flecks else ():
+        spots[(xx - cx) ** 2 + (yy - cy) ** 2 < 100] = 1
+    fleck = np.clip(cv2.GaussianBlur(spots, (0, 0), 3.0), 0, 1)
+    shade = _strength(h, w) * (1 - fleck)
+    shot = np.power(lin * (1 - shade[..., None] * (1 - light)), 1 / 2.2).astype(np.float32)
+    return shot, np.power(lin, 1 / 2.2).astype(np.float32), shade, fleck
 
 
 def _log_y(img):
@@ -101,6 +139,129 @@ class ShadowTests(unittest.TestCase):
                 if lit.any():  # before 0.5.2: 0.83 at 16 px
                     self.assertLess(err[lit].mean(), 0.2)
 
+    def test_keep_lit_spots_leaves_sun_flecks_lit(self):
+        """A lit spot that the shadow encloses (sun through leaves) looks just like a bright thing in the shadow,
+        so it's lifted like one, unless Keep lit spots is on (0.6.0): then it and its soft edge are lifted only as
+        far as they're shaded, in any light, while the shadow itself is lifted as before."""
+        for radius, soft, centers, light in ((8, 3.0, FLECKS, BLUE), (12, 1.0, FLECKS[:1], BLUE),
+                                             (5, 1.0, FLECKS, BLUE), (18, 3.0, FLECKS[:1], BLUE),
+                                             (8, 3.0, FLECKS, (0.22, 0.22, 0.22))):
+            shot, truth, shade, fleck = _fleck_scene(radius, soft, centers, light)
+            spot, edge = (fleck > 0.9) & (shade < 0.05), (fleck > 0.1) & (fleck < 0.9)
+            on = _log_y(lift_shadows(shot, replace(_over_shadow(), spots=True))) - _log_y(truth)
+            with self.subTest(radius=radius, soft=soft, flecks=len(centers), light=light):  # off: 0.59 to 0.93
+                self.assertLess(np.abs(on[spot].mean()), 0.25)  # 0.03 to 0.15
+                self.assertLess(np.abs(on[edge].mean()), 0.25)  # 0.04 to 0.14; off: 0.6 to 0.71
+                self.assertLess(np.abs(on[shade > 0.99].mean()), 0.05)
+                if radius == 8:  # off: lifted like a bright thing, as before 0.6.0
+                    off = _log_y(lift_shadows(shot, _over_shadow())) - _log_y(truth)
+                    self.assertGreater(off[spot].mean(), 0.5)
+
+    def test_keep_lit_spots_where_the_shadow_varies(self):
+        """How much lighter than the plain shadow a lit spot must be is measured around it: one measure for the
+        whole painting was widened by light changing across the shadow (fleck edges came out 0.18 too bright), or
+        by a dark thing over a third of it or dark patches over a quarter (the flecks were lifted as with Keep lit
+        spots off, 0.7 too bright). Things much darker than the shadow are left out of that measure."""
+        h, w = 400, 600
+        yy, xx = np.mgrid[:h, :w]
+        ramp = np.clip(0.15 + 0.45 * (xx - w / 4) / (w / 2), 0.15, 0.6).astype(np.float32)
+        e = (xx - w / 2) ** 2 / (w / 4) ** 2 + (yy - h / 2) ** 2 / (h / 4) ** 2
+        cut = np.sort(xx[e < 1])[int(0.35 * (e < 1).sum())]  # a dark thing over the left 35% of the shadow
+        dark = cv2.GaussianBlur(np.where((xx < cut) & (e < 1.3), 0.35, 1.0).astype(np.float32), (0, 0), 1.0)
+        right = ((300, 150), (380, 180), (340, 245), (420, 220))
+        patches = np.ones((h, w), np.float32)  # six dark patches over a quarter of the shadow, flecks between them
+        for cx, cy in ((235, 150), (365, 150), (235, 250), (365, 250), (170, 200), (430, 200)):
+            patches[(np.abs(xx - cx) < 30) & (np.abs(yy - cy) < 18)] = 0.2
+        between = ((300, 150), (300, 250), (230, 200), (370, 200))
+        for name, centers, light, albedo, edge_max in (
+                ("light slope", FLECKS, np.repeat(ramp[..., None], 3, 2), None, 0.14),
+                ("dark thing", right, BLUE, dark, 0.14),
+                ("dark patches", between, BLUE, cv2.GaussianBlur(patches, (0, 0), 1.0), 0.1)):
+            shot, truth, shade, fleck = _fleck_scene(10, 3.0, centers, light, albedo=albedo)
+            spot, edge = (fleck > 0.9) & (shade < 0.05), (fleck > 0.1) & (fleck < 0.9)
+            on = _log_y(lift_shadows(shot, replace(_over_shadow(), spots=True))) - _log_y(truth)
+            with self.subTest(name):  # off: spots 0.75, 0.73, 0.71; edges 0.35, 0.64, 0.6
+                self.assertLess(np.abs(on[spot].mean()), 0.15)  # 0.04, 0.01, 0.01 (one measure: 0.04, 0.73, 0.71)
+                self.assertLess(np.abs(on[edge].mean()), edge_max)  # 0.05, 0.11, 0.07 (one measure: 0.15, 0.6, 0.6;
+                # the dark patches' cells in the middle: 0.21)
+
+    def test_keep_lit_spots_keeps_lit_gaps(self):
+        """Keep lit spots never takes lit ground away: a lit gap's soft edges are lifted with it on as with it
+        off, also where dark patches in the shadow lower how light a lit spot must be (they came out up to 0.13
+        brighter than with it off)."""
+        edit = ShadowEdit((Stroke(((0.15, 0.5), (0.85, 0.5)), 0.2),), strength=100)
+        yy, xx = np.mgrid[:400, :600]
+        patch = (((yy >= 120) & (yy < 160)) | ((yy >= 240) & (yy < 280))) & \
+            (((xx >= 140) & (xx < 250)) | ((xx >= 350) & (xx < 460)))
+        dark = cv2.GaussianBlur(np.where(patch, 0.2, 1.0).astype(np.float32), (0, 0), 1.0)[..., None]
+        for width in (24, 48):
+            _, truth, strength = _gap_scene(width)
+            lin = np.power(truth, 2.2) * dark
+            truth = np.power(lin, 1 / 2.2).astype(np.float32)
+            illum = 1 - strength[..., None] * (1 - np.array(BLUE, np.float32))
+            shot = np.power(lin * illum, 1 / 2.2).astype(np.float32)
+            off = _log_y(lift_shadows(shot, edit)) - _log_y(truth)
+            on = _log_y(lift_shadows(shot, replace(edit, spots=True))) - _log_y(truth)
+            edge = (np.abs(xx - 300) < width / 2 + 12) & (yy > 110) & (yy < 290) & (strength > 0.05) & \
+                (strength < 0.95)
+            plain = (strength > 0.99) & ~patch & (np.abs(xx - 300) > width / 2 + 40)
+            with self.subTest(width=width):  # the same as off (0.04, 0.03); taking lit ground away: 0.14
+                self.assertLess(on[edge].mean(), off[edge].mean() + 0.01)
+                self.assertLess(np.percentile(on[edge], 95), np.percentile(off[edge], 95) + 0.03)
+                self.assertLess(np.abs(on[plain].mean()), 0.1)  # and the shadow is lifted: 0.03 (unlifted: -1.55)
+
+    def test_keep_lit_spots_on_coarse_ground(self):
+        """On ground with a coarse pattern (grass, leaf litter) the shadow's lighter patches reach the lit level
+        too. With Keep lit spots they'd be left unlifted, with the plain shadow that slopes down to them, unless
+        they must stand out from the plain shadow's own spread (SPOT_MARGIN): a first try left a faint shadow's
+        core (light 0.68) 0.064 darker and its pattern 0.13 flatter. Sun flecks there stay lit; in a deep shadow
+        the plain shadow is lifted about as with it off, while in a faint one, where the pattern is as strong as
+        the shadow, some of its lighter patches are still left (that's a limit). This is one ground pattern: over
+        eight, the core changed by up to 0.02, 0.045 and 0.048, the pattern flattened by up to 0.10, 0.15 and
+        0.11, and the flecks came out 0.04 to 0.31 too bright in the deep shadow and 0.13 to 0.36 in the faint
+        ones (off 0.20 to 0.87), worst where the pattern's lighter bits inside a fleck count as a bright thing."""
+        # light, then the most the plain shadow's core may change (measured: 0.012, 0.044, 0.048), the most its
+        # pattern may flatten (0.06, 0.15, 0.11) and the most the flecks may be too bright (0.11, 0.14, 0.19; off
+        # 0.86, 0.49, 0.38)
+        for light, shift, flatter, flecks_on in ((0.3, 0.03, 0.08, 0.25), (0.55, 0.06, 0.18, 0.3),
+                                                 (0.68, 0.06, 0.14, 0.3)):
+            shot, truth, shade, _ = _coarse_scene(light, False)
+            off = _log_y(lift_shadows(shot, _over_shadow()))
+            on = _log_y(lift_shadows(shot, replace(_over_shadow(), spots=True)))
+            core, want = shade > 0.99, _log_y(truth)
+            with self.subTest(light=light):
+                self.assertLess(np.abs((on - off)[core].mean()), shift)
+                self.assertGreater(on[core].std() / want[core].std(), off[core].std() / want[core].std() - flatter)
+                shot, truth, shade, fleck = _coarse_scene(light, True)
+                err = _log_y(lift_shadows(shot, replace(_over_shadow(), spots=True))) - _log_y(truth)
+                self.assertLess(err[(fleck > 0.9) & (shade < 0.05)].mean(), flecks_on)
+
+    def test_keep_lit_spots_and_bright_things(self):
+        """With Keep lit spots on, a thing in the shadow much brighter than lit ground is still a bright thing and
+        gets the full lift, its soft edge too (no darker ring), as with it off; so does a wider one as far as it
+        did with it off (its middle looks lit: see the 6x disc above). One about as bright as lit ground (here 2.5
+        to 10 times as bright as the ground in this 1.5-deep shadow) is a lit spot, and left as it is: that's what
+        the switch costs."""
+        h, w = 400, 600
+        yy, xx = np.mgrid[:h, :w]
+        r2 = (xx - w * 0.42) ** 2 + (yy - h / 2) ** 2
+        for radius, blur, ratio in ((8, 1.5, 12.0), (16, 2.0, 12.0), (16, 2.0, 4.6)):
+            disc = cv2.GaussianBlur((r2 < radius ** 2).astype(np.float32), (0, 0), blur)
+            albedo = (1.2 / ratio) * np.exp(np.log(ratio) * disc)
+            shot, truth, _, _ = _scene(albedo=albedo.astype(np.float32))
+            off = _log_y(lift_shadows(shot, _over_shadow())) - _log_y(truth)
+            on = _log_y(lift_shadows(shot, replace(_over_shadow(), spots=True))) - _log_y(truth)
+            core, rim = r2 < (0.6 * radius) ** 2, (r2 > (radius - 2) ** 2) & (r2 < (radius + 6) ** 2)
+            with self.subTest(radius=radius, ratio=ratio):
+                if ratio < 10:  # not lifted: about a full depth (1.5) too dark, -1.54 (off: -0.73)
+                    self.assertLess(on[core].mean(), -1.2)
+                    continue
+                self.assertGreater(on[core].mean(), off[core].mean() - 0.02)
+                self.assertGreater(on[rim].mean(), off[rim].mean() - 0.02)
+                if radius == 8:  # the full lift: -0.01 (16 px: -1.19 either way)
+                    self.assertGreater(on[core].mean(), -0.1)
+                    self.assertGreater(on[rim].mean(), -0.1)
+
     def test_lit_ground_by_hand(self):
         """_lit_ground on small fields worked out by hand: growth from outside, the steepest way down, a row's
         end not running on into the next row, a bright thing taking its shaded part first, odd shapes and
@@ -133,11 +294,41 @@ class ShadowTests(unittest.TestCase):
         # a cell that isn't a number beside 1.0 doesn't stop it going down through 0.5 to the lit 0.0
         np.testing.assert_array_equal(lit([[0.0, 0.5], [np.nan, 1.0]], [[True, False], [False, False]]),
                                       [[True, True], [False, True]])
+        # a lit spot (0.0) that shadow encloses: lit ground only with Keep lit spots, with the slopes down to it
+        # (1.0 beside 0.0 and 0.5); a 1.0 with nothing lower beside it isn't
+        spot, ends = [[1.0, 1.0, 1.0, 0.0, 0.5, 1.0, 1.0, 1.0]], [[True] + [False] * 6 + [True]]
+        self.assertFalse(lit(spot, ends).any())
+        np.testing.assert_array_equal(shadows._lit_ground(np.array(spot, np.float32), np.array(ends), 1.0, True),
+                                      [[False, False, True, True, True, True, False, False]])
+        # the soft edge (0.22) of a bright thing (-0.8) is the bright thing's, not a lit spot: it reaches it first
+        bright = np.array([[1.0, -0.8, 0.22, 1.0, 0.0, 1.0]], np.float32)
+        np.testing.assert_array_equal(shadows._lit_ground(bright, np.array([[True] + [False] * 4 + [True]]), 1.0, True),
+                                      [[False, False, False, True, True, False]])
+        # a spot a little brighter than the lit level (-0.3, short of a bright thing) is one too; a cell that isn't a
+        # number never is, nor is a way down through it (the 0.45 past it leads nowhere)
+        odd = np.array([[1.0, 1.0, 1.0, 1.0, -0.3, 0.45, np.nan, 0.45, 1.0, 1.0, 1.0, 1.0]], np.float32)
+        np.testing.assert_array_equal(shadows._lit_ground(odd, np.array([[True] + [False] * 10 + [True]]), 1.0, True),
+                                      [[False] * 3 + [True] * 3 + [False] * 6])
+        # a slope must be lighter than the plain shadow around it by SPOT_MARGIN of its spread: here the shadow's
+        # cells are 0.9..1.1 (middle 1.0, spread 0.15), so slopes must be about 0.7 or less: the 0.9 beside the spot
+        # (and the 1.1 and 1.0 leading down to it) are plain shadow, the 0.5 a soft edge
+        noisy = np.array([[1.0, 1.1, 0.9] * 10 + [0.0, 0.5] + [1.0, 0.9, 1.1] * 10], np.float32)
+        np.testing.assert_array_equal(shadows._lit_ground(noisy, np.array([[True] + [False] * 60 + [True]]), 1.0, True),
+                                      [[False] * 30 + [True] * 2 + [False] * 30])
+        # with spots there's never less lit ground than without, whatever the plain shadow is like
+        rng = np.random.default_rng(3)
+        ring = np.ones((24, 24), bool)
+        ring[3:-3, 3:-3] = False
+        for _ in range(20):
+            field = cv2.GaussianBlur(rng.normal(0.6, 0.6, (24, 24)).astype(np.float32), (0, 0), 1.0)
+            without, with_spots = (shadows._lit_ground(field, ring, 1.0, s) for s in (False, True))
+            self.assertFalse((without & ~with_spots).any())
 
     def test_lit_ground_depends_only_on_the_painting(self):
-        """_lit_ground works on the painting's box, so field around it (here a far-off bright cell, and the
-        box-vs-whole tests' patched _extent) changes nothing, even when a long winding painted path runs past
-        the growing's cap."""
+        """What _lit_ground finds depends on the painting and its level only, not on the field around it (here a
+        far-off bright cell), even when a long winding painted path runs past the growing's cap (set by the
+        painting's box), with Keep lit spots too. (With it, the plain shadow is measured at a scale set by the
+        field's size, which is the picture's.)"""
         level = np.ones((40, 40), np.float32)
         outside = np.ones((40, 40), bool)
         for row in range(2, 38, 2):  # a one-cell-wide painted path winding down the field, 702 cells long
@@ -149,13 +340,18 @@ class ShadowTests(unittest.TestCase):
         far[39, 39] = -0.6  # a bright cell outside the painting, far from it
         want = shadows._lit_ground(level, outside, 1.0)
         self.assertLess(want[~outside].sum(), (~outside).sum())  # the cap is reached
-        saved = shadows._extent
-        shadows._extent = lambda m: (slice(0, m.shape[0]), slice(0, m.shape[1]))
-        try:
-            for got in (shadows._lit_ground(far, outside, 1.0), shadows._lit_ground(level, outside, 1.0)):
-                np.testing.assert_array_equal(got, want)
-        finally:
-            shadows._extent = saved
+        np.testing.assert_array_equal(shadows._lit_ground(far, outside, 1.0), want)
+        # Keep lit spots: shadow across the path's middle row (0.6 and 1.4: a spread so wide that only a cell below
+        # about -0.19 is lighter enough to be a lit spot, so the path itself isn't) and two such cells past the cap,
+        # which lit ground grows from too
+        spotted = level.copy()
+        spotted[20, 5:35] = np.tile(np.array([0.6, 1.4], np.float32), 15)
+        spotted[36, [10, 30]] = -0.24
+        want_spots = shadows._lit_ground(spotted, outside, 1.0, True)
+        self.assertTrue(want_spots[36, [10, 30]].all())
+        self.assertLess(want_spots[~outside].sum(), (~outside).sum())  # the cap is reached here too
+        spotted[39, 39] = -0.6
+        np.testing.assert_array_equal(shadows._lit_ground(spotted, outside, 1.0, True), want_spots)
 
     def test_lit_level_leaves_bright_things_out(self):
         """The lit ground's light is measured without the bright things (and dark fringes) outside the painting,
@@ -242,11 +438,14 @@ class ShadowTests(unittest.TestCase):
         whole = lambda m: (slice(0, m.shape[0]), slice(0, m.shape[1]))  # noqa: E731
         small = ShadowEdit((Stroke(((0.2, 0.47), (0.33, 0.52)), 0.04),))  # small, over the shadow's edge
         gapped, _, _ = _gap_scene(32)  # lit ground beside the painting's box, reaching into it
+        flecked = _fleck_scene(8, h=500, w=900)[0]
         for shot, edit in ((shot, small),
                            (shot, ShadowEdit((Stroke(((0.0, 0.5), (0.45, 0.5)), 0.05),), 80, 100)),  # off the edge
                            (shot, _over_shadow(500, 900)),
                            (tiled, small),
-                           (gapped, ShadowEdit((Stroke(((0.3, 0.5), (0.55, 0.5)), 0.08),)))):
+                           (gapped, ShadowEdit((Stroke(((0.3, 0.5), (0.55, 0.5)), 0.08),))),
+                           (flecked, replace(_over_shadow(500, 900), spots=True)),  # Keep lit spots
+                           (tiled, replace(small, spots=True))):
             got = lift_shadows(shot, edit)
             self.assertIsNot(got, shot)  # it found a shadow to lift
             saved = shadows._extent
@@ -275,7 +474,8 @@ class ShadowTests(unittest.TestCase):
                  (corners, ShadowEdit((Stroke(((0.0, 0.08), (0.12, 0.0)), 0.06),), 90, 0)),  # in a corner
                  (corners, ShadowEdit((Stroke(((0.0, 0.08), (0.12, 0.0)), 0.06),
                                        Stroke(((1.0, 0.92), (0.88, 1.0)), 0.06)), 90)),  # two corners
-                 (gray, _over_shadow(500, 900)))  # a gray picture as the pipeline hands it over
+                 (gray, _over_shadow(500, 900)),  # a gray picture as the pipeline hands it over
+                 (shot, replace(ShadowEdit((paint,)), spots=True)))  # Keep lit spots
         lightings = {}
         for img, edit in cases:
             lighting = lightings.setdefault(id(img), shadows.measure(img))
@@ -295,6 +495,9 @@ class ShadowTests(unittest.TestCase):
     def test_round_trip_and_pipeline(self):
         edit = ShadowEdit((Stroke(((0.1, 0.2), (0.3, 0.4)), 0.05), Stroke(((0.5, 0.5),), 0.02, True)), 40, 70)
         self.assertEqual(ShadowEdit.from_dict(edit.to_dict()), edit)
+        self.assertEqual(ShadowEdit.from_dict(replace(edit, spots=True).to_dict()), replace(edit, spots=True))
+        old = {k: v for k, v in edit.to_dict().items() if k != "spots"}  # saved before 0.6.0
+        self.assertEqual(ShadowEdit.from_dict(old), edit)
         shot, _, inner, _ = _scene()
         img16 = np.round(shot * 65535).astype(np.uint16)
         out = process(img16, {"color": 0, "jpeg": 0, "detail": 0}, shadow=_over_shadow())
