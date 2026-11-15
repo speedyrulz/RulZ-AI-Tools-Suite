@@ -9,16 +9,19 @@ from PySide6.QtWidgets import (QAbstractItemDelegate, QApplication, QCheckBox, Q
                                QPlainTextEdit, QProgressBar, QPushButton, QSlider, QToolBar, QVBoxLayout,
                                QWidget, QHBoxLayout)
 
-from . import config, theme
-from .backend import CaptionEngine, ServerManager, StartCancelled, external_endpoints
+from . import check, config, edits, theme
+from .backend import CUT_OFF, CaptionEngine, ServerManager, StartCancelled, external_endpoints
+from .bulk_dialog import BulkEditDialog
 from .gridview import CaptionEditor, ImageGrid
-from .model import (BUSY, ERROR, IDLE, QUEUED, FilterProxy, ImageModel, caption_clashes, caption_path,
-                    collect_images, load_entries, read_caption, unique_new)
+from .model import (BUSY, ERROR, IDLE, QUEUED, FilterProxy, ImageModel, PathRole, caption_clashes,
+                    caption_path, collect_images, load_entries, read_caption, unique_new)
 from .settings_dialog import SettingsDialog
 
 MANAGED_KEYS = ("llama_server", "model", "mmproj", "gpus", "gpu_mode", "tensor_split", "ctx_size", "ngl",
                 "slots_per_server", "extra_args", "base_port", "disable_thinking", "thinking_budget")
 SEARCH_DELAY_MS = 200
+FILTERS = [("all", "All"), ("missing", "Missing captions"), ("captioned", "Captioned"),
+           ("review", "Needs review"), ("failed", "Failed")]
 
 
 class ServerBridge(QObject):
@@ -57,6 +60,8 @@ class MainWindow(QMainWindow):
         self.warnings = 0
         self.run_managed = False  # the current job runs on the app's own llama-servers
         self.snapshots = {}  # path -> caption when it was queued, to spot edits made meanwhile
+        self.job_group = None  # the captions one job writes are undone together
+        self.job_saved = set()  # images whose caption the current job saved
 
         self.grid = ImageGrid()
         self.grid.setModel(self.proxy)
@@ -88,7 +93,12 @@ class MainWindow(QMainWindow):
         self.adder.progress.connect(lambda n: self.statusBar().showMessage(f"Adding images… {n:,} read"))
         self.adder.done.connect(self._added)
         self.model.stats_changed.connect(self._update_stats)
+        self.model.history_changed.connect(self._update_undo)
+        self.suffix.editingFinished.connect(self._apply_review_options)
+        self.prefix.editingFinished.connect(self._apply_review_options)
+        self._apply_review_options()
         self._update_stats()
+        self._update_undo()
 
     # ------------------------------------------------------------------ UI
     def _act(self, text, slot, shortcut=None):
@@ -111,12 +121,21 @@ class MainWindow(QMainWindow):
         self.a_stop_srv = self._act("Stop Servers", self.stop_servers)
         self.a_settings = self._act("Settings…", self.open_settings, "Ctrl+,")
         self.a_stop.setEnabled(False)
+        self.a_undo = self._act("Undo", self.undo, "Ctrl+Z")
+        self.a_redo = self._act("Redo", self.redo, "Ctrl+Y")
+        self.a_replace = self._act("Find and Replace…", lambda: self.edit_captions(edits.REPLACE), "Ctrl+H")
+        self.a_add_text = self._act("Add Text to Captions…", lambda: self.edit_captions(edits.START))
+        self.a_checked = self._act("Mark Selected as Checked", self.mark_checked)
 
         m = self.menuBar()
         f = m.addMenu("&File")
         for a in (self.a_add, self.a_folder, self.a_folder_r, None, self.a_remove, self.a_clear, None,
                   self._act("Exit", self.close)):
             f.addSeparator() if a is None else f.addAction(a)
+        ed = m.addMenu("&Edit")
+        for a in (self.a_undo, self.a_redo, None, self.a_replace, self.a_add_text, None, self.a_checked):
+            ed.addSeparator() if a is None else ed.addAction(a)
+        ed.aboutToShow.connect(self._update_undo)  # the count in "Undo captioning (12)" grows during a job
         c = m.addMenu("&Captions")
         for a in (self.a_cap_all, self.a_cap_sel, self.a_stop):
             c.addAction(a)
@@ -144,9 +163,8 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         tb.addWidget(QLabel(" Show: "))
         self.filter_box = QComboBox()
-        self.filter_box.addItems(["All", "Missing captions", "Captioned"])
-        self.filter_box.currentIndexChanged.connect(
-            lambda i: self.proxy.set_filter(mode=("all", "missing", "captioned")[i]) or self._update_stats())
+        self.filter_box.addItems([label for _, label in FILTERS])
+        self.filter_box.currentIndexChanged.connect(self._filter_changed)
         tb.addWidget(self.filter_box)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search captions / names")
@@ -399,6 +417,13 @@ class MainWindow(QMainWindow):
             self.pending_job = None  # nor for a job waiting for the model (which goes on loading)
             self.model.clear()
 
+    def _filter_changed(self, i):
+        mode = FILTERS[i][0]
+        if mode == "review":
+            self.model.recheck()  # the check trails captions by a moment: list what is true now
+        self.proxy.set_filter(mode=mode)
+        self._update_stats()
+
     def _apply_search(self):
         self.search_timer.stop()
         if self.search.text().lower() != self.proxy.text:
@@ -412,7 +437,9 @@ class MainWindow(QMainWindow):
     def _update_stats(self):
         n, c = len(self.model.items), self.model.captioned_count()
         shown = self.proxy.rowCount()
-        self.stats.setText(f"{n} images · {c} captioned · {n - c} missing" + (f" · showing {shown}" if shown != n else ""))
+        review = f" · {self.model.review} to review" if self.model.review else ""
+        self.stats.setText(f"{n} images · {c} captioned · {n - c} missing{review}"
+                           + (f" · showing {shown}" if shown != n else ""))
 
     def _context_menu(self, pos):
         idx = self.grid.indexAt(pos)
@@ -423,8 +450,10 @@ class MainWindow(QMainWindow):
         m = QMenu(self)
         m.addAction("Caption selected", lambda: self.caption("selected"))
         m.addAction("Clear caption(s)", self._clear_selected_captions)
+        if any(self.model.items[r].get("issues") for r in self._selected_rows()):
+            m.addAction("Mark as checked", self.mark_checked)
         m.addAction("Show in Explorer", lambda: subprocess.Popen(
-            ["explorer", "/select,", os.path.normpath(self.proxy.data(idx, Qt.ToolTipRole))]))
+            ["explorer", "/select,", os.path.normpath(self.proxy.data(idx, PathRole))]))
         m.addAction("Remove from list", self.remove_selected)
         m.exec(self.grid.viewport().mapToGlobal(pos))
 
@@ -432,18 +461,87 @@ class MainWindow(QMainWindow):
         rows = self._selected_rows()
         if not rows or QMessageBox.question(self, "Clear captions", f"Empty the caption of {len(rows)} image(s)?") != QMessageBox.Yes:
             return
-        failed = []
-        for r in rows:  # one file that can't be written no longer stops the rest (with an uncaught error)
-            try:
-                self.model.set_caption(r, "", stats=False)
-            except RuntimeError as e:
-                failed.append(str(e))
-        self.model.stats_changed.emit()
+        _, failed = self._apply_changes([(r, "") for r in rows], "clear captions")
         if failed:
-            for m in failed:
-                self._log(m)
             QMessageBox.warning(self, "Clear captions", f"{len(failed)} caption file(s) couldn't be written "
                                 f"(see View ▸ Log):\n\n" + "\n".join(failed[:5]))
+
+    # ------------------------------------------------------------------ editing many captions, undo
+    def _apply_changes(self, changes, label):
+        """Save [(row, caption)] as one undo step. Returns (captions changed, error messages); the
+        errors are in the log too. One file that can't be written doesn't stop the rest."""
+        group = self.model.history.group(label)
+        changed, failed = 0, []
+        for row, text in changes:
+            try:
+                changed += bool(self.model.set_caption(row, text, stats=False, group=group))
+            except RuntimeError as e:
+                failed.append(str(e))
+                self._log(str(e))
+        self.model.stats_changed.emit()
+        self._update_undo()  # "Undo find and replace (12)": the count, now that the step is whole
+        return changed, failed
+
+    def _captions(self, scope):
+        """[(row, caption)] of the selected images, or of the ones the grid shows. Captions that
+        couldn't be read are left out: they are shown empty, not as what the file holds."""
+        if scope == "selected":
+            rows = self._selected_rows()
+        else:
+            rows = [self.proxy.mapToSource(self.proxy.index(i, 0)).row() for i in range(self.proxy.rowCount())]
+        return [(r, self.model.items[r]["caption"]) for r in rows if not self.model.items[r].get("unreadable")]
+
+    def edit_captions(self, action):
+        self._commit_open_editors()
+        self._apply_search()  # "the images shown" is what the search box says now
+        dlg = BulkEditDialog(self._captions, self._apply_changes, len(self._selected_rows()),
+                             self.proxy.rowCount(), action, self)
+        dlg.exec()
+
+    def mark_checked(self):
+        rows = [r for r in self._selected_rows() if self.model.items[r].get("issues")]
+        if rows:
+            self.model.mark_checked(rows)
+            self.statusBar().showMessage(f"{len(rows)} caption(s) marked as checked (until they change or "
+                                         "the app closes)", 4000)
+
+    def undo(self):
+        if not self.a_stop.isEnabled():  # see _update_undo
+            self._replay(self.model.undo, "Undid", "undo")
+
+    def redo(self):
+        if not self.a_stop.isEnabled():
+            self._replay(self.model.redo, "Redid", "redo")
+
+    def _replay(self, step, did, verb):
+        self._commit_open_editors()  # what is being typed is the newest change
+        QApplication.setOverrideCursor(Qt.WaitCursor)  # a job of thousands of captions takes seconds
+        try:
+            result = step()
+        finally:
+            QApplication.restoreOverrideCursor()
+        if result is None:
+            return self.statusBar().showMessage(f"Nothing to {verb}", 3000)
+        label, done, left = result
+        msg = f"{did} {label}: {done:,} caption(s)"
+        if left:
+            msg += (f"; {left:,} left as they are (changed since, couldn't be written, or the image is off "
+                    "the list)")
+        self.statusBar().showMessage(msg, 8000 if left else 4000)
+
+    def _update_undo(self):
+        for a, steps, name in ((self.a_undo, self.model.history.undo, "Undo"),
+                               (self.a_redo, self.model.history.redo, "Redo")):
+            # not while a job runs: its next caption would wipe what Redo holds and split the job
+            a.setEnabled(bool(steps) and not self.a_stop.isEnabled())
+            n = len(steps[-1]["changes"]) if steps else 0
+            a.setText(f"{name} {steps[-1]['label']}" + (f" ({n:,})" if n > 1 else "") if steps else name)
+            a.setToolTip("Not while captioning" if self.a_stop.isEnabled() else "")
+
+    def _apply_review_options(self):
+        self.model.set_review_options(check.flag_words(self.s["flag_words"]),
+                                      [c for c in self.s["review_skip"].split(",") if c],
+                                      self.suffix.text(), self.prefix.text())
 
     # ------------------------------------------------------------------ settings / servers
     def current_settings(self):
@@ -455,6 +553,7 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self.current_settings(), self)
         if dlg.exec():
             self.s = dlg.result_settings()
+            self._apply_review_options()
             if not config.save_settings(self.s):
                 QMessageBox.warning(self, "Settings not saved", f"{config.SETTINGS_FILE} couldn't be read when "
                                     "the app started (another program may have it open), so it isn't "
@@ -591,8 +690,10 @@ class MainWindow(QMainWindow):
         self.model.set_statuses(rows, QUEUED)
         self.snapshots = {self.model.items[r]["path"]: self.model.items[r]["caption"] for r in rows}
         self.failures = self.warnings = 0
+        self.job_group, self.job_saved = self.model.history.group("captioning"), set()
         self.run_managed = s["backend"] == "managed"
         self.a_stop.setEnabled(True)
+        self._update_undo()
         # the settings go with the job: ones changed while the model loads apply to the next job, not
         # to this one (whose servers were started with the old ones)
         job = (paths, self.sys_edit.toPlainText(), self.user_edit.toPlainText().strip(), s)
@@ -657,7 +758,8 @@ class MainWindow(QMainWindow):
                       f"{os.path.basename(path)} was being captioned (model caption not saved): {text}")
             return
         try:
-            self.model.set_caption(row, text, force=True)
+            self.model.set_caption(row, text, force=True, group=self.job_group)
+            self.job_saved.add(path)
         except RuntimeError as e:  # captioned, but the .txt couldn't be written: that image failed
             self.failures += 1
             self._log(f"FAILED {os.path.basename(path)}: {e}")
@@ -672,6 +774,8 @@ class MainWindow(QMainWindow):
     def _on_warning(self, path, msg):
         self.warnings += 1
         self._log(f"WARNING {os.path.basename(path)}: {msg}" if path else f"WARNING: {msg}")
+        if msg == CUT_OFF and path in self.job_saved:  # not when the caption was kept as it was
+            self.model.mark_cut_off(path)
 
     def _on_progress(self, done, total):
         self.progress.setRange(0, total)
@@ -682,6 +786,7 @@ class MainWindow(QMainWindow):
         if self.engine.active:  # late signal of the previous job, after the next one started
             return
         self._reset_queued()
+        self._update_undo()
         self.progress.setVisible(False)
         self.a_stop.setEnabled(False)
         self.a_start_srv.setEnabled(True)

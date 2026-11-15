@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QListView, QPlainTextEdit, QSt
                                QStyledItemDelegate)
 
 from . import theme
-from .model import BUSY, ERROR, QUEUED, StatusRole
+from .model import BUSY, ERROR, QUEUED, ReviewRole, StatusRole
 
 PAD = 8
 NAME_H = 18
@@ -75,13 +75,36 @@ class CardDelegate(QStyledItemDelegate):
         p.setBrush(QColor(colour))
         p.drawEllipse(tr.left() + 4, tr.top() + 4, 12, 12)
 
+        # "needs review" mark: the caption check found something (the tooltip says what)
+        review = index.data(ReviewRole)
+        if review:
+            br = QRect(tr.right() - 21, tr.top() + 3, 18, 18)
+            p.setBrush(QColor("#f59e0b"))
+            p.drawRoundedRect(br, 4, 4)
+            bf = p.font()
+            bf.setBold(True)
+            p.setFont(bf)
+            p.setPen(QColor("#1f1300"))
+            p.drawText(br, Qt.AlignCenter, "!")
+            bf.setBold(False)
+            p.setFont(bf)
+
         # filename
         nr = QRect(tr.left(), tr.bottom() + 2, self.thumb, NAME_H)
         p.setPen(pal.text().color())
         f = p.font()
         f.setPointSizeF(max(7.0, f.pointSizeF() - 1))
         p.setFont(f)
-        name = QFontMetrics(f).elidedText(index.data(Qt.DisplayRole), Qt.ElideMiddle, nr.width())
+        fm = QFontMetrics(f)
+        if review:  # why it needs review, at the right of the name where there is room for it
+            room = min(fm.horizontalAdvance(review), nr.width() * 3 // 5)
+            p.save()
+            p.setPen(QColor("#f59e0b" if pal.base().color().lightness() < 128 else "#b45309"))
+            p.drawText(QRect(nr.right() - room + 1, nr.top(), room, NAME_H), Qt.AlignVCenter | Qt.AlignRight,
+                       fm.elidedText(review, Qt.ElideRight, room))
+            p.restore()
+            nr.setWidth(nr.width() - room - 6)
+        name = fm.elidedText(index.data(Qt.DisplayRole), Qt.ElideMiddle, nr.width())
         p.drawText(nr, Qt.AlignVCenter | Qt.AlignLeft, name)
 
         # caption box
@@ -102,7 +125,18 @@ class CardDelegate(QStyledItemDelegate):
 
     # inline editor
     def createEditor(self, parent, option, index):
-        return CaptionEditor(parent)
+        editor = CaptionEditor(parent)
+        hold = getattr(index.model(), "hold", None)
+        if hold:
+            editor.setProperty("held", hold(index))
+        return editor
+
+    def destroyEditor(self, editor, index):
+        held = editor.property("held")
+        release = getattr(self.view.model(), "release", None)
+        super().destroyEditor(editor, index)
+        if held and release:
+            release(held)
 
     def setEditorData(self, editor, index):
         # Qt calls this again for every change to the row (its thumbnail arriving, its status dot), not
