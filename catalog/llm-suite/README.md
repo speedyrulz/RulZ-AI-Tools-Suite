@@ -87,6 +87,19 @@ Discover/downloads, RAG and a CLI are planned.
   - **Practice tasks**: reads `build/tasks.jsonl` from the RE training kit (`C:\coding\Trainers\re-training-kit`),
     copies a task's binary to a fresh work folder, and checks the final `ANSWER:` line automatically (a port of the
     kit's `verify.py`).
+  - **Batch runs**: **Start batch run** under the practice tasks runs them one after another without you and keeps a
+    score, so two models (or one model before and after fine-tuning) can be compared on the same tasks. Options: at
+    most N tasks (taken family by family in turn, so a short run still covers every family), tries per task, a time
+    limit per task (counted from the task's first reply, so loading the model is not counted), only tasks no earlier
+    session solved, and a label. Each task is a normal recorded practice session in its own chat. A tool call that
+    would ask for approval is refused instead of waiting (the model is told why and carries on); the form warns when a
+    tool every session starts with, such as `rea__open_binary`, still asks, with an **Always allow** button. A task
+    still calling tools at the round limit or the time limit is graded as failed. **Stop after this task** and
+    **Stop now** end a run; the play button on its row runs the tasks not run yet. **Batch runs** lists every run:
+    solved tries out of the tries that ran to an end (errors and tasks you stopped are not counted), median tool rounds
+    and time of the solved ones, a score per task family, and each task's result, rounds, time and largest prompt, with
+    a button to open its chat. Runs are kept in `%APPDATA%\RulZ LLM Suite\re-batches.json`; removing a run keeps its
+    chats. The chat is busy while a run is going, so other chats wait until it ends or is stopped.
   - **Export**: writes `train.jsonl` in the kit's format (OpenAI / Hugging Face chat: `messages`, `tools`, `meta`;
     thinking in `reasoning_content`) plus `manifest.json`, from solved sessions by default, at most N per practice task
     (fewest tool rounds first), leaving out sessions whose context was trimmed. Email addresses are replaced.
@@ -142,7 +155,7 @@ cd RulZ-AI-Tools-Suite\apps\rulz-llm-suite
 npm install
 node node_modules/electron/install.js   # first time only: Electron downloads its binary lazily
 npm run dev          # run with hot reload
-npm test             # unit tests (GGUF reader, model grouping, args, estimates, SSE, context fitting)
+npm test             # unit tests (GGUF reader, model grouping, args, estimates, SSE, context fitting, batch runs)
 npm run typecheck
 npm run build:win    # installer → dist/RulZ-LLM-Suite-Setup-<version>.exe
 ```
