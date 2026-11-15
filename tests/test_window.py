@@ -5,29 +5,11 @@ import time
 
 import pytest
 from PySide6.QtGui import QColor, QImage
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication
 
 from captioner import main_window, settings_dialog
 from captioner.config import DEFAULT_SETTINGS
 from captioner.model import BUSY, ERROR, IDLE, QUEUED
-
-
-@pytest.fixture
-def boxes(monkeypatch):
-    """Message boxes record what they would show instead of waiting for a click."""
-    shown = []
-    monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda parent, title, text, *a: shown.append(title)))
-    monkeypatch.setattr(QMessageBox, "question",
-                        staticmethod(lambda parent, title, text, *a: shown.append(title) or QMessageBox.Yes))
-    return shown
-
-
-@pytest.fixture
-def win(boxes):
-    w = main_window.MainWindow()
-    yield w
-    w.servers.stop()
-    w.deleteLater()
 
 
 def _image(path):

@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QDoubleSpin
                                QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
                                QRadioButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
+from .check import CHECKS
 from .config import detect_gpus
 
 
@@ -146,6 +147,32 @@ class SettingsDialog(QDialog):
         f.addRow("Thinking limit", self.budget)
         tabs.addTab(w, "Generation")
 
+        # ---- caption check
+        w = QWidget()
+        v = QVBoxLayout(w)
+        intro = QLabel("Captions the check finds get a ! mark and are listed by Show ▸ Needs review. "
+                       "Hover over a card to see what was found. Look for:")
+        intro.setWordWrap(True)
+        v.addWidget(intro)
+        off = set(s["review_skip"].split(","))
+        self.review_checks = []
+        for code, label in CHECKS:
+            c = QCheckBox(label)
+            c.setChecked(code not in off)
+            self.review_checks.append((code, c))
+            v.addWidget(c)
+        f3 = QFormLayout()
+        self.flag_words = QLineEdit(s["flag_words"])
+        self.flag_words.setPlaceholderText("comma separated, e.g. ohwx, blonde hair, watermark")
+        self.flag_words.setToolTip("Whole words or phrases, any case. For example your trigger word, if "
+                                   "your trainer adds it itself (RulZ Trainer does),\nor features a "
+                                   "character LoRA's captions should leave out.")
+        f3.addRow("Flagged words", self.flag_words)
+        v.addSpacing(8)
+        v.addLayout(f3)
+        v.addStretch(1)
+        tabs.addTab(w, "Caption check")
+
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
@@ -171,5 +198,7 @@ class SettingsDialog(QDialog):
             temperature=self.temp.value(), max_tokens=self.maxtok.value(),
             max_image_side=self.side.value(), single_line=self.single.isChecked(),
             disable_thinking=self.nothink.isChecked(), thinking_budget=self.budget.value(),
+            flag_words=self.flag_words.text().strip(),
+            review_skip=",".join(code for code, c in self.review_checks if not c.isChecked()),
         )
         return s

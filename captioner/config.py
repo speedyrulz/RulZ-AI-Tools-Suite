@@ -42,6 +42,8 @@ DEFAULT_SETTINGS = {
     "single_line": True,
     "disable_thinking": True,
     "thinking_budget": 1024,  # max thinking tokens when thinking is enabled; -1 = unlimited
+    "flag_words": "",   # caption check: words and phrases to flag, comma separated
+    "review_skip": "",  # caption check: the checks switched off (codes from check.CHECKS, comma separated)
     "thumb_size": 180,
     "last_dir": "",
     "last_prompt": "Natural language",
