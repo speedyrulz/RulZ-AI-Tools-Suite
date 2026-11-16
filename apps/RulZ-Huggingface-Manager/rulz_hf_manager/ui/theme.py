@@ -131,6 +131,9 @@ body {
 .q-table tbody tr:not(.q-tr--no-hover):hover > td:not(.q-td--no-hover):before { background: var(--rz-hover); }
 .q-table tbody tr.selected > td:after, .q-table--dark tbody tr.selected > td:after { background: var(--rz-red-soft); }
 .rulz-table tbody tr { cursor: default; }
+/* a table that fills a flex column and scrolls inside it (the local file picker) */
+.rz-fill-table { min-height: 0; }
+.rz-fill-table .q-table__middle { flex: 1 1 0; min-height: 0; }
 .rulz-name:hover span { text-decoration: underline; text-decoration-color: var(--rz-red-bright); text-underline-offset: 3px; }
 
 /* public / private pill, storage badges, chips */
