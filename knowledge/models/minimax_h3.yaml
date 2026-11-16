@@ -1,0 +1,618 @@
+# MiniMax H3 (video + audio, FL2VA and Ref2VA): character LoRA starting recipe.
+# Public file: no handles, no personal details, no dataset names. Shared sources are in general.yaml.
+id: minimax_h3
+name: MiniMax H3 (video + audio)
+kind: video
+updated: 2026-11-16
+summary: >-
+  H3 is CFG-distilled: plain flow-match training slowly erases the distillation (washed colour, clipped highlights,
+  broken motion and audio), so keep the training adapter on, train only blocks 20-49 on stills, and save often because
+  the best checkpoint comes early and then erodes. A person is best taught from 20-70 varied still photos with close-ups
+  (images beat video-only for likeness); clips and voice are separate, harder jobs, and RulZ AI Trainer trains the
+  video only (the audio is silent and never in the loss). Rank 16 at 1e-4 is the best-supported start; the optimizer
+  and the training guard (adapter vs contrastive-guidance loss) are disputed.
+model_preset: MiniMax-H3-FL2VA
+model_path: MiniMaxAI/MiniMax-H3
+variants:
+  - id: fl2va
+    label: FL2VA (first-last frame to video and audio)
+    model_path: MiniMaxAI/MiniMax-H3
+    base: {}
+  - id: ref2va
+    label: Ref2VA (reference images to video and audio)
+    model_path: MiniMaxAI/MiniMax-H3#ref2va
+    base: {}
+facts:
+  - text: "H3 is CFG-distilled (plus mild step distillation). Plain flow-match LoRA training slowly erases it: washed colour, clipped highlights, broken motion and audio, then collapse. It is the main H3 problem, reported by many from the first week."
+    confidence: CONF
+    sources: [bano_h3_adapters_2026_08]
+  - text: "Three guards exist: a training adapter (a frozen LoRA that is on while training and off when sampling; RulZ AI Trainer's training_adapter auto picks ostris' v3 for the FL2VA or Ref2VA base), a contrastive-guidance loss (scale about 3-3.5; not in RulZ AI Trainer yet) and base-preservation. The author of AI Toolkit advises not stacking adapter and guidance loss. Reports on which is best are dataset-dependent: v3 alone is stable but 'wooden' for some; guidance alone is livelier but overcooks after about 2,500-4,500 steps; one tester found v3 beat guidance in every test and the stack distorted audio and video."
+    confidence: DISP
+    sources: [bano_h3_adapters_2026_08, bano_h3_cg_2026_08, bano_h3_adapter_vs_cg_2026_10, atk_ostris_h3_2026_08]
+  - text: "Image-only training of the video model: training all 50 blocks cut motion by about half; train blocks 20-49. RulZ AI Trainer already does that for a run with no clips and an empty lora_blocks (lora_blocks all opts out)."
+    confidence: CONF
+    sources: [bano_h3_blocks_2026_09, doc_trainer_3_28]
+  - text: "Never train or export the adaLN projection: it is a bottleneck of 8 channels, the file doubles in size and ComfyUI's pruned checkpoint rejects it. RulZ AI Trainer's targets are attention qkv and out plus the MLP only."
+    confidence: CONF
+    sources: [atk_ostris_h3_2026_08, doc_trainer_3_28]
+  - text: "Images beat video-only for a person: video-only runs learn the voice but not the face in 4-10k steps. Close-ups are required. 10-50 stills are typical; 70 mostly upper-body images with some close-ups, and 20 images with 14 close-ups, each gave a good run."
+    confidence: CONF
+    sources: [bano_h3_images_first_2026_09, bano_h3_closeups_2026_08]
+  - text: "Spatial position encoding is area-normalised: training at one resolution forgets the token spacing at others. Use several resolutions (training only at 192-256 without a high-resolution stage gave noisy results; stills at 768-1344 are cheap)."
+    confidence: CONF
+    sources: [bano_h3_res_2026_09]
+  - text: "Clips: 24 fps, frame counts of 17n+5 (RulZ AI Trainer snaps to them). 25 fps data gives fast uncanny motion; trim clips to the exact length instead of letting a tool cut them mid-word. Above 512 px video is low value; add 1024 stills for detail."
+    confidence: CONF
+    sources: [bano_h3_clips_2026_09, bano_h3_adapters_2026_08]
+  - text: "RulZ AI Trainer trains clips against a SILENT audio track (the audio rows are a cached zero-waveform latent and never in the loss). Voice and sound cannot be trained or judged here; musubi-tuner's docs advise captions that state the silence for stills."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  - text: "Staged plan used by several: stills first (3,000-5,000 steps at 1e-4), then low-resolution video (about 384 px) for about 1,000-2,000 steps, optionally a 100-300-step high-resolution video tail; an image:video ratio of about 4:1 per batch was suggested. A newer mixed run with image microbatch 4, video loss 1.0 and audio 0.7 had good voice and likeness at about 1,200 steps and near-perfect likeness at 1,800."
+    confidence: REP
+    sources: [bano_h3_mix_2026_09, bano_h3_audio_2026_10]
+  - text: "Rank 16 beat ranks 4 and 32 in a controlled comparison (same seed, data and config), and beat 32 and 64 in blind votes on a realism style; low rank wins in most one-person reports (rank 4 over 8; rank 8 reaching likeness at 1,000 steps where a higher rank had none at 4,000; rank 64 on 20 images never reached likeness in 8,000 steps). Alpha equals rank (alpha 8 on rank 128 was far too weak). The author of one recipe suggests rank 2-4 for a single character, so the trend is for low, not proof that 16 is optimal."
+    confidence: CONF
+    sources: [bano_h3_rank_2026_09, web_fal_h3_2026_08, bano_h3_recipe_2026_08]
+  - text: "Learning rate decides where the peak is: about 1,050 steps at 1e-4 and about 5,000 at 5e-5; AdamW 3e-4 showed likeness at about 250 steps and was fried by 1,000; 2e-4 was best at about 1,000-1,200. Save every 50-250 steps and pick by samples."
+    confidence: CONF
+    sources: [bano_h3_lr_2026_08]
+  - text: "Sigmoid timesteps keep the distilled model from breaking down (shift weights the early, compositional steps harder); the AI Toolkit default 'shift' was considered weak for characters. The distilled guidance lives mostly at high noise (about 5% of the prediction below sigma 0.5, 47% at 0.8-0.9, 71% above 0.9). RulZ AI Trainer's own default for H3 is the 'reference' sampler (musubi-tuner's shift-12 curve), which has never been compared with sigmoid on H3 here."
+    confidence: DISP
+    sources: [atk_ostris_h3_2026_08, bano_h3_recipe_2026_08, doc_trainer_3_28]
+  - text: "Loss is useless as a stop signal at batch 1 and rises by design with preservation losses. Hold out 2-3 photos and compare checkpoints at fixed seeds; validate every 300 steps and save every 150."
+    confidence: CONF
+    sources: [atk_ckpt_eval_2026_07, bano_h3_audio_2026_10]
+  - text: "Captions: describe what changes (clothes, scenery, features that must stay mutable) and give the person a distinct trigger; use the trigger in ONE place in the caption (duplicating hurt adherence in one test). Blank captions are harmful and empty caption files crash some trainers. Unique real-looking names beat gibberish, which prints as text on signs; very short names near real names pull the base."
+    confidence: REP
+    sources: [bano_h3_captions_2026_08, web_fal_h3_2026_08]
+  - text: "Fl2va LoRAs work on t2v, i2v and ref2va for most users but duplicate the subject on ref2va for at least one; one user reached 99% likeness in 50 epochs training on ref2va for image-only characters vs about 250 epochs on fl2va. Train on the base you will use."
+    confidence: DISP
+    sources: [bano_h3_refvsfl_2026_09]
+  - text: "Not working: no distillation guard on fl2va (ghost motion); adapter v1/v2 plus contrastive guidance degraded after about 1,750-2,500 steps; rank 64 on 20 images; 41,000 steps on 1,000 images plus 100 clips (destroyed backgrounds); 320 images at 6,000 steps (warped before 3,000, adherence lost 3,000-5,000)."
+    confidence: REP
+    sources: [bano_h3_adapters_2026_08, atk_h3_failures_2026_09]
+  - text: "Memory: the pruned int8 transformer is 21 GB and the Qwen3-VL-32B text encoder 15.7 GB in nvfp4_awq. A 16 GB laptop GPU needed 64 GB RAM plus a large pagefile (about 110 GB combined use); a 24 GB card needed 64 GB RAM at 512 px. Block swap is nearly free. flash_attn with int8 convrot breaks; torch.compile with offload gives NaN."
+    confidence: CONF
+    sources: [bano_h3_memory_2026_08]
+  - text: "Measured in RulZ AI Trainer: H3 stills and clips train on a 32 GB card; a 400-step clip run (39 frames, 512 px, small synthetic set of camera-move clips plus stills) kept the prompt's motion, learned the character by step 200 and cost 1.4-1.6 s/step at 27.6 GB with 7 of 50 blocks kept; clip probes (22 frames) reached 40% face likeness in 100 steps. Block swap, two GPUs, real footage and a clip LoRA in ComfyUI were not tested."
+    confidence: MEAS
+    sources: [meas_h3_clips_2026_11]
+  - text: "Generating: H3 at 0.5 MP then SeedVR2 upscaling was more coherent for motion and likeness than native high resolution (one user); EasyCache chops the sampler schedule tail and looks like a failed LoRA; Euler beta beat res_multistep for skin. Judge in ComfyUI."
+    confidence: REP
+    sources: [atk_h3_gen_2026_08]
+base:
+  network_type:
+    value: lora
+    why: "Every H3 report that gives a recipe uses a plain LoRA. No LoKr-vs-LoRA comparison exists for H3 characters, and LoKr factor 32 failed for one user."
+    confidence: REP
+    sources: [bano_h3_rank_2026_09, bano_h3_recipe_2026_08]
+  lora_rank:
+    value: 16
+    why: "Best-supported: won a controlled comparison against 4 and 32, beat 32 and 64 in blind votes, and is the rank of the widely copied recipe. Some advise 2-4 for one person, so try 8 on a small set. Rank 64 on 20 images never reached likeness."
+    confidence: CONF
+    sources: [bano_h3_rank_2026_09, web_fal_h3_2026_08, bano_h3_recipe_2026_08, web_stuubzzz_2026_11]
+  lora_alpha:
+    value: 16.0
+    why: "Alpha equals rank: H3 LoRAs are saved without alpha, and an alpha far below rank is far too weak."
+    confidence: CONF
+    sources: [bano_h3_rank_2026_09, bano_h3_recipe_2026_08]
+  lora_blocks:
+    value: "20-49"
+    why: "Stills trained on all 50 blocks cut the video model's motion by about half; the first 20 blocks carry motion. The trainer does this itself when no clips are present; it is set explicitly so the config shows it."
+    confidence: CONF
+    sources: [bano_h3_blocks_2026_09, doc_trainer_3_28]
+  training_adapter:
+    value: auto
+    why: "The family's training adapter (ostris v3, the FL2VA or Ref2VA file by base) is the guard RulZ AI Trainer can offer: H3 is CFG-distilled and trained bare it washes out. The contrastive-guidance loss is not available here, and the author advises against stacking the two."
+    confidence: DISP
+    sources: [bano_h3_adapters_2026_08, bano_h3_adapter_vs_cg_2026_10, atk_ostris_h3_2026_08]
+  optimizer:
+    value: adamw
+    why: "Both sides: automagic v3 is the most recommended on banodoco (the copied recipe, a no-guidance setup that worked) while users of AI Toolkit report it exploding or stalling on H3 (deterioration at about 1,000 steps) and fall back to AdamW8bit. AdamW at 1e-4 is the measured choice in RulZ AI Trainer's H3-family runs; 8-bit state saves almost nothing for a rank-16 LoRA, so full AdamW is used."
+    confidence: DISP
+    sources: [bano_h3_recipe_2026_08, atk_h3_automagic_2026_08, atk_h3_image_recipe_2026_08, meas_h3_clips_2026_11]
+  learning_rate:
+    value: 1.0e-4
+    why: "The standard H3 rate (two web recipes and the copied community recipe). Peak step depends on it: about 1,050 steps at 1e-4. 2e-4 is the fal default and baked later than 3e-4; one mixed run used higher."
+    confidence: CONF
+    sources: [bano_h3_lr_2026_08, bano_h3_recipe_2026_08, web_fal_h3_2026_08, web_stuubzzz_2026_11]
+  lr_scheduler:
+    value: constant
+    why: "Constant with no or short warm-up in the recipes that give one."
+    confidence: REP
+    sources: [bano_h3_recipe_2026_08]
+  timestep_sampling:
+    value: sigmoid
+    why: "Sigmoid keeps the distilled model from breaking down and is what the copied recipes and the AI Toolkit author's guidance use. RulZ AI Trainer's own default is reference (musubi-tuner's shift-12 curve); that was never compared with sigmoid on H3 here (open question)."
+    confidence: CONF
+    sources: [atk_ostris_h3_2026_08, bano_h3_recipe_2026_08, atk_h3_image_recipe_2026_08]
+  timestep_buckets:
+    value: 8
+    why: "Stratified timestep buckets (8) gave fewer loss spikes and a faster run in a small-step regime; widely adopted. Needs a non-reference sampler, which is why sigmoid is set."
+    confidence: REP
+    sources: [bano_h3_recipe_2026_08]
+  sigma_min:
+    value: 0.15
+    why: "A minimum timestep of 150 (of 1,000) keeps the lowest noise levels, which add drift pressure, out of training (the trainer rescales the range, a little different from the original's preserve-distribution flag)."
+    confidence: REP
+    sources: [bano_h3_recipe_2026_08]
+  batch_size:
+    value: 1
+    why: "Batch 1 is preferred (batch above 1 on images smoothed results); one user ran image micro-batch 4 faster with good results."
+    confidence: CONF
+    sources: [bano_h3_recipe_2026_08, bano_h3_audio_2026_10]
+  caption_dropout:
+    value: 0.0
+    why: "No H3 character evidence for caption dropout (open question); blank captions are harmful on this text-conditioned model and dropout corrupts the empty branch of a guidance loss. Zero is the cautious start; a dropped caption keeps the trigger in RulZ AI Trainer, which is why 0.05 would also be safe."
+    confidence: GUESS
+    sources: []
+  resolutions:
+    value: [0.5, 1.0]
+    why: "Spatial position encoding forgets spacing at other resolutions, and training only at very low resolution gave noisy results. Half a megapixel plus 1 MP is a cheap multi-resolution set (H3's own canvas is about 1 MP)."
+    confidence: REP
+    sources: [bano_h3_res_2026_09]
+  model_file_quant:
+    value: pruned_int8_convrot
+    why: "Comfy-Org's pruned int8 file (21 GB): the layers the LoRA trains are the full model's."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  text_encoder_file_quant:
+    value: nvfp4_awq
+    why: "The 15.7 GB NVFP4 Qwen3-VL-32B is the smallest; what does not fit the card runs from system RAM while the captions cache. Train and generate with the same text-encoder precision (training on 8-bit and generating on 4-bit was reported to break renders)."
+    confidence: DOC
+    sources: [doc_trainer_3_28, bano_h3_adapters_2026_08]
+  gradient_checkpointing:
+    value: true
+    why: "Needed on every consumer card for a 21 GB model."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_seeds:
+    value: 4
+    why: "A single probe swings about 10 points; four seeds make a curve you can read."
+    confidence: MEAS
+    sources: [meas_region_2026_11, meas_krea_race_2026_11]
+  likeness_framing:
+    value: true
+    why: "Counts a body render with no body as zero so the best-checkpoint tracker is not fooled by lost framing (it was in 8 of 9 runs on another model)."
+    confidence: MEAS
+    sources: [meas_region_2026_11]
+  copy_check:
+    value: "on"
+    why: "Logs the copy score with the probes so a memorised checkpoint is visible (copy 0.6-0.7 marked the memorised rows in our races)."
+    confidence: MEAS
+    sources: [meas_krea_race_2026_11]
+steps:
+  epochs: 80
+  min: 1000
+  max: 3500
+  round_to: 50
+  why: "Both sides: the stills-first recipes run 3,000-5,000 steps (up to 6,000 on a big set) while a 1e-4 run peaked at about 1,050 steps and a newer mixed run was best at 1,200-1,800. About 80 epochs of a 20-40 image set (1,600-3,200 steps) with probes every 25 steps lets the likeness peak choose the stop; a big set gets fewer epochs, not more steps."
+  confidence: DISP
+  sources: [bano_h3_mix_2026_09, bano_h3_lr_2026_08, bano_h3_audio_2026_10, atk_h3_failures_2026_09]
+adjust:
+  - id: tiny_dataset
+    when: {images_max: 14}
+    set:
+      lora_rank: {value: 8, why: "Under 15 images a big rank overfits and copies the background; low rank is the trend for one person and rank 4 beat 8 in one test.", confidence: REP, sources: [bano_h3_rank_2026_09, bano_h3_recipe_2026_08]}
+      lora_alpha: {value: 8.0, why: "Alpha equals rank.", confidence: CONF, sources: [bano_h3_rank_2026_09]}
+      crop_augment: {value: face+bust, why: "Face and bust crops add close-up variety to a set too small to have it; no H3 comparison exists.", confidence: GUESS, sources: []}
+    note: "Under about 10 images the LoRA is stiff and copies the background and expression; add photos before tuning. The step minimum is 1,000, so a 10-image set trains 100 epochs: stop at the first good probe."
+  - id: small_dataset
+    when: {images_min: 15, images_max: 40}
+    set:
+      holdout_images: {value: 3, why: "Three held-out photos let the sweeps show where the subject stops being learned; in our runs that peak came at 35-50% of the run, before the probes agreed. Measured on another model (a fine-tuned Qwen-Image 2.1); never run on H3.", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "A sweep every 4 epochs costs little on a small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "The base recipe is made for this size (20-70 stills with close-ups)."
+  - id: large_dataset
+    when: {images_min: 80}
+    set:
+      holdout_images: {value: 8, why: "Up to a fifth of the set may be held out; eight photos give a steadier held-out curve.", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "As for the small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "80+ images: the step cap (3,500) already gives under 45 epochs, which is right. 320 images at 6,000 steps warped before step 3,000 and lost prompt following; culling to 30-60 varied images is more reliable than adding steps."
+  - id: goal_quick
+    when: {goal: quick}
+    set:
+      learning_rate: {value: 2.0e-4, why: "AdamW 2e-4 reached a likeness peak at about 1,000-1,200 steps; a faster rate burned by 1,000 at 3e-4. Stop at the first good probe.", confidence: REP, sources: [bano_h3_lr_2026_08]}
+      resolutions: {value: [0.5], why: "Half a megapixel keeps the first test short.", confidence: GUESS, sources: []}
+      probe_seeds: {value: 2, why: "A first test needs a rough read only.", confidence: GUESS, sources: []}
+    note: "A quick test: expect the peak at about 600-1,200 steps and a burned look soon after."
+  - id: goal_likeness
+    when: {goal: likeness}
+    set:
+      learning_rate: {value: 7.0e-5, why: "A lower rate peaks later and flatter (1e-4 about step 1,050, 5e-5 about step 5,000) and halved the train/held-out gap in our runs on another model; 7e-5 is an interpolation inside the 3,500-step cap.", confidence: GUESS, sources: [bano_h3_lr_2026_08, meas_region_2026_11]}
+      probe_seeds: {value: 6, why: "More probe seeds make the best checkpoint reliable.", confidence: MEAS, sources: [meas_krea_race_2026_11]}
+  - id: focus_face
+    when: {focus: face}
+    set:
+      crop_augment: {value: face, why: "Close-ups teach the face's detail; H3 needs close-ups and distant faces are the weakest part.", confidence: GUESS, sources: [bano_h3_closeups_2026_08]}
+      face_weight: {value: 1.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+      body_weight: {value: 0.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: focus_face_body
+    when: {focus: face_body}
+    set:
+      crop_augment: {value: face+bust, why: "Close-ups for the face plus head-and-shoulders crops between them and the whole photos; the build is learned from the whole photos.", confidence: GUESS, sources: [bano_h3_closeups_2026_08]}
+      resolutions: {value: [0.5, 1.0, 1.5], why: "A distant face needs enough pixels and distant examples; training above 1 MP is the one hint for higher-resolution training for distance.", confidence: REP, sources: [bano_h3_closeups_2026_08, bano_h3_res_2026_09]}
+    note: "Distant faces lose likeness unless the set has distant examples: add half-body and full-body shots with the face still sharp."
+  - id: low_median_mp
+    when: {median_mp_max: 0.4}
+    set:
+      resolutions: {value: [0.5], why: "The photos are under 0.4 MP: training above their size only upscales them.", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: no_captions
+    when: {has_captions: false}
+    set:
+      caption_dropout: {value: 0.0, why: "Most images have no caption file, so there is nothing to drop; blank captions are harmful on H3.", confidence: REP, sources: [bano_h3_captions_2026_08]}
+    note: "Write captions first: a short natural sentence with the trigger plus what changes (clothes, place, pose)."
+  - id: clips
+    when: {videos_min: 1}
+    set:
+      lora_blocks: {value: all, why: "The restriction to blocks 20-49 protects motion when training on stills only; clips teach motion themselves.", confidence: GUESS, sources: [bano_h3_blocks_2026_09, doc_trainer_3_28]}
+      train_frames: {value: 39, why: "39 frames (17n+5, about 1.6 s at 24 fps) is the clip length that was run and checked in RulZ AI Trainer.", confidence: MEAS, sources: [meas_h3_clips_2026_11]}
+      video_resolution: {value: 512, why: "Above 512 px video is low value and a clip costs many stills; add 1024 stills for detail.", confidence: REP, sources: [bano_h3_clips_2026_09, meas_h3_clips_2026_11]}
+      probe_frames: {value: 22, why: "22 frames was run for clip probes (middle frame scored).", confidence: MEAS, sources: [meas_h3_clips_2026_11]}
+      sample_frames: {value: 39, why: "Clip samples at the training length were run.", confidence: MEAS, sources: [meas_h3_clips_2026_11]}
+    note: "Clips are trained without audio (silent) and the face crops, region weights and probes act on the stills of a mixed set only. Keep a few stills in the set. Trim clips to exactly 24 fps and the right length."
+  - id: ref2va
+    when: {variant: ref2va}
+    set:
+      save_every: {op: min, value: 100, why: "One user reached 99% likeness in 50 epochs on ref2va vs about 250 on fl2va; check more often. (One source; others report duplicated subjects when an fl2va LoRA is used on ref2va.)", confidence: DISP, sources: [bano_h3_refvsfl_2026_09]}
+    note: "Training adapter auto uses the Ref2VA file for this base. Ref2va adapters were not trained with reference audio and may garble it."
+  - id: vram_24
+    when: {vram_max_gb: 24}
+    set:
+      block_swap: {value: 8, why: "The 21 GB model plus a step does not fit 24 GB: the trainer's plan is about 4 blocks of the 50 (0.39 GB each); 8 leaves room for a 1 MP step. An estimate, not a measurement.", confidence: GUESS, sources: [doc_trainer_3_28, bano_h3_memory_2026_08]}
+    note: "Keep 64 GB of system RAM: block-swapped weights wait there."
+  - id: vram_16
+    when: {vram_max_gb: 16}
+    set:
+      block_swap: {value: 26, why: "At 16 GB the trainer's plan is about 25 of the 50 blocks swapped; 26 for margin. One user trained H3 stills on a 16 GB laptop GPU with 64 GB RAM and a 60 GB pagefile (about 110 GB combined). An estimate.", confidence: GUESS, sources: [doc_trainer_3_28, bano_h3_memory_2026_08]}
+      resolutions: {value: [0.5], why: "Half a megapixel halves the tokens per step; a 512 px run worked on a 24 GB card with 64 GB RAM.", confidence: REP, sources: [bano_h3_memory_2026_08]}
+  - id: clips_low_vram
+    when: {videos_min: 1, vram_max_gb: 24}
+    set:
+      train_frames: {value: 22, why: "A 39-frame clip needed 27.6 GB on a 32 GB card even with 7 blocks kept; 22 frames (17+5) is the shortest clip that has motion.", confidence: GUESS, sources: [meas_h3_clips_2026_11]}
+      video_resolution: {value: 384, why: "A clip costs many stills; 384 px was the low-resolution video stage some users used.", confidence: REP, sources: [bano_h3_mix_2026_09]}
+evaluate:
+  strength: "1.0 (0.7-1.2). A LoRA trained with a guidance loss looks over-applied at 1.0, so try 0.7-0.85; at weight 1.0 one ref2va character leaned toward the camera."
+  sampler: "ComfyUI H3 pipeline; Euler with the beta scheduler gave better skin than res_multistep (a 20-step Euler beta57 was used for a sound-trained style LoRA). Turn EasyCache off: it chops the schedule tail and looks like a failed LoRA. Render at 0.5 MP and upscale (SeedVR2) for more coherent motion and likeness, or at the 1 MP canvas."
+  steps: "RulZ AI Trainer's own samples use 30 steps (or the 8-step turbo LoRA); H3's pipeline takes about 49 model evaluations."
+  cfg: "1.0: H3 is guidance-distilled, so no CFG."
+  notes:
+    - "Save every 100-250 steps (150 and validate every 300 in the one mixed run). Checkpoints are not monotonic."
+    - "Judge by fixed-seed samples and held-out photos, not the loss (it rises by design with preservation losses and is useless at batch 1)."
+    - "Look for the distillation going: washed colour, clipped highlights, plastic skin, ghost motion. That is the sign to go back to an earlier checkpoint."
+    - "Test with a prompt unlike every training image (other clothes, other place) and with a distant shot, a profile and a motion prompt."
+    - "A face_refs picture without a detectable face silently disables the probes."
+    - "RulZ AI Trainer cannot judge voice: listen to the voice in your own inference stack."
+flaws:
+  - symptom: no_likeness
+    causes:
+      - "the model's distillation was erased (adapter off) or the adapter does not match the base"
+      - "rank too high for a small set"
+      - "no close-ups, or the face is small in every photo"
+      - "learning rate too low"
+    fixes:
+      - set: {training_adapter: {value: auto}, lora_rank: {op: min, value: 16}, lora_alpha: {op: min, value: 16.0}}
+        why: "Adapter on and rank 16: the best-supported H3 start. Rank 64 on 20 images never reached likeness in 8,000 steps; rank 16 beat 4, 32 and 64 elsewhere."
+        confidence: CONF
+        sources: [bano_h3_rank_2026_09, bano_h3_adapters_2026_08]
+      - action: "Add close-ups with the face large in the frame (a 20-image set with 14 close-ups and a few body shots gave a good run), and check the step-0 sample: it should be a clean frame with the prompt's content."
+        why: "Close-ups are required on H3."
+        confidence: CONF
+        sources: [bano_h3_closeups_2026_08, bano_h3_images_first_2026_09]
+      - set: {learning_rate: {op: max, value: 1.0e-4}}
+        why: "If the rate is below 1e-4, bring it to the standard H3 rate; the likeness peak scales with it."
+        confidence: CONF
+        sources: [bano_h3_lr_2026_08]
+      - action: "If the LoRA will be used on Ref2VA and nothing works on FL2VA, train on the Ref2VA base: one user got 99% likeness in 50 epochs there vs about 250."
+        why: "A single report; disputed."
+        confidence: DISP
+        sources: [bano_h3_refvsfl_2026_09]
+  - symptom: slow_likeness
+    causes:
+      - "learning rate low, or FL2VA training that needs about 250 epochs"
+    fixes:
+      - set: {learning_rate: {op: mul, value: 1.5}}
+        why: "2e-4 gave a peak at about 1,000-1,200 steps; up to 2e-4 is within the evidence, 3e-4 burned."
+        confidence: REP
+        sources: [bano_h3_lr_2026_08]
+      - action: "Keep going past 2,000 steps with a lower tail rate only if the held-out curve is still rising; stills-first recipes ran 3,000-5,000."
+        why: "Image-only recipes ran longer than the 1,000-1,800 of the mixed run."
+        confidence: DISP
+        sources: [bano_h3_mix_2026_09, bano_h3_audio_2026_10]
+  - symptom: peaked_early
+    causes:
+      - "learning rate high: likeness at about 250-1,000 steps and burned shortly after"
+      - "the distillation was erased"
+    fixes:
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "AdamW 3e-4 was fried by 1,000 steps and 2e-4 peaked later; 1e-4 peaks about 1,050 and 5e-5 about 5,000."
+        confidence: CONF
+        sources: [bano_h3_lr_2026_08]
+      - set: {timestep_sampling: {value: sigmoid}, sigma_min: {value: 0.15}, timestep_buckets: {value: 8}}
+        why: "Sigmoid timesteps, a minimum timestep of 150 and stratified buckets keep the distilled model from breaking down and cut loss spikes."
+        confidence: REP
+        sources: [atk_ostris_h3_2026_08, bano_h3_recipe_2026_08]
+      - action: "Keep checkpoints every 50-150 steps and take the one at the probe peak (often 1,000-1,200 steps at 2e-4, 3,000 of 4,000 in one clip run)."
+        why: "Peak checkpoint is the cheap fix."
+        confidence: CONF
+        sources: [bano_h3_lr_2026_08, web_stuubzzz_2026_11]
+  - symptom: burned
+    causes:
+      - "the distillation was erased by too many steps or too high a rate"
+    fixes:
+      - action: "Go back to an earlier checkpoint. If you use a contrastive-guidance loss outside RulZ AI Trainer, scale 4 was reported 'too strong' and 2-3.5 is the range; a guidance loss rescued a LoRA broken at 1,700 steps in 100 steps (AI Toolkit)."
+        why: "The most reported H3 problem."
+        confidence: CONF
+        sources: [bano_h3_adapters_2026_08, bano_h3_cg_2026_08]
+      - set: {learning_rate: {op: mul, value: 0.5}, training_adapter: {value: auto}}
+        why: "Lower rate, adapter on."
+        confidence: CONF
+        sources: [bano_h3_lr_2026_08, bano_h3_adapters_2026_08]
+  - symptom: washed_colors
+    causes:
+      - "the distillation drifting: the single clearest sign of plain training on H3"
+    fixes:
+      - set: {training_adapter: {value: auto}, timestep_sampling: {value: sigmoid}}
+        why: "Without a guard H3's colours wash out and highlights clip; the adapter and sigmoid timesteps are what RulZ AI Trainer can offer. Do not combine the adapter with a guidance loss unless you have tested it."
+        confidence: CONF
+        sources: [bano_h3_adapters_2026_08, atk_ostris_h3_2026_08]
+      - action: "Compare the adapter-only run with a guidance-loss-only run outside RulZ AI Trainer on the same seeds; adapter v3 alone was stable but 'wooden' for some, guidance alone lively but overcooked late."
+        why: "Disputed and dataset-dependent."
+        confidence: DISP
+        sources: [bano_h3_adapter_vs_cg_2026_10]
+  - symptom: plastic_skin
+    causes:
+      - "the distillation drifting"
+      - "overbaked"
+    fixes:
+      - action: "Earlier checkpoint; keep the training adapter on; render with Euler beta and skip EasyCache."
+        why: "Distillation drift gives plastic skin, and Euler beta beat res_multistep for skin."
+        confidence: REP
+        sources: [bano_h3_adapters_2026_08, atk_h3_gen_2026_08]
+  - symptom: soft_blurry
+    causes:
+      - "training only at very low resolution"
+    fixes:
+      - set: {resolutions: {value: [0.5, 1.0]}}
+        why: "Training only at 192-256 px gave noisy results; stills at 768-1344 train cheaply; 2x resolution costs 4x."
+        confidence: CONF
+        sources: [bano_h3_res_2026_09]
+      - action: "Add a short high-resolution tail at the end of a run (100-300 steps) or upscale generations (render at 0.5 MP and use SeedVR2)."
+        why: "Resolution curriculum."
+        confidence: REP
+        sources: [bano_h3_res_2026_09, atk_h3_gen_2026_08]
+  - symptom: noisy_grainy
+    causes:
+      - "training only at very low resolution"
+      - "runs go to noise at 500-1,250 steps and recover by 2,500"
+    fixes:
+      - set: {resolutions: {value: [0.5, 1.0]}}
+        why: "Low-resolution-only training gave noisy results."
+        confidence: REP
+        sources: [bano_h3_res_2026_09]
+      - action: "Test a later checkpoint before giving up: noisy samples at 500-1,250 steps recovered by 2,500 for one user."
+        why: "Reported once."
+        confidence: REP
+        sources: [atk_h3_failures_2026_09]
+  - symptom: likeness_unstable
+    causes:
+      - "loss spikes in a short run"
+    fixes:
+      - set: {timestep_buckets: {value: 8}, probe_seeds: {op: max, value: 4}}
+        why: "Stratified timestep buckets (8) gave fewer spikes and a faster run; more probe seeds make the curve readable."
+        confidence: REP
+        sources: [bano_h3_recipe_2026_08, meas_region_2026_11]
+  - symptom: lr_collapsed
+    causes:
+      - "automagic v3 stalled or deteriorated on H3 for several users"
+    fixes:
+      - set: {optimizer: {value: adamw}, learning_rate: {value: 1.0e-4}}
+        why: "AdamW8bit was the reliable fallback after automagic deteriorated at about 1,000 steps for three AI Toolkit users; RulZ AI Trainer's measured H3-family runs used AdamW at 1e-4."
+        confidence: DISP
+        sources: [atk_h3_automagic_2026_08, meas_h3_clips_2026_11]
+  - symptom: nan_or_diverged
+    causes:
+      - "torch.compile together with block swap or offload"
+      - "an attention kernel with int8"
+      - "text encoder precision mismatch between training and generation"
+    fixes:
+      - set: {compile_model: {value: false}, attention_backend: {value: torch}}
+        why: "torch.compile with transformer offload gives errors and NaN on H3; flash_attn with int8 convrot breaks."
+        confidence: CONF
+        sources: [bano_h3_memory_2026_08]
+      - action: "Generate with the same text-encoder precision you trained with: training on the 8-bit encoder and inferring on 4-bit broke renders for one user."
+        why: "A single report."
+        confidence: REP
+        sources: [bano_h3_adapters_2026_08]
+  - symptom: out_of_memory
+    causes:
+      - "21 GB model plus a step on a 16-24 GB card"
+      - "RAM below 64 GB"
+    fixes:
+      - set: {block_swap: {op: add, value: 8}, resolutions: {value: [0.5]}, text_encoder_file_quant: {value: nvfp4_awq}}
+        why: "Block swap is nearly free (about 5% from 0 to 48 blocks), half a megapixel halves the tokens, and the NVFP4 text encoder is the smallest."
+        confidence: CONF
+        sources: [bano_h3_memory_2026_08, doc_trainer_3_28]
+      - action: "Provide 64 GB RAM and a large pagefile; a near-full run freezes instead of crashing."
+        why: "A 16 GB laptop GPU used about 110 GB combined."
+        confidence: CONF
+        sources: [bano_h3_memory_2026_08]
+  - symptom: identity_bleed
+    causes:
+      - "several characters in one scene or LoRA with similar triggers"
+    fixes:
+      - action: "Give each person a distinct trigger, describe everything else in the caption, and add more images; a visual bleed fixed this way, but voice bleed between same-gender characters remained."
+        why: "A reported visual fix on a three-person LoRA."
+        confidence: REP
+        sources: [bano_h3_bleed_2026_08]
+      - set: {isolation: {value: true}}
+        why: "The AI Toolkit author's only working image-only identity test used DOP on the class word; another user found DOP did not help H3. Isolation costs 1.5-2x the time and memorised scenes in our Krea 2 runs."
+        confidence: DISP
+        sources: [atk_ostris_h3_2026_08, atk_h3_automagic_2026_08, meas_krea_race_2026_11]
+  - symptom: wrong_at_distance
+    causes:
+      - "not enough examples where the face is small"
+    fixes:
+      - action: "Add distant-face photos (half-body, full-body) with the face still sharp and consider training at 1.5 MP; no controlled comparison exists."
+        why: "The explanation and fix of the user who got two good runs."
+        confidence: REP
+        sources: [bano_h3_closeups_2026_08]
+      - set: {resolutions: {value: [0.5, 1.0, 1.5]}}
+        why: "More pixels for small faces."
+        confidence: REP
+        sources: [bano_h3_closeups_2026_08, bano_h3_res_2026_09]
+  - symptom: lost_motion
+    causes:
+      - "all 50 blocks trained on stills"
+    fixes:
+      - set: {lora_blocks: {value: "20-49"}}
+        why: "Training all blocks on photos cut motion by about half; blocks 20-49 kept it (Fizgig skips 0-19 for photos). Some still see damping."
+        confidence: CONF
+        sources: [bano_h3_blocks_2026_09]
+      - action: "Every second block (lora_blocks even) was reported to keep 85-90% of the motion; unverified, so test it against 20-49. Mixing a few clips into the set or lowering the LoRA strength also restores motion."
+        why: "One unverified report."
+        confidence: GUESS
+        sources: []
+  - symptom: bad_audio
+    causes:
+      - "RulZ AI Trainer trains video only: the audio is silent and never in the loss"
+      - "audio shares layers with video and overtrains fast; with many images it starves"
+      - "ref2va adapters were not trained with reference audio"
+    fixes:
+      - action: "Voice cannot be trained in RulZ AI Trainer. In another trainer keep video loss 0.7-1.0 while raising audio (1.0 and 0.7 worked at image microbatch 4; video 0.2 gave voice but motion drift), use audio-only 5 s clips for the voice, strip background music from clips, and expect same-gender voice bleed to remain unsolved."
+        why: "One user's report; voice-first runs drifted in motion."
+        confidence: REP
+        sources: [bano_h3_audio_2026_10, bano_h3_bleed_2026_08]
+      - action: "If reference audio is garbled on a Ref2VA LoRA, try the FL2VA adapter or lower the LoRA strength."
+        why: "The adapters were not trained with reference audio or video."
+        confidence: REP
+        sources: [bano_h3_adapters_2026_08]
+  - symptom: ignores_prompt
+    causes:
+      - "overfit: prompt following goes first"
+      - "blank or poor captions"
+    fixes:
+      - set: {caption_dropout: {value: 0.0}}
+        why: "Blank captions are harmful on this text-conditioned model."
+        confidence: GUESS
+        sources: [bano_h3_captions_2026_08]
+      - action: "Earlier checkpoint; 320 images at 6,000 steps lost adherence at 3,000-5,000."
+        why: "Adherence loss is overfit."
+        confidence: REP
+        sources: [atk_h3_failures_2026_09]
+  - symptom: too_strong
+    causes:
+      - "a guidance-loss LoRA looks over-applied at strength 1.0"
+    fixes:
+      - action: "Lower the LoRA strength to 0.7-0.85, or use an earlier checkpoint."
+        why: "Reported for LoRAs trained with a guidance loss at scale 3-3.5."
+        confidence: CONF
+        sources: [bano_h3_cg_2026_08]
+open_questions:
+  - "Adapter vs contrastive-guidance loss vs base preservation for a person, with the same data and seed: nobody has a controlled answer, and RulZ AI Trainer only has the adapter."
+  - "Sigmoid vs the trainer's reference timesteps (shift 12) on H3 in RulZ AI Trainer."
+  - "Optimizer: automagic v3 vs AdamW on H3 characters in RulZ AI Trainer, and a proven automagic floor."
+  - "Caption dropout value, and close-up / half / full-body percentages: no H3 evidence."
+  - "How many clips and what image:video ratio; whether image-only training plus a short clip stage beats stills alone."
+  - "LoKr vs LoRA for one person on H3."
+  - "Whether blocks 20-49 or every second block keeps more motion with the adapter on."
+  - "Voice cannot be trained or judged in RulZ AI Trainer (silent audio)."
+sources:
+  bano_h3_rank_2026_09:
+    kind: community
+    where: "banodoco Discord #minimax_h3_training"
+    date: "2026-09"
+    people: 1
+    url: null
+    note: "Controlled comparison of rank 4, 16 and 32 with seed, data and config held constant: 16 gave the best likeness. Alpha 16 is a conventional match, not tested separately."
+  bano_h3_recipe_2026_08:
+    kind: community
+    where: "banodoco Discord #minimax_h3_training and AI Toolkit Discord #minimax_h3"
+    date: "2026-08"
+    people: 3
+    url: null
+    note: "The widely copied recipe: automagic v3, sigmoid timesteps, rank 16/16, LR 1e-4, weight decay 1e-4, min timestep 150, 8 timestep buckets, constant schedule."
+  bano_h3_adapter_vs_cg_2026_10:
+    kind: community
+    where: "banodoco Discord #minimax_h3_training and #minimax_h3_chatter"
+    date: "2026-10"
+    people: 6
+    url: null
+    note: "Adapter v3 vs contrastive-guidance loss: adapter alone stable but wooden for some, guidance alone lively but overcooks late, one tester saw the stack distort audio and video."
+  bano_h3_images_first_2026_09:
+    kind: community
+    where: "banodoco Discord #minimax_h3_training"
+    date: "2026-09"
+    people: 3
+    url: null
+    note: "Images beat video-only for a person's likeness; video-only learns voice, not face in 4-10k steps."
+  bano_h3_res_2026_09:
+    kind: community
+    where: "banodoco Discord #minimax_h3_training"
+    date: "2026-09"
+    people: 3
+    url: null
+    note: "Spatial RoPE is area-normalised; 256-384 for most steps then a short high-resolution tail; only 192-256 gave noisy results."
+  bano_h3_clips_2026_09:
+    kind: community
+    where: "banodoco Discord #minimax_h3_training and AI Toolkit Discord #minimax_h3"
+    date: "2026-09"
+    people: 3
+    url: null
+    note: "24 fps and 17n+5 frames; 25 fps gives fast motion; trim exactly; video above 512 px is low value."
+  bano_h3_refvsfl_2026_09:
+    kind: community
+    where: "banodoco Discord #minimax_h3_training"
+    date: "2026-09"
+    people: 4
+    url: null
+    note: "FL2VA LoRAs on ref2va: works for some, duplicate subjects for one; a ref2va-trained image character reached 99% in 50 epochs vs about 250 on fl2va."
+  bano_h3_bleed_2026_08:
+    kind: community
+    where: "banodoco Discord #minimax_h3_training"
+    date: "2026-08"
+    people: 1
+    url: null
+    note: "Distinct trigger per person, describing everything and more images reduced visual bleed on a three-person LoRA; same-gender voices still bled."
+  atk_ostris_h3_2026_08:
+    kind: community
+    where: "AI Toolkit Discord #development and #minimax_h3 (the trainer's author)"
+    date: "2026-08"
+    people: 1
+    url: null
+    note: "H3 has no guidance embedding to pin; do not stack adapter and guidance loss; adaLN projection must not be trained; sigmoid keeps the distilled model from breaking down; his image-only identity test worked only with guidance, adapter off and DOP on the class word."
+  atk_h3_automagic_2026_08:
+    kind: community
+    where: "AI Toolkit Discord #minimax_h3 and #training"
+    date: "2026-08"
+    people: 4
+    url: null
+    note: "Automagic v3 often exploded or stalled on H3 for these users; AdamW8bit was the reliable fallback; one user found DOP not helping H3."
+  atk_h3_image_recipe_2026_08:
+    kind: community
+    where: "AI Toolkit Discord #minimax_h3"
+    date: "2026-08"
+    people: 2
+    url: null
+    note: "Image-only recipe several copied: AdamW8bit, sigmoid, LR 1e-4, weight decay 1e-4, 512/768/1024, 50-200 images, 4,000-6,000 steps, natural captions."
+  atk_h3_gen_2026_08:
+    kind: community
+    where: "AI Toolkit Discord #general and banodoco Discord #minimax_h3_gens"
+    date: "2026-08"
+    people: 3
+    url: null
+    note: "H3 at 0.5 MP then SeedVR2; EasyCache chops the tail; Euler beta beats res_multistep for skin; a 20-step Euler beta57 used for a style LoRA."
+  web_fal_h3_2026_08:
+    kind: web
+    where: "fal.ai guide to training an H3 LoRA"
+    date: "2026-08"
+    people: null
+    url: "https://fal.ai/learn/devs/how-to-train-a-lora-for-minimax-h3"
+    note: "Clips 3-15 s at 24 fps, at least 10 clips; default rank 32 but rank 16 beat 32 and 64 in blind votes (realism style); LR 2e-4 default, 1e-4 won; trigger in one place only. No dedicated character advice."
+  meas_h3_clips_2026_11:
+    kind: measured
+    where: "RulZ AI Trainer own runs on a rented RTX 5090 (MiniMax H3 int8, synthetic clips and stills from a fictional test set)"
+    date: "2026-11"
+    people: null
+    url: null
+    note: "400-step clip run and 100-step clip probes; stills runs on the H3 family used AdamW at 1e-4; block swap, real footage and ComfyUI loading were not tested."

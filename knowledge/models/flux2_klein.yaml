@@ -1,0 +1,381 @@
+# FLUX.2 Klein (9B base): character LoRA starting recipe.
+# Public file: no handles, no personal details, no dataset names. Shared sources are in general.yaml.
+id: flux2_klein
+name: FLUX.2 Klein (9B)
+kind: image
+updated: 2026-11-16
+summary: >-
+  FLUX.2 Klein 9B Base is the character model of the Klein family and still beat FLUX.3 Klein on the same photos in
+  October 2026 (a checkpoint at 200 steps beat FLUX.3 at 7,500). Train on Base and judge on Base: the distilled model looks
+  too polished and the likeness slips. The best-supported start is a LOW learning rate (1e-5 to 2e-5 gave likeness at
+  1,000-1,500 steps on about 30 images) against the vendor and the trainer's 1e-4, so the file starts between them at
+  5e-5 and notes both sides. High rates, Prodigy and 3e-4 collapse or deform bodies. Do not train characters on the 4B
+  model, whose editing dies after about 20 epochs.
+model_preset: FLUX-2-Klein-9B-Base
+model_path: black-forest-labs/FLUX.2-klein-base-9B
+facts:
+  - text: "Likeness on base 9B: 30 images, LR 2e-5, likeness from about 1,500 steps (two thumbs-up); the next day, defaults but LR 1e-5 or 2e-5 gave likeness from about 1,000 steps. 20 images at 5,000 steps gave an 'okay' character with the loss gently down. Judge likeness in samples and quality in ComfyUI."
+    confidence: REP
+    sources: [f2_lowlr_2026_01, f2_steps_2026_06]
+  - text: "Train on and judge on the Base model: it looks more natural than the distilled model, which is 'too polished' with the likeness 'not quite there'. The vendor agrees on base for training and distilled for fast inference (16 steps, CFG 1, LoRA scale 0.75; Base inference is 50 steps at CFG 3.5)."
+    confidence: CONF
+    sources: [f2_lowlr_2026_01, f2_vs_f3_2026_10, web_bfl_f2_training_2026_01]
+  - text: "Learning rate is disputed. Low side: 1e-5 to 2e-5 (one user, likeness from 1,000-1,500 steps), lowering the rate on a retrain fixed deformed bodies and collapses (several), Klein 'crumbles' at 3e-4 and one run collapsed by step 250-500 with an unshared config, and the vendor's own page says to lower to 5e-5 if it collapses. High side: the vendor's character guidance of 8e-5 to 1e-4 ('higher for characters'), Fizgig's 1e-4 'Old Reliable' recipe for rank 16 (the trainer's wizard) and one web default of 3e-4."
+    confidence: DISP
+    sources: [f2_lowlr_2026_01, atk_klein_lr_2026_07, web_bfl_f2_training_2026_01, web_academia_2026_11, doc_trainer_3_28]
+  - text: "Deformed hands and bodies, big heads on tiny bodies and extra legs were seen on Klein 9B with high learning rates and with Prodigy; the fix was a lower rate and more full-body shots."
+    confidence: CONF
+    sources: [atk_klein_lr_2026_07]
+  - text: "FLUX.2 Klein 9B beat FLUX.3 for identity in two same-settings comparisons in October; the 4B model's four-week finetune got worse and its editing dies after about 20 epochs: stay on 9B. Likeness versus other models is disputed (Klein 85% against Z-Image Base 95-99% for one user; 'plainly superior' to Krea 2 for another)."
+    confidence: DISP
+    sources: [f2_vs_f3_2026_10, f2_4b_2026_06, atk_klein_compare_2026_07]
+  - text: "Differential guidance 3-4 'makes a difference' for one user, and regularisation on a small set made samples jump so he turned it off; DOP is called 'massively' helpful by one user and 'unusable without' by another, and a regularisation set at 1:1 worked for a third. The older note that guidance causes body horror was not re-found. None of these knobs is settled."
+    confidence: DISP
+    sources: [f2_dop_2026_06, f2_lowlr_2026_01, atk_dop_reg_2026_08]
+  - text: "Captions: 'trigger standing, wearing X' with a thin scene taught nothing on Klein and Ideogram (38 images, consistency 'piss poor'). Describe the scene and what changes, and keep the person's own traits out. The vendor's captions are descriptive and end with a trigger phrase."
+    confidence: REP
+    sources: [f2_caption_2026_06, web_bfl_f2_training_2026_01]
+  - text: "Vendor guidance: character LoRAs at 1,500-3,000 steps, 1024+ images, varied pose, angle and lighting, start at 512 for iteration; the 4B base needs about 12 GB and the 9B base about 22 GB (bf16). An early run on a man lightened his skin tone and was fixed by caption and rank changes."
+    confidence: DOC
+    sources: [web_bfl_f2_training_2026_01, web_mesmertools_2026_07]
+  - text: "RulZ AI Trainer samples with Base at 20 steps and CFG 3.5 when the turbo LoRA is off; its default turbo LoRA (a rank-256 extraction, 4 steps) shows static noise above strength 0.5 on its card and has not been tried on real weights here."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+base:
+  network_type:
+    value: lora
+    why: "Every Klein 9B character report uses a plain LoRA; the wizard recommends it too."
+    confidence: CONF
+    sources: [f2_lowlr_2026_01, web_bfl_f2_training_2026_01, doc_trainer_3_28]
+  lora_rank:
+    value: 16
+    why: "Fizgig's 'Old Reliable' Klein rank (and the wizard's), also a web default; a vendor example used 128 for a style and a blog 64. Rank was not the difference in any character report."
+    confidence: REP
+    sources: [doc_trainer_3_28, web_academia_2026_11]
+  lora_alpha:
+    value: 16.0
+    why: "Alpha equals rank."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  optimizer:
+    value: adamw8bit
+    why: "The AI Toolkit default the low-rate reports used and the wizard's choice; Adafactor with sigmoid was also called good on FLUX.2, and Prodigy deformed bodies."
+    confidence: REP
+    sources: [f2_lowlr_2026_01, atk_klein_lr_2026_07, doc_trainer_3_28]
+  learning_rate:
+    value: 5.0e-5
+    why: "Both sides: 1e-5 to 2e-5 gave likeness at 1,000-1,500 steps and 3e-4 collapses, but the vendor says 8e-5 to 1e-4 for characters and the wizard uses 1e-4. 5e-5 is the vendor's own 'if training collapses' value, between the two."
+    confidence: DISP
+    sources: [f2_lowlr_2026_01, atk_klein_lr_2026_07, web_bfl_f2_training_2026_01, doc_trainer_3_28]
+  lr_scheduler:
+    value: constant
+    why: "Constant, as the trainer's default and Fizgig's recipe."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  timestep_sampling:
+    value: reference
+    why: "Fizgig's flux2_shift for Klein (logit-normal shifted by image size), which is what the wizard sets; the character reports did not state a timestep and one vendor style example used shift."
+    confidence: DOC
+    sources: [doc_trainer_3_28, web_bfl_f2_training_2026_01]
+  batch_size:
+    value: 1
+    why: "Batch 1 is the wizard's value; AI Toolkit does not scale the LR with batch."
+    confidence: DOC
+    sources: [doc_trainer_3_28, atk_lr_scaling_2026_11]
+  resolutions:
+    value: [0.25, 0.5, 1.0]
+    why: "Vendor: 1024+ images, start at 512 for iteration; mixed buckets give far shots. Two sizes of a style example ran 256-1536."
+    confidence: REP
+    sources: [web_bfl_f2_training_2026_01, atk_distance_multires_2026_01]
+  isolation:
+    value: false
+    why: "Both sides: one user says DOP made a massive difference on Klein and another that it is unusable without it, but a regularisation set on a small set made one user's samples jump and he turned it off; it costs 1.5-2x the time and is unmeasured here. Turn it on for bleed onto other people."
+    confidence: DISP
+    sources: [f2_dop_2026_06, f2_lowlr_2026_01]
+  turbo_lora:
+    value: ""
+    why: "The LoRA looks right on Base and off on the distilled model, so samples and probes run on Base at 20 steps and CFG 3.5 (the trainer's own turbo LoRA is untested here and shows static noise above strength 0.5)."
+    confidence: REP
+    sources: [f2_lowlr_2026_01, doc_trainer_3_28]
+  sample_steps:
+    value: 20
+    why: "The vendor's Base default as the trainer uses it."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  sample_cfg:
+    value: 3.5
+    why: "The vendor's guidance for Base; Klein has no guidance embedding, CFG steers it."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_steps:
+    value: 20
+    why: "Probes sample as the previews do so the face score sees the look you judge."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_cfg:
+    value: 3.5
+    why: "As the samples."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_seeds:
+    value: 4
+    why: "A single probe swings about 10 points between seeds; four seeds give a curve you can read."
+    confidence: MEAS
+    sources: [meas_region_2026_11, meas_krea_race_2026_11]
+  likeness_framing:
+    value: true
+    why: "Counts a body render with no body as zero so best-checkpoint tracking is not fooled by lost framing."
+    confidence: MEAS
+    sources: [meas_region_2026_11]
+  copy_check:
+    value: "on"
+    why: "Logs the copy score with the probes so a memorised checkpoint shows."
+    confidence: MEAS
+    sources: [meas_krea_race_2026_11]
+steps:
+  epochs: 50
+  min: 1000
+  max: 3000
+  round_to: 50
+  why: "Both sides: likeness from 1,000-1,500 steps on 30 images at a low rate and the vendor's 1,500-3,000 for characters, against a 20-image run that took 5,000 steps and the community's 'about 100 steps per image' for Klein-class models. Fifty epochs of a 20-40 image set (1,000-2,000 steps) with probes every ~10% lets the likeness peak decide."
+  confidence: DISP
+  sources: [f2_lowlr_2026_01, f2_steps_2026_06, web_bfl_f2_training_2026_01, atk_steps_per_image_2026_06]
+adjust:
+  - id: tiny_dataset
+    when: {images_max: 14}
+    set:
+      lora_rank: {value: 8, why: "A small set overfits a big adapter and copies its background; low rank is the trend for one person.", confidence: GUESS, sources: [atk_rank_lokr_2026]}
+      lora_alpha: {value: 8.0, why: "Alpha equals rank.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "Under 15 images the LoRA is stiff and copies the background and expression; add photos first. The step minimum is 1,000, so a 10-image set runs 100 epochs: stop at the first good probe."
+  - id: small_dataset
+    when: {images_min: 15, images_max: 40}
+    set:
+      holdout_images: {value: 3, why: "Three held-out photos let the sweeps show where the subject stops being learned (measured on a Qwen-Image 2.1 fine-tune; never run on Klein).", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "A sweep every 4 epochs costs little on a small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "The base recipe is made for this size (about 30 images)."
+  - id: large_dataset
+    when: {images_min: 80}
+    set:
+      lora_rank: {value: 32, why: "More data supports a bigger adapter; the vendor's FLUX.3 table and the blog above used 32 and 64.", confidence: GUESS, sources: [web_mesmertools_2026_07, atk_rank_lokr_2026]}
+      lora_alpha: {value: 32.0, why: "Alpha equals rank.", confidence: DOC, sources: [doc_trainer_3_28]}
+      holdout_images: {value: 8, why: "Up to a fifth of the set may be held out; eight photos give a steadier held-out curve.", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "As for the small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "80+ images: the step cap (3,000) gives under 40 epochs. A 320-image run warped on another model; culling to the best 30-60 is more reliable than adding steps."
+  - id: goal_quick
+    when: {goal: quick}
+    set:
+      learning_rate: {value: 1.0e-4, why: "The vendor's and wizard's rate learns fastest; watch for collapse and drop to 5e-5 if bodies deform.", confidence: DISP, sources: [web_bfl_f2_training_2026_01, doc_trainer_3_28]}
+      resolutions: {value: [0.5], why: "The vendor says to start at 512 for iteration.", confidence: DOC, sources: [web_bfl_f2_training_2026_01]}
+      probe_seeds: {value: 2, why: "A first test needs a rough read only.", confidence: GUESS, sources: []}
+    note: "A quick test: expect likeness at about 500-1,000 steps and body deformation or collapse if the rate is too high."
+  - id: goal_likeness
+    when: {goal: likeness}
+    set:
+      learning_rate: {value: 2.0e-5, why: "The one two-thumbs-up character result used 2e-5 (likeness from about 1,500 steps on 30 images); lower rates fixed deformed bodies for several users.", confidence: REP, sources: [f2_lowlr_2026_01, atk_klein_lr_2026_07]}
+      probe_seeds: {value: 6, why: "More probe seeds make the best checkpoint reliable.", confidence: MEAS, sources: [meas_krea_race_2026_11]}
+    note: "At 2e-5 the likeness window is about 1,000-1,500 steps for 30 images (up to 5,000 for 20): do not cut the run short."
+  - id: focus_face
+    when: {focus: face}
+    set:
+      crop_augment: {value: face, why: "Close-ups teach the face's detail; bust crops would mostly teach the build.", confidence: DOC, sources: [doc_trainer_3_28]}
+      face_weight: {value: 1.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+      body_weight: {value: 0.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: focus_face_body
+    when: {focus: face_body}
+    set:
+      crop_augment: {value: face+bust, why: "Close-ups for the face, head-and-shoulders crops between them and the whole photos; the build comes from the whole photos.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "Klein 9B deforms hands and bodies: include full-body shots, and use a lower rate if bodies go wrong."
+  - id: low_median_mp
+    when: {median_mp_max: 0.4}
+    set:
+      resolutions: {value: [0.25], why: "The photos are under 0.4 MP: training above their size only upscales them.", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: no_captions
+    when: {has_captions: false}
+    set:
+      caption_dropout: {value: 0.0, why: "Most images have no caption file, so there is nothing to drop.", confidence: GUESS, sources: []}
+    note: "Write descriptive captions of the scene and what changes: a bare 'trigger standing, wearing X' taught nothing."
+  - id: vram_24
+    when: {vram_max_gb: 24}
+    set:
+      transformer_quant: {value: int8_convrot, why: "bf16 is 17 GB; int8 is 9.6 GB and the trainer picks it from 18 GB.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "The Qwen3-8B text encoder (15 GB in bf16) runs as it is from 19.5 GB."
+  - id: vram_16
+    when: {vram_max_gb: 16}
+    set:
+      transformer_quant: {value: nvfp4, why: "NVFP4 is 5.6 GB against int8's 9.6 GB; slower (fp4 weights are expanded each step).", confidence: DOC, sources: [doc_trainer_3_28]}
+      text_encoder_quant: {value: int8, why: "Halves the 15 GB text encoder so it fits on the card for caching.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "Not run on a card this small here. The vendor says the 4B base needs about 12 GB and the 9B base about 22 GB."
+evaluate:
+  strength: "1.0 (0.75 on the distilled model per the vendor); do not judge at a strength that hides a weak LoRA."
+  sampler: "Base model, not distilled; ComfyUI with the model's own scheduler."
+  steps: "20 on Base for previews (the vendor's default; 50 on the quality path); 16 steps with CFG 1 on the distilled model."
+  cfg: "3.5 on Base; 1 on the distilled model."
+  notes:
+    - "Judge likeness in the samples and quality in ComfyUI on Base; the distilled model is too polished and the likeness slips."
+    - "Save every 100-250 steps: at 2e-5 the likeness window is about 1,000-1,500 steps for 30 images."
+    - "Look for big heads on small bodies, extra legs and bad hands: they mean the rate is too high."
+    - "Test with a prompt unlike every training photo, a full-body shot and a second person."
+flaws:
+  - symptom: deformed_bodies
+    causes:
+      - "learning rate too high (3e-4 crumbles), or Prodigy"
+      - "too few full-body shots"
+    fixes:
+      - set: {learning_rate: {op: min, value: 5.0e-5}, optimizer: {value: adamw8bit}}
+        why: "Retraining at a lower rate fixed deformed hands and bodies for several users; Prodigy and high rates were the common cause."
+        confidence: CONF
+        sources: [atk_klein_lr_2026_07, f2_lowlr_2026_01]
+      - action: "Add more full-body shots with the body in different poses."
+        why: "The fix several users named alongside the lower rate."
+        confidence: CONF
+        sources: [atk_klein_lr_2026_07]
+  - symptom: no_likeness
+    causes:
+      - "distilled sampling: the LoRA looks right only on Base"
+      - "learning rate too high so the run collapses by step 250-500"
+      - "thin captions that name only the trigger and the clothes"
+    fixes:
+      - set: {turbo_lora: {value: ""}, sample_steps: {value: 20}, sample_cfg: {value: 3.5}}
+        why: "Apply and judge the LoRA on Base: distilled inference looks plastic and off."
+        confidence: REP
+        sources: [f2_lowlr_2026_01]
+      - set: {learning_rate: {value: 2.0e-5}}
+        why: "The one two-thumbs-up character result used 2e-5 and defaults."
+        confidence: REP
+        sources: [f2_lowlr_2026_01]
+      - action: "Describe the scene and what changes in every caption; 'trigger standing, wearing X' taught nothing."
+        why: "One posted failure."
+        confidence: REP
+        sources: [f2_caption_2026_06]
+  - symptom: slow_likeness
+    causes:
+      - "learning rate low: at 1e-5 to 2e-5 likeness arrives at about 1,000-1,500 steps"
+      - "a 20-image set that needs about 5,000 steps"
+    fixes:
+      - action: "Keep going to 1,500 steps (30 images) or up to about 5,000 (20 images) before changing anything; raise the rate toward 5e-5 only if the probes stay flat."
+        why: "Two reports of when likeness arrived."
+        confidence: REP
+        sources: [f2_lowlr_2026_01, f2_steps_2026_06]
+      - set: {learning_rate: {op: mul, value: 2.0}}
+        why: "The vendor's range for characters is 8e-5 to 1e-4."
+        confidence: DOC
+        sources: [web_bfl_f2_training_2026_01]
+  - symptom: peaked_early
+    causes:
+      - "learning rate too high: one run collapsed by step 250-500"
+    fixes:
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "The vendor says to lower to 5e-5 if training collapses; lower retrains fixed collapses for several users."
+        confidence: CONF
+        sources: [web_bfl_f2_training_2026_01, atk_klein_lr_2026_07]
+      - action: "Keep the best early checkpoint; save every 100-250 steps."
+        why: "Checkpoints are not monotonic."
+        confidence: CONF
+        sources: [atk_ckpt_eval_2026_07]
+  - symptom: plastic_skin
+    causes:
+      - "inference on the distilled model, which is too polished"
+      - "Klein's edit rendering"
+    fixes:
+      - set: {turbo_lora: {value: ""}}
+        why: "Judge and use the LoRA on Base: it looks more natural than distilled."
+        confidence: REP
+        sources: [f2_lowlr_2026_01]
+  - symptom: identity_bleed
+    causes:
+      - "a single-identity LoRA touches what every person shares"
+    fixes:
+      - set: {isolation: {value: true}}
+        why: "One user calls DOP massively helpful on Klein and another unusable without it; a 1:1 regularisation set worked for a third while a small-set regularisation made samples jump for a fourth. About 1.5-2x the time."
+        confidence: DISP
+        sources: [f2_dop_2026_06, f2_lowlr_2026_01, atk_dop_reg_2026_08]
+      - action: "A two-subject LoKr showed minimal bleed with two and fell apart at three; train all characters in one LoRA with distinct long names and about 20% group images."
+        why: "One heavy user's tests, plus the most repeated multi-character fix."
+        confidence: REP
+        sources: [atk_multichar_2026_08]
+  - symptom: lr_collapsed
+    causes:
+      - "automagic's effective LR sinks (not a Klein-specific finding)"
+    fixes:
+      - set: {automagic_min_lr: {value: 2.0e-5}}
+        why: "The floor RulZ AI Trainer ships since 3.24.0."
+        confidence: CONF
+        sources: [atk_automagic_floor_2026_10]
+  - symptom: out_of_memory
+    causes:
+      - "bf16 weights (17 GB) with a 1 MP bucket on a card under 30 GB"
+    fixes:
+      - set: {transformer_quant: {value: int8_convrot}, text_encoder_quant: {value: int8}, resolutions: {value: [0.25, 0.5]}}
+        why: "int8 is 9.6 GB and halves the text encoder; smaller buckets shrink the step."
+        confidence: DOC
+        sources: [doc_trainer_3_28]
+open_questions:
+  - "The best learning rate: 1e-5 to 2e-5 (one result, two thumbs-up) against the vendor's and wizard's 1e-4. No A/B exists; 5e-5 is a compromise, not a finding."
+  - "Rank and timestep for a person were never settled; no Klein 9B character report states a timestep."
+  - "Differential guidance, DOP and regularisation are all disputed on Klein; differential guidance is not a RulZ AI Trainer setting."
+  - "The trainer's own turbo LoRA (rank 256, 4 steps) has never been tried on real weights; the Base-only sampling used here is slow."
+  - "Does Klein's body deformation come from the rate or from Klein 9B itself? A 4B model is not an alternative (editing dies)."
+sources:
+  f2_lowlr_2026_01:
+    kind: community
+    where: "AI Toolkit Discord #training"
+    date: "2026-01"
+    people: 3
+    url: null
+    note: "Base 9B, 30 images, LR 2e-5, likeness from about 1,500 steps (two thumbs-up); next day LR 1e-5 or 2e-5, from about 1,000 steps; base more natural than distilled; differential guidance 3-4 helped; regularisation on a small set turned off."
+  f2_steps_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #training"
+    date: "2026-06"
+    people: 1
+    url: null
+    note: "About 20 images at 5,000 steps gave an 'okay' character; loss gently down."
+  f2_vs_f3_2026_10:
+    kind: community
+    where: "AI Toolkit Discord #flux3-image and banodoco Discord #flux3-image-model"
+    date: "2026-10"
+    people: 2
+    url: null
+    note: "Same dataset and settings: FLUX.2 identity much better than FLUX.3 at the same step; a FLUX.2 checkpoint at 200 steps beat FLUX.3 at 7,500."
+  f2_4b_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #training"
+    date: "2026-06"
+    people: 1
+    url: null
+    note: "Klein 4B: a four-week finetune got worse and editing dies after about 20 epochs."
+  f2_dop_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #training"
+    date: "2026-06"
+    people: 3
+    url: null
+    note: "DOP 'massive difference' for one user, 'unusable without DOP' for another; a 1:1 regularisation set worked for a third. Disputed."
+  f2_caption_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #training"
+    date: "2026-06"
+    people: 1
+    url: null
+    note: "38 images with base settings, consistency poor; a caption naming the trigger plus clothes with a thin scene taught nothing (also on Ideogram)."
+  atk_klein_compare_2026_07:
+    kind: community
+    where: "AI Toolkit Discord #general and #training-images"
+    date: "2026-07"
+    people: 4
+    url: null
+    note: "Klein 85% against Z-Image Base 95-99% for one user; 'plainly superior in likeness' to Krea 2 for another; near 100% on both for a third. Disputed."
+  web_bfl_f2_training_2026_01:
+    kind: official
+    where: "Black Forest Labs documentation: FLUX.2 Klein training"
+    date: "2026-01"
+    people: null
+    url: https://docs.bfl.ml/flux_2/flux2_klein_training
+    note: "Undated page. LoRA LR 8e-5 to 1e-4 (lower for style, higher for characters); characters 1,500-3,000 steps; 1024+ images; vary pose, angle and lighting; start at 512; 4B base about 12 GB, 9B base about 22 GB."
+  web_academia_2026_11:
+    kind: web
+    where: "AcademiaSD LoRAlab trainer studio changelog"
+    date: "2026-11"
+    people: null
+    url: https://github.com/AcademiaSD/AcademiaSD_LoRAlab-TrainerStudio
+    note: "Klein 9B defaults: rank 16, 3e-4, 768 px, 1,000 steps on 14 images, likeness from about 500 steps; defaults tested to work, not tuned."

@@ -1,0 +1,1130 @@
+# RulZ AI Trainer Optimizer: knowledge shared by every model (character / person-likeness LoRAs).
+# Read docs/DESIGN.md "Knowledge base" for the schema. Public file: no handles, no personal details, no dataset names.
+updated: 2026-11-16
+
+symptoms:
+  # --- metric symptoms (diagnose.py detects them from a run folder) ---
+  - id: no_likeness
+    label: "No likeness: the person is not recognisable"
+    kind: both
+    description: "Probe likeness stays near the untrained model's score for most of the run, or the samples do not look like the person."
+  - id: slow_likeness
+    label: "Likeness still rising at the last probe"
+    kind: metric
+    description: "The smoothed likeness curve is still climbing when the run ends: the run stopped too early or learns too slowly."
+  - id: peaked_early
+    label: "Best checkpoint long before the end, then falling"
+    kind: metric
+    description: "Likeness peaks well before the last step and erodes afterwards (overtraining, or the model's distillation wearing off)."
+  - id: likeness_unstable
+    label: "Likeness jumps between probes or seeds"
+    kind: metric
+    description: "A large spread between probe seeds or between neighbouring checkpoints, so no checkpoint can be trusted from one probe."
+  - id: lost_framing
+    label: "Prompts stop being followed: body renders turn into portraits"
+    kind: both
+    description: "Body probes show no body, or the prompt check drifts away from the step-0 framing (full-body prompts give head-and-shoulders)."
+  - id: memorized
+    label: "Copies training photos"
+    kind: metric
+    description: "The copy check is above its limit, or a face or body score is above 100 of its scale: renders reproduce training pictures."
+  - id: lr_collapsed
+    label: "Self-tuning learning rate collapsed"
+    kind: metric
+    description: "With an Automagic-family optimizer the adapted learning rate sat below 1e-5 for most of the run, so learning stopped."
+  - id: nan_or_diverged
+    label: "NaN, noise or divergence"
+    kind: metric
+    description: "Loss is NaN or explodes, or samples turn to noise."
+  - id: out_of_memory
+    label: "Out of memory"
+    kind: metric
+    description: "The run stopped or crawled with an out-of-memory error or a near-full GPU and system RAM."
+  # --- visual symptoms (the user ticks them after looking at the images) ---
+  - id: burned
+    label: "Burned, overcooked, oversaturated or crunchy"
+    kind: visual
+    description: "Harsh contrast, crunchy detail, textures or marks that do not belong (patterns on skin, grid freckles), usually late in the run."
+  - id: plastic_skin
+    label: "Plastic, waxy or peach-fuzz skin"
+    kind: visual
+    description: "Skin without pores or grain, smooth like wax, often with a shiny look."
+  - id: washed_colors
+    label: "Washed-out colours or clipped highlights"
+    kind: visual
+    description: "Flat, pale colour, blown highlights, or a lost look of the base model (typical when a distilled model drifts)."
+  - id: color_shift
+    label: "Skin tone or colour cast shifted"
+    kind: visual
+    description: "The person's skin looks lighter, darker, redder or yellower than the photos, or the whole image has a cast."
+  - id: soft_blurry
+    label: "Soft or blurry faces and detail"
+    kind: visual
+    description: "Faces lack sharpness and fine detail compared with the photos, even though the identity is right."
+  - id: noisy_grainy
+    label: "Noisy or grainy skin"
+    kind: visual
+    description: "Visible noise or grain on skin and backgrounds that the photos do not have."
+  - id: identity_bleed
+    label: "Identity bleeds into other people"
+    kind: visual
+    description: "Other people in the picture get the trained face, or a second trained character takes on the first one's features."
+  - id: everyone_same_face
+    label: "Every woman or man gets the face"
+    kind: visual
+    description: "Prompts that name only a class word (woman, man) give the trained person."
+  - id: wrong_at_distance
+    label: "Face is wrong when small in the frame"
+    kind: visual
+    description: "Likeness is good in close-ups but the face is wrong or generic in full-body and wide shots."
+  - id: wrong_at_angles
+    label: "Face is wrong at side or odd angles"
+    kind: visual
+    description: "Likeness holds for the poses in the photos but not for profile, three-quarter, from-above or from-below views."
+  - id: wrong_body
+    label: "Face right, body generic or wrong build"
+    kind: visual
+    description: "The face matches but the body shape, proportions or skin marks do not."
+  - id: same_pose_outfit
+    label: "Always the same pose, outfit or background"
+    kind: visual
+    description: "Renders repeat a pose, clothes or room from the photos whatever the prompt says."
+  - id: trigger_as_text
+    label: "Trigger word printed as text in the image"
+    kind: visual
+    description: "The trigger word appears on signs, name tags or logos."
+  - id: needs_high_strength
+    label: "Only works with the LoRA strength above 1.0"
+    kind: visual
+    description: "At strength 1.0 the person is weak or missing and needs 1.2 or more."
+  - id: too_strong
+    label: "Too strong: over-applied at strength 1.0"
+    kind: visual
+    description: "At strength 1.0 the look is overbearing (stiff, repeated expression, burned), and it needs 0.6-0.8."
+  - id: deformed_bodies
+    label: "Deformed hands or bodies"
+    kind: visual
+    description: "Extra limbs, bad hands, big heads on small bodies."
+  - id: lost_motion
+    label: "Video model: motion is damped or lost"
+    kind: visual
+    description: "Clips made with the LoRA move less or stiffer than the base model's."
+  - id: bad_audio
+    label: "Video model: bad or wrong voice or sound"
+    kind: visual
+    description: "Voice is garbled, static, the wrong voice, or the audio of other people takes the trained voice."
+  - id: ignores_prompt
+    label: "Ignores the prompt"
+    kind: visual
+    description: "Clothes, place, pose and style asked for are not followed; the model gives the training look."
+
+general_facts:
+  # --- captions, triggers, datasets ---
+  - text: "Caption what must stay changeable (clothes, pose, place, light, camera) and leave out the identity itself. Anything that is in every photo and not in the caption binds to the trigger word."
+    confidence: CONF
+    sources: [atk_captions_2026_06, web_caption_what_changes]
+  - text: "Put the trigger or the person's name in EVERY caption. Missing from some captions was the main reason one run showed nothing at 2,500 steps and the right direction at 250 after the fix."
+    confidence: CONF
+    sources: [atk_captions_2026_06]
+  - text: "Use the same subject noun in every caption (man or woman, not person in some and the human in others): mixed wording made two people appear for one."
+    confidence: CONF
+    sources: [atk_subject_noun_2026_07]
+  - text: "Do not use trigger words with digits or symbols (names like m@d4): they print as text on signs and logos. Pick a real-word-style name. Expect about 1% of renders to still show it."
+    confidence: CONF
+    sources: [atk_trigger_text_2026_07]
+  - text: "Test a new trigger word alone on the base model first: a word that already means something (a car, a cartoon, a celebrity) pulls that concept in."
+    confidence: REP
+    sources: [atk_trigger_text_2026_07]
+  - text: "20-35 well-chosen images is the sweet spot on current models. 10 to 200 images all worked at 2,500 steps in one comparison; 170 images were no better than 30; under 7-10 images give a stiff LoRA that copies the background and expression. Cull rather than add."
+    confidence: CONF
+    sources: [atk_dataset_size_2026_07]
+  - text: "Vary distance and angle: close-ups, half-body, full body, left and right, from above and below. A set of only head shots makes the model guess the body; a set of only full-body shots at low resolution makes the face too small to learn."
+    confidence: CONF
+    sources: [atk_dataset_mix_2026_06]
+  - text: "Quality beats quantity: denoised, upscaled or AI-smoothed images carry that smoothness (and denoise artifacts) into the LoRA; keep natural grain. Tonal clean-up of clipped highlights and oversaturated photos helps."
+    confidence: REP
+    sources: [atk_dataset_quality_2026_06]
+  - text: "Background removal (grey fill) is disputed: one user got near-100% vs 95-98% likeness, another tested it side by side and saw no gain with harder prompting, and the first later reintroduced simple backgrounds. Leftover data in alpha-removed areas can still leak."
+    confidence: DISP
+    sources: [atk_bg_removal_2026]
+  - text: "Several characters in one LoRA: train them together in ONE LoRA with a distinct long natural-language name each and about 20% group images captioned with position ('on the left'). Separately trained character LoRAs stacked at inference blend; short shared tokens like CHAR_ make it worse."
+    confidence: CONF
+    sources: [atk_multichar_2026_08]
+  - text: "Other people in the photos: keep them but caption them ('the character is second from the right'); keep and caption blurry backgrounds."
+    confidence: REP
+    sources: [atk_multichar_2026_08]
+  - text: "Do not caption what is part of the character if you want it always present (tattoos, birthmarks, glasses) and do caption it if it should be optional. Users disagree about tattoos; the mechanism is the same seen from both sides."
+    confidence: DISP
+    sources: [atk_captions_2026_06]
+  - text: "Faces need pixels: train with several resolutions so far shots exist, and optionally finish with a short high-resolution pass; the face can also be repaired afterwards by inpainting with the same LoRA."
+    confidence: CONF
+    sources: [atk_distance_multires_2026_01]
+  # --- training behaviour ---
+  - text: "Train on the Base / Raw / undistilled checkpoint and apply a turbo or distilled LoRA only when sampling, or keep the model's training adapter on. Distilled checkpoints trained bare wash colours out and lose their speed."
+    confidence: CONF
+    sources: [atk_distilled_guard_2026_09, meas_krea_race_2026_11]
+  - text: "Likeness often keeps rising while the run overfits, so the best-looking checkpoint is often the overcooked one. Test with a prompt unlike every training image (other hair, other clothes, other place) and check prompt following, not just the face."
+    confidence: CONF
+    sources: [atk_overfit_tells_2026_01]
+  - text: "Training loss is a poor signal at small batch sizes (a stationary random series). Judge by fixed-seed samples, by held-out photos of the same person, and by a numeric face score. The model author recommends held-out images with fixed noise and diverse timesteps; validation loss falls and then rises when the run overfits."
+    confidence: CONF
+    sources: [atk_ckpt_eval_2026_07]
+  - text: "Checkpoints are not monotonic: likeness waves better, worse, better. Save every 100-250 steps and compare neighbours at several seeds and strengths."
+    confidence: CONF
+    sources: [atk_overfit_tells_2026_01, atk_ckpt_eval_2026_07]
+  - text: "Samples inside a trainer can look wrong while the exported file is fine in ComfyUI (the sampling path differs). Judge the final choice in the inference stack you will use."
+    confidence: CONF
+    sources: [atk_trainer_vs_comfy_2026_08]
+  - text: "A run's likeness peak depends on the learning rate: about 1,000 steps at 1e-4 and about 5,000 at 5e-5 on a video model; at 3e-4 likeness showed at 250 steps and burned by 1,000. Lower rate = later and flatter peak."
+    confidence: CONF
+    sources: [bano_h3_lr_2026_08]
+  - text: "Sigmoid timesteps are the usual choice for faces and characters; linear was clearly worse for likeness among about 15 settings tried on one model, and the model author says the target (style vs character) matters more than the model."
+    confidence: CONF
+    sources: [atk_timestep_2026_07]
+  - text: "Low rank or LoKr factor 4-8 is enough for one person. A big rank overfits small sets (rank 64 on 20 images never reached likeness in 8,000 steps on one model). Keep alpha equal to rank. A LoKr file of 1.4 GB means the factor was not set (full matrix)."
+    confidence: CONF
+    sources: [atk_rank_lokr_2026]
+  - text: "Batch size and gradient accumulation do not scale the learning rate in AI Toolkit; a larger batch needs about 1.5-2.5x more steps. Batch 1 is the common choice for characters (an averaged gradient dulls likeness)."
+    confidence: REP
+    sources: [atk_lr_scaling_2026_11]
+  - text: "Steps per image: about 100 steps per image (about 100 epochs) is the common start for Z-Image-class models; faster models (Krea 2, FIBO 2, MiniMax-H3-Image) need only 30-70 per image and burn if run long. More than 10,000 steps for a LoRA means something is off."
+    confidence: CONF
+    sources: [atk_steps_per_image_2026_06]
+  - text: "Automagic's learning rate can sink below 1e-5 and learning stops (confirmed by its author on several models). RulZ AI Trainer has a floor (automagic_min_lr, default 2e-5 since 3.24.0). Other users run floors up to 2.5e-4 to 1e-3 on MOSS and FIBO 2. Watch the effective LR."
+    confidence: CONF
+    sources: [atk_automagic_floor_2026_10, doc_trainer_3_28]
+  - text: "Automagic v4 is an unsafe default: it fried a P-H3-Image run where v3 did not, cranks LR up and fries MOSS, and spikes then turns to noise for others; a few users find it better on FIBO 2 and in production tests. Stay on automagic3 or AdamW unless you are testing v4."
+    confidence: DISP
+    sources: [atk_automagic4_2026_11]
+  - text: "Regularisation and DOP against identity bleed are disputed. DOP worked 'amazingly' on one model and badly on another, was incompatible with cached text embeddings on some builds, and is slower. A 1:1 regularisation set was reported to work by one user and not by another. The lighter the LoRA that still reaches the likeness, the less it bleeds."
+    confidence: DISP
+    sources: [atk_dop_reg_2026_08]
+  - text: "Adding a long unique name, using it in prompts, and raising the sampler's shift at generation each reduced 'every woman gets the face', at some image-quality cost."
+    confidence: REP
+    sources: [atk_dop_reg_2026_08]
+  - text: "Face scores: ArcFace, FaceNet and AdaFace tell people apart about equally; none picked a stable best step under seed resampling, and the three often disagree on the best checkpoint. AdaFace is RulZ AI Trainer's default held-out scorer. Use several signals plus your eyes."
+    confidence: MEAS
+    sources: [meas_probes_2026_11]
+  - text: "Likeness probes only run when face_refs and the probe prompts are set; a face_refs picture without a detectable face silently disables probes. Check the Monitor shows probe rows by step 25-50."
+    confidence: MEAS
+    sources: [meas_probes_2026_11]
+  # --- our own measurements (RulZ AI Trainer runs on rented GPUs) ---
+  - text: "Run-to-run noise is large: the same settings and seed gave combined likeness 57 and 40 on two runs, plain-AdamW results pool to a standard deviation of about 2.5-3.7, and a single probe swings about 10 points. Treat a gap between two single runs under about 10-15 as possibly chance; sweeps over all pictures resolve about half a point."
+    confidence: MEAS
+    sources: [meas_krea_race_2026_11, meas_region_2026_11]
+  - text: "Prompt following depends on the seed: across four otherwise identical seeds only one kept the full-body probe on its prompt through 2,000 steps. Changing the default seed does not fix it."
+    confidence: MEAS
+    sources: [meas_region_2026_11]
+  - text: "Held-out photos: what the LoRA learned of the subject peaked at about step 700-950 (of 2,000) and then fell while training pictures kept improving; FaceNet on the probes peaked at the same place. Train/held-out gap +14 to +16 points at lr 1e-4, +8 at lr 5e-5 with no likeness lost on the probes."
+    confidence: MEAS
+    sources: [meas_region_2026_11]
+  - text: "Halving the learning rate was the only change that helped in nine runs on one fine-tuned model: smaller memorising gap and the full-body framing kept 200-400 steps longer, though it also collapsed in the end."
+    confidence: MEAS
+    sources: [meas_region_2026_11]
+  - text: "Fixed region weights (face x3 with background 0.3, or background 0.3 alone) made things worse than the seed spread: more memorising of the training faces, no likeness gain, framing lost sooner; the weight taken from the background goes to the person. Adaptive steering did nothing. RulZ AI Trainer's own wizard still lists region_weights as a good face setting from earlier tests: DISP."
+    confidence: DISP
+    sources: [meas_region_2026_11, doc_trainer_3_28]
+  - text: "Best-checkpoint tracking was fooled by lost framing in 8 of 9 runs (a body score from 1-4 renders, scores above 100, a frozen body score). likeness_framing (on by default since 3.4.0) counts a body render with no body as zero; keep it on and check a few checkpoints by eye."
+    confidence: MEAS
+    sources: [meas_region_2026_11]
+  - text: "OFT gave +12 combined on two seeds on Krea 2 (face and body, 8 of 8 probe seeds) at lr 1e-4 but pulls training-photo clothing into headshots; on Qwen-Image 2.1 it overtrained at 1e-4 and held face and framing at 5e-5. LoRA plus OFT keeps the copy score near the limit. Not tested on the H3 family."
+    confidence: MEAS
+    sources: [meas_krea_race_2026_11, meas_qwen_optim_2026_11]
+  - text: "Isolation (DOP plus fused triggers) gave a high first score (54 combined) that did not repeat (32 on the second seed) and memorised scenes (copy 0.68, face probes collapsed to one selfie scene). Treat a single Isolation run with suspicion; it costs 1.5-2x the time."
+    confidence: MEAS
+    sources: [meas_krea_race_2026_11]
+  - text: "Self-tuning optimizers were not better than AdamW in our runs: Hull tied AdamW over repeated runs; Keel reached about +7 FaceNet on Krea 2 once and the body gain did not repeat; Muon equalled AdamW at twice the time. Keel results used the old 1e-8 floor and are not comparable with new runs unless automagic_min_lr is set to 1.0e-8."
+    confidence: MEAS
+    sources: [meas_keel_2026_11, meas_krea_race_2026_11, meas_qwen_optim_2026_11]
+  - text: "A probe prompt unlike the training photos (a seated three-quarter scene) is the better test of identity; the standing probe collapsed to one studio shot. It swings up to 20 points per seed, so use several seeds."
+    confidence: MEAS
+    sources: [meas_keel_2026_11, meas_region_2026_11]
+  - text: "CPU-heavy side jobs on a rented instance slow a training run even when niced (steps went from 0.4 s to 1.3-1.6 s). Run face detection and scoring on your own PC."
+    confidence: MEAS
+    sources: [meas_probes_2026_11]
+
+flaws:
+  # Cross-model fixes, one entry per symptom. A model file's own fixes for the same symptom come first.
+  - symptom: no_likeness
+    causes:
+      - "the trigger or name is missing from some captions"
+      - "learning rate too low for the optimizer, or the run is too short"
+      - "rank too big for a small set"
+      - "too few close-ups (the face is small in the frame)"
+      - "trained bare on a distilled or turbo model"
+      - "Automagic's learning rate collapsed"
+    fixes:
+      - action: "Put the trigger / name in EVERY caption and use one subject noun throughout (no blank caption files)."
+        why: "Fixed 'nothing at 2,500 steps' to 'right direction at 250' for one user; the repeated first answer."
+        confidence: CONF
+        sources: [atk_captions_2026_06, atk_subject_noun_2026_07]
+      - set: {learning_rate: {op: mul, value: 1.5}}
+        why: "A slow run may simply be under-driven; the commonly copied LoRA rates are 1e-4 to 2e-4."
+        confidence: REP
+        sources: [bano_h3_lr_2026_08]
+      - set: {lora_rank: {op: min, value: 16}, lora_alpha: {op: min, value: 16.0}}
+        why: "Rank 64 on 20 images never reached likeness in 8,000 steps; low rank wins in most one-person reports."
+        confidence: REP
+        sources: [atk_rank_lokr_2026]
+      - action: "Cull to the 20-35 best images and add close-ups with the face large in the frame."
+        why: "Cull rather than add; the face needs pixels."
+        confidence: CONF
+        sources: [atk_dataset_size_2026_07, atk_dataset_mix_2026_06]
+      - action: "Train on the Base / Raw model, not the distilled one, or keep the family's training adapter on (training_adapter auto)."
+        why: "Training bare on a distilled model drifts."
+        confidence: CONF
+        sources: [atk_distilled_guard_2026_09]
+      - set: {automagic_min_lr: {op: max, value: 5.0e-5}}
+        why: "If the effective learning rate fell to the floor, raise the floor (or switch to AdamW)."
+        confidence: CONF
+        sources: [atk_automagic_floor_2026_10]
+  - symptom: slow_likeness
+    causes:
+      - "run stopped before the peak"
+      - "learning rate low"
+      - "big dataset with few epochs"
+    fixes:
+      - action: "Continue the run from the last state (resume) or start again with more steps; likeness often arrives late for the body."
+        why: "The curve was still rising at the end."
+        confidence: REP
+        sources: [atk_dataset_mix_2026_06]
+      - set: {learning_rate: {op: mul, value: 1.5}}
+        why: "AdamW at 2e-4 baked later than 3e-4 but peaked around 1,000-1,200 steps on a video model; a higher rate reaches the peak sooner."
+        confidence: REP
+        sources: [bano_h3_lr_2026_08]
+      - set: {steps: {op: mul, value: 1.3}}
+        why: "The steps are the knob when the rate is already usual."
+        confidence: GUESS
+        sources: []
+  - symptom: peaked_early
+    causes:
+      - "learning rate too high: overtraining after the peak"
+      - "model drifting away from its distillation"
+    fixes:
+      - action: "Use the checkpoint at the best probe (or about 60-70% of the last step) and delete the rest; run again with a lower rate if you need more."
+        why: "Checkpoint choice is the cheapest fix and the community's first advice."
+        confidence: CONF
+        sources: [atk_overfit_tells_2026_01, atk_ckpt_eval_2026_07]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "Peak step scales with rate (about 1,050 steps at 1e-4, about 5,000 at 5e-5); halving flattened the peak and halved the train/held-out gap in our nine-run test."
+        confidence: CONF
+        sources: [bano_h3_lr_2026_08, meas_region_2026_11]
+      - set: {likeness_patience: {op: max, value: 5}}
+        why: "Stop automatically after N probes without a new best so the run does not erode past the peak."
+        confidence: DOC
+        sources: [doc_trainer_3_28]
+  - symptom: likeness_unstable
+    causes:
+      - "single probe seed: probe noise is about 10 points"
+      - "small steps between checkpoints that all look alike"
+      - "a high learning rate"
+    fixes:
+      - set: {probe_seeds: {op: max, value: 4}}
+        why: "A single probe swings about 10 points; four to eight seeds make the curve readable."
+        confidence: MEAS
+        sources: [meas_region_2026_11, meas_krea_race_2026_11]
+      - set: {lora_ema: {value: 0.98}}
+        why: "A weight average gave about 5 likeness points above no average late in a run, with half the swing between checkpoints (measured by the Fizgig author)."
+        confidence: DOC
+        sources: [doc_trainer_3_28]
+      - action: "Compare three neighbouring checkpoints on the same prompts and seeds and pick the middle of a plateau, not a single spike."
+        why: "Spikes do not repeat."
+        confidence: CONF
+        sources: [atk_overfit_tells_2026_01]
+      - set: {learning_rate: {op: mul, value: 0.7}}
+        why: "A lower rate smooths the curve."
+        confidence: GUESS
+        sources: []
+  - symptom: lost_framing
+    causes:
+      - "overtraining: full-body prompts drift toward the training headshots"
+      - "head-only or head-and-shoulders photos dominate the set"
+      - "best-checkpoint tracking fooled by a body score from few renders"
+    fixes:
+      - action: "Pick a checkpoint from before the framing is lost (the probe table shows the share of body renders that have a body per step)."
+        why: "In our runs the best-looking combined score landed on probes where half the body renders had no body."
+        confidence: MEAS
+        sources: [meas_region_2026_11]
+      - set: {likeness_framing: {value: true}}
+        why: "Counts a body render with no body as zero, caps scores at the scale top, and stops the smoothed body score freezing."
+        confidence: MEAS
+        sources: [meas_region_2026_11]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "At 5e-5 no body render lost its body through step 1200 (vs 600-800 at 1e-4), though it collapsed later."
+        confidence: MEAS
+        sources: [meas_region_2026_11]
+      - set: {region_weights: {value: false}}
+        why: "Fixed face weights lost framing sooner (4 of 8 body renders at step 600) and memorised the training faces."
+        confidence: MEAS
+        sources: [meas_region_2026_11]
+      - action: "Add full-body and half-body photos with different clothes; a set of headshots teaches every prompt to become a headshot."
+        why: "Mix distances."
+        confidence: CONF
+        sources: [atk_dataset_mix_2026_06]
+      - set: {likeness_best_min_kept: {value: 0.5}}
+        why: "No new best checkpoint while fewer than half the body renders keep their body (never run in a real training)."
+        confidence: DOC
+        sources: [doc_trainer_3_28]
+  - symptom: memorized
+    causes:
+      - "overtraining"
+      - "tiny set or one outfit / room in a large share of the photos"
+      - "near-duplicate photos"
+      - "Isolation or fixed region weights"
+    fixes:
+      - action: "Use an earlier checkpoint; check with a prompt unlike every training image."
+        why: "Copy scores rose with steps in every run."
+        confidence: CONF
+        sources: [atk_overfit_tells_2026_01, meas_krea_race_2026_11]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "Lower rate halved the train/held-out gap (+8 vs +14 to +16) and the copy peak was lower (0.58 vs 0.55-0.64, within noise)."
+        confidence: MEAS
+        sources: [meas_region_2026_11]
+      - set: {isolation: {value: false}}
+        why: "Isolation memorised scenes (copy 0.68, face probes collapsed to one scene) and its score did not repeat."
+        confidence: MEAS
+        sources: [meas_krea_race_2026_11]
+      - set: {region_weights: {value: false}}
+        why: "Face x3 raised the train/held-out gap to +22."
+        confidence: MEAS
+        sources: [meas_region_2026_11]
+      - action: "Vary outfits, backgrounds and poses; remove near-duplicates; caption the outfit and place so they stay promptable."
+        why: "Constant outfit and setting is the main driver of a stiff LoRA."
+        confidence: CONF
+        sources: [atk_captions_2026_06, atk_dataset_size_2026_07]
+  - symptom: lr_collapsed
+    causes:
+      - "Automagic lowered its rate by itself (often 2e-6 after 100 steps on MOSS and FIBO 2)"
+    fixes:
+      - set: {automagic_min_lr: {value: 5.0e-5}}
+        why: "The author confirmed the collapse; floors of 2e-5 to 3e-5 were the first advice and users later ran 2.5e-4 to 1e-3. Raise the floor and watch the effective LR."
+        confidence: CONF
+        sources: [atk_automagic_floor_2026_10]
+      - set: {optimizer: {value: adamw}}
+        why: "AdamW has no such collapse and is the reliable fallback."
+        confidence: CONF
+        sources: [atk_automagic_floor_2026_10, atk_automagic4_2026_11]
+      - set: {optimizer: {value: automagic3}}
+        why: "If the run used automagic4 or Keel, step back to automagic3; automagic4 climbs or collapses on several models."
+        confidence: DISP
+        sources: [atk_automagic4_2026_11]
+  - symptom: nan_or_diverged
+    causes:
+      - "learning rate too high or automagic4 climbing"
+      - "torch.compile together with block swap or transformer offload"
+      - "an attention kernel that does not mix with int8"
+      - "uncapped sigma_sqrt loss weighting"
+    fixes:
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "Halve the rate; Klein collapsed at 3e-4 and recovered at lower rates."
+        confidence: CONF
+        sources: [atk_klein_lr_2026_07]
+      - set: {compile_model: {value: false}}
+        why: "torch.compile with offload gives errors and NaN (H3 and LTX)."
+        confidence: CONF
+        sources: [bano_h3_memory_2026_08]
+      - set: {attention_backend: {value: torch}}
+        why: "flash_attn plus int8 convrot breaks; PyTorch's own attention (sdpa) works."
+        confidence: CONF
+        sources: [bano_h3_memory_2026_08]
+      - set: {loss_weighting: {value: none}}
+        why: "sigma_sqrt weighting is uncapped (one step can weigh 1e6x)."
+        confidence: REP
+        sources: [bano_h3_adapters_2026_08]
+      - set: {optimizer: {value: automagic3}}
+        why: "Automagic v4 is the less stable Automagic; a P-H3-Image run was fried by v4 and not by v3."
+        confidence: CONF
+        sources: [atk_automagic4_2026_11]
+      - action: "NaNs or noisy samples in the first 400-1,250 steps often clear by step 2,500; test a later checkpoint before giving up."
+        why: "Reported twice on H3."
+        confidence: REP
+        sources: [atk_h3_failures_2026_09]
+  - symptom: out_of_memory
+    causes:
+      - "the model plus a step does not fit the card"
+      - "resolution too high"
+      - "system RAM too small for block swap"
+    fixes:
+      - set: {block_swap: {op: add, value: 8}}
+        why: "More blocks' frozen weights wait in pinned system RAM; block swap costs only a few percent of speed."
+        confidence: CONF
+        sources: [bano_h3_memory_2026_08]
+      - set: {resolutions: {value: [0.5]}}
+        why: "Half a megapixel halves the tokens per step."
+        confidence: CONF
+        sources: [bano_h3_memory_2026_08]
+      - set: {gradient_checkpointing: {value: true}}
+        why: "Saves most of the activation memory for a modest slowdown."
+        confidence: DOC
+        sources: [doc_trainer_3_28]
+      - action: "Keep 64 GB or more system RAM (plus a large pagefile on Windows) for the 21 GB H3 family; a near-full GPU may crawl instead of crashing, so stop and lower the settings if steps suddenly take several times longer."
+        why: "Near-OOM freezes instead of crashing."
+        confidence: CONF
+        sources: [bano_h3_memory_2026_08]
+  - symptom: burned
+    causes:
+      - "overtraining (late in the run)"
+      - "learning rate too high"
+      - "distilled model drifting"
+      - "burned textures: wallpaper pattern on skin, grid freckles, random birthmarks"
+    fixes:
+      - action: "Take an earlier checkpoint (burn started about 4,000 steps on one model, about 1,000 at a high rate on another)."
+        why: "Choose from saved checkpoints; test with prompts that name textures (pores, rough concrete)."
+        confidence: CONF
+        sources: [atk_burn_2026_08, bano_h3_lr_2026_08]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "AdamW 3e-4 fried by 1,000 steps; 2e-4 baked later; usual go-to is to halve."
+        confidence: CONF
+        sources: [bano_h3_lr_2026_08, atk_burn_2026_08]
+      - set: {steps: {op: mul, value: 0.6}}
+        why: "Shorter run: about 60-70% of the best step."
+        confidence: REP
+        sources: [atk_ckpt_eval_2026_07]
+  - symptom: plastic_skin
+    causes:
+      - "a turbo LoRA at full strength in the samples"
+      - "overbaked"
+      - "denoised or smoothed training photos"
+    fixes:
+      - set: {turbo_lora_strength: {value: 0.6}}
+        why: "Raw plus the turbo LoRA at 0.45-0.7 (cfg 1-2.5, 10-16 steps) gave natural skin where full strength looked plastic; four users."
+        confidence: CONF
+        sources: [atk_plastic_turbo_2026_10]
+      - action: "Render at 2-3 MP or add a 1.5x second pass, keep some natural grain in the training photos, and stop earlier."
+        why: "Plastic close-ups on turbo; denoised sets carry AI smoothness."
+        confidence: REP
+        sources: [atk_plastic_turbo_2026_10, atk_dataset_quality_2026_06]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "Overbaking smooths skin."
+        confidence: GUESS
+        sources: []
+  - symptom: washed_colors
+    causes:
+      - "a distilled model drifting away from its distillation during training"
+      - "clipped highlights or oversaturation in the photos"
+      - "wrong prediction type, VAE or precision (SDXL)"
+    fixes:
+      - set: {training_adapter: {value: auto}}
+        why: "The family's training adapter guards a distilled model; without it washed colour and clipped highlights are the first sign."
+        confidence: CONF
+        sources: [atk_distilled_guard_2026_09, bano_h3_adapters_2026_08]
+      - action: "Use an earlier checkpoint; the drift grows with steps."
+        why: "Distillation erodes with training."
+        confidence: CONF
+        sources: [bano_h3_adapters_2026_08]
+      - action: "Do a tone pass on the photos (reduce excess saturation or clipped highlights) and keep some blown highlights and crushed blacks so the set is not flat."
+        why: "Krea 2 clips highlights by itself; style LoRAs lost saturation at the wrong alpha/rank ratio."
+        confidence: REP
+        sources: [atk_dataset_quality_2026_06]
+      - action: "Before changing rank, recheck prediction type, VAE and precision (bf16 weights with 8-bit AdamW and no stochastic rounding is a precision trap)."
+        why: "Samples washed out are often a setup problem."
+        confidence: REP
+        sources: [web_offlinecreator_2026]
+  - symptom: color_shift
+    causes:
+      - "skin tone or lighting mix in the photos"
+      - "uncaptioned dominant colour (every photo in the same light)"
+      - "model-specific cast (a red hue above about 0.75 MP in image edit; a yellow tint on FIBO 2)"
+    fixes:
+      - action: "Caption skin tone and lighting if they vary in the photos, and balance the set so no single light dominates."
+        why: "A light-skinned shift on one model was fixed with caption and rank changes."
+        confidence: REP
+        sources: [web_mesmertools_2026_07]
+      - action: "Compare the checkpoint against the base model on the same seed; if the base has the cast too, it is the model, not the LoRA."
+        why: "Casts were reported on base models."
+        confidence: REP
+        sources: [web_mesmertools_2026_07]
+      - set: {learning_rate: {op: mul, value: 0.7}}
+        why: "A gentler LoRA moves the colour balance less."
+        confidence: GUESS
+        sources: []
+  - symptom: soft_blurry
+    causes:
+      - "training only at one low resolution"
+      - "blurred or smoothed photos"
+      - "lower detail of a turbo / distilled sampling model"
+    fixes:
+      - set: {resolutions: {value: [0.5, 1.0]}}
+        why: "Several resolutions (and a high-resolution end) keep detail; a 1024-only run was soft for three users."
+        confidence: REP
+        sources: [atk_soft_faces_2026_06]
+      - action: "Render with a 1.5x hires pass (raised the face match from about 40% for one user) and judge on the full-step base sampler, not the speed LoRA."
+        why: "Generation-side fix."
+        confidence: REP
+        sources: [atk_soft_faces_2026_06]
+      - action: "Check the source photos for denoise or upscale artifacts."
+        why: "Smoothness is learned."
+        confidence: REP
+        sources: [atk_dataset_quality_2026_06]
+  - symptom: noisy_grainy
+    causes:
+      - "denoise artifacts in the photos, or a noisy sampler"
+      - "too much turbo LoRA strength"
+      - "an overtrained or unstable run"
+    fixes:
+      - set: {turbo_lora_strength: {value: 0.6}}
+        why: "Lower the turbo LoRA strength."
+        confidence: REP
+        sources: [atk_plastic_turbo_2026_10]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "Grain appears late in a high-rate run (a PAN 2 run showed grain at step 600)."
+        confidence: GUESS
+        sources: []
+      - action: "Use an earlier checkpoint and check the source photos for Topaz-style denoise artifacts."
+        why: "Noisy skin in samples traced to dataset denoising."
+        confidence: REP
+        sources: [atk_dataset_quality_2026_06]
+  - symptom: identity_bleed
+    causes:
+      - "the LoRA changes weights every person shares"
+      - "two characters trained as separate LoRAs"
+      - "short or shared trigger tokens"
+    fixes:
+      - action: "Train several characters in ONE LoRA with distinct long natural-language names and about 20% group images captioned with positions; do not stack two character LoRAs."
+        why: "The most repeated bleed fix, five users."
+        confidence: CONF
+        sources: [atk_multichar_2026_08]
+      - set: {isolation: {value: true}}
+        why: "DOP plus a trigger-free pass keeps the subject's face off other people; the community is split, and our own Isolation runs memorised scenes."
+        confidence: DISP
+        sources: [atk_dop_reg_2026_08, meas_krea_race_2026_11]
+      - set: {lora_rank: {op: min, value: 8}, lora_alpha: {op: min, value: 8.0}}
+        why: "The lighter the LoRA that still reaches likeness, the less it bleeds."
+        confidence: REP
+        sources: [atk_dop_reg_2026_08]
+      - action: "Lower the LoRA strength at generation, or use an earlier checkpoint; a reg-image folder (reg_dir) at 1:1 is a user-reported but unverified option."
+        why: "Less overfit means less bleed."
+        confidence: REP
+        sources: [atk_dop_reg_2026_08]
+  - symptom: everyone_same_face
+    causes:
+      - "identity overfit onto the class word (woman / man)"
+    fixes:
+      - action: "Use a longer unique name (first and surname) in training captions and in prompts instead of a short token or the class word alone."
+        why: "Reported to restore separation."
+        confidence: REP
+        sources: [atk_dop_reg_2026_08]
+      - set: {isolation: {value: true}}
+        why: "DOP replaces the trigger with the class word in a second pass so the class stays untouched; disputed."
+        confidence: DISP
+        sources: [atk_dop_reg_2026_08, meas_krea_race_2026_11]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "Fewer or gentler steps first; lowering strength is the cheap check."
+        confidence: REP
+        sources: [atk_dop_reg_2026_08]
+  - symptom: wrong_at_distance
+    causes:
+      - "faces too small in the training buckets"
+      - "a single training resolution"
+      - "no distant shots in the set"
+    fixes:
+      - action: "Add training photos where the face is small (half-body and full-body shots) with the face still sharp."
+        why: "Insufficient examples at that scale was the explanation in two reports."
+        confidence: CONF
+        sources: [atk_distance_multires_2026_01, bano_h3_closeups_2026_08]
+      - set: {resolutions: {value: [0.5, 1.0, 1.5]}}
+        why: "Train multi-resolution so small faces occur (256-1024 together, optionally ending at the highest only)."
+        confidence: CONF
+        sources: [atk_distance_multires_2026_01]
+      - action: "Inpaint the face afterwards with the same LoRA (works on current models)."
+        why: "Generation-side repair."
+        confidence: REP
+        sources: [atk_distance_multires_2026_01]
+  - symptom: wrong_at_angles
+    causes:
+      - "all photos from one side or one angle"
+    fixes:
+      - action: "Add photos from the missing angles (profile, three-quarter, above, below, left and right). A set where 17 of 20 stills showed the left side needed nine more angles."
+        why: "The model only knows what it was shown."
+        confidence: REP
+        sources: [web_stuubzzz_2026_11]
+      - action: "Name the angle in the prompt once the LoRA knows it."
+        why: "A prompt must name what the caption named."
+        confidence: REP
+        sources: [web_stuubzzz_2026_11]
+  - symptom: wrong_body
+    causes:
+      - "only head shots (the model guesses the body)"
+      - "the body needs more steps than the face"
+      - "full-body photos are too small or too few"
+    fixes:
+      - action: "Mix head, half-body and full-body shots; the build is learned from whole photos, not crops."
+        why: "Five users, several models."
+        confidence: CONF
+        sources: [atk_dataset_mix_2026_06]
+      - set: {steps: {op: mul, value: 1.3}}
+        why: "The face locked at about 3,100 steps in one report and the body later."
+        confidence: REP
+        sources: [atk_dataset_mix_2026_06]
+      - set: {crop_augment: {value: none}}
+        why: "Crops teach face and bust; for the build train on the whole photos."
+        confidence: GUESS
+        sources: []
+  - symptom: same_pose_outfit
+    causes:
+      - "overtraining"
+      - "tiny set (5 images repeat the background)"
+      - "one outfit or room in a large share of the photos"
+    fixes:
+      - action: "Use 20+ varied photos; vary outfits and backgrounds; caption outfit and place so they stay controllable."
+        why: "Outfit bleed appears even with captions if the outfit repeats a lot."
+        confidence: CONF
+        sources: [atk_dataset_size_2026_07, atk_captions_2026_06]
+      - action: "Use an earlier checkpoint and test with a prompt unlike any training image (red hair, other clothes)."
+        why: "Memorised looks arrive with steps."
+        confidence: CONF
+        sources: [atk_overfit_tells_2026_01]
+      - set: {learning_rate: {op: mul, value: 0.7}}
+        why: "Gentler training memorises less."
+        confidence: MEAS
+        sources: [meas_region_2026_11]
+  - symptom: trigger_as_text
+    causes:
+      - "the trigger is gibberish with digits or symbols"
+    fixes:
+      - action: "Rename the trigger to a real-word-style name without digits or symbols and re-caption; avoid LLM rewriters that change it."
+        why: "Four users; the rate stays around 1% even then."
+        confidence: CONF
+        sources: [atk_trigger_text_2026_07]
+  - symptom: needs_high_strength
+    causes:
+      - "undertrained"
+      - "trained on a different checkpoint than it is used on (Raw vs Turbo)"
+      - "the inference stack applies the LoRA weaker"
+    fixes:
+      - set: {learning_rate: {op: mul, value: 1.5}}
+        why: "Lowering the weight loses likeness, so train more instead of pushing strength."
+        confidence: REP
+        sources: [atk_strength_2026_07]
+      - set: {steps: {op: mul, value: 1.3}}
+        why: "As above."
+        confidence: REP
+        sources: [atk_strength_2026_07]
+      - action: "Train on Base/Raw and run Base plus a partial turbo LoRA; 15-20 turbo steps gave better likeness than 8 for one user."
+        why: "Matching the training and inference models."
+        confidence: REP
+        sources: [atk_strength_2026_07]
+  - symptom: too_strong
+    causes:
+      - "overtraining"
+      - "a guidance-loss or distilled-guidance LoRA (over-applied at strength 1.0)"
+    fixes:
+      - action: "Lower the LoRA strength to 0.6-0.85 and use an earlier checkpoint."
+        why: "Shown for contrastive-guidance LoRAs; also the usual cure for overtrained ones."
+        confidence: CONF
+        sources: [bano_h3_cg_2026_08, atk_overfit_tells_2026_01]
+      - set: {steps: {op: mul, value: 0.7}}
+        why: "Shorter run."
+        confidence: REP
+        sources: [atk_ckpt_eval_2026_07]
+  - symptom: deformed_bodies
+    causes:
+      - "learning rate too high (Klein 9B)"
+      - "an image LoRA used on an edit model"
+    fixes:
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "Retrain at a lower rate fixed body horror on Klein for three users."
+        confidence: CONF
+        sources: [atk_klein_lr_2026_07]
+      - action: "Add more full-body shots; use a LoRA trained as an edit LoRA (with reference pairs) on an edit model."
+        why: "A text-to-image LoRA on an edit model disfigures people."
+        confidence: REP
+        sources: [atk_klein_lr_2026_07]
+  - symptom: lost_motion
+    causes:
+      - "photos only: all blocks trained cut motion by about half on a video model"
+    fixes:
+      - set: {lora_blocks: {value: "20-49"}}
+        why: "On the H3 video model the first 20 blocks carry motion; training only 20-49 on stills kept it. Only for video models."
+        confidence: CONF
+        sources: [bano_h3_blocks_2026_09]
+      - action: "Mix in short clips (keep the video share meaningful) or add low-resolution video after the image phase."
+        why: "Clips teach motion directly."
+        confidence: REP
+        sources: [bano_h3_mix_2026_09]
+  - symptom: bad_audio
+    causes:
+      - "audio shares layers with video; voice overtrains fast and starves with many images"
+      - "ref2va adapters were not trained with reference audio"
+      - "background music in the clips"
+    fixes:
+      - action: "RulZ AI Trainer trains the video only (audio never enters the loss): fix voice in a trainer that trains audio. In any trainer, keep the video loss at 0.7-1.0 while raising audio (video 1.0 / audio 0.7 worked), and strip background music from clips."
+        why: "One user got good voice with video 0.2 but motion drifted."
+        confidence: REP
+        sources: [bano_h3_audio_2026_10]
+      - action: "Try the fl2va training adapter or no adapter if reference audio is garbled."
+        why: "The adapters were not trained with reference audio."
+        confidence: REP
+        sources: [bano_h3_adapters_2026_08]
+  - symptom: ignores_prompt
+    causes:
+      - "overfit: prompt adherence is lost late"
+      - "empty or poor captions on a strongly text-conditioned model"
+      - "memorised set"
+    fixes:
+      - action: "Use an earlier checkpoint; check with a prompt unlike all training images."
+        why: "Prompt following goes first as a run overfits."
+        confidence: CONF
+        sources: [atk_overfit_tells_2026_01]
+      - action: "Make the captions describe what changes (clothes, place, pose) and avoid blank caption files."
+        why: "Bad captions are worse than none, and blank ones are harmful on text-conditioned models."
+        confidence: REP
+        sources: [atk_captions_2026_06, bano_h3_captions_2026_08]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "320 images at 6,000 steps lost adherence at 3,000-5,000."
+        confidence: REP
+        sources: [atk_h3_failures_2026_09]
+
+dataset_rules:
+  - id: few_images
+    text: "Under about 10 images the LoRA tends to be stiff, copy backgrounds and keep one expression. Aim for 20-35 varied images; with fewer, stay at low rank, stop early and expect to see the same pose."
+  - id: many_images
+    text: "Over about 100 images rarely helps (170 images were no better than 30). Cull to the best 30-60 unless you have varied clothes, places and light for a big set; a big set needs fewer epochs, not more steps."
+  - id: small_images
+    text: "Images with a shortest side under 512 px are upscaled in training: only the sharp ones help. Replace or drop them; below 1024 px faces get few details."
+  - id: duplicates
+    text: "Near-duplicate pairs give one scene extra weight, inflate the copy score and leak between training and held-out photos. Keep the better of each pair."
+  - id: no_captions
+    text: "Fewer than 80% of the images have a caption file. Write captions that describe clothes, pose, place and light and name the person with the trigger; blank captions are worse than short ones."
+  - id: trigger_missing
+    text: "The trigger word is not in at least 60% of the first caption words or captions. Put the same trigger in EVERY caption (one missing from some captions was the usual reason for no likeness)."
+  - id: trigger_bad_chars
+    text: "A trigger with digits or symbols prints as text in the images. Use a real-word-style name."
+  - id: low_median_mp
+    text: "The median image is under about 0.4 MP: training above that only upscales. Use half a megapixel, or find larger copies of the photos."
+  - id: few_closeups
+    text: "Few photos with the face large in the frame. Include close-ups (head and shoulders to full face) so the face has detail; crop_augment adds face crops if you have none."
+  - id: one_framing
+    text: "All photos have the same framing. Mix close-ups, half-body and full-body shots, left and right, from above and below."
+  - id: no_distant_shots
+    text: "No photos where the face is small in the frame. The face will be wrong at distance; add some half-body and full-body shots and train at several resolutions."
+  - id: same_outfit_background
+    text: "One outfit, hairstyle or room fills a big share of the photos. It will be baked in even when captioned; vary clothes, places and light, or crop the repeats down."
+  - id: text_or_watermarks
+    text: "Photos with text, logos or watermarks. Caption them or remove them, or the trigger drags them in."
+  - id: smoothed_photos
+    text: "Denoised, upscaled or AI-smoothed photos teach plastic skin. Prefer natural grain; run a tone pass on oversaturated or clipped photos."
+  - id: other_people
+    text: "Other people in the photos: caption them (the character is second from the right) or crop them out."
+
+sources:
+  # --- community: AI Toolkit Discord (several channels), cross-model ---
+  atk_captions_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #general and #training-images"
+    date: "2026-06"
+    people: 6
+    url: null
+    note: "Name in every caption; caption what you do not want baked in; natural short captions. Camps disagree only about trigger-only vs described captions, tattoos and glasses."
+  atk_subject_noun_2026_07:
+    kind: community
+    where: "AI Toolkit Discord #general"
+    date: "2026-07"
+    people: 2
+    url: null
+    note: "One subject noun in every caption (two people appeared with 'the human' vs 'the big human')."
+  atk_trigger_text_2026_07:
+    kind: community
+    where: "AI Toolkit Discord #general"
+    date: "2026-07"
+    people: 4
+    url: null
+    note: "Digits and symbols in a trigger print as text; rate stays about 1%. A name that already means something drags that concept in (one user, three cases)."
+  atk_dataset_size_2026_07:
+    kind: community
+    where: "AI Toolkit Discord #general and #training-images"
+    date: "2026-07"
+    people: 4
+    url: null
+    note: "10 to 200 images all fine at 2,500 steps; cull rather than add; under 7-10 images stiff."
+  atk_dataset_mix_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #general"
+    date: "2026-06"
+    people: 5
+    url: null
+    note: "Various angles and distances rule repeated across models; ratio numbers are thin."
+  atk_dataset_quality_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #general and #training-images"
+    date: "2026-08"
+    people: 3
+    url: null
+    note: "Denoised, upscaled or AI-rendered photos carry smoothness or noise; tone clean-up of clipped highlights."
+  atk_bg_removal_2026:
+    kind: community
+    where: "AI Toolkit Discord #general"
+    date: "2026-07"
+    people: 4
+    url: null
+    note: "For and against background removal; the main advocate later reintroduced backgrounds."
+  atk_distance_multires_2026_01:
+    kind: community
+    where: "AI Toolkit Discord #general"
+    date: "2026-01"
+    people: 4
+    url: null
+    note: "Multi-resolution (256-1024) so far shots exist; inpaint the face with the same LoRA."
+  atk_multichar_2026_08:
+    kind: community
+    where: "AI Toolkit Discord #general and #training-images"
+    date: "2026-08"
+    people: 5
+    url: null
+    note: "One LoRA, distinct long names, about 20% group images with positions; LoKr alone did not fix bleed."
+  atk_dop_reg_2026_08:
+    kind: community
+    where: "AI Toolkit Discord #general and #training-images"
+    date: "2026-10"
+    people: 7
+    url: null
+    note: "DOP and regularisation images: worked on one model and not another, slower, not compatible with cached text embeddings on some builds; 1:1 reg set reported by one user."
+  atk_ckpt_eval_2026_07:
+    kind: community
+    where: "AI Toolkit Discord #general and #training-images (the AI Toolkit author among them)"
+    date: "2026-07"
+    people: 4
+    url: null
+    note: "Loss graph is not a good indicator at small batch; held-out images with fixed noise; validation-loss curves show an overtraining mountain; face-match numbers in use."
+  atk_overfit_tells_2026_01:
+    kind: community
+    where: "AI Toolkit Discord #general"
+    date: "2026-01"
+    people: 3
+    url: null
+    note: "Likeness tends to get better while overfitting; waves; test with a prompt unlike the data; prompt disobedience and patterns creeping in are tells."
+  atk_trainer_vs_comfy_2026_08:
+    kind: community
+    where: "AI Toolkit Discord #general"
+    date: "2026-09"
+    people: 3
+    url: null
+    note: "Trainer samples look wrong while the file is fine in ComfyUI; inference is the goal."
+  atk_distilled_guard_2026_09:
+    kind: community
+    where: "AI Toolkit Discord #general, #development and #new_models"
+    date: "2026-09"
+    people: 5
+    url: null
+    note: "Distilled checkpoints need an adapter, a guidance loss or training on base; seen on H3, Qwen 2.1, Z-Image and Krea Turbo."
+  atk_timestep_2026_07:
+    kind: community
+    where: "AI Toolkit Discord #training-images and #development"
+    date: "2026-07"
+    people: 3
+    url: null
+    note: "Sigmoid for likeness; linear clearly worse among about 15 settings; weighted best for fine detail; the author: the target matters more than the model."
+  atk_rank_lokr_2026:
+    kind: community
+    where: "AI Toolkit Discord #general and #training-images"
+    date: "2026-08"
+    people: 6
+    url: null
+    note: "LoKr factor 4-8 or LoRA rank 8-16 for one person; big rank overfits small sets; auto factor makes tiny files; a 1.4 GB LoKr is full-matrix."
+  atk_lr_scaling_2026_11:
+    kind: community
+    where: "AI Toolkit Discord #general"
+    date: "2026-11"
+    people: 2
+    url: null
+    note: "AI Toolkit does not scale LR with batch size; larger batch needs 1.5-2.5x steps; no batch for characters, fine for style."
+  atk_steps_per_image_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #general and #training-images"
+    date: "2026-06"
+    people: 4
+    url: null
+    note: "About 100 steps per image for Z-Image/Klein-class models; Krea 2 and FIBO 2 are faster; over 10k steps means something is off."
+  atk_automagic_floor_2026_10:
+    kind: community
+    where: "AI Toolkit Discord #development and #new_models"
+    date: "2026-10"
+    people: 4
+    url: null
+    note: "Automagic's LR collapses (author confirmed 2026-09); users now run floors from 2e-5 to 1e-3; log the effective LR."
+  atk_automagic4_2026_11:
+    kind: community
+    where: "AI Toolkit Discord #development and #new_models"
+    date: "2026-11"
+    people: 6
+    url: null
+    note: "Automagic v4: fried P-H3-Image where v3 did not; LR climbs on MOSS; better on FIBO 2 for one user; the author advised v3 until a rework."
+  atk_plastic_turbo_2026_10:
+    kind: community
+    where: "AI Toolkit Discord #general"
+    date: "2026-10"
+    people: 4
+    url: null
+    note: "Plastic skin on a turbo model at full strength; raw plus a turbo LoRA at 0.45-0.7 fixes it."
+  atk_soft_faces_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #general and #training-images"
+    date: "2026-06"
+    people: 3
+    url: null
+    note: "Soft faces from 1024-only training; hires fix 1.5x; train 768 and 1024."
+  atk_burn_2026_08:
+    kind: community
+    where: "AI Toolkit Discord #general"
+    date: "2026-08"
+    people: 2
+    url: null
+    note: "Burned textures about 4,000 steps on Krea 2 for one user; another saw 8,000 steps still fine (disputed number)."
+  atk_klein_lr_2026_07:
+    kind: community
+    where: "AI Toolkit Discord #general"
+    date: "2026-07"
+    people: 3
+    url: null
+    note: "Klein 9B deformed bodies and collapses at high LR; retrain lower."
+  atk_strength_2026_07:
+    kind: community
+    where: "AI Toolkit Discord #general"
+    date: "2026-07"
+    people: 3
+    url: null
+    note: "Identity LoRAs that only work above 1.0; turbo adapters made identity LoRAs burn at 1.0; 15-20 turbo steps gave better likeness than 8."
+  atk_h3_failures_2026_09:
+    kind: community
+    where: "AI Toolkit Discord #general"
+    date: "2026-09"
+    people: 2
+    url: null
+    note: "320 images at 6,000 steps warped before 3,000 and lost adherence 3,000-5,000; noise at 500-1,250 recovering by 2,500."
+  # --- H3 family sources shared by the three MiniMax files ---
+  bano_h3_adapters_2026_08:
+    kind: community
+    where: "banodoco Discord #minimax_h3_training and #minimax_h3_chatter"
+    date: "2026-08"
+    people: 5
+    url: null
+    note: "H3 is CFG-distilled; plain flow-match training erases the distillation (washed colour, clipped highlights, broken motion and audio); adapter, contrastive-guidance loss and base preservation were each tried."
+  bano_h3_cg_2026_08:
+    kind: community
+    where: "banodoco Discord #minimax_h3_training"
+    date: "2026-10"
+    people: 4
+    url: null
+    note: "Contrastive guidance scale 3-3.5 consensus; LoRAs trained with it look over-applied at strength 1.0."
+  bano_h3_lr_2026_08:
+    kind: community
+    where: "banodoco Discord #minimax_h3_training and AI Toolkit Discord #minimax_h3"
+    date: "2026-10"
+    people: 2
+    url: null
+    note: "AdamW 3e-4 learned likeness at about 250 steps and fried by 1,000; 2e-4 baked later and peaked about 1,000-1,200; 1e-4 peaks about 1,050 then erodes and 5e-5 about 5,000. Different datasets, so confounded."
+  bano_h3_blocks_2026_09:
+    kind: community
+    where: "banodoco Discord #minimax_h3_training and #minimax_h3_chatter"
+    date: "2026-09"
+    people: 4
+    url: null
+    note: "Image-only training of the video model: all 50 blocks cut motion by about half; train blocks 20-49. Every second block reported to keep 85-90% (unverified)."
+  bano_h3_closeups_2026_08:
+    kind: community
+    where: "banodoco Discord #minimax_h3_training and AI Toolkit Discord #minimax_h3"
+    date: "2026-08"
+    people: 3
+    url: null
+    note: "Close-ups required; distant faces need distant examples; one run used 70 mostly upper-body images, another 20 with 14 close-ups."
+  bano_h3_mix_2026_09:
+    kind: community
+    where: "banodoco Discord #minimax_h3_training"
+    date: "2026-09"
+    people: 2
+    url: null
+    note: "Images first (3-5k steps), then low-resolution video; image:video about 4:1 per batch."
+  bano_h3_audio_2026_10:
+    kind: community
+    where: "banodoco Discord #minimax_h3_training"
+    date: "2026-10"
+    people: 1
+    url: null
+    note: "Video loss 1.0 / audio 0.7 with image microbatch 4 gave good voice and likeness at about 1,200-1,800 steps; video 0.2 gave voice but motion drift."
+  bano_h3_captions_2026_08:
+    kind: community
+    where: "banodoco Discord #minimax_h3_training and AI Toolkit Discord #minimax_h3"
+    date: "2026-08"
+    people: 4
+    url: null
+    note: "Caption camps disagree (mutable traits only vs minimal); blank captions are harmful on this strongly text-conditioned model."
+  bano_h3_memory_2026_08:
+    kind: community
+    where: "banodoco Discord #minimax_h3_training and AI Toolkit Discord #minimax_h3"
+    date: "2026-09"
+    people: 4
+    url: null
+    note: "Block swap nearly free, torch.compile plus offload gives errors and NaN, flash_attn plus int8 convrot breaks, 16 GB laptop and 24 GB cards need 64 GB RAM."
+  # --- web ---
+  web_caption_what_changes:
+    kind: web
+    where: "Public LoRA guides (SDXL character guide, a 2026 base-model comparison, an H3 LoRA tutorial)"
+    date: "2026-07"
+    people: null
+    url: "https://github.com/mikeabakumoff/sdxl-character-lora-guide"
+    note: "Caption what changes (pose, clothes, place, light, camera) and let the trigger carry identity; also repeated in the H3 and MesmerTools pages."
+  web_mesmertools_2026_07:
+    kind: web
+    where: "MesmerTools blog, best base model for LoRA training"
+    date: "2026-07"
+    people: null
+    url: "https://mesmer.tools/blog/best-base-model-for-lora-training-2026"
+    note: "Model comparison for person likeness; one early run lightened skin tone, fixed with caption and rank changes."
+  web_stuubzzz_2026_11:
+    kind: web
+    where: "stuubzzz.studio H3 character LoRA tutorial"
+    date: "2026-11"
+    people: null
+    url: "https://stuubzzz.studio/blog/train-minimax-h3-character-lora-ai-toolkit/"
+    note: "29 three-second clips, ref2va adapter v2, rank 16, 1e-4, 4,000 steps; best 3,000; a one-sided set (17 of 20 left side) needed nine more angles."
+  web_offlinecreator_2026:
+    kind: web
+    where: "offlinecreator.com SDXL character LoRA guide"
+    date: "2026-06"
+    people: null
+    url: null
+    note: "Washed-out samples: recheck prediction type, VAE and precision before changing rank. No numbers given."
+  # --- trainer documentation ---
+  doc_trainer_3_28:
+    kind: official
+    where: "RulZ AI Trainer 3.28.0 documentation, wizard and config.py"
+    date: "2026-11"
+    people: null
+    url: null
+    note: "Defaults, valid values and per-arch recommendations of the trainer; the Fizgig-measured weight average (lora_ema 0.98) and its notes on ComfyUI dynamic VRAM making H3-Image LoRAs about 15% weaker."
+  # --- measured: RulZ AI Trainer's own runs on rented GPUs (no dataset names) ---
+  meas_region_2026_11:
+    kind: measured
+    where: "RulZ AI Trainer own runs on a rented RTX 5090 (a fine-tuned Qwen-Image 2.1, small fictional test set, 9 runs)"
+    date: "2026-11"
+    people: null
+    url: null
+    note: "Region watch, sweeps, held-out photos, class weights, steering, seeds 42-45 and lr 5e-5: sweeps repeat, probes do not, fixed weights hurt, lr 5e-5 helped, framing lost in 8 of 9 best checkpoints."
+  meas_krea_race_2026_11:
+    kind: measured
+    where: "RulZ AI Trainer own races on a rented GPU (Krea 2, small fictional test set, races A-F plus single runs)"
+    date: "2026-11"
+    people: null
+    url: null
+    note: "OFT +12 on two seeds, Keel +7 face once, Isolation 54 then 32, step-up and reward single runs not credited; plain-AdamW pool mean about 31, sd about 2.7."
+  meas_qwen_optim_2026_11:
+    kind: measured
+    where: "RulZ AI Trainer own runs on a rented RTX 5090 (Qwen-Image 2.1, small fictional test set)"
+    date: "2026-11"
+    people: null
+    url: null
+    note: "AdamW, Muon, Keel, OFT rows; OFT overtrained at 1e-4 and held face and framing at 5e-5; all rows lost body framing."
+  meas_keel_2026_11:
+    kind: measured
+    where: "RulZ AI Trainer own Keel and Hull runs (local and rented GPU, fictional test sets)"
+    date: "2026-11"
+    people: null
+    url: null
+    note: "Hull tied AdamW over repeats; Keel gains did not repeat on the body; Keel used the old 1e-8 Automagic floor."
+  meas_probes_2026_11:
+    kind: measured
+    where: "RulZ AI Trainer own probe, face-score and run tests (offline on about 2,900 saved renders; live runs)"
+    date: "2026-11"
+    people: null
+    url: null
+    note: "ArcFace, FaceNet and AdaFace compared; a face_refs picture without a face silently disables probes; CPU side jobs slowed a live run."

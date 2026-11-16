@@ -1,0 +1,328 @@
+# FLUX.3 Klein: character LoRA starting recipe (a weak one: characters are widely reported as worse than on FLUX.2 Klein).
+# Public file: no handles, no personal details, no dataset names. Shared sources are in general.yaml.
+id: flux3_klein
+name: FLUX.3 Klein
+kind: image
+updated: 2026-11-16
+summary: >-
+  Do not start a person here if another model is an option: in the first weeks after release (October 2026) several
+  independent users got no likeness or a poor one on FLUX.3 Klein where FLUX.2 Klein 9B, Krea 2 and Qwen-Image 2.1 worked
+  on the same photos (a FLUX.2 checkpoint at 200 steps beat FLUX.3 at 7,500). The only partial success used Adafactor with
+  sigmoid timesteps, not automagic, whose LR sagged without a face appearing. This file therefore gives Black Forest Labs'
+  vendor recipe (rank 32, 1e-4, 200 warm-up steps, about 4,000 steps) with that optimizer swap; none of it is a verified
+  character recipe. Train on the Base model and judge on Base at 50 steps, CFG 3.5.
+model_preset: FLUX-3-Klein-Base
+model_path: black-forest-labs/flux-3-image-klein-base
+facts:
+  - text: "FLUX.3 Klein released on 2026-10-15. Within 48 hours several users reported weak or no likeness: automagic v3 fell from 1e-4 to 5.8e-5 with no likeness at 800 steps where Krea 2 and Qwen-Image 2.1 show a face; 3,000 steps were still 'awful'; the same photos and settings gave a much better FLUX.2 identity at the same step count; a self-trained set looked like a 'sleep paralysis demon'; a FLUX.2 checkpoint at 200 steps beat FLUX.3 at 7,500; one user's same dataset was weaker than on Qwen-Image 2.1."
+    confidence: CONF
+    sources: [f3_neg_2026_10]
+  - text: "Styles, concepts and edits with target and control images train well on FLUX.3 (the most stable training one user had seen, best photoreal style likeness he had seen with the base preserved, limited by base anatomy). That is style, not a person. Two users say edit pairs get memorised instead of the style being learned."
+    confidence: REP
+    sources: [f3_neg_2026_10]
+  - text: "The only reported partial success for a person: Adafactor with sigmoid timesteps 'started doing something' after automagic v3 did not; another user had found that pair good on FLUX.2. Nobody posted a finished FLUX.3 character, and nobody posted an automagic floor (2e-5 to 3e-5, the Qwen and MOSS fix) on it."
+    confidence: REP
+    sources: [f3_adafactor_2026_10]
+  - text: "Rank was not the difference: ranks 16 and 32 at defaults both gave little character success. One user suspects the captions do not match the model's prompt upsampler (the model expects LLM-expanded prompts); untested."
+    confidence: REP
+    sources: [f3_neg_2026_10]
+  - text: "Vendor recipe (a style example, not a character): rank and alpha 32, AdamW with betas 0.9 and 0.95, LR 1e-4, 200 warm-up steps then constant, batch 1, 4,000 steps with a checkpoint every 250, about 1 MP at native aspect ratio, 20 images, about 4.5 h on one GPU; captions describe the image and end with the trigger phrase. A Diffusers example used rank 16, 1e-4 and 1,500 steps. Timestep shift is not stated."
+    confidence: DOC
+    sources: [web_bfl_f3_docs_2026_10]
+  - text: "Judge on the Base model at 50 steps and CFG 3.5-4 with a heavy negative prompt; 2 MP and 40-step samples looked horrible. With a distilled or 'SD' LoRA, 0.4 at 16 steps and CFG 3, or about 0.8 at 20 steps and CFG up to 3, are the quoted settings. Humans want more than 16 steps on the distilled model. Plastic skin on realism is a base-model complaint, not a LoRA overcook."
+    confidence: CONF
+    sources: [f3_eval_2026_10]
+  - text: "FLUX.2 Klein LoRAs do not load on FLUX.3. A control-image bug (only one control image used) was reported fixed on 2026-10-17/18; verify control pairs if you train edits. Base FLUX.3 refused mild nudity that FLUX.2 learned (one user)."
+    confidence: REP
+    sources: [f3_neg_2026_10]
+  - text: "RulZ AI Trainer has no turbo LoRA and no training adapter for FLUX.3 Klein: nobody publishes a turbo LoRA that loads without custom nodes, so previews and probes run on Base at full steps (about 2.5 min for a 1 MP preview on a 16 GB card). The trainer's wizard recipe is the vendor's (about 200 epochs of the set, up to 4,000 steps, warm-up 200, save every 250)."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+base:
+  network_type:
+    value: lora
+    why: "The vendor recipe is a plain LoRA; no LoKr or OFT comparison exists for FLUX.3 characters."
+    confidence: DOC
+    sources: [web_bfl_f3_docs_2026_10]
+  lora_rank:
+    value: 32
+    why: "The vendor's rank (alpha equal), which is also the wizard's value. Ranks 16 and 32 both gave little success, so rank is not the lever."
+    confidence: DOC
+    sources: [web_bfl_f3_docs_2026_10, f3_neg_2026_10]
+  lora_alpha:
+    value: 32.0
+    why: "Alpha equals rank."
+    confidence: DOC
+    sources: [web_bfl_f3_docs_2026_10]
+  optimizer:
+    value: adafactor
+    why: "Both sides: the vendor's table uses AdamW; the only reported partial character success used Adafactor with sigmoid, while automagic v3's LR sagged and no face appeared. Adafactor is taken from the single positive report."
+    confidence: REP
+    sources: [f3_adafactor_2026_10, web_bfl_f3_docs_2026_10]
+  learning_rate:
+    value: 1.0e-4
+    why: "The vendor's rate (for AdamW; not verified with Adafactor). Another source lowers to 5e-5 if training collapses."
+    confidence: DOC
+    sources: [web_bfl_f3_docs_2026_10, doc_trainer_3_28]
+  lr_scheduler:
+    value: constant
+    why: "The vendor recipe: constant after the warm-up."
+    confidence: DOC
+    sources: [web_bfl_f3_docs_2026_10]
+  warmup_steps:
+    value: 200
+    why: "The vendor recipe's 200 warm-up steps."
+    confidence: DOC
+    sources: [web_bfl_f3_docs_2026_10]
+  timestep_sampling:
+    value: logit_normal
+    why: "RulZ AI Trainer's name for the sigmoid in the only positive report. The trainer's 'reference' curve is a constant shift of 6.93, a guess about an unpublished recipe."
+    confidence: REP
+    sources: [f3_adafactor_2026_10]
+  batch_size:
+    value: 1
+    why: "The vendor recipe uses batch 1."
+    confidence: DOC
+    sources: [web_bfl_f3_docs_2026_10]
+  resolutions:
+    value: [0.5, 1.0]
+    why: "The vendor trains at about 1 MP; mixed sizes from 256/512 up were advised for FLUX.3 and give far shots. Half a megapixel keeps the first checkpoints quick."
+    confidence: REP
+    sources: [web_bfl_f3_docs_2026_10, f3_eval_2026_10]
+  isolation:
+    value: false
+    why: "DOP is unmeasured on FLUX.3 and costs 1.5-2x the time; the first goal is to get any likeness at all."
+    confidence: GUESS
+    sources: []
+  probe_steps:
+    value: 28
+    why: "Base needs many steps; one trainer previews at 28 steps and CFG 3.5, a compromise against the 50 of the quality path (a 50-step probe costs minutes)."
+    confidence: REP
+    sources: [web_academia_2026_11, f3_eval_2026_10]
+  probe_cfg:
+    value: 3.5
+    why: "CFG 3.5 is the vendor's guidance for Base."
+    confidence: DOC
+    sources: [web_bfl_f3_docs_2026_10]
+  probe_seeds:
+    value: 4
+    why: "A single probe swings about 10 points between seeds; four seeds give a curve you can read."
+    confidence: MEAS
+    sources: [meas_region_2026_11, meas_krea_race_2026_11]
+  likeness_framing:
+    value: true
+    why: "Counts a body render with no body as zero so best-checkpoint tracking is not fooled by lost framing."
+    confidence: MEAS
+    sources: [meas_region_2026_11]
+  copy_check:
+    value: "on"
+    why: "Logs the copy score with the probes so a memorised checkpoint shows."
+    confidence: MEAS
+    sources: [meas_krea_race_2026_11]
+steps:
+  epochs: 200
+  min: 1500
+  max: 4000
+  round_to: 50
+  why: "Both sides: the vendor recipe is about 200 epochs of 20 images (4,000 steps) and the wizard follows it, but a FLUX.2 checkpoint at 200 steps beat FLUX.3 at 7,500 and 3,000 steps were still awful, so more steps are not the fix. Probes every ~10% show whether a face ever appears; stop a plainly failing run early."
+  confidence: DISP
+  sources: [web_bfl_f3_docs_2026_10, doc_trainer_3_28, f3_neg_2026_10]
+adjust:
+  - id: tiny_dataset
+    when: {images_max: 14}
+    set:
+      lora_rank: {value: 16, why: "A small set overfits a big adapter; rank 16 is the Diffusers example (rank was not the difference on FLUX.3).", confidence: REP, sources: [web_bfl_f3_docs_2026_10, f3_neg_2026_10]}
+      lora_alpha: {value: 16.0, why: "Alpha equals rank.", confidence: DOC, sources: [web_bfl_f3_docs_2026_10]}
+    note: "Under 15 images the LoRA is stiff and copies the background; add photos first. The step minimum is 1,500, so a 10-image set runs 150 epochs: stop at the first good probe."
+  - id: small_dataset
+    when: {images_min: 15, images_max: 40}
+    set:
+      holdout_images: {value: 3, why: "Three held-out photos let the sweeps show where the subject stops being learned (measured on a Qwen-Image 2.1 fine-tune; never run on FLUX.3).", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "A sweep every 4 epochs costs little on a small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "The vendor recipe is made for about 20 images."
+  - id: large_dataset
+    when: {images_min: 80}
+    set:
+      holdout_images: {value: 8, why: "Up to a fifth of the set may be held out; eight photos give a steadier held-out curve.", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "As for the small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "80+ images: the step cap (4,000) gives under 50 epochs. Nothing about large sets is known for FLUX.3."
+  - id: goal_quick
+    when: {goal: quick}
+    set:
+      resolutions: {value: [0.5], why: "Half a megapixel keeps the first test short.", confidence: GUESS, sources: []}
+      probe_seeds: {value: 2, why: "A first test needs a rough read only.", confidence: GUESS, sources: []}
+    note: "A quick FLUX.3 test is a go/no-go: if no face shows by about 800 steps, move the dataset to FLUX.2 Klein 9B, Krea 2 or Qwen-Image 2.1."
+  - id: goal_likeness
+    when: {goal: likeness}
+    set:
+      probe_seeds: {value: 6, why: "More probe seeds make the best checkpoint reliable.", confidence: MEAS, sources: [meas_krea_race_2026_11]}
+    note: "If the closest likeness matters more than FLUX.3's strengths (style, edits), use FLUX.2 Klein 9B instead."
+  - id: focus_face
+    when: {focus: face}
+    set:
+      crop_augment: {value: face, why: "Close-ups teach the face's detail; bust crops would mostly teach the build.", confidence: DOC, sources: [doc_trainer_3_28]}
+      face_weight: {value: 1.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+      body_weight: {value: 0.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: focus_face_body
+    when: {focus: face_body}
+    set:
+      crop_augment: {value: face+bust, why: "Close-ups for the face, head-and-shoulders crops between them and the whole photos; the build comes from the whole photos.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "Body mangling is a base-model limit at low steps: sample at 50 steps, CFG 3.5 with a negative prompt, and expect it to stay imperfect."
+  - id: low_median_mp
+    when: {median_mp_max: 0.4}
+    set:
+      resolutions: {value: [0.25], why: "The photos are under 0.4 MP: training above their size only upscales them.", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: no_captions
+    when: {has_captions: false}
+    set:
+      caption_dropout: {value: 0.0, why: "Most images have no caption file, so there is nothing to drop.", confidence: GUESS, sources: []}
+    note: "The vendor's captions describe the image (content only) and end with the trigger phrase; a caption such as 'trigger standing, wearing X' taught nothing on a related model."
+  - id: vram_24
+    when: {vram_max_gb: 24}
+    set:
+      text_encoder_quant: {value: auto, why: "The 9 GB text encoder fits a 24 GB card; the trainer's auto picks for the memory it runs in.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "bf16 (9.7 GB) fits a 16 GB card; a 1 MP step peaked at 12.2 GB."
+  - id: vram_16
+    when: {vram_max_gb: 16}
+    set:
+      text_encoder_quant: {value: int8, why: "Halves the 9 GB text encoder so it fits on a small card for caching (the trainer's wizard picks int8 under 13 GB).", confidence: DOC, sources: [doc_trainer_3_28]}
+      gradient_checkpointing: {value: true, why: "Saves most activation memory; needed on small cards.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "Not run on a card this small here. Under 10 GB the trainer uses int8 for the transformer and NVFP4 below that."
+evaluate:
+  strength: "1.0; a 130% LoRA with a heavy negative gave less body-mangling for one user and was still not worth it against other models."
+  sampler: "Base model, not distilled; ComfyUI with the model's own scheduler. Expects LLM-expanded prompts."
+  steps: "50 on Base (the quality path); a distilled or SD LoRA at 0.4 with 16 steps, or at about 0.8 with 20 steps. Trainer probes use 28."
+  cfg: "3.5-4 on Base with a heavy negative; about 3 with a distilled LoRA."
+  notes:
+    - "Judge at 50 steps and CFG 3.5 before blaming the LoRA; 2 MP and 40-step samples looked horrible."
+    - "Save every 250 steps (the vendor's cadence) and test whether a face appears by about 800 steps; if not, switch models rather than training to 7,500."
+    - "Look for the 'sleep paralysis' look, body mangling and plastic skin; skin plastic is largely the base model."
+    - "FLUX.2 Klein LoRAs do not load here."
+flaws:
+  - symptom: no_likeness
+    causes:
+      - "the model: characters were weak for several users from release"
+      - "automagic's LR sagged (1e-4 to 5.8e-5) without likeness"
+      - "captions that do not match the model's prompt upsampler (suspected)"
+    fixes:
+      - set: {optimizer: {value: adafactor}, timestep_sampling: {value: logit_normal}}
+        why: "Adafactor with sigmoid was the only setting that started to show a face on FLUX.3, and another user found the pair good on FLUX.2."
+        confidence: REP
+        sources: [f3_adafactor_2026_10]
+      - action: "Move the dataset to FLUX.2 Klein 9B (base), Krea 2 or Qwen-Image 2.1: several users got a clearly better identity on the same photos at the same step count."
+        why: "Same-settings A/Bs by two users."
+        confidence: CONF
+        sources: [f3_neg_2026_10]
+      - action: "Judge on Base at 50 steps and CFG 3.5 first, and caption towards the model's LLM prompt style (untested)."
+        why: "Distilled-style sampling hides a LoRA; the caption idea is one user's suspicion."
+        confidence: REP
+        sources: [f3_eval_2026_10, f3_neg_2026_10]
+  - symptom: slow_likeness
+    causes:
+      - "the model is slower than FLUX.2 for identity"
+    fixes:
+      - action: "More steps did not help (3,000 still awful; FLUX.2 at 200 steps beat FLUX.3 at 7,500). Change model or optimizer instead of waiting."
+        why: "Several users."
+        confidence: CONF
+        sources: [f3_neg_2026_10]
+  - symptom: lr_collapsed
+    causes:
+      - "automagic's effective LR sagged (1e-4 to 5.8e-5 at 800 steps)"
+    fixes:
+      - set: {optimizer: {value: adafactor}, learning_rate: {value: 1.0e-4}}
+        why: "A fixed-rate optimizer; Adafactor is the pair that showed a face."
+        confidence: REP
+        sources: [f3_adafactor_2026_10]
+      - set: {optimizer: {value: automagic3}, automagic_min_lr: {value: 3.0e-5}}
+        why: "The Qwen and MOSS fix (a floor of 2e-5 to 3e-5); nobody posted a finished FLUX.3 character with it, so this is untested here."
+        confidence: GUESS
+        sources: [atk_automagic_floor_2026_10]
+  - symptom: deformed_bodies
+    causes:
+      - "base anatomy, worse at low steps"
+      - "learning rate too high"
+    fixes:
+      - action: "Sample at 50 steps and CFG 3.5 with a negative prompt and more full-body shots; it was often still not enough."
+        why: "One user's finding."
+        confidence: REP
+        sources: [f3_neg_2026_10]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "Klein-family models collapse and deform at high rates; another source lowers to 5e-5."
+        confidence: GUESS
+        sources: [atk_klein_lr_2026_07, web_bfl_f3_docs_2026_10]
+  - symptom: plastic_skin
+    causes:
+      - "a base-model trait on realism (not a LoRA overcook)"
+    fixes:
+      - action: "Sample on Base at 50 steps rather than a distilled model; a distilled LoRA at about 0.4-0.8 trades quality for speed."
+        why: "Reported as a base-model complaint."
+        confidence: REP
+        sources: [f3_eval_2026_10]
+  - symptom: ignores_prompt
+    causes:
+      - "captions that name the trigger and the clothes but give the scene too little"
+      - "prompts that are not expanded the way the model expects"
+    fixes:
+      - action: "Write fuller content captions (the vendor's style) and expand the test prompts with an LLM before judging."
+        why: "The model expects LLM-upsampled prompts; one user suspects the captions did not match."
+        confidence: REP
+        sources: [f3_neg_2026_10, web_bfl_f3_docs_2026_10]
+  - symptom: peaked_early
+    causes:
+      - "learning rate high for the set"
+    fixes:
+      - action: "Keep the best early checkpoint (save every 250 steps); a run that has not shown a face by about 800-1,500 steps is not likely to later."
+        why: "No FLUX.3 character recipe exists to tell a late bloomer from a failure."
+        confidence: GUESS
+        sources: []
+  - symptom: out_of_memory
+    causes:
+      - "a 1 MP step with a bf16 text encoder on a card under 16 GB"
+    fixes:
+      - set: {text_encoder_quant: {value: int8}, resolutions: {value: [0.5]}}
+        why: "int8 halves the 9 GB text encoder and a half-megapixel bucket shrinks the step (a 1 MP step peaked at 12.2 GB in bf16)."
+        confidence: DOC
+        sources: [doc_trainer_3_28]
+open_questions:
+  - "Is there any FLUX.3 Klein character recipe that works? Nobody has posted a finished one; the evidence so far is negative."
+  - "Does an automagic floor (2e-5 to 3e-5), or AdamW instead of Adafactor, fix it? Neither has been reported."
+  - "Do captions in the model's LLM prompt style change identity? One user suspects it; untested."
+  - "Timestep: the vendor does not state a shift; 'reference' (a constant shift of 6.93) is a guess about an unpublished recipe and has not been compared with sigmoid."
+  - "How do characters train on the distilled Klein, and is a turbo LoRA for sampling worth adding? None is published without custom nodes."
+  - "Regularisation or DOP (disputed on FLUX.2) has not been tried here."
+sources:
+  f3_neg_2026_10:
+    kind: community
+    where: "AI Toolkit Discord #flux3-image and banodoco Discord #flux3-image-model"
+    date: "2026-10"
+    people: 6
+    url: null
+    note: "First 48 hours and the following weeks: no or weak likeness, FLUX.2 beats FLUX.3 on the same photos, edit pairs memorised, styles train well."
+  f3_adafactor_2026_10:
+    kind: community
+    where: "AI Toolkit Discord #flux3-image"
+    date: "2026-10"
+    people: 2
+    url: null
+    note: "Adafactor plus sigmoid started to show a face after automagic v3 failed; another user had found the pair good on FLUX.2. One run, not a finished character."
+  f3_eval_2026_10:
+    kind: community
+    where: "banodoco Discord #flux3-image-model"
+    date: "2026-10"
+    people: 4
+    url: null
+    note: "Base at 50 steps and CFG 3.5-4; distilled LoRA 0.4 at 16 steps CFG 3, or about 0.8 at 20 steps; humans want more than 16 steps on distilled; plastic skin is a base-model complaint."
+  web_bfl_f3_docs_2026_10:
+    kind: official
+    where: "Black Forest Labs documentation: FLUX.3 Klein image"
+    date: "2026-10"
+    people: null
+    url: https://docs.bfl.ml/flux_3/flux3_image_klein
+    note: "Undated page (the month is the release). Rank 32, AdamW betas 0.9/0.95, 1e-4, 200 warm-up, 4,000 steps, 1 MP, 20 images; a style example, not a character."
+  web_academia_2026_11:
+    kind: web
+    where: "AcademiaSD LoRAlab trainer studio changelog"
+    date: "2026-11"
+    people: null
+    url: https://github.com/AcademiaSD/AcademiaSD_LoRAlab-TrainerStudio
+    note: "Fixed timestep shift 6.93 and previews at 28 steps, CFG 3.5; defaults tested to work, not tuned."
