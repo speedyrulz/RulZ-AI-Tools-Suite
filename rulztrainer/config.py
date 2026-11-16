@@ -105,6 +105,12 @@ def family_named_in(text: str) -> str | None:
             return "minimax_h3_image"
     if re.search(r"(^|[^a-z0-9])pan[-_ ]?2", hint):  # IFM/PAN2, PAN2_nvfp4.safetensors, pan2_int8.safetensors
         return "pan2"
+    # SDXL and its fine-tune families (sd_xl_base_1.0.safetensors, Illustrious-XL, ponyDiffusionV6XL, noobaiXL): all the
+    # SDXL architecture. After the families above, so a name that holds one of them wins; a word, not a substring
+    # ("ponytail"), for the short one
+    if any(s in hint for s in ("sdxl", "sd_xl", "sd-xl", "stable-diffusion-xl", "stable_diffusion_xl",
+                               "illustrious", "noobai")) or re.search(r"(^|[^a-z0-9])pony(?!tail)", hint):
+        return "sdxl"
     for word, family in (("ideogram", "ideogram4"), ("minimax", "minimax_h3"), ("fibo", "fibo2"), ("krea", "krea2"),
                          ("moss", "moss_image")):
         if word in hint:
@@ -362,6 +368,19 @@ ARCH_FULL_SAMPLE["pan2"] = (50, 2.5)
 # families that train on video clips (train_frames) and render samples and probes as clips (sample_frames,
 # probe_frames). MiniMax H3 is the video + audio model, not MiniMax-H3-Image or P-H3-Image (stills only).
 VIDEO_ARCHS = ("pan2", "minimax_h3")
+
+# SDXL (Stability AI's UNet, rulztrainer.sdxl): LoRA on the UNet only, as OneTrainer, ai-toolkit and Fizgig train it. Its
+# text encoders (CLIP-L and OpenCLIP bigG) read 77 tokens, so max_token_length is held at SDXL_TOKENS. The default
+# targets are Fizgig's: q/k/v/o of both attentions, the feed-forward in/out, and each Transformer2DModel's proj_in /
+# proj_out. Sampling is the usual 30 steps at CFG 6 (Euler on the model's own schedule). model_source "files" takes one
+# all-in-one checkpoint (transformer_file; the VAE and text encoders default to the same file), and nobody's ComfyUI
+# repackage is fetched (COMFY_REPOS has no entry). No turbo LoRA, sampling LoRA or training adapter exists for it.
+MODEL_PRESETS["SDXL-Base-1.0"] = "stabilityai/stable-diffusion-xl-base-1.0"
+ARCH_NAMES += ("sdxl",)
+ARCH_DEFAULT_TARGETS["sdxl"] = _CORE_TARGETS + ("proj",)
+ARCH_FULL_SAMPLE["sdxl"] = (30, 6.0)
+SDXL_TOKENS = 77
+SDXL_PREDICTIONS = ("auto", "epsilon", "v_prediction")
 VIDEO_EXTS = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v")  # video files a dataset trains as clips
 
 
@@ -497,6 +516,10 @@ class TrainConfig:
     nvfp4_matmul: bool = True  # nvfp4 layers on Blackwell GPUs (RTX 50): activations to NVFP4, FP4 tensor-core matmul
     #                            (W4A4, backward exact in bf16); off, or on older GPUs: weight dequantized to bf16
     nvfp4_backward: str = "bf16"  # native nvfp4 layers' grad_x: bf16 (exact) | fp4 (FP4 tensor cores, faster, approx.)
+    # SDXL: what the UNet predicts: auto (the model's scheduler_config.json, or a single file's v_pred key, else epsilon) |
+    # epsilon | v_prediction; and whether its schedule has zero terminal SNR (a single file's ztsnr key turns it on)
+    sdxl_prediction: str = "auto"
+    sdxl_zero_terminal_snr: bool = False
     attention_backend: str = "auto"  # DiT attention kernel: auto (cuDNN on RTX 40 / 50 and B200, else PyTorch's pick) |
     #   torch (PyTorch picks) | cudnn | flash | efficient | math
 
@@ -526,7 +549,7 @@ class TrainConfig:
     trigger_word: str = ""
     caption_dropout: float = 0.05
     caption_dropout_keep_trigger: bool = True  # a dropped caption keeps the trigger word (else the empty prompt)
-    max_token_length: int = 1024
+    max_token_length: int = 1024  # SDXL: held at 77 (SDXL_TOKENS) by validate
     cache_dir: str = ""  # defaults to <dataset>/.rulz_cache per dataset (the run's own files: the first dataset's)
     recache: bool = False
     # --- regularisation dataset (after Fizgig's, Nov 2026): a second folder of ordinary captioned pictures of the same
@@ -1211,6 +1234,13 @@ class TrainConfig:
             if self.isolation:
                 raise ValueError("LoRA Isolation builds side-by-side pictures from the dataset's photos: it does not "
                                  "take video clips (set train_frames to 1, or turn isolation off)")
+        if self.sdxl_prediction not in SDXL_PREDICTIONS:
+            raise ValueError(f"sdxl_prediction must be one of {', '.join(SDXL_PREDICTIONS)}, got "
+                             f"{self.sdxl_prediction!r}")
+        if not isinstance(self.sdxl_zero_terminal_snr, bool):
+            raise ValueError(f"sdxl_zero_terminal_snr must be true or false, got {self.sdxl_zero_terminal_snr!r}")
+        if self.family() == "sdxl":
+            self.validate_sdxl()
         if self.optimizer.lower() == "hull":
             self.validate_hull()
         self.validate_region_actions()
@@ -1432,6 +1462,80 @@ class TrainConfig:
             if self.probe_every <= 0 or not (self.face_refs or self.body_refs):
                 raise ValueError("resolution_step_up needs likeness probes: set probe_every > 0 and face_refs "
                                  "and/or body_refs (the step-up decision is the probe likeness score)")
+
+    def family(self) -> str:
+        """The model family this config trains, as the trainer will find it: model_arch when set, else the transformer
+        file's own header (a single file), else the names (arch_name). Reads the file's header, unlike arch_name."""
+        from .archs import guess_arch_name
+
+        return guess_arch_name(self)
+
+    def validate_sdxl(self) -> None:
+        """What an SDXL run cannot do (v1 is a LoRA on the UNet): each refusal names the setting, none is a silent
+        no-op. "auto" settings that name nothing for SDXL (transformer_quant, compile_model, the downloads, the
+        checkpointing's kept blocks) resolve to off; a fresh SDXL config trips none of these."""
+        no = ValueError
+        if self.block_swap:
+            raise no("block_swap: SDXL's UNet is not swapped block by block (its 2.6B weights fit a 12 GB card): set "
+                     "block_swap to 0")
+        if self.multi_gpu == "model_split":
+            raise no("multi_gpu model_split: the UNet cannot be split across GPUs here (use off or data_parallel)")
+        if self.activation_offload:
+            raise no("activation_offload: not available for SDXL (diffusers' checkpointing is all or nothing): turn "
+                     "it off")
+        for key in ("attn_localize", "id_align", "body_align"):
+            if getattr(self, key):
+                raise no(f"{key}: reads the transformer blocks' attention and states, which SDXL's UNet does not "
+                         f"expose that way: turn {key} off")
+        if self.optimizer.lower() in ("keel_fb", "hull"):
+            raise no(f"optimizer {self.optimizer}: not available for SDXL (keel_fb and hull read the face-token taps "
+                     "and region gains of the transformer blocks); use adamw, adamw8bit, adafactor, automagic3/4, "
+                     "keel, muon or normuon")
+        if self.optimizer.lower() in KEEL and self.keel_face_gain > 0:
+            raise no("keel_face_gain: the face-token gain hooks the transformer blocks' outputs, which SDXL does not "
+                     "have in that form: set keel_face_gain to 0")
+        if self.training_maps:
+            raise no("training_maps: its attention heat maps are read inside the transformer blocks, which SDXL's UNet "
+                     "does not expose that way: turn training_maps off")
+        if str(self.transformer_quant or "auto") not in ("auto", "none"):
+            raise no(f"transformer_quant {self.transformer_quant!r}: SDXL's UNet trains in bf16; use auto or none")
+        if self.compile_model is True:
+            raise no("compile_model: true is not available for SDXL (the UNet is not compiled; auto and false run "
+                     "it eagerly)")
+        if self.loss_type != "mse":
+            raise no(f"loss_type {self.loss_type}: not available for SDXL (its loss is the model's own epsilon / "
+                     "v-prediction MSE); use mse")
+        if self.loss_weighting == "sigma_sqrt":
+            raise no("loss_weighting sigma_sqrt: a flow-matching weight with no meaning for SDXL's epsilon / "
+                     "v-prediction loss; use none or min_snr")
+        if self.finetune:
+            raise no("finetune: SDXL trains a LoRA only here: turn finetune off")
+        if self.network_type != "lora" or self.dora:
+            raise no("network_type / dora: SDXL's LoRA file is kohya's plain lora_down / lora_up layout: use "
+                     "network_type lora and turn dora off")
+        if self.train_text_embedder:
+            raise no("train_text_embedder: SDXL has no text projection inside its UNet, and its text encoders are not "
+                     "trained: turn train_text_embedder off")
+        for key in ("turbo_lora", "sample_lora", "training_adapter"):
+            if str(getattr(self, key) or "") not in ("", "auto"):
+                raise no(f"{key}: no such LoRA exists for SDXL here (auto and empty both mean none): clear {key}")
+        if self.checkpoint_keep_blocks > 0:
+            raise no("checkpoint_keep_blocks: SDXL's checkpointing is all or nothing (diffusers'): use -1 or 0")
+        if self.max_token_length != SDXL_TOKENS:
+            self.max_token_length = SDXL_TOKENS  # CLIP's 77 tokens: the text cache and the prompt checks read this
+        if self.sdxl_zero_terminal_snr and self.sdxl_prediction == "epsilon":
+            raise no("sdxl_zero_terminal_snr with sdxl_prediction epsilon: an epsilon model cannot predict the clean "
+                     "image at zero SNR (x0 = (x - b eps) / a with a = 0); zero terminal SNR needs v_prediction")
+        if self.timestep_sampling == "logit_normal" and not self.race:
+            import logging
+
+            # the general default (logit_normal) concentrates the steps mid-schedule, on noise levels SDXL was not
+            # trained on; SDXL's own recipe is uniform timesteps, as OneTrainer, ai-toolkit and Fizgig train it.
+            # (sigmoid with sigmoid_scale 1 is the same distribution as logit_normal, for whoever wants it.)
+            logging.getLogger("rulztrainer").info(
+                "timestep_sampling logit_normal -> reference: SDXL trains on its own uniform DDPM timesteps (use "
+                "timestep_sampling: sigmoid for a logit-normal draw)")
+            self.timestep_sampling = "reference"
 
     def validate_finetune(self) -> None:
         """What a full fine-tune cannot combine with (finetune.py)."""
