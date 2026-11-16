@@ -13,7 +13,7 @@ import dataclasses
 import logging
 
 from .config import (ARCH_SAMPLE_LORA, ARCH_TRAINING_ADAPTER, ARCH_TURBO, COMFY_DIFFUSION_FILES, COMFY_DIFFUSION_QUANTS, COMFY_REPOS,
-                     COMFY_TEXT_ENCODER_FILES, COMFY_TEXT_ENCODER_QUANTS, COMFY_VAE_FILES, TrainConfig)
+                     COMFY_TEXT_ENCODER_FILES, COMFY_TEXT_ENCODER_QUANTS, COMFY_VAE_FILES, SDXL_SINGLE_FILE, TrainConfig)
 from .config import COMFY_DEFAULT_QUANT, COMFY_TEXT_ENCODER_REPOS, training_adapter_for
 
 log = logging.getLogger("rulztrainer")
@@ -30,17 +30,18 @@ def planned_downloads(cfg: TrainConfig) -> list[tuple[str, str, str]]:
 
     fam = guess_arch_name(cfg)  # (a single file names its own family: an SDXL checkpoint with no hint in its name)
     out = []
-    if cfg.model_source == "files" and fam not in COMFY_REPOS:
-        # a family nobody publishes single files of (PAN 2): every file has to be set. SDXL's all-in-one checkpoint
-        # holds the UNet, both text encoders and the VAE: transformer_file alone (an empty text_encoder_file /
-        # vae_file means the same file; a separate VAE file may be set)
-        files = ("transformer_file",) if fam == "sdxl" else ("transformer_file", "text_encoder_file", "vae_file")
-        missing = [f for f in files if not getattr(cfg, f)]
+    if cfg.model_source == "files" and fam == "sdxl":
+        # SDXL's all-in-one checkpoint holds the UNet, both text encoders and the VAE: transformer_file alone (an empty
+        # text_encoder_file / vae_file means the same file; a separate VAE file may be set). Left empty, the base 1.0
+        # checkpoint is downloaded
+        if not cfg.transformer_file:
+            out.append(("transformer_file", *SDXL_SINGLE_FILE))
+    elif cfg.model_source == "files" and fam not in COMFY_REPOS:
+        # a family nobody publishes single files of (PAN 2): every file has to be set
+        missing = [f for f in ("transformer_file", "text_encoder_file", "vae_file") if not getattr(cfg, f)]
         if missing:
-            hint = ("the all-in-one checkpoint (a .safetensors holding the UNet, the text encoders and the VAE)"
-                    if fam == "sdxl" else "for PAN 2, the files scripts/pan2/convert_pan2.py makes")
-            raise ValueError(f"No single-file download exists for {fam}: set {', '.join(missing)} ({hint}), or use "
-                             "the Hugging Face source")
+            raise ValueError(f"No single-file download exists for {fam}: set {', '.join(missing)} (for PAN 2, the "
+                             "files scripts/pan2/convert_pan2.py makes), or use the Hugging Face source")
     elif cfg.model_source == "files":
         repo = COMFY_REPOS[fam]
         if not cfg.transformer_file:
