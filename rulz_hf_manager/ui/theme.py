@@ -134,6 +134,8 @@ body {
 /* a table that fills a flex column and scrolls inside it (the local file picker) */
 .rz-fill-table { min-height: 0; }
 .rz-fill-table .q-table__middle { flex: 1 1 0; min-height: 0; }
+/* an icon name the font lacks renders as wide blank text that spills over the row's checkbox: keep it in its box */
+.rz-ic-file, .rz-ic-dir, .rz-ic-weight { overflow: hidden; }
 .rulz-name:hover span { text-decoration: underline; text-decoration-color: var(--rz-red-bright); text-underline-offset: 3px; }
 
 /* public / private pill, storage badges, chips */
