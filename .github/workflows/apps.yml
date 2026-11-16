@@ -101,7 +101,7 @@ jobs:
       - name: Describe the app
         run: |
           $apps = @{
-            'rulz-trainer'       = @{ dir = 'RulzTrainer'; name = 'RulzTrainer'; kind = 'source' }
+            'rulz-trainer'       = @{ dir = 'RulzTrainer'; name = 'RulZ AI Trainer'; kind = 'source' }
             'image-organizer'    = @{ dir = 'RulZ-Image-Organizer'; name = 'RulZ Image Organizer'; kind = 'python' }
             'image-tournament'   = @{ dir = 'RulZ-Image-Tournament'; name = 'RulZ Image Tournament'; kind = 'dotnet' }
             'llm-suite'          = @{ dir = 'rulz-llm-suite'; name = 'RulZ LLM Suite'; kind = 'electron' }
@@ -216,9 +216,9 @@ jobs:
       - if: env.KIND == 'source'
         name: Check the Python sources compile
         run: python -m compileall -q $env:DIR
-      # RulZ Trainer's tests run on the CPU without model weights; a failure stops the release below.
+      # RulZ AI Trainer's tests run on the CPU without model weights; a failure stops the release below.
       - if: env.APP == 'rulz-trainer'
-        name: Run the RulZ Trainer tests
+        name: Run the RulZ AI Trainer tests
         working-directory: ${{ env.DIR }}
         env:
           CUDA_VISIBLE_DEVICES: ''

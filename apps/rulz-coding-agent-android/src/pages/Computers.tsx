@@ -108,7 +108,7 @@ function AddComputer({ onDone }: { onDone: () => void }) {
 
   return (
     <section className="space-y-4 rounded-2xl border border-border bg-panel p-4">
-      <h2 className="flex items-center gap-2 text-[17px] font-semibold">
+      <h2 className="font-[family-name:var(--font-display)] flex items-center gap-2 text-[17px] font-semibold">
         <QrCode size={20} className="text-accent" /> Add a computer
       </h2>
       <ol className="list-decimal space-y-1.5 pl-5 text-[15px] text-muted">
@@ -173,7 +173,7 @@ export function Connecting() {
           </p>
         ) : (
           <>
-            <h1 className="text-[18px] font-semibold">{problem?.title ?? `Connecting to ${name}…`}</h1>
+            <h1 className="font-[family-name:var(--font-display)] text-[18px] font-semibold">{problem?.title ?? `Connecting to ${name}…`}</h1>
             {problem?.text && <p className="text-[15px] text-muted">{problem.text}</p>}
             {state.kind === 'connecting' && state.error && <p className="text-[13px] text-faint">{state.error}</p>}
           </>

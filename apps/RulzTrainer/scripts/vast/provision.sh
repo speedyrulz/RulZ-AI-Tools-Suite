@@ -18,7 +18,7 @@ REPO_URL="${RULZ_REPO:-https://github.com/speedyrulz/RulZ-AI-Tools-Suite.git}"
 BRANCH="${RULZ_BRANCH:-app/rulz-trainer}"  # RulzTrainer on its own, split from the suite's apps/RulzTrainer
 DIR="${WORKSPACE}/RulzTrainer"
 
-echo "== RulzTrainer provisioning: ${REPO_URL} (${BRANCH}) -> ${DIR}"
+echo "== RulZ AI Trainer provisioning: ${REPO_URL} (${BRANCH}) -> ${DIR}"
 if [ -d "${DIR}/.git" ]; then
     # Checkouts of the old RulzTrainer repository move over: the branch continues its history.
     git -C "${DIR}" remote set-url origin "${REPO_URL}"
@@ -48,4 +48,4 @@ if [ -n "${RULZ_MODEL_BUCKET:-}" ]; then
     echo "== Downloading models from bucket ${RULZ_MODEL_BUCKET} in the background (log: ${LOG})"
     nohup bash scripts/vast/download_models.sh > "${LOG}" 2>&1 &
 fi
-echo "== RulzTrainer ready: open it from the Instance Portal (or the instance's external port for 7870)"
+echo "== RulZ AI Trainer ready: open it from the Instance Portal (or the instance's external port for 7870)"

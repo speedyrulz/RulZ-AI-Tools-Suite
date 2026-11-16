@@ -62,7 +62,7 @@ export function Wizard() {
           {step === 0 && (
             <div className="space-y-5">
               <div>
-                <h1 className="text-xl font-semibold">Welcome to RulZ Coding Agent</h1>
+                <h1 className="font-[family-name:var(--font-display)] text-xl font-semibold">Welcome to RulZ Coding Agent</h1>
                 <p className="mt-2 text-sm text-muted">
                   Describe the app you want in plain English. An AI model running on this computer builds it for you: it writes the files, installs what
                   is needed, runs the app and fixes problems.
@@ -82,7 +82,7 @@ export function Wizard() {
 
           {step === 1 && (
             <div className="space-y-4">
-              <h1 className="text-xl font-semibold">Which AI model should build your apps?</h1>
+              <h1 className="font-[family-name:var(--font-display)] text-xl font-semibold">Which AI model should build your apps?</h1>
               <p className="text-sm text-muted">
                 A coding model works best. Qwen3-Coder is a great choice. Models marked “ready” are already loaded; others load when you start your
                 first task.
@@ -93,7 +93,7 @@ export function Wizard() {
 
           {step === 2 && (
             <div className="space-y-4">
-              <h1 className="text-xl font-semibold">When should I ask you first?</h1>
+              <h1 className="font-[family-name:var(--font-display)] text-xl font-semibold">When should I ask you first?</h1>
               <p className="text-sm text-muted">
                 Before each task I save a restore point, so <b>Undo last task</b> can always put your project back. I'll ask for your OK before steps
                 you might not want, and you can change this any time in Settings.
@@ -104,7 +104,7 @@ export function Wizard() {
 
           {step === 3 && (
             <div className="space-y-4">
-              <h1 className="text-xl font-semibold">Name your first project</h1>
+              <h1 className="font-[family-name:var(--font-display)] text-xl font-semibold">Name your first project</h1>
               <p className="text-sm text-muted">Each project gets its own folder. You can make as many as you like.</p>
               <Input value={name} onChange={(e) => setName(e.target.value)} className="h-10 text-sm" autoFocus onKeyDown={(e) => e.key === 'Enter' && name.trim() && void finish(true)} />
               <div className="flex items-center justify-between gap-3 text-xs text-muted">

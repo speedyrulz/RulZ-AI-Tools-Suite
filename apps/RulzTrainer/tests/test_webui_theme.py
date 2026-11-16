@@ -34,6 +34,6 @@ def test_css_variables_defined_for_both_looks():
         assert f"{name}:" in dark_block, name
     light_names = set(re.findall(r"(--rz-[\w-]+):", light_block))
     assert light_names <= set(re.findall(r"(--rz-[\w-]+):", dark_block))
-    # every themed color except the brand reds is redefined for the light look
-    assert set(re.findall(r"(--rz-[\w-]+):", dark_block)) - light_names == {"--rz-red", "--rz-red-bright",
-                                                                           "--rz-red-soft"}
+    # every themed color except the brand red is redefined for the light look (its hover and wash differ, as in
+    # the launcher)
+    assert set(re.findall(r"(--rz-[\w-]+):", dark_block)) - light_names == {"--rz-red"}

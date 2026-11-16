@@ -3,8 +3,8 @@ using System.Windows;
 
 [assembly: System.Reflection.AssemblyTitle("RulZ Image Grid")]
 [assembly: System.Reflection.AssemblyProduct("RulZ Image Grid")]
-[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.2.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.3.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.3.0.0")]
 // csc doesn't add this the way MSBuild does. Without it .NET keeps its pre-4.6.2 behaviour: WPF ignores the
 // per-monitor DPI setting in app.manifest (the window keeps its first monitor's scale on another monitor) and
 // paths longer than 260 characters can't be opened or saved even where Windows allows them.

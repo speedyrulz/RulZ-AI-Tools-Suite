@@ -18,26 +18,30 @@ namespace RulZImageGrid
     public sealed class Palette
     {
         public bool IsLight;
-        public Color Back, Panel, Control, Hover, Border, Text, Dim;
-        public Color Accent, AccentText, AccentFill, AccentFillHover, OnAccent, Workspace, WarnText;
+        public Color Back, Panel, Control, Hover, Border, BorderStrong, Text, Dim;
+        public Color Accent, AccentText, AccentFill, AccentFillHover, AccentPressed, OnAccent, Workspace, WarnText, DangerText;
         public string LogoResource;
 
         public static readonly Palette Dark = new Palette
         {
-            Back = Color.FromRgb(12, 12, 14),
-            Panel = Color.FromRgb(22, 22, 25),
-            Control = Color.FromRgb(36, 36, 40),
-            Hover = Color.FromRgb(54, 54, 60),
-            Border = Color.FromRgb(64, 64, 70),
-            Text = Color.FromRgb(242, 242, 242),
-            Dim = Color.FromRgb(150, 150, 158),
+            // Values follow the launcher (bg, panel, panel-2, hover, border, border-strong, text, muted).
+            Back = Color.FromRgb(5, 5, 5),
+            Panel = Color.FromRgb(12, 12, 14),
+            Control = Color.FromRgb(20, 20, 23),         // panel-2: raised controls
+            Hover = Color.FromRgb(28, 28, 33),
+            Border = Color.FromRgb(35, 35, 40),          // hairlines
+            BorderStrong = Color.FromRgb(52, 52, 59),    // control outlines, hovered borders
+            Text = Color.FromRgb(242, 242, 243),
+            Dim = Color.FromRgb(163, 163, 171),
             Accent = Color.FromRgb(237, 0, 13),          // the logo red
-            AccentText = Color.FromRgb(255, 70, 70),     // red that stays readable on black
-            AccentFill = Color.FromRgb(120, 0, 8),       // primary buttons
-            AccentFillHover = Color.FromRgb(165, 0, 12),
-            OnAccent = Color.FromRgb(242, 242, 242),
+            AccentText = Color.FromRgb(255, 107, 114),   // red that stays readable on black
+            AccentFill = Color.FromRgb(237, 0, 13),      // primary buttons
+            AccentFillHover = Color.FromRgb(255, 38, 51),
+            AccentPressed = Color.FromRgb(200, 0, 11),
+            OnAccent = Color.FromRgb(255, 255, 255),
             Workspace = Color.FromRgb(5, 5, 5),          // behind the grid
             WarnText = Color.FromRgb(252, 214, 121),
+            DangerText = Color.FromRgb(255, 138, 142),
             LogoResource = "RulZ.ImageGrid.logo.png",
         };
 
@@ -46,24 +50,30 @@ namespace RulZImageGrid
             IsLight = true,
             Back = Color.FromRgb(255, 255, 255),
             Panel = Color.FromRgb(245, 245, 247),
-            Control = Color.FromRgb(255, 255, 255),
-            Hover = Color.FromRgb(235, 235, 239),
+            Control = Color.FromRgb(235, 235, 239),
+            Hover = Color.FromRgb(226, 226, 231),
             Border = Color.FromRgb(217, 217, 222),
+            BorderStrong = Color.FromRgb(196, 196, 203),
             Text = Color.FromRgb(17, 17, 20),
             Dim = Color.FromRgb(95, 96, 104),
             Accent = Color.FromRgb(237, 0, 13),
             AccentText = Color.FromRgb(200, 0, 11),      // a little darker so small text reads well on white
             AccentFill = Color.FromRgb(237, 0, 13),
             AccentFillHover = Color.FromRgb(200, 0, 11),
+            AccentPressed = Color.FromRgb(168, 0, 10),
             OnAccent = Color.FromRgb(255, 255, 255),
             Workspace = Color.FromRgb(226, 226, 231),
             WarnText = Color.FromRgb(138, 83, 0),
+            DangerText = Color.FromRgb(180, 0, 10),
             LogoResource = "RulZ.ImageGrid.logo-light.png",
         };
     }
 
     public static class Theme
     {
+        /// <summary>The UI face: Segoe UI Variable Text on Windows 11, Segoe UI elsewhere (WPF takes a fallback list).</summary>
+        public const string UiFont = "Segoe UI Variable Text, Segoe UI";
+
         public static Palette Current = Palette.Dark;
         public static bool IsLight => Current.IsLight;
         public static event Action Changed;
@@ -88,15 +98,18 @@ namespace RulZImageGrid
             Add("Control", p.Control);
             Add("Hover", p.Hover);
             Add("Border", p.Border);
+            Add("BorderStrong", p.BorderStrong);
             Add("Text", p.Text);
             Add("Dim", p.Dim);
             Add("Accent", p.Accent);
             Add("AccentText", p.AccentText);
             Add("AccentFill", p.AccentFill);
             Add("AccentFillHover", p.AccentFillHover);
+            Add("AccentPressed", p.AccentPressed);
             Add("OnAccent", p.OnAccent);
             Add("Workspace", p.Workspace);
             Add("WarnText", p.WarnText);
+            Add("DangerText", p.DangerText);
 
             var merged = Application.Current.Resources.MergedDictionaries;
             if (brushes != null) merged.Remove(brushes);
@@ -112,8 +125,8 @@ namespace RulZImageGrid
         {
             w.SetResourceReference(Window.BackgroundProperty, "Back");
             w.SetResourceReference(Window.ForegroundProperty, "Text");
-            w.FontFamily = new FontFamily("Segoe UI");
-            w.FontSize = 13;
+            w.FontFamily = new FontFamily(UiFont);
+            w.FontSize = 14;
             w.SourceInitialized += (s, e) => UseDarkTitleBar(w, !IsLight);
         }
 

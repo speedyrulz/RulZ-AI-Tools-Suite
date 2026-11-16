@@ -11,7 +11,7 @@ describe('prepareReadme', () => {
       '  </picture>',
       '</p>',
       '',
-      '# RulzTrainer',
+      '# RulZ AI Trainer',
       '',
       'A simple trainer.'
     ].join('\r\n')

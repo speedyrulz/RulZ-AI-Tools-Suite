@@ -19,44 +19,51 @@ STATIC_URL = '/rulz-static'
 LOGO_DARK = f'{STATIC_URL}/logo-dark.png'    # white lettering, for the dark look
 LOGO_LIGHT = f'{STATIC_URL}/logo-light.png'  # black lettering, for the light look
 FAVICON = STATIC / 'icon.png'
-RED = '#E10600'
-RED_BRIGHT = '#FF3B30'
+RED = '#ED000D'
+RED_BRIGHT = '#FF2633'
 
 # 'auto' (follow the system) is still understood for settings files written before the look was Dark or Light.
 DARK_VALUE: dict[str, bool | None] = {'auto': None, 'light': False, 'dark': True}
 
 CSS = r'''
 :root {
-  --rz-red: #E10600; --rz-red-bright: #FF3B30; --rz-red-soft: rgba(225, 6, 0, .14); --rz-red-line: rgba(255, 59, 48, .40);
-  --rz-bg: #0A0A0A; --rz-surface: #131313; --rz-surface-2: #1A1A1A; --rz-hover: rgba(255, 255, 255, .045);
-  --rz-border: #262626; --rz-border-strong: #3A3A3A; --rz-hover-border: #52525B;
-  --rz-text: #EDEDED; --rz-text-2: #D4D4D8; --rz-heading: #FFFFFF; --rz-muted: #A1A1AA; --rz-label: #B5B5BD;
-  --rz-header-bg: #000000; --rz-field-bg: #0D0D0D; --rz-tooltip-bg: #1F1F1F; --rz-menu-bg: #161616;
-  --rz-deep: #050505; --rz-code-bg: #1F1F1F; --rz-code: #FCA5A5; --rz-scroll: #2A2A2A; --rz-track: #212121;
-  --rz-ok: #22C55E; --rz-ok-text: #86EFAC; --rz-warn: #F59E0B; --rz-warn-text: #FCD34D; --rz-err-text: #FFB4AE;
-  --rz-file-icon: #8B8B94; --rz-weight-icon: #E4E4E7; --rz-shadow: 0 24px 64px rgba(0, 0, 0, .55);
+  --rz-red: #ED000D; --rz-red-bright: #FF2633; --rz-red-soft: rgba(237, 0, 13, .13); --rz-red-line: rgba(237, 0, 13, .40);
+  --rz-link: #ff5961;
+  --rz-bg: #050505; --rz-surface: #0c0c0e; --rz-surface-2: #141417; --rz-hover: #1c1c21;
+  --rz-border: #232328; --rz-border-strong: #34343b; --rz-hover-border: #34343b;
+  --rz-text: #f2f2f3; --rz-text-2: #d4d4d8; --rz-heading: #f2f2f3; --rz-muted: #a3a3ab; --rz-faint: #82828c; --rz-label: #82828c;
+  --rz-header-bg: #050505; --rz-field-bg: #0c0c0e; --rz-tooltip-bg: #141417; --rz-menu-bg: #141417;
+  --rz-deep: #0a0a0c; --rz-code-bg: #141417; --rz-code: #ff6b72; --rz-scroll: #34343b; --rz-track: rgba(255, 255, 255, .08);
+  --rz-ok: #4ade80; --rz-ok-text: #4ade80; --rz-warn: #fbbf24; --rz-warn-text: #fcd679; --rz-err-text: #ff8a8e;
+  --rz-danger: #ff5a5f; --rz-danger-text: #ff8a8e; --rz-danger-bg: #3a0c0f; --rz-danger-border: #6b1418; --rz-danger-hover: #4a1014;
+  --rz-file-icon: #82828c; --rz-weight-icon: #f2f2f3; --rz-shadow: 0 24px 64px rgba(0, 0, 0, .9);
+  --q-primary: #ED000D; --q-positive: #4ade80; --q-warning: #fbbf24; --q-negative: #ff5a5f;
 }
 body.body--light {
-  --rz-red-soft: rgba(225, 6, 0, .08); --rz-red-line: rgba(225, 6, 0, .35);
-  --rz-bg: #FFFFFF; --rz-surface: #F5F5F7; --rz-surface-2: #EBEBEF; --rz-hover: rgba(0, 0, 0, .035);
-  --rz-border: #D9D9DE; --rz-border-strong: #C4C4CC; --rz-hover-border: #A1A1AA;
-  --rz-text: #111114; --rz-text-2: #2E2E33; --rz-heading: #111114; --rz-muted: #5F6068; --rz-label: #4A4A52;
-  --rz-header-bg: #FFFFFF; --rz-field-bg: #FFFFFF; --rz-tooltip-bg: #FFFFFF; --rz-menu-bg: #FFFFFF;
-  --rz-deep: #FFFFFF; --rz-code-bg: #EBEBEF; --rz-code: #B4000A; --rz-scroll: #C9C9CF; --rz-track: #E4E4E8;
-  --rz-ok: #16A34A; --rz-ok-text: #15803D; --rz-warn: #B45309; --rz-warn-text: #92400E; --rz-err-text: #B4000A;
-  --rz-file-icon: #6E6E77; --rz-weight-icon: #2E2E33; --rz-shadow: 0 24px 64px rgba(0, 0, 0, .18);
+  --rz-red-bright: #C8000B; --rz-red-soft: rgba(237, 0, 13, .08); --rz-red-line: rgba(237, 0, 13, .35);
+  --rz-link: #d0000b;
+  --rz-bg: #FFFFFF; --rz-surface: #F5F5F7; --rz-surface-2: #EBEBEF; --rz-hover: #e2e2e7;
+  --rz-border: #D9D9DE; --rz-border-strong: #c4c4cb; --rz-hover-border: #c4c4cb;
+  --rz-text: #111114; --rz-text-2: #2a2a30; --rz-heading: #111114; --rz-muted: #5F6068; --rz-faint: #68696f; --rz-label: #68696f;
+  --rz-header-bg: #FFFFFF; --rz-field-bg: #F5F5F7; --rz-tooltip-bg: #F5F5F7; --rz-menu-bg: #EBEBEF;
+  --rz-deep: #F5F5F7; --rz-code-bg: #EBEBEF; --rz-code: #C8000B; --rz-scroll: #c4c4cb; --rz-track: rgba(0, 0, 0, .08);
+  --rz-ok: #15803d; --rz-ok-text: #15803d; --rz-warn: #a16207; --rz-warn-text: #8a5300; --rz-err-text: #b4000a;
+  --rz-danger: #d4161c; --rz-danger-text: #b4000a; --rz-danger-bg: #fdecec; --rz-danger-border: #f5b8bb; --rz-danger-hover: #fbd8da;
+  --rz-file-icon: #68696f; --rz-weight-icon: #2a2a30; --rz-shadow: 0 24px 64px rgba(0, 0, 0, .18);
+  --q-positive: #15803d; --q-warning: #a16207; --q-negative: #d4161c;
 }
-html { background: #0A0A0A; }
+html { background: #050505; scrollbar-width: thin; scrollbar-color: var(--rz-border-strong) transparent; }
 html:has(body.body--light) { background: #FFFFFF; }
 body, .q-layout, .q-page-container { background: var(--rz-bg); }
 body {
-  color: var(--rz-text); -webkit-font-smoothing: antialiased;
-  font-family: "Inter", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Roboto, Arial, sans-serif;
+  color: var(--rz-text); -webkit-font-smoothing: antialiased; font-size: 14px;
+  font-family: "Segoe UI Variable Text", "Segoe UI", Inter, system-ui, sans-serif;
 }
-::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-thumb { background: var(--rz-scroll); border-radius: 10px; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--rz-border-strong); border-radius: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::selection { background: rgba(225, 6, 0, .35); }
+::selection { background: rgba(237, 0, 13, .40); }
+:focus-visible { outline: 2px solid var(--rz-red); outline-offset: 2px; }
 
 /* header: logo, page links, open box, activity, look switch, account */
 .nicegui-header.rz-header {
@@ -65,8 +72,12 @@ body {
 }
 .rz-header-row { width: 100%; max-width: 1400px; margin: 0 auto; padding: 10px 16px; min-height: 60px; }
 .rz-brand { color: inherit; text-decoration: none; }
-.rz-logo { height: 26px; width: auto; display: block; }
-.rz-wordmark { letter-spacing: .3em; font-weight: 600; font-size: 11px; color: var(--rz-muted); padding-top: 7px; white-space: nowrap; }
+.rz-logo { height: 24px; width: auto; display: block; }
+.rz-wordmark {
+  font-family: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+  letter-spacing: .2em; font-weight: 600; font-size: 13px; text-transform: uppercase;
+  color: var(--rz-muted); padding-top: 1px; white-space: nowrap;
+}
 .q-btn.rz-nav-btn { color: var(--rz-muted); font-weight: 500; padding: 4px 12px; }
 .q-btn.rz-nav-btn:hover { color: var(--rz-heading); }
 .q-btn.rz-nav-btn.rz-on { color: var(--rz-heading); background: var(--rz-red-soft); }
@@ -78,7 +89,7 @@ body {
 
 /* cards, dialogs, drawer */
 .q-card.rulz-card {
-  background: var(--rz-surface); color: var(--rz-text); border: 1px solid var(--rz-border); border-radius: 14px;
+  background: var(--rz-surface); color: var(--rz-text); border: 1px solid var(--rz-border); border-radius: 12px;
   box-shadow: none;
 }
 .q-dialog .q-card.rulz-card { border-color: var(--rz-border-strong); box-shadow: var(--rz-shadow); }
@@ -87,7 +98,10 @@ body {
 .q-drawer--right.q-drawer--bordered { border-left: 1px solid var(--rz-border); }
 .q-card.rulz-card.rz-job { background: var(--rz-surface-2); }
 .q-separator { background: var(--rz-border); }
-.rz-page-title { font-size: 22px; font-weight: 700; color: var(--rz-heading); }
+.rz-page-title, .rz-title, .q-dialog .text-lg.font-semibold {
+  font-family: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+}
+.rz-page-title { font-size: 22px; font-weight: 600; color: var(--rz-heading); }
 .rz-title { font-size: 16px; font-weight: 600; color: var(--rz-heading); }
 .q-dialog .text-lg.font-semibold { color: var(--rz-heading); }
 .rz-sec-icon {
@@ -107,7 +121,7 @@ body {
 .rz-stat-sub { font-size: 12px; color: var(--rz-muted); }
 
 /* tables */
-.q-table__card { background: var(--rz-surface); color: var(--rz-text); border-radius: 14px; box-shadow: none; }
+.q-table__card { background: var(--rz-surface); color: var(--rz-text); border-radius: 12px; box-shadow: none; }
 .q-table--bordered { border: 1px solid var(--rz-border); }
 .q-table thead tr th {
   font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--rz-muted);
@@ -135,17 +149,34 @@ body {
 .q-chip.rz-shortcut:hover { border-color: var(--rz-red); }
 
 /* form fields, buttons, toggles, tabs, menus */
-.q-field--outlined .q-field__control { border-radius: 9px; }
-.q-field--outlined .q-field__control:before { border-color: var(--rz-border-strong); }
+.q-field--outlined .q-field__control { border-radius: 8px; background: var(--rz-field-bg); }
+.q-field--outlined .q-field__control:before { border-color: var(--rz-border); }
+.q-field__native::placeholder, .q-field__input::placeholder { color: var(--rz-faint); opacity: 1; }
 .q-field__label { color: var(--rz-label); }
 .q-field__native, .q-field__input, .q-field__prefix, .q-field__suffix { color: var(--rz-text); }
-.q-field--dark .q-field__native, .q-field--dark .q-field__input { color: #F4F4F5; }
-.q-btn { text-transform: none; font-weight: 600; letter-spacing: .01em; border-radius: 9px; }
+.q-field--dark .q-field__native, .q-field--dark .q-field__input { color: #f2f2f3; }
+.q-btn { text-transform: none; font-weight: 500; letter-spacing: 0; border-radius: 8px; }
+.q-btn.q-btn--dense { border-radius: 6px; }
 .q-btn.q-btn--round { border-radius: 50%; }
-/* NiceGUI gives every button the primary color. Filled buttons stay red; flat and outline ones get neutral text
-   (in the layer block at the end) with a red icon, and round icon-only ones a muted icon that lights up on hover. */
-.q-btn--flat.text-primary .q-icon, .q-btn--outline.text-primary .q-icon { color: var(--rz-red-bright); }
+/* NiceGUI gives every button the primary color. Filled buttons stay red, with the launcher glow; flat ones get
+   neutral text (in the layer block at the end), outline ones a red border and link text, danger ones the danger wash. */
+.q-btn.bg-primary:not(.q-btn--flat):not(.q-btn--outline) {
+  box-shadow: 0 6px 20px -8px rgba(237, 0, 13, .8);
+}
+.q-btn-toggle .q-btn.bg-primary { box-shadow: none; }
+.q-btn.bg-primary.disabled, .q-btn.bg-primary:disabled { box-shadow: none; }
+.q-btn.disabled, .q-btn:disabled { opacity: .45; }
+.q-btn.bg-primary:not(.q-btn--flat):not(.q-btn--outline):hover { background: var(--rz-red-bright); }
+.q-btn-toggle .q-btn.bg-primary:hover { background: var(--rz-red); }
+.q-btn.bg-negative {
+  background: var(--rz-danger-bg); color: var(--rz-danger-text); border: 1px solid var(--rz-danger-border);
+}
+.q-btn.bg-negative:hover { background: var(--rz-danger-hover); }
+.q-btn--flat.text-primary .q-icon { color: var(--rz-red-bright); }
 .q-btn--outline.text-primary:before { border-color: var(--rz-red); }
+.q-btn--outline.text-primary:hover { background: var(--rz-red-soft); }
+.q-btn--outline.text-primary:hover:before { border-color: var(--rz-red); }
+.q-btn--outline.text-negative:before { border-color: var(--rz-danger-border); }
 .q-btn--flat.q-btn--round.text-primary .q-icon { color: var(--rz-muted); }
 .q-btn--flat.q-btn--round.text-primary:hover .q-icon { color: var(--rz-heading); }
 .q-btn-toggle { border: 1px solid var(--rz-border-strong); }
@@ -155,7 +186,7 @@ body {
   background: var(--rz-tooltip-bg); border: 1px solid var(--rz-border-strong); color: var(--rz-text);
   font-size: 13px; max-width: 440px; line-height: 1.45;
 }
-.q-menu { background: var(--rz-menu-bg); border: 1px solid var(--rz-border-strong); color: var(--rz-text); }
+.q-menu { background: var(--rz-menu-bg); border: 1px solid var(--rz-border); color: var(--rz-text); border-radius: 8px; }
 .rz-tabs { border-bottom: 1px solid var(--rz-border); }
 .rz-tabs .q-tab { color: var(--rz-muted); min-height: 42px; }
 .rz-tabs .q-tab__label { font-weight: 500; }
@@ -174,12 +205,14 @@ body {
 .rz-warn { color: var(--rz-warn-text); }
 .rz-ok { color: var(--rz-ok-text); }
 .rz-err { color: var(--rz-err-text); }
-.rulz-mono { font-family: ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace; }
+.rulz-mono, .nicegui-markdown code, .nicegui-markdown pre {
+  font-family: "Cascadia Code", "Cascadia Mono", Consolas, ui-monospace, monospace;
+}
 .rz-box { border: 1px solid var(--rz-border); border-radius: 8px; background: var(--rz-deep); }
 .rz-banner { border-radius: 10px; padding: 10px 14px; font-size: 13px; }
 .rz-banner.info { background: var(--rz-surface); border: 1px solid var(--rz-border-strong); color: var(--rz-text-2); }
 .rz-banner.info .q-icon { color: var(--rz-red-bright); }
-.nicegui-markdown a, .rz-link { color: var(--rz-red-bright); }
+.nicegui-markdown a, .rz-link { color: var(--rz-link); }
 .nicegui-markdown code { background: var(--rz-code-bg); color: var(--rz-code); padding: 1px 6px; border-radius: 5px; }
 .nicegui-markdown pre { background: var(--rz-deep); border: 1px solid var(--rz-border); border-radius: 10px; }
 .nicegui-markdown pre code { background: transparent; color: var(--rz-text-2); padding: 0; }
@@ -187,28 +220,28 @@ body {
 /* "Choose your look" (first start) */
 .rz-look-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; width: 100%; }
 .rz-look {
-  border: 2px solid var(--rz-border-strong); border-radius: 14px; padding: 10px; cursor: pointer; gap: 10px;
+  border: 2px solid var(--rz-border-strong); border-radius: 12px; padding: 10px; cursor: pointer; gap: 10px;
   background: var(--rz-surface); transition: border-color .15s, box-shadow .15s;
 }
 .rz-look:hover { border-color: var(--rz-hover-border); }
-.rz-look.selected { border-color: var(--rz-red); box-shadow: 0 0 0 3px rgba(225, 6, 0, .18); }
+.rz-look.selected { border-color: var(--rz-red); box-shadow: 0 0 0 3px rgba(237, 0, 13, .18); }
 .rz-look-name { font-weight: 600; font-size: 15px; color: var(--rz-heading); }
 .rz-look-note { font-size: 12px; color: var(--rz-muted); }
 .rz-check { display: none; color: var(--rz-red-bright); font-size: 20px; }
 .rz-look.selected .rz-check { display: inline-flex; }
 .rz-mini {
   border-radius: 9px; height: 104px; padding: 10px; display: flex; flex-direction: column; gap: 7px;
-  border: 1px solid #262626; overflow: hidden; align-self: stretch;
+  border: 1px solid #232328; overflow: hidden; align-self: stretch;
 }
 .rz-mini img { height: 13px; width: auto; align-self: flex-start; }
-.rz-mini.dark { background: #0A0A0A; }
+.rz-mini.dark { background: #050505; }
 .rz-mini.light { background: #FFFFFF; border-color: #D9D9DE; }
 .rz-mini .bar { height: 8px; border-radius: 4px; }
-.rz-mini.dark .bar { background: #1F1F1F; }
+.rz-mini.dark .bar { background: #1c1c21; }
 .rz-mini.light .bar { background: #EBEBEF; }
-.rz-mini .bar.red { width: 34%; background: #E10600; height: 14px; margin-top: auto; }
+.rz-mini .bar.red { width: 34%; background: #ED000D; height: 14px; margin-top: auto; }
 .rz-mini .panel { border-radius: 6px; flex: 1; padding: 6px; display: flex; flex-direction: column; gap: 5px; }
-.rz-mini.dark .panel { background: #131313; border: 1px solid #262626; }
+.rz-mini.dark .panel { background: #0c0c0e; border: 1px solid #232328; }
 .rz-mini.light .panel { background: #F5F5F7; border: 1px solid #D9D9DE; }
 
 /* Rules that must beat Quasar's own !important utilities (text-primary and the like). NiceGUI loads those into its
@@ -217,7 +250,15 @@ body {
   .rz-light-only { display: none !important; }
   body.body--light .rz-light-only { display: inline-flex !important; }
   body.body--light .rz-dark-only { display: none !important; }
-  .q-btn--flat.text-primary, .q-btn--outline.text-primary, .q-chip--outline.text-primary { color: var(--rz-text-2) !important; }
+  .q-btn--flat.text-primary, .q-chip--outline.text-primary { color: var(--rz-text-2) !important; }
+  .q-btn--outline.text-primary, .q-btn--outline.text-primary .q-icon { color: var(--rz-link) !important; }
+  .q-btn.bg-primary:not(.q-btn--flat):not(.q-btn--outline):hover { background: var(--rz-red-bright) !important; }
+  .q-btn-toggle .q-btn.bg-primary:hover { background: var(--rz-red) !important; }
+  .q-btn.bg-negative { background: var(--rz-danger-bg) !important; color: var(--rz-danger-text) !important; border: 1px solid var(--rz-danger-border) !important; }
+  .q-btn.bg-negative .q-icon { color: var(--rz-danger-text) !important; }
+  .q-btn.bg-negative:hover { background: var(--rz-danger-hover) !important; }
+  .q-btn--flat.text-negative, .q-btn--outline.text-negative,
+  .q-btn--flat.text-negative .q-icon, .q-btn--outline.text-negative .q-icon { color: var(--rz-danger-text) !important; }
   .rz-kind-icon, .rz-ic-dir { color: var(--rz-red-bright) !important; }
   .rz-ic-weight { color: var(--rz-weight-icon) !important; }
   .rz-ic-file { color: var(--rz-file-icon) !important; }
@@ -229,8 +270,8 @@ body {
 def setup() -> None:
     """Once per process, before the first page: the logo files, the brand colors and the stylesheet."""
     app.add_static_files(STATIC_URL, STATIC)
-    app.colors(primary=RED, secondary='#27272A', accent=RED_BRIGHT, dark='#131313', dark_page='#0A0A0A',
-               positive='#22C55E', negative='#FF453A', info='#3F3F46', warning='#F59E0B')
+    app.colors(primary=RED, secondary='#141417', accent=RED_BRIGHT, dark='#0c0c0e', dark_page='#050505',
+               positive='#4ade80', negative='#ff5a5f', info='#3F3F46', warning='#fbbf24')
     ui.add_css(CSS, shared=True)
 
 

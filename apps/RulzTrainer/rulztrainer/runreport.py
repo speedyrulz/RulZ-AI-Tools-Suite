@@ -768,7 +768,7 @@ def summary(run: Run, path: Path, dpi: int = 150) -> Path:
     saved = [Path(str(s)).name for s in run.status.get("saved") or []]
     if saved and yy < y + h - 0.3:
         page.text(x, y + h - 0.02, "Files: " + _short(", ".join(saved), 100), size=7.2, color=MUTED, va="bottom")
-    page.text(0.6, H - 0.33, f"RulZ Trainer {_version()}   ·   made {time.strftime('%Y-%m-%d %H:%M')}   ·   {run.job_dir}",
+    page.text(0.6, H - 0.33, f"RulZ AI Trainer {_version()}   ·   made {time.strftime('%Y-%m-%d %H:%M')}   ·   {run.job_dir}",
               size=7, color=FAINT)
     path.parent.mkdir(parents=True, exist_ok=True)
     page.fig.savefig(path, dpi=dpi, facecolor=SURFACE)
@@ -802,7 +802,7 @@ def _pdf_page(plt, run: Run, title: str, number: int):
     page.text(0.5, 0.2, _short(run.job, 40), size=10, color=BAND_INK, weight="bold")
     page.text(A4[0] - 0.5, 0.22, title, size=9, color=BAND_MUTED, ha="right")
     page.text(A4[0] / 2, A4[1] - 0.3, f"{number}", size=7.5, color=FAINT, ha="center")
-    page.text(0.5, A4[1] - 0.3, f"RulZ Trainer {_version()}", size=7, color=FAINT)
+    page.text(0.5, A4[1] - 0.3, f"RulZ AI Trainer {_version()}", size=7, color=FAINT)
     return page
 
 
@@ -1041,7 +1041,7 @@ def pdf(run: Run, path: Path) -> Path:
         done(out, page)
         meta = out.infodict()
         meta["Title"] = f"Training run report: {run.job}"
-        meta["Creator"] = f"RulZ Trainer {_version()}"
+        meta["Creator"] = f"RulZ AI Trainer {_version()}"
     return path
 
 

@@ -879,7 +879,7 @@ def cmd_update(args) -> int:
         raise Refused(f"{plan['changed_count']} file(s) changed here since the last update ({names}), by "
                       "rulz_remote.py sync perhaps: --discard replaces them with the newest release's.")
     if plan["up_to_date"] and not plan["changed_count"] and not args.reinstall and not plan["unfinished"]:
-        show(dict(plan, state="current", note=f"Already the newest RulzTrainer "
+        show(dict(plan, state="current", note=f"Already the newest RulZ AI Trainer "
                                               f"({plan['current'].get('version') or plan['current'].get('commit')})."))
         return 0
     return run_update(plan, args.reinstall)
@@ -940,7 +940,7 @@ def cmd_webui(args) -> int:
 
 
 def parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="rulz_agent", description="RulzTrainer's runs on this machine")
+    ap = argparse.ArgumentParser(prog="rulz_agent", description="RulZ AI Trainer's runs on this machine")
     sub = ap.add_subparsers(dest="command", required=True)
 
     def command(name, func, job_name=False):

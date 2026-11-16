@@ -69,7 +69,7 @@ export function Projects() {
           )}
 
           <section className="rounded-2xl border border-border bg-panel p-4">
-            <h2 className="flex items-center gap-2 text-[16px] font-semibold">
+            <h2 className="font-[family-name:var(--font-display)] flex items-center gap-2 text-[16px] font-semibold">
               <FolderPlus size={19} className="text-accent" /> New project
             </h2>
             <div className="mt-3 flex gap-2">
@@ -94,7 +94,7 @@ export function Projects() {
 
           <section className="rounded-2xl border border-border bg-panel p-2">
             <div className="flex items-center justify-between px-2 pt-1">
-              <h2 className="text-[16px] font-semibold">Your projects</h2>
+              <h2 className="font-[family-name:var(--font-display)] text-[16px] font-semibold">Your projects</h2>
               <Button size="sm" onClick={() => setPicker('open')}>
                 <FolderOpen size={15} /> Open folder
               </Button>

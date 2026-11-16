@@ -550,7 +550,7 @@ function EmptyState() {
     <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto p-8">
       <div className="max-w-lg text-center">
         <LogoMark className="mx-auto w-14" />
-        <h2 className="mt-4 text-lg font-semibold">What should I build in “{project.name}”?</h2>
+        <h2 className="font-[family-name:var(--font-display)] mt-4 text-lg font-semibold">What should I build in “{project.name}”?</h2>
         <p className="mt-2 text-sm text-muted">Describe it in your own words below. Here are some ideas:</p>
         <div className="mt-4 flex flex-col gap-2">
           {EXAMPLES.map((ex) => (

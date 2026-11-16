@@ -912,6 +912,9 @@ class MainWindow(QMainWindow):
         for sb in (self.out_w, self.out_h, self.len_sec, self.len_frames, self.aspect_edit):
             sb.editingFinished.connect(self._release_focus)
         self.aspect_combo.activated.connect(lambda _: self._release_focus())
+        for b in self.findChildren(QPushButton):  # a click doesn't ring a button; Tab still reaches it
+            if b.focusPolicy() == Qt.StrongFocus:
+                b.setFocusPolicy(Qt.TabFocus)
         self.view.setFocus()
         # A paused frame is scaled for the view's size: render it again after a resize (maximize),
         # or it stays upscaled and blurry until the next step.

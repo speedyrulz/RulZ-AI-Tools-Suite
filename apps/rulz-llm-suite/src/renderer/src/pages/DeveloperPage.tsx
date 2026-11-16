@@ -112,7 +112,7 @@ export function DeveloperPage() {
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-5">
         <div className="flex items-center gap-3">
           <div className="min-w-0 flex-1">
-            <h1 className="text-base font-semibold">Developer</h1>
+            <h1 className="font-[family-name:var(--font-display)] text-base font-semibold">Developer</h1>
             <div className="text-xs text-muted">Local OpenAI- and Anthropic-compatible API in front of your models.</div>
           </div>
           <div className="flex items-center gap-2">

@@ -137,7 +137,7 @@ function slimReleases(list: RawRelease[]): RawRelease[] {
 const RELEASE_PAGE = 100
 /**
  * How deep the shared release list is read: one request a page serves every app. An app whose newest release is older
- * than this many pages of other apps' releases (RulzTrainer alone publishes dozens a month) is found through its tags
+ * than this many pages of other apps' releases (RulZ AI Trainer alone publishes dozens a month) is found through its tags
  * instead, two requests of its own.
  */
 const RELEASE_PAGES = 5

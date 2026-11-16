@@ -78,9 +78,9 @@ namespace RulZ.ImageTournament
         CheckBox _chkSubfolders, _chkShuffle, _chkKeepZoom, _chkLight, _tglSide, _tglSplit;
 
         // Themed controls by role, re-colored by ApplyTheme.
-        readonly List<Button> _buttons = new List<Button>();
-        readonly List<CheckBox> _toggles = new List<CheckBox>();
-        readonly List<CheckBox> _checks = new List<CheckBox>();
+        readonly List<RoundButton> _buttons = new List<RoundButton>();
+        readonly List<RoundToggle> _toggles = new List<RoundToggle>();
+        readonly List<ThemedCheck> _checks = new List<ThemedCheck>();
         readonly List<Label> _labels = new List<Label>();
         readonly List<Label> _separators = new List<Label>();
 
@@ -109,7 +109,7 @@ namespace RulZ.ImageTournament
             AutoScaleDimensions = new SizeF(96f, 96f);
             AutoScaleMode = AutoScaleMode.Dpi;
             Text = AppName;
-            Font = new Font("Segoe UI", 9f);
+            Font = Theme.Font(10.5f);
             MinimumSize = new Size(900, 560);
             Size = new Size(1400, 900);
             StartPosition = FormStartPosition.CenterScreen;
@@ -190,7 +190,7 @@ namespace RulZ.ImageTournament
                 {
                     Size = new Size(20 * _logo.Width / _logo.Height, 20),
                     Anchor = AnchorStyles.Left,
-                    Margin = new Padding(4, 3, 12, 3),
+                    Margin = new Padding(2, 3, 8, 3),
                 });
             bar.Controls.AddRange(new Control[]
             {
@@ -222,7 +222,7 @@ namespace RulZ.ImageTournament
             {
                 Dock = DockStyle.Fill,
                 TextAlign = ContentAlignment.MiddleCenter,
-                Font = new Font("Segoe UI", 10f),
+                Font = Theme.Font(10.5f),
                 UseMnemonic = false,
             };
             bottom.Controls.Add(_btnLeft, 0, 0);
@@ -237,16 +237,21 @@ namespace RulZ.ImageTournament
             PerformLayout();
         }
 
-        Button MakeButton(string text, string tip)
+        RoundButton MakeButton(string text, string tip)
         {
-            var b = new Button
+            // Sized from the text like the toggles (same 96-DPI units, scaled by the form later): text + 12px
+            // each side, 32px high, so buttons and toggles line up in the toolbar.
+            Size textSize = TextRenderer.MeasureText(text ?? "", Font);
+            float screenScale;
+            using (var g = Graphics.FromHwnd(IntPtr.Zero)) screenScale = Math.Max(1f, g.DpiX / 96f);
+            var b = new RoundButton
             {
                 Text = text,
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                AutoSize = false,
+                Size = new Size((int)Math.Ceiling(textSize.Width / screenScale) + 24, 32),
                 FlatStyle = FlatStyle.Flat,
-                Padding = new Padding(3, 2, 3, 2),
-                Margin = new Padding(2, 3, 2, 3),
+                Radius = 6,
+                Margin = new Padding(1, 3, 1, 3),
                 UseVisualStyleBackColor = false,
                 Anchor = AnchorStyles.Left,
             };
@@ -259,12 +264,14 @@ namespace RulZ.ImageTournament
         {
             var b = MakeButton("", null);
             b.AutoSize = false;
+            b.MinimumSize = Size.Empty;
+            b.Radius = 10;
             b.Dock = DockStyle.Fill;
-            b.Font = new Font("Segoe UI", 13f, FontStyle.Bold);
+            b.Font = Theme.Font(13f, FontStyle.Bold);
             return b;
         }
 
-        CheckBox MakeToggle(string text, string tip)
+        RoundToggle MakeToggle(string text, string tip)
         {
             // AutoSize doesn't account for button appearance, so size it from the text. MeasureText works in
             // screen pixels, but sizes set here are in 96-DPI units that the form scales up afterwards, so
@@ -272,14 +279,15 @@ namespace RulZ.ImageTournament
             Size textSize = TextRenderer.MeasureText(text, Font);
             float screenScale;
             using (var g = Graphics.FromHwnd(IntPtr.Zero)) screenScale = Math.Max(1f, g.DpiX / 96f);
-            var c = new CheckBox
+            var c = new RoundToggle
             {
                 Text = text,
                 Appearance = Appearance.Button,
                 AutoSize = false,
-                Size = new Size((int)Math.Ceiling(textSize.Width / screenScale) + 22, (int)Math.Ceiling(textSize.Height / screenScale) + 14),
+                Size = new Size((int)Math.Ceiling(textSize.Width / screenScale) + 24, Math.Max(32, (int)Math.Ceiling(textSize.Height / screenScale) + 8)),
                 FlatStyle = FlatStyle.Flat,
-                Margin = new Padding(2, 3, 2, 3),
+                Radius = 6,
+                Margin = new Padding(1, 3, 1, 3),
                 TextAlign = ContentAlignment.MiddleCenter,
                 Anchor = AnchorStyles.Left,
             };
@@ -291,9 +299,9 @@ namespace RulZ.ImageTournament
             return c;
         }
 
-        CheckBox MakeCheck(string text, string tip)
+        ThemedCheck MakeCheck(string text, string tip)
         {
-            var c = new CheckBox { Text = text, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(4, 3, 0, 3) };
+            var c = new ThemedCheck { Text = text, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(2, 3, 0, 3) };
             // Hand focus back to the images so the mouse wheel and shortcuts keep working.
             c.Click += delegate { _view.Focus(); };
             _checks.Add(c);
@@ -303,14 +311,14 @@ namespace RulZ.ImageTournament
 
         Label MakeLabel(string text)
         {
-            var l = new Label { Text = text, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 3, 0, 3) };
+            var l = new Label { Text = text, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(2, 3, 0, 3) };
             _labels.Add(l);
             return l;
         }
 
         Label MakeSeparator()
         {
-            var l = new Label { AutoSize = false, Width = 1, Height = 26, Margin = new Padding(5, 4, 5, 4) };
+            var l = new Label { AutoSize = false, Width = 1, Height = 26, Margin = new Padding(3, 4, 3, 4) };
             _separators.Add(l);
             return l;
         }
@@ -336,7 +344,9 @@ namespace RulZ.ImageTournament
                 b.BackColor = Theme.Control;
                 b.FlatAppearance.BorderColor = big ? Theme.Accent : Theme.Border;
                 b.FlatAppearance.MouseOverBackColor = big ? Theme.AccentFillHover : Theme.Hover;
-                b.FlatAppearance.MouseDownBackColor = big ? Theme.AccentFill : Theme.Border;
+                b.FlatAppearance.MouseDownBackColor = big ? Theme.AccentPressed : Theme.Border;
+                b.HoverBorderColor = big ? Theme.AccentFillHover : Theme.BorderStrong;
+                b.HoverForeColor = big ? Theme.OnAccent : Color.Empty;
             }
             foreach (var c in _toggles)
             {
@@ -346,6 +356,7 @@ namespace RulZ.ImageTournament
                 c.FlatAppearance.CheckedBackColor = Theme.AccentFill;
                 c.FlatAppearance.MouseOverBackColor = Theme.Hover;
                 c.FlatAppearance.MouseDownBackColor = Theme.Border;
+                c.HoverBorderColor = Theme.BorderStrong;
             }
             foreach (var c in _checks) { c.ForeColor = Theme.Text; c.BackColor = Theme.Panel; }
             foreach (var l in _labels) { l.ForeColor = Theme.Dim; l.BackColor = Theme.Panel; }

@@ -12,43 +12,53 @@
 </script>
 <style>
   :root, :root[data-theme="dark"] {
-    --bg: #0b0b0c; --panel: #151517; --text: #f2f2f3; --muted: #a3a3a9; --border: #2c2c31;
-    --accent: #e30613; --accent-hover: #ff1f2c; --accent-text: #ffffff; --good: #4cc27f;
-    --warn-bg: #2a1a0c; --warn-border: #8a5a1f; --bad: #ff6b6b; --chip: #1f1f23;
-    --header: #000000; --shadow: none; color-scheme: dark;
+    --bg: #050505; --panel: #0c0c0e; --panel-2: #141417; --hover: #1c1c21;
+    --text: #f2f2f3; --muted: #a3a3ab; --faint: #82828c; --border: #232328; --border-strong: #34343b;
+    --accent: #ed000d; --accent-hover: #ff2633; --accent-text: #ffffff; --accent-soft: rgba(237, 0, 13, .13);
+    --link: #ff5961; --good: #4ade80; --warn: #fbbf24;
+    --warn-bg: #2a1a0c; --warn-border: #8a5a1f; --bad: #ff8a8e; --chip: #141417;
+    --header: #050505; --shadow: none; color-scheme: dark;
   }
   :root[data-theme="light"] {
-    --bg: #f4f4f5; --panel: #ffffff; --text: #111113; --muted: #5f6068; --border: #dcdce0;
-    --accent: #d1000f; --accent-hover: #b0000c; --accent-text: #ffffff; --good: #1d8a4a;
-    --warn-bg: #fff4d6; --warn-border: #e8c15a; --bad: #c23b3b; --chip: #efeff1;
+    --bg: #ffffff; --panel: #f5f5f7; --panel-2: #ebebef; --hover: #e2e2e7;
+    --text: #111114; --muted: #5f6068; --faint: #68696f; --border: #d9d9de; --border-strong: #c4c4cb;
+    --accent: #ed000d; --accent-hover: #c8000b; --accent-text: #ffffff; --accent-soft: rgba(237, 0, 13, .08);
+    --link: #d0000b; --good: #15803d; --warn: #a16207;
+    --warn-bg: #fff4d6; --warn-border: #e8c15a; --bad: #b4000a; --chip: #ebebef;
     --header: #ffffff; --shadow: 0 1px 2px rgba(0,0,0,.06); color-scheme: light;
   }
-  * { box-sizing: border-box; }
+  * { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+  ::selection { background: rgba(237, 0, 13, .4); }
   body { margin: 0; background: var(--bg); color: var(--text); accent-color: var(--accent);
-         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-  .topbar { background: var(--header); border-bottom: 3px solid var(--accent); }
+         font: 14px/1.45 "Segoe UI Variable Text", "Segoe UI", Inter, system-ui, sans-serif; }
+  .topbar { background: var(--bg); border-bottom: 1px solid var(--border); }
   .topbar-inner { max-width: 1200px; margin: 0 auto; padding: 12px 16px; display: flex; align-items: center; gap: 14px; }
   .brand { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; }
-  .brand img { height: 40px; width: auto; display: block; }
+  .brand img { height: 28px; width: auto; display: block; }
   .logo-light { display: none !important; }
   :root[data-theme="light"] .logo-light { display: block !important; }
   :root[data-theme="light"] .logo-dark { display: none !important; }
-  h1 { font-size: 22px; margin: 0; font-weight: 700; letter-spacing: .02em; white-space: nowrap; }
-  @media (max-width: 460px) { .brand img { height: 30px; } h1 { font-size: 18px; } }
+  h1 { font-family: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+       font-size: 20px; margin: 0; font-weight: 600; letter-spacing: 0; line-height: 1.2; white-space: nowrap; }
+  @media (max-width: 460px) { .brand img { height: 24px; } h1 { font-size: 16px; } }
   #themeBtn { white-space: nowrap; }
   main { max-width: 1200px; margin: 0 auto; padding: 20px 16px 48px; }
   button.primary:hover:not(:disabled), .btn.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
-  button:hover:not(:disabled):not(.primary) { border-color: var(--accent); }
-  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
-  .panel h2 { border-left: 3px solid var(--accent); padding-left: 8px; }
+  button:hover:not(:disabled):not(.primary), .btn:hover:not(.primary) { background: var(--hover); border-color: var(--border-strong); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .folder-pick input:focus { outline: none; border: 2px solid var(--accent); padding: 7px 9px; }
+  input::placeholder, textarea::placeholder { color: var(--faint); opacity: 1; }
+  .panel h2 { border-left: 3px solid var(--accent); padding-left: 8px;
+              font-family: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif; font-weight: 600; }
   .sub { color: var(--muted); margin: 0 0 16px; }
-  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
            padding: 16px; margin-bottom: 16px; box-shadow: var(--shadow); }
   .panel h2 { font-size: 15px; margin: 0 0 12px; }
   label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
   input[type=text], input[type=number], textarea {
-    width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
-    background: var(--bg); color: var(--text); font: inherit; }
+    width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--panel); color: var(--text); font: inherit; }
   textarea { min-height: 96px; resize: vertical; font-size: 14px; }
   .row { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
   .row4 { display: grid; gap: 12px; grid-template-columns: repeat(4, 1fr); }
@@ -57,20 +67,25 @@
   .field { margin-bottom: 12px; }
   .check { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 14px; margin-top: 26px; }
   .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-  button, .btn { appearance: none; border: 1px solid var(--border); background: var(--panel); color: var(--text);
-                 padding: 8px 14px; border-radius: 6px; font: inherit; cursor: pointer; text-decoration: none;
-                 display: inline-block; }
-  button.primary, .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
-  button:disabled { opacity: .5; cursor: not-allowed; }
+  button, .btn { appearance: none; border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+                 height: 36px; padding: 0 16px; border-radius: 8px; font: inherit; font-weight: 500; cursor: pointer;
+                 text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }
+  button.primary, .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text);
+                                 box-shadow: 0 6px 20px -8px rgba(237, 0, 13, .8); }
+  button.primary:disabled, .btn.primary:disabled { box-shadow: none; }
+  #themeBtn, #historyRefresh, #pauseBtn, #resumeBtn, #cancelBtn, #newBtn, #backToRun, .hrow > button {
+    height: 32px; padding: 0 12px; border-radius: 6px; font-size: 13px; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
   .hint { font-size: 13px; color: var(--muted); }
   .error { color: var(--bad); font-size: 14px; margin-top: 8px; }
   .banner { background: var(--warn-bg); border: 1px solid var(--warn-border); border-radius: 8px;
             padding: 12px 14px; margin-bottom: 16px; }
-  .banner code { display: block; margin-top: 6px; font-size: 12.5px; overflow-x: auto; white-space: pre; }
+  .banner code { display: block; margin-top: 6px; font-size: 12.5px; overflow-x: auto; white-space: pre;
+                 font-family: "Cascadia Code", "Cascadia Mono", Consolas, ui-monospace, monospace; }
   .hidden { display: none !important; }
   .status-line { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
   .pill { padding: 2px 10px; border-radius: 999px; background: var(--chip); font-size: 13px; font-weight: 600; }
-  .pill.running { color: var(--accent); } .pill.paused { color: #b7871b; }
+  .pill.running { color: var(--accent); } .pill.paused { color: var(--warn); }
   .pill.done { color: var(--good); } .pill.failed, .pill.cancelled { color: var(--bad); }
   .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; margin-bottom: 12px; }
   .stat { background: var(--chip); border-radius: 8px; padding: 8px 10px; }
@@ -81,7 +96,7 @@
   .slider { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
   .slider input { flex: 1; min-width: 160px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
-  .card { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--bg);
+  .card { border: 1px solid var(--border); border-radius: 12px; overflow: hidden; background: var(--bg);
           display: flex; flex-direction: column; }
   .card .thumb { aspect-ratio: 4 / 3; background: var(--chip); display: block; }
   .card img { width: 100%; height: 100%; object-fit: contain; display: block; }
@@ -89,10 +104,11 @@
   .conf { font-weight: 700; }
   .evidence { color: var(--muted); }
   .card .links { display: flex; gap: 10px; margin-top: auto; padding-top: 4px; }
-  .card a { color: var(--accent); }
+  .card a { color: var(--link); }
   .empty { color: var(--muted); padding: 12px 0; }
   .dims { font-size: 12px; color: var(--muted); }
-  .path { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+  .path { font-size: 12px; color: var(--muted); overflow-wrap: anywhere;
+          font-family: "Cascadia Code", "Cascadia Mono", Consolas, ui-monospace, monospace; }
   .source { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 12px; font-size: 14px; }
   .source label { display: flex; align-items: center; gap: 6px; color: var(--text); font-size: 14px; margin: 0; cursor: pointer; }
   .folder-pick { display: flex; gap: 8px; }
@@ -104,7 +120,7 @@
   .hrow { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--border);
           border-radius: 8px; background: var(--bg); }
   .hinfo { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 14px; }
-  .pill.interrupted { color: #b7871b; }
+  .pill.interrupted { color: var(--warn); }
   details { margin-top: 12px; font-size: 13px; }
   details ul { margin: 6px 0 0; padding-left: 18px; color: var(--muted); max-height: 220px; overflow: auto; }
   details li { overflow-wrap: anywhere; }

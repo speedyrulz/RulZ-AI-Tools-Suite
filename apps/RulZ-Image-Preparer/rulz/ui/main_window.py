@@ -175,6 +175,9 @@ class MainWindow(QMainWindow):
         self.editor.modeRequested.connect(self._request_mode)
         self.stack.addWidget(self.editor)
         self._update_counts()
+        for b in self.findChildren(QPushButton):  # a click doesn't ring a button; Tab still reaches it
+            b.setFocusPolicy(Qt.TabFocus)
+        self.stack.currentWidget().setFocus()  # start on the content, not on the first button
 
     # ---- layout ----------------------------------------------------------
     def _build_library(self) -> QWidget:
@@ -184,14 +187,19 @@ class MainWindow(QMainWindow):
         tl = QHBoxLayout(top)
         tl.setContentsMargins(16, 10, 16, 10)
         tl.setSpacing(10)
-        logo = QLabel()
-        pm = QPixmap(theme.logo_file())
-        if not pm.isNull():
-            logo.setPixmap(pm.scaledToHeight(30, Qt.SmoothTransformation))
-        tl.addWidget(logo)
+        self.logo = QLabel()
+        self._update_logo()
+        tl.addWidget(self.logo)
         tl.addWidget(QLabel("Image Preparer", objectName="PageTitle"))
         tl.addStretch(1)
-        add = QPushButton(theme.icon("add"), "  Add images", clicked=self._browse)
+        self.theme_btn = QPushButton(clicked=lambda: self.set_theme(not theme.is_dark()))
+        self.theme_btn.setProperty("flat", True)
+        self.theme_btn.setCursor(Qt.PointingHandCursor)
+        self.theme_btn.setToolTip("Switch between dark and light (Ctrl+Shift+L)")
+        self._update_theme_button()
+        QShortcut(QKeySequence("Ctrl+Shift+L"), self, lambda: self.set_theme(not theme.is_dark()))
+        tl.addWidget(self.theme_btn)
+        add =QPushButton(theme.icon("add"), "  Add images", clicked=self._browse)
         add.setToolTip("Pick photos to add (you can also drag photos or folders onto the window)")
         self.clear_btn = QPushButton(theme.icon("clear"), "  Clear", clicked=self._clear)
         self.save_btn = QPushButton(theme.icon("save", "#ffffff"), "  Save all…", clicked=self._save_all)
@@ -273,6 +281,31 @@ class MainWindow(QMainWindow):
         lay.addWidget(tools)
         lay.addWidget(self.body, 1)
         return page
+
+    def _update_logo(self):
+        pm = QPixmap(theme.logo_file())
+        if not pm.isNull():
+            self.logo.setPixmap(pm.scaledToHeight(30, Qt.SmoothTransformation))
+        else:
+            self.logo.setText("RulZ")
+
+    def _update_theme_button(self):
+        dark = theme.is_dark()
+        self.theme_btn.setText("  Light mode" if dark else "  Dark mode")
+        self.theme_btn.setIcon(theme.icon("sun" if dark else "moon", None, 16))
+
+    def set_theme(self, dark: bool):
+        """Switch dark/light right away and remember it."""
+        from PySide6.QtWidgets import QApplication
+
+        theme.save_choice(dark)
+        if dark == theme.is_dark():
+            return
+        theme.apply(QApplication.instance(), dark)
+        self._update_logo()
+        self._update_theme_button()
+        self.grid.viewport().update()
+        self.editor.update()
 
     @staticmethod
     def _modifiers() -> bool:

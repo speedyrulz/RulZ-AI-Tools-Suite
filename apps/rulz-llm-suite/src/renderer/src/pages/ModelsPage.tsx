@@ -47,7 +47,7 @@ export function ModelsPage() {
       <div className="flex min-w-0 flex-1 flex-col">
         <div className="flex items-center gap-3 border-b border-border px-6 py-4">
           <div className="min-w-0 flex-1">
-            <h1 className="text-base font-semibold">My Models</h1>
+            <h1 className="font-[family-name:var(--font-display)] text-base font-semibold">My Models</h1>
             <div className="truncate text-xs text-muted">
               {models.length} models · {formatBytes(totalSize)} · <span className="font-mono">{settings?.modelsDir}</span>
             </div>

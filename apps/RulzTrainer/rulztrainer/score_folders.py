@@ -1,4 +1,4 @@
-"""Score folders of finished samples for likeness, from any trainer, on RulzTrainer's probe scores: a spreadsheet that
+"""Score folders of finished samples for likeness, from any trainer, on RulZ AI Trainer's probe scores: a spreadsheet that
 compares runs checkpoint by checkpoint.
 
     python -m rulztrainer.score_folders --face-refs <folder> --body-refs <folder> --baseline <folder>
@@ -329,7 +329,7 @@ def build_workbook(result: dict, face_weight: float = 0.7, title: str = "Likenes
     p0, p1 = 5, 4 + max(1, len(pics))
     pictures["A1"] = "Every picture's raw scores"
     pictures["A1"].font = h1
-    pictures["A2"] = ("Measured with RulzTrainer's scorers (blue). Face and gold face: the best match among the face "
+    pictures["A2"] = ("Measured with RulZ AI Trainer's scorers (blue). Face and gold face: the best match among the face "
                       "references, in %. Body: the anchored score, 0 = the baseline's bodies, 100 = the body "
                       "references' mean. Empty: no face found, or no body window in the picture.")
     pictures["A2"].font = muted
@@ -356,7 +356,7 @@ def build_workbook(result: dict, face_weight: float = 0.7, title: str = "Likenes
     # -------------------------------------------------------- Scale (inputs and the scale's tops)
     scale["A1"] = "Likeness scale"
     scale["A1"].font = h1
-    scale["A2"] = ("RulzTrainer's normalize() (likeness.py): score = MIN(100, 100 x MAX(0, (raw - floor) / "
+    scale["A2"] = ("RulZ AI Trainer's normalize() (likeness.py): score = MIN(100, 100 x MAX(0, (raw - floor) / "
                    "(top - floor)) ^ curve), top = floor + (MAX(level, floor + minimum span) - floor) x span. "
                    "0 = the base model without a LoRA. The anchored body score is on its own scale already "
                    "(0 = the baseline's bodies, 100 = the references' mean), so its floor, top and curve are fixed.")
@@ -496,7 +496,7 @@ def build_workbook(result: dict, face_weight: float = 0.7, title: str = "Likenes
     # -------------------------------------------------------- Summary
     summary["A1"] = title
     summary["A1"].font = h1
-    summary["A2"] = ("Scored with RulzTrainer's probe scorers on its likeness scale: 0 = the base model without a LoRA "
+    summary["A2"] = ("Scored with RulZ AI Trainer's probe scorers on its likeness scale: 0 = the base model without a LoRA "
                      "(the baseline pictures); the face's 100 sits past the face references' own level (the Scale "
                      "sheet says where that level reads), the body's 100 is the body references' mean. Late = the "
                      "checkpoints from the Scale sheet's late step on (all of a run's pictures without steps). "
@@ -579,7 +579,7 @@ def build_workbook(result: dict, face_weight: float = 0.7, title: str = "Likenes
         ("Face", "ArcFace (InsightFace buffalo_l): the largest face's best cosine match among the face references, "
                  f"as a %. {len(refs.get('face') or [])} face references have a face."),
         ("Gold face", ("AdaFace (ViT-Base, WebFace4M)" if refs.get("gold_name") != "facenet" else
-                       "FaceNet (VGGFace2)") + " on the same face. Nothing in RulzTrainer trains on it, so it checks "
+                       "FaceNet (VGGFace2)") + " on the same face. Nothing in RulZ AI Trainer trains on it, so it checks "
                       "runs that trained against ArcFace."),
         ("Body", "The anchored body score (bodyanchor.py): the body from the neck to mid-thigh, upright, cut out, "
                  "its colour and sharpness normalised, embedded by SigLIP 2 and DINOv2; how far it moved from the "

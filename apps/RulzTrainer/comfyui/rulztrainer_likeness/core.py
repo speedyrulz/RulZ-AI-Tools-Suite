@@ -1,4 +1,4 @@
-"""Likeness scoring as the RulzTrainer trainer does it, for the ComfyUI nodes (no ComfyUI imports here).
+"""Likeness scoring as the RulZ AI Trainer trainer does it, for the ComfyUI nodes (no ComfyUI imports here).
 
 Everything that decides a score is the trainer's own code (rulztrainer.facesim, rulztrainer.bodysim,
 rulztrainer.likeness): the same face model (InsightFace buffalo_l, the largest face, the best cosine against any
@@ -259,7 +259,7 @@ def job_scale(job_dir) -> dict:
     p = Path(str(job_dir).strip().strip('"'))
     p = p if p.name == "likeness.jsonl" else p / "likeness.jsonl"
     if not p.is_file():
-        raise FileNotFoundError(f"No likeness.jsonl in {p.parent} (a RulzTrainer run with likeness probes)")
+        raise FileNotFoundError(f"No likeness.jsonl in {p.parent} (a RulZ AI Trainer run with likeness probes)")
     scale = None
     for line in p.read_text(encoding="utf-8").splitlines():
         try:

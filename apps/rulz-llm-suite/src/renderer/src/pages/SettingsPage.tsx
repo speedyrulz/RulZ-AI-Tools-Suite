@@ -11,7 +11,7 @@ import { useApp } from '../stores/app'
 function Card({ title, description, children }: { title: string; description?: string; children: ReactNode }) {
   return (
     <section className="rounded-xl border border-border bg-panel p-5">
-      <h2 className="text-sm font-semibold">{title}</h2>
+      <h2 className="font-[family-name:var(--font-display)] text-sm font-semibold">{title}</h2>
       {description && <p className="mt-0.5 text-xs text-muted">{description}</p>}
       <div className="mt-4 space-y-4">{children}</div>
     </section>
@@ -51,7 +51,7 @@ export function SettingsPage() {
   return (
     <div className="h-full overflow-y-auto">
       <div className="mx-auto max-w-3xl space-y-5 px-6 py-8">
-        <h1 className="text-lg font-semibold">Settings</h1>
+        <h1 className="font-[family-name:var(--font-display)] text-lg font-semibold">Settings</h1>
 
         <Card title="Engine" description="RulZ LLM Suite runs models with your own llama.cpp build (llama-server).">
           <Field label="llama.cpp folder" hint="Folder containing llama-server.exe. Empty = auto-detect.">

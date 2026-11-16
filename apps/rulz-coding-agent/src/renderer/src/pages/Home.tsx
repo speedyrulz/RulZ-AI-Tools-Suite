@@ -57,7 +57,7 @@ export function Home() {
           </div>
 
           <section className="rounded-xl border border-border bg-panel p-6">
-            <h2 className="flex items-center gap-2 text-[15px] font-semibold">
+            <h2 className="font-[family-name:var(--font-display)] flex items-center gap-2 text-[15px] font-semibold">
               <FolderPlus size={18} className="text-accent" /> New project
             </h2>
             <div className="mt-4 flex gap-2">
@@ -89,7 +89,7 @@ export function Home() {
 
           <section className="rounded-xl border border-border bg-panel p-6">
             <div className="flex items-center justify-between">
-              <h2 className="text-[15px] font-semibold">Your projects</h2>
+              <h2 className="font-[family-name:var(--font-display)] text-[15px] font-semibold">Your projects</h2>
               <Button
                 onClick={async () => {
                   const dir = await invoke('dialog:pickFolder', { title: 'Open a project folder', defaultPath: settings.projectsDir })

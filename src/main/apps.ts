@@ -1199,6 +1199,10 @@ export class AppManager {
         try {
           await createShortcut(paths[where], target)
           result[where] = paths[where]
+          // An app that was renamed in the catalog leaves its old shortcut under the old name.
+          const old = info.shortcuts[where]
+          // Best effort: a leftover that can't be removed must not lose track of the new shortcut.
+          if (old && old.toLowerCase() !== paths[where].toLowerCase()) await removeShortcut(old).catch(() => undefined)
         } catch (e) {
           if (!onError) throw e
           onError(e)

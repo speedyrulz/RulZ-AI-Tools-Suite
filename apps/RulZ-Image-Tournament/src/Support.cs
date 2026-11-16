@@ -14,26 +14,29 @@ namespace RulZ.ImageTournament
     sealed class Palette
     {
         public bool IsLight;
-        public Color Back, Panel, Control, Hover, Border, Text, Dim;
-        public Color Accent, AccentText, AccentFill, AccentFillHover, OnAccent, Overlay, ErrorText;
+        public Color Back, Panel, Control, Hover, Border, BorderStrong, Text, Dim;
+        public Color Accent, AccentText, AccentFill, AccentFillHover, AccentPressed, OnAccent, Overlay, ErrorText;
         public string LogoResource;
 
         public static readonly Palette Dark = new Palette
         {
-            Back = Color.FromArgb(12, 12, 14),
-            Panel = Color.FromArgb(22, 22, 25),
-            Control = Color.FromArgb(36, 36, 40),
-            Hover = Color.FromArgb(54, 54, 60),
-            Border = Color.FromArgb(64, 64, 70),
-            Text = Color.FromArgb(242, 242, 242),
-            Dim = Color.FromArgb(150, 150, 158),
+            // Values follow the launcher: bg, panel, panel-2 (Control), hover, border, border-strong, text, muted (Dim).
+            Back = Color.FromArgb(5, 5, 5),
+            Panel = Color.FromArgb(12, 12, 14),
+            Control = Color.FromArgb(20, 20, 23),
+            Hover = Color.FromArgb(28, 28, 33),
+            Border = Color.FromArgb(35, 35, 40),
+            BorderStrong = Color.FromArgb(52, 52, 59),
+            Text = Color.FromArgb(242, 242, 243),
+            Dim = Color.FromArgb(163, 163, 171),
             Accent = Color.FromArgb(237, 0, 13),          // the logo red
-            AccentText = Color.FromArgb(255, 70, 70),     // red that stays readable on black
-            AccentFill = Color.FromArgb(120, 0, 8),       // selected toggles and the Keep buttons
-            AccentFillHover = Color.FromArgb(165, 0, 12),
-            OnAccent = Color.FromArgb(242, 242, 242),
+            AccentText = Color.FromArgb(255, 107, 114),   // red that stays readable on black
+            AccentFill = Color.FromArgb(237, 0, 13),      // selected toggles and the Keep buttons: solid accent
+            AccentFillHover = Color.FromArgb(255, 38, 51),
+            AccentPressed = Color.FromArgb(200, 0, 11),
+            OnAccent = Color.FromArgb(255, 255, 255),
             Overlay = Color.FromArgb(16, 16, 18),         // boxes behind text drawn over the images
-            ErrorText = Color.Salmon,
+            ErrorText = Color.FromArgb(255, 138, 142),
             LogoResource = "RulZ.ImageTournament.logo.png",
         };
 
@@ -42,18 +45,20 @@ namespace RulZ.ImageTournament
             IsLight = true,
             Back = Color.FromArgb(255, 255, 255),
             Panel = Color.FromArgb(245, 245, 247),
-            Control = Color.FromArgb(255, 255, 255),
-            Hover = Color.FromArgb(235, 235, 239),
+            Control = Color.FromArgb(235, 235, 239),
+            Hover = Color.FromArgb(226, 226, 231),
             Border = Color.FromArgb(217, 217, 222),
+            BorderStrong = Color.FromArgb(196, 196, 203),
             Text = Color.FromArgb(17, 17, 20),
             Dim = Color.FromArgb(95, 96, 104),
             Accent = Color.FromArgb(237, 0, 13),
             AccentText = Color.FromArgb(200, 0, 11),      // a little darker so small text reads well on white
             AccentFill = Color.FromArgb(237, 0, 13),
             AccentFillHover = Color.FromArgb(200, 0, 11),
+            AccentPressed = Color.FromArgb(168, 0, 10),
             OnAccent = Color.FromArgb(255, 255, 255),
             Overlay = Color.FromArgb(255, 255, 255),
-            ErrorText = Color.FromArgb(200, 0, 11),
+            ErrorText = Color.FromArgb(180, 0, 10),
             LogoResource = "RulZ.ImageTournament.logo-light.png",
         };
     }
@@ -68,14 +73,33 @@ namespace RulZ.ImageTournament
         public static Color Control { get { return Current.Control; } }
         public static Color Hover { get { return Current.Hover; } }
         public static Color Border { get { return Current.Border; } }
+        public static Color BorderStrong { get { return Current.BorderStrong; } }
         public static Color Text { get { return Current.Text; } }
         public static Color Dim { get { return Current.Dim; } }
         public static Color Accent { get { return Current.Accent; } }
         public static Color AccentText { get { return Current.AccentText; } }
         public static Color AccentFill { get { return Current.AccentFill; } }
         public static Color AccentFillHover { get { return Current.AccentFillHover; } }
+        public static Color AccentPressed { get { return Current.AccentPressed; } }
         public static Color OnAccent { get { return Current.OnAccent; } }
         public static Color ErrorText { get { return Current.ErrorText; } }
+
+        // The UI face: Segoe UI Variable Text on Windows 11, Segoe UI where that family is not installed.
+        public static readonly string UiFamily = FindUiFamily();
+
+        static string FindUiFamily()
+        {
+            try
+            {
+                using (var f = new Font("Segoe UI Variable Text", 10f))
+                    if (string.Equals(f.Name, "Segoe UI Variable Text", StringComparison.OrdinalIgnoreCase)) return f.Name;
+            }
+            catch (ArgumentException) { }
+            return "Segoe UI";
+        }
+
+        public static Font Font(float points) { return new Font(UiFamily, points); }
+        public static Font Font(float points, FontStyle style) { return new Font(UiFamily, points, style); }
 
         // The translucent box behind text drawn over images.
         public static Color Overlay(int alpha) { return Color.FromArgb(alpha, Current.Overlay); }

@@ -104,10 +104,10 @@ namespace RulZImageGrid
             toolbar.Children.Add(left);
 
             var right = new StackPanel { Orientation = Orientation.Horizontal };
-            right.Children.Add(new TextBlock { Text = "Zoom", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0) });
+            right.Children.Add(new TextBlock { Text = "Zoom", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(10, 0, 8, 0) });
             zoomSlider = new Slider
             {
-                Width = 170,
+                Width = 130,
                 Minimum = Math.Log(0.01),
                 Maximum = Math.Log(4),
                 VerticalAlignment = VerticalAlignment.Center,

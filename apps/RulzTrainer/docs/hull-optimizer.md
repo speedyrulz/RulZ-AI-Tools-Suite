@@ -792,7 +792,7 @@ confirmation on N then applies the bar. R0a and R0b run before the pilot and pic
 
 | race | rows | reads |
 |---|---|---|
-| R0a | AdamW at 1e-4: `timestep_sampling: reference` (logit-normal plus the resolution shift, `archs.py:586-593`; SD3 found logit-normal(0, 1) best-ranked and trains and samples at one shift, [2403.03206](https://arxiv.org/abs/2403.03206) Eq. 23 [P]; RulzTrainer's MiniMax H3 recipe uses it, `README.md:2461-2462`) against `logit_normal` | the sampler of later rows |
+| R0a | AdamW at 1e-4: `timestep_sampling: reference` (logit-normal plus the resolution shift, `archs.py:586-593`; SD3 found logit-normal(0, 1) best-ranked and trains and samples at one shift, [2403.03206](https://arxiv.org/abs/2403.03206) Eq. 23 [P]; RulZ AI Trainer's MiniMax H3 recipe uses it, `README.md:2461-2462`) against `logit_normal` | the sampler of later rows |
 | R0b | AdamW at 0.5x, 1x, 2x of 1e-4, widened if the best sits at an end | tuned control; rho_0 |
 | R1 | H0 at 0.5x, 1x, 2x rho_0 | H0 against tuned AdamW |
 | R1b | per-layer vs global step; balanced vs Riemannian metric; rank-component growth logged | scope; face bias of the GD-like ordering [H] |

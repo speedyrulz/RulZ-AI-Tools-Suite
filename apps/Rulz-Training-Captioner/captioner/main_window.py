@@ -99,6 +99,7 @@ class MainWindow(QMainWindow):
         self._apply_review_options()
         self._update_stats()
         self._update_undo()
+        self.grid.setFocus()  # start on the content, not on a control
 
     # ------------------------------------------------------------------ UI
     def _act(self, text, slot, shortcut=None):

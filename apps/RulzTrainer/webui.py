@@ -1,4 +1,4 @@
-"""RulzTrainer WebUI (NiceGUI). Run: python webui.py [--port 7870] [--open]
+"""RulZ AI Trainer WebUI (NiceGUI). Run: python webui.py [--port 7870] [--open]
 
 Training runs in a subprocess so Stop frees GPU memory cleanly; the UI polls
 <output>/<job>/status.json and train.log. The running job (pid + job dir) is recorded in .webui_job.json, so a
@@ -441,7 +441,7 @@ def browse_shortcuts() -> list[tuple[str, Path]]:
     """Folders worth one click: the project and its models / datasets / output, the vast.ai workspace, home, a
     ComfyUI models folder, and the drives (Windows) or / (Linux). Only existing ones, each once."""
     workspace = Path(os.environ.get("WORKSPACE") or "/workspace")
-    cands = [("RulzTrainer", ROOT), ("models", ROOT / "models"), ("datasets", ROOT / "datasets"),
+    cands = [("RulZ AI Trainer", ROOT), ("models", ROOT / "models"), ("datasets", ROOT / "datasets"),
              ("output", ROOT / "output"), ("workspace", workspace), ("home", Path.home())]
     cands += [("ComfyUI models", base / "ComfyUI" / "models") for base in (workspace, Path.home(), ROOT.parent)]
     if sys.platform == "win32":
@@ -2326,43 +2326,48 @@ def fits_options(widget, value) -> bool:
 # ---------------------------------------------------------------- look and feel
 
 ASSETS = ROOT / "assets"
-RED = "#E10600"
+RED = "#ED000D"
 CHART_COLORS = ["#FF3B30", "#F4F4F5", "#F59E0B", "#A1A1AA", "#FB7185", "#60A5FA", "#34D399", "#C084FC"]
 
 THEME_CSS = """
 :root {
-  --rz-red: #E10600; --rz-red-bright: #FF3B30; --rz-red-soft: rgba(225, 6, 0, 0.14);
-  --rz-bg: #0A0A0A; --rz-surface: #131313; --rz-surface-2: #1A1A1A;
-  --rz-border: #262626; --rz-border-strong: #3A3A3A;
-  --rz-text: #EDEDED; --rz-muted: #B4B4BD; --rz-ok: #22C55E;
+  --rz-red: #ED000D; --rz-red-bright: #FF2633; --rz-red-soft: rgba(237, 0, 13, 0.13);
+  --rz-faint: #82828c; --rz-hover: #1c1c21; --rz-link: #ff5961; --rz-danger-text: #ff8a8e; --rz-danger-bg: #3a0c0f; --rz-danger-border: #6b1418; --rz-danger-hover: #4a1014;
+  --rz-bg: #050505; --rz-surface: #0c0c0e; --rz-surface-2: #141417;
+  --rz-border: #232328; --rz-border-strong: #34343b;
+  --rz-text: #f2f2f3; --rz-muted: #a3a3ab; --rz-ok: #4ade80;
   --rz-heading: #FFFFFF; --rz-text-2: #D4D4D8; --rz-text-3: #E4E4E7; --rz-tagline: #71717A;
-  --rz-header-bg: #000000; --rz-footer-bg: rgba(0, 0, 0, .94); --rz-pill-bg: #0D0D0D; --rz-hover-border: #52525B;
+  --rz-header-bg: #050505; --rz-footer-bg: rgba(0, 0, 0, .94); --rz-pill-bg: #0D0D0D; --rz-hover-border: #52525B;
   --rz-scroll: #2A2A2A; --rz-tooltip-bg: #1F1F1F; --rz-menu-bg: #161616; --rz-deep: #050505; --rz-thumb-bg: #0E0E0E;
   --rz-code-bg: #1F1F1F; --rz-code: #FCA5A5; --rz-dot-idle: #2A2A2A; --rz-badge-muted: #3F3F46; --rz-label: #B5B5BD;
   --rz-warn: #FBBF24; --rz-rec: #FCA5A5; --rz-ok-text: #86EFAC; --rz-err-text: #FFB4AE; --rz-warn-text: #FCD34D;
-  --rz-track: #212121; --rz-img-bg: #000000; --rz-choice-bg: rgba(225, 6, 0, .16);
+  --rz-track: #212121; --rz-img-bg: #000000; --rz-choice-bg: rgba(237, 0, 13, .16);
 }
 html[data-theme="light"] {
+  --rz-red-bright: #c8000b; --rz-red-soft: rgba(237, 0, 13, .08); --rz-faint: #68696f; --rz-hover: #e2e2e7; --rz-link: #d0000b; --rz-danger-text: #b4000a; --rz-danger-bg: #fdecec; --rz-danger-border: #f5b8bb; --rz-danger-hover: #fbd8da;
   --rz-bg: #FFFFFF; --rz-surface: #F5F5F7; --rz-surface-2: #EBEBEF;
-  --rz-border: #D9D9DE; --rz-border-strong: #C4C4CC;
-  --rz-text: #111114; --rz-muted: #55565E; --rz-ok: #16A34A;
+  --rz-border: #D9D9DE; --rz-border-strong: #c4c4cb;
+  --rz-text: #111114; --rz-muted: #5f6068; --rz-ok: #15803d;
   --rz-heading: #111114; --rz-text-2: #2E2E33; --rz-text-3: #1F1F23; --rz-tagline: #6B6B73;
   --rz-header-bg: #FFFFFF; --rz-footer-bg: rgba(255, 255, 255, .94); --rz-pill-bg: #F5F5F7; --rz-hover-border: #A1A1AA;
   --rz-scroll: #C9C9CF; --rz-tooltip-bg: #FFFFFF; --rz-menu-bg: #FFFFFF; --rz-deep: #F5F5F7; --rz-thumb-bg: #E4E4E8;
   --rz-code-bg: #EBEBEF; --rz-code: #B4000A; --rz-dot-idle: #A1A1AA; --rz-badge-muted: #8A8A93; --rz-label: #4A4A52;
-  --rz-warn: #B45309; --rz-rec: #C8000B; --rz-ok-text: #15803D; --rz-err-text: #B4000A; --rz-warn-text: #92400E;
-  --rz-track: #E4E4E8; --rz-img-bg: #EBEBEF; --rz-choice-bg: rgba(225, 6, 0, .08);
+  --rz-warn: #a16207; --rz-rec: #C8000B; --rz-ok-text: #15803D; --rz-err-text: #B4000A; --rz-warn-text: #92400E;
+  --rz-track: #E4E4E8; --rz-img-bg: #EBEBEF; --rz-choice-bg: rgba(237, 0, 13, .08);
   color-scheme: light;
 }
 body, .q-page-container, .q-layout { background: var(--rz-bg); }
 body {
-  color: var(--rz-text); font-size: 15px; line-height: 1.5; -webkit-font-smoothing: antialiased;
-  font-family: "Inter", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Roboto, Arial, sans-serif;
+  color: var(--rz-text); font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased;
+  font-family: "Segoe UI Variable Text", "Segoe UI", "Inter", system-ui, sans-serif;
 }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--rz-scroll); border-radius: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 
+h1, h2, h3, .rz-pane-title { font-family: "Segoe UI Variable Display", "Segoe UI", "Inter", system-ui, sans-serif; }
+.q-btn:focus-visible, a:focus-visible, .q-tab:focus-visible, .q-toggle:focus-visible, .q-checkbox:focus-visible { outline: 2px solid var(--rz-red); outline-offset: 2px; }
+.q-field--focused .q-field__control:after { border-color: var(--rz-red); }
 /* header: logo and version, the tabs in their three groups, the machine chip; under it the run strip */
 .nicegui-header.rz-header {
   background: var(--rz-header-bg); border-bottom: 1px solid var(--rz-border); padding: 0; gap: 0;
@@ -2370,8 +2375,8 @@ body {
 }
 .rz-header-row { max-width: 1440px; margin: 0 auto; padding: 4px 20px 0; gap: 0 18px; flex-wrap: wrap; }
 .rz-brand { padding: 6px 0; flex-shrink: 0; }
-.rz-logo { height: 26px; width: auto; display: block; }
-.rz-wordmark { letter-spacing: .34em; font-weight: 600; font-size: 12px; color: var(--rz-muted); padding-top: 5px; }
+.rz-logo { height: 24px; width: auto; display: block; }
+.rz-wordmark { letter-spacing: .2em; font-weight: 600; font-size: 13px; color: var(--rz-muted); padding-top: 5px; }
 .rz-version {
   font-size: 11px; font-weight: 600; color: var(--rz-muted); border: 1px solid var(--rz-border-strong);
   border-radius: 999px; padding: 0 8px; margin-top: 4px; font-variant-numeric: tabular-nums;
@@ -2428,9 +2433,9 @@ body {
 .rz-page { width: 100%; max-width: 1440px; margin: 0 auto; }
 
 /* cards and settings sections */
-.rz-card { background: var(--rz-surface); border: 1px solid var(--rz-border); border-radius: 14px; padding: 18px 20px; }
-.rz-section { background: var(--rz-surface); border: 1px solid var(--rz-border); border-radius: 14px; scroll-margin-top: 104px; }
-.rz-section > .q-expansion-item__container > .q-item { padding: 12px 18px; min-height: 64px; border-radius: 14px; }
+.rz-card { background: var(--rz-surface); border: 1px solid var(--rz-border); border-radius: 12px; padding: 18px 20px; }
+.rz-section { background: var(--rz-surface); border: 1px solid var(--rz-border); border-radius: 12px; scroll-margin-top: 104px; }
+.rz-section > .q-expansion-item__container > .q-item { padding: 12px 18px; min-height: 64px; border-radius: 12px; }
 .rz-section > .q-expansion-item__container > .q-item .q-item__section--avatar { min-width: 0; padding-right: 14px; }
 .rz-section > .q-expansion-item__container > .q-item .q-item__section--avatar .q-icon {
   color: var(--rz-red-bright); background: var(--rz-red-soft); border-radius: 10px; font-size: 20px;
@@ -2454,7 +2459,7 @@ body {
 .rz-fields { gap: 14px 16px; align-items: center; flex-wrap: wrap; }
 
 /* form fields and buttons */
-.q-field--outlined .q-field__control { border-radius: 9px; }
+.q-field--outlined .q-field__control { border-radius: 8px; }
 .q-field--dense .q-field__control, .q-field--dense .q-field__marginal { height: 46px; }
 .q-field--dense.q-field--auto-height .q-field__control, .q-field--dense.q-textarea .q-field__control { height: auto; min-height: 46px; }
 .q-field--dense .q-field__label { font-size: 15px; top: 13px; }
@@ -2467,16 +2472,24 @@ body {
 .q-field__label { color: var(--rz-label); }
 .q-field--dark .q-field__native, .q-field--dark .q-field__input, .q-field--dark .q-select__dropdown-icon { color: #F4F4F5; }
 .q-field--outlined:not(.q-field--dark) .q-field__control:before { border-color: var(--rz-border-strong); }
-.q-btn { text-transform: none; font-weight: 600; letter-spacing: .01em; border-radius: 9px; font-size: 14px; }
+.q-btn { text-transform: none; font-weight: 500; letter-spacing: .01em; border-radius: 8px; font-size: 14px; }
 /* red is the one main action of a view and what is switched on: every other button is plain text with a red icon */
 /* (Quasar's color classes are !important in a later cascade layer: their variable is set instead) */
-.q-btn--flat.text-primary, .q-btn--outline.text-primary { --q-primary: var(--rz-text); }
-.q-btn--flat.text-primary .q-icon, .q-btn--outline.text-primary .q-icon { color: var(--rz-red-bright); }
-.q-btn--flat.text-primary:hover, .q-btn--outline.text-primary:hover { --q-primary: var(--rz-heading); }
-.q-btn--outline.text-primary::before { border-color: var(--rz-border-strong); }
-.q-btn--outline.text-primary:hover::before { border-color: var(--rz-red); }
-.q-btn.rz-danger, .q-btn.rz-danger .q-icon { color: #FF453A; }
-html[data-theme="light"] .q-btn.rz-danger, html[data-theme="light"] .q-btn.rz-danger .q-icon { color: #C8000B; }
+.q-btn.bg-primary { box-shadow: 0 6px 20px -8px rgba(237, 0, 13, .8); }
+.q-btn.bg-primary.q-btn--lg { font-weight: 600; }
+.q-btn.bg-primary:hover { --q-primary: var(--rz-red-bright); }
+.q-btn.bg-primary.disabled, .q-btn.bg-primary:disabled { box-shadow: none; }
+.q-btn--dense { border-radius: 6px; }
+.q-btn--flat.text-primary { --q-primary: var(--rz-text); }
+.q-btn--flat.text-primary .q-icon { color: var(--rz-red-bright); }
+.q-btn--flat.text-primary:hover { --q-primary: var(--rz-heading); }
+.q-btn--outline.text-primary { --q-primary: var(--rz-link); }
+.q-btn--outline.text-primary::before { border-color: var(--rz-red); }
+.q-btn--outline.text-primary:hover { background: var(--rz-red-soft); }
+.q-btn.rz-danger, .q-btn.rz-danger .q-icon { color: var(--rz-danger-text); }
+.q-btn.rz-danger:not(.rz-icon-only) { background: var(--rz-danger-bg); border: 1px solid var(--rz-danger-border); }
+.q-btn.rz-danger:not(.rz-icon-only):hover { background: var(--rz-danger-hover); }
+.q-dialog .q-card { border-radius: 12px; }
 .q-btn.disabled { opacity: .38 !important; }
 .q-table th { font-size: 13px; color: var(--rz-muted); font-weight: 600; }
 .q-table td { font-size: 14px; }
@@ -2496,7 +2509,7 @@ html[data-theme="light"] .q-btn.rz-danger, html[data-theme="light"] .q-btn.rz-da
 .rz-nav-btn .q-icon { color: var(--rz-muted); font-size: 18px; }
 .rz-nav-btn.rz-on { background: var(--rz-red-soft); color: var(--rz-heading); border-left-color: var(--rz-red); }
 .rz-nav-btn.rz-on .q-icon { color: var(--rz-red-bright); }
-.rz-pane { background: var(--rz-surface); border: 1px solid var(--rz-border); border-radius: 14px; padding: 18px 24px 14px; gap: 16px; }
+.rz-pane { background: var(--rz-surface); border: 1px solid var(--rz-border); border-radius: 12px; padding: 18px 24px 14px; gap: 16px; }
 .rz-pane-head { padding-bottom: 16px; border-bottom: 1px solid var(--rz-border); }
 .rz-pane-icon { color: var(--rz-red-bright); background: var(--rz-red-soft); border-radius: 11px; font-size: 22px; width: 42px; height: 42px; flex-shrink: 0; }
 .rz-pane-title { font-size: 20px; font-weight: 700; color: var(--rz-heading); line-height: 1.25; }
@@ -2547,7 +2560,7 @@ html[data-theme="light"] .q-btn.rz-danger, html[data-theme="light"] .q-btn.rz-da
 .rz-tile-value { font-size: 20px; font-weight: 600; color: var(--rz-heading); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 .rz-tile-sub { font-size: 13px; color: var(--rz-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 .rz-banner { border-radius: 10px; padding: 10px 14px; font-size: 14px; width: 100%; }
-.rz-banner.error { background: rgba(225, 6, 0, .12); border: 1px solid rgba(255, 59, 48, .45); color: var(--rz-err-text); }
+.rz-banner.error { background: rgba(237, 0, 13, .12); border: 1px solid rgba(255, 59, 48, .45); color: var(--rz-err-text); }
 .rz-banner.warning { background: rgba(245, 158, 11, .10); border: 1px solid rgba(245, 158, 11, .40); color: var(--rz-warn-text); }
 .rz-banner.info { background: var(--rz-surface); border: 1px solid var(--rz-border-strong); color: var(--rz-text-2); }
 .rz-banner.ok { background: rgba(34, 197, 94, .10); border: 1px solid rgba(34, 197, 94, .40); color: #86EFAC; }
@@ -2587,7 +2600,7 @@ html[data-theme="light"] .q-btn.rz-danger, html[data-theme="light"] .q-btn.rz-da
 /* Previous Runs: a probe image's "tick to compare" box over its corner, and the ticked ones outlined */
 .rz-shot { position: relative; }
 .rz-shot-pick { position: absolute; top: 4px; right: 4px; background: rgba(0, 0, 0, .55); color: #fff; }
-.rz-shot.rz-picked { border: 2px solid var(--rz-red, #E10600); }
+.rz-shot.rz-picked { border: 2px solid var(--rz-red, #ED000D); }
 .rz-compare-half { width: 50%; }
 .rz-compare-img { height: calc(100vh - 96px); }
 .rz-ds-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; width: 100%; }
@@ -2599,7 +2612,7 @@ html[data-theme="light"] .q-btn.rz-danger, html[data-theme="light"] .q-btn.rz-da
 .rz-ds-thumbs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px; background: var(--rz-thumb-bg); }
 .rz-ds-empty { display: flex; align-items: center; justify-content: center; aspect-ratio: 4 / 1;
   color: var(--rz-muted); font-size: 13px; background: var(--rz-thumb-bg); }
-.rz-mono { font-family: ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace; font-size: 13px; line-height: 1.5; color: var(--rz-text-2); }
+.rz-mono { font-family: "Cascadia Code", "Cascadia Mono", Consolas, monospace; font-size: 13px; line-height: 1.5; color: var(--rz-text-2); }
 
 /* Wizard */
 .rz-stepper { background: transparent; box-shadow: none; }
@@ -2634,7 +2647,7 @@ html[data-theme="light"] .q-btn.rz-danger, html[data-theme="light"] .q-btn.rz-da
 .rz-choice:hover { border-color: #71717A; }
 .rz-choice.selected {
   border-color: var(--rz-red); background: var(--rz-choice-bg);
-  box-shadow: inset 0 0 0 1px var(--rz-red), 0 0 0 3px rgba(225, 6, 0, .18);
+  box-shadow: inset 0 0 0 1px var(--rz-red), 0 0 0 3px rgba(237, 0, 13, .18);
 }
 .rz-choice-icon { color: var(--rz-red-bright); font-size: 24px; }
 .rz-check { display: none; color: var(--rz-red-bright); font-size: 22px; }
@@ -2725,26 +2738,26 @@ html[data-theme="light"] .rz-dark-only { display: none !important; }
 .rz-theme-btn { color: var(--rz-muted); }
 .rz-theme-btn:hover { color: var(--rz-heading); }
 .rz-look-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; width: 100%; }
-.rz-look { border: 2px solid var(--rz-border-strong); border-radius: 14px; padding: 10px; cursor: pointer; gap: 10px;
+.rz-look { border: 2px solid var(--rz-border-strong); border-radius: 12px; padding: 10px; cursor: pointer; gap: 10px;
   background: var(--rz-surface); transition: border-color .15s, box-shadow .15s; }
 .rz-look:hover { border-color: var(--rz-hover-border); }
-.rz-look.selected { border-color: var(--rz-red); box-shadow: 0 0 0 3px rgba(225, 6, 0, .18); }
+.rz-look.selected { border-color: var(--rz-red); box-shadow: 0 0 0 3px rgba(237, 0, 13, .18); }
 .rz-look-name { font-weight: 600; font-size: 15px; color: var(--rz-heading); }
 .rz-look .rz-check { font-size: 20px; }
 .rz-look.selected .rz-check { display: inline-flex; }
 .rz-mini { border-radius: 9px; height: 96px; padding: 10px; display: flex; flex-direction: column; gap: 7px;
-  border: 1px solid #262626; overflow: hidden; align-self: stretch; }
-.rz-mini.dark { background: #0A0A0A; }
+  border: 1px solid #232328; overflow: hidden; align-self: stretch; }
+.rz-mini.dark { background: #050505; }
 .rz-mini.light { background: #FFFFFF; border-color: #D9D9DE; }
 .rz-mini .bar { height: 8px; border-radius: 4px; }
 .rz-mini.dark .bar { background: #1F1F1F; }
 .rz-mini.light .bar { background: #EBEBEF; }
 .rz-mini .bar.text { width: 60%; }
-.rz-mini.dark .bar.text { background: #EDEDED; }
+.rz-mini.dark .bar.text { background: #f2f2f3; }
 .rz-mini.light .bar.text { background: #111114; }
-.rz-mini .bar.red { width: 34%; background: #E10600; height: 14px; margin-top: auto; }
+.rz-mini .bar.red { width: 34%; background: #ED000D; height: 14px; margin-top: auto; }
 .rz-mini .panel { border-radius: 6px; flex: 1; padding: 6px; display: flex; flex-direction: column; gap: 5px; }
-.rz-mini.dark .panel { background: #131313; border: 1px solid #262626; }
+.rz-mini.dark .panel { background: #0c0c0e; border: 1px solid #232328; }
 .rz-mini.light .panel { background: #F5F5F7; border: 1px solid #D9D9DE; }
 
 /* Help */
@@ -2756,7 +2769,7 @@ html[data-theme="light"] .rz-dark-only { display: none !important; }
 .rz-help code { background: var(--rz-code-bg); color: var(--rz-code); padding: 1px 6px; border-radius: 5px; font-size: 13px; }
 .rz-help pre { background: var(--rz-deep); border: 1px solid var(--rz-border); border-radius: 10px; padding: 12px 14px; overflow-x: auto; }
 .rz-help pre code { background: transparent; color: var(--rz-text-3); padding: 0; }
-.rz-help a { color: var(--rz-red-bright); }
+.rz-help a { color: var(--rz-link); }
 """
 
 
@@ -2990,8 +3003,8 @@ def setup_theme() -> None:
 
 
 def theme_colors() -> None:
-    ui.colors(primary=RED, secondary="#27272A", accent="#FF3B30", dark="#131313", dark_page="#0A0A0A",
-              positive="#22C55E", negative="#FF453A", info="#3F3F46", warning="#F59E0B")
+    ui.colors(primary=RED, secondary="#141417", accent="#FF2633", dark="#0c0c0e", dark_page="#050505",
+              positive="#4ade80", negative="#ff5a5f", info="#3F3F46", warning="#fbbf24")
 
 
 CLEAN_SLIDE = "60:7:30:8:3"  # Fizgig's MOSS-Image Slide until 8 November 2026 (rulztrainer.clean_share.SLIDE)
@@ -4255,7 +4268,7 @@ class StepGallery:
 
 def build_dataset_tab(f: Form):
     """The datasets as cards with a few thumbnails each, Create dataset and Add a folder; a dataset opened below to
-    add images and captions (upload from this computer, or copy a folder on the machine running RulzTrainer), edit
+    add images and captions (upload from this computer, or copy a folder on the machine running RulZ AI Trainer), edit
     its captions and pick references."""
     picker: DatasetPicker = f.w["datasets"]
     state = {"page": 0, "images": [], "busy": False, "open": None, "sync": False}
@@ -4296,7 +4309,7 @@ def build_dataset_tab(f: Form):
         ui.label("Create dataset").classes("rz-setting-title")
         name_in = ui.input("Name", placeholder="for example: anna full body").classes("w-full")
         name_err = ui.label("").classes("text-xs text-negative")
-        hint(f"A new, empty folder in {root_label}/ on the machine running RulzTrainer.")
+        hint(f"A new, empty folder in {root_label}/ on the machine running RulZ AI Trainer.")
         with ui.row().classes("w-full justify-end gap-2"):
             ui.button("Cancel", on_click=create_dlg.close).props("flat")
             create_btn = ui.button("Create", icon="add").props("unelevated")
@@ -4308,9 +4321,9 @@ def build_dataset_tab(f: Form):
             ui.button("Create dataset", icon="add",
                       on_click=lambda: (name_err.set_text(""), create_dlg.open())).props("unelevated")
             add_btn = ui.button("Add a folder", icon="create_new_folder").props("flat") \
-                .tooltip("A dataset folder you already have on the machine running RulzTrainer: it joins the list")
+                .tooltip("A dataset folder you already have on the machine running RulZ AI Trainer: it joins the list")
             ui.button(icon="refresh", on_click=lambda: refresh_cards()).props("flat round dense").tooltip("Refresh")
-        hint(f"New datasets go in {root_label}/ on the machine running RulzTrainer. Click a dataset to add images and "
+        hint(f"New datasets go in {root_label}/ on the machine running RulZ AI Trainer. Click a dataset to add images and "
              "write captions. Tick the ones to train on with Train on this dataset, or on the Train tab (Dataset "
              "section), where each also gets its own resolutions and repeats.")
         cards = ui.element("div").classes("rz-ds-grid")
@@ -4326,7 +4339,7 @@ def build_dataset_tab(f: Form):
                 ui.space()
                 use_box = ui.checkbox("Train on this dataset").tooltip("Ticks it on the Train tab (Dataset section)")
                 copy_btn = ui.button("Copy from a folder", icon="drive_folder_upload").props("flat") \
-                    .tooltip("Copy the images and captions of a folder on the machine running RulzTrainer into this "
+                    .tooltip("Copy the images and captions of a folder on the machine running RulZ AI Trainer into this "
                              "dataset (sub-folders kept; files it already has are left alone)")
                 remove_btn = ui.button("Remove from list", icon="playlist_remove").props("flat") \
                     .tooltip("Takes this folder off the list; its files stay where they are")
@@ -4336,7 +4349,7 @@ def build_dataset_tab(f: Form):
                 spinner.visible = False
                 info = ui.label("").classes("text-sm")
             hint("Upload sends images, video clips and their .txt or .json captions from the computer or phone this "
-                 "browser runs on to the machine running RulzTrainer; on the same machine that is a plain copy. Files "
+                 "browser runs on to the machine running RulZ AI Trainer; on the same machine that is a plain copy. Files "
                  "go one at a time in 8 MB pieces: when the connection drops, the piece is sent again after a pause "
                  "and the files already sent stay, so keep the page open until it says Uploaded (on a phone the "
                  "screen is kept on meanwhile where the browser allows it). A file with the same name is replaced. "
@@ -5788,7 +5801,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         r["network_type"] = ("oft", "14 to 15 points over a plain LoRA on two seeds of one small set, face and body; "
                                     "loads in ComfyUI, not diffusers; not tested with the identity recipe's extras"
                              ) if character and krea else (
-                             "lora", "reached likeness much sooner than LoKr in RulzTrainer's tests so far, and "
+                             "lora", "reached likeness much sooner than LoKr in RulZ AI Trainer's tests so far, and "
                                      "loads everywhere (ComfyUI and diffusers)")
         if cfg.network_type == "lokr":
             r["lokr_factor"] = (8, "Fizgig's measured default: lower is bigger files, nothing gained above 8")
@@ -6125,7 +6138,7 @@ LR_USUAL = {"lora": (5e-5, 2e-4), "finetune": (1e-5, 1e-5)}
 
 def start_warnings(cfg: TrainConfig) -> list[str]:
     """The usual mistakes, said before a run starts (never a block): images with no caption, captions that already
-    hold the trigger word (RulzTrainer puts it at the start of every caption, so it would be there twice) and a
+    hold the trigger word (RulZ AI Trainer puts it at the start of every caption, so it would be there twice) and a
     learning rate well outside the model's usual range."""
     import re
 
@@ -6162,7 +6175,7 @@ def start_warnings(cfg: TrainConfig) -> list[str]:
                    + ("the trigger word alone." if cfg.trigger_word else "an empty prompt."))
     if doubled:
         out.append(f"{doubled} of {images} captions already hold the trigger word ({', '.join(sorted(doubled_words))}). "
-                   "RulzTrainer puts it at the start of every caption, so those captions have it twice: take it "
+                   "RulZ AI Trainer puts it at the start of every caption, so those captions have it twice: take it "
                    "out of the caption files, or clear the trigger word.")
     kind = "finetune" if cfg.finetune else "lora" if cfg.network_type == "lora" else None
     if kind and cfg.optimizer not in AUTOMAGIC and cfg.learning_rate > 0:
@@ -6346,9 +6359,9 @@ WIZARD_AUTO = ("multi_gpu", "dp_balance", "transformer_quant", "text_encoder_qua
 
 # How well tested an experimental setting is: (badge, what the badge means)
 EVIDENCE = {
-    "measured": ("Measured gain", "RulzTrainer measured a gain on more than one seed, on one set so far."),
+    "measured": ("Measured gain", "RulZ AI Trainer measured a gain on more than one seed, on one set so far."),
     "worse": ("Looked worse here", "Measured here and scored below the plain setup, on one seed of one set so far."),
-    "others": ("Tested by others", "Someone else (usually Fizgig's likeness tests) measured a gain; RulzTrainer has "
+    "others": ("Tested by others", "Someone else (usually Fizgig's likeness tests) measured a gain; RulZ AI Trainer has "
                                    "not repeated it yet."),
     "mixed": ("Small or mixed result", "Measured, but the effect was small, neutral or only seen in a short test."),
     "cost": ("Only speed tested", "Its speed and memory were measured, but not yet whether it improves the likeness."),
@@ -6368,7 +6381,7 @@ EXPERIMENTS = [
      "short": "LoKr or OFT instead of a plain LoRA.",
      "what": "A LoRA adds a small pair of matrices to each layer. LoKr uses a Kronecker pair instead (factor 8 by "
              "default); OFT rotates each layer's output channels in blocks, which keeps the base model's structure.",
-     "tested": "OFT is the one confirmed gain in RulzTrainer's tests: 43.4 and 42.9 combined on two seeds, 14 to 15 "
+     "tested": "OFT is the one confirmed gain in RulZ AI Trainer's tests: 43.4 and 42.9 combined on two seeds, 14 to 15 "
                "points over its own base rows on face and body, on all 8 probe seeds, and still rising at step 2000. "
                "One small set of a generated character on Krea 2; the copy check crossed its limit once (0.59 at the "
                "last probe on one seed), so check the pictures. LoKr factor 8 tied plain here (29.5, one seed) with "
@@ -6437,7 +6450,7 @@ EXPERIMENTS = [
              "(you then prompt with it joined, for example gweltman); and adds pictures of the subject next to a "
              "generated stranger.",
      "tested": "Fizgig, on Krea 2: strangers read as the subject in 48 of 50 pictures without it and 0 of 50 with "
-               "it, while the subject's own likeness held (0.77 to 0.78). In RulzTrainer the strangers test was not "
+               "it, while the subject's own likeness held (0.77 to 0.78). In RulZ AI Trainer the strangers test was not "
                "repeated. Its likeness was unsettled on one small set: 54.5 then 32.0 combined on two seeds, against "
                "about 31 plain. Copy reached 0.68, and headshots came back in a training photo's room on both seeds, "
                "so check for memorising.",
@@ -6590,7 +6603,7 @@ EXPERIMENTS = [
              "Muon it is 11:7:40:8:3 (the Slide Muon button).",
      "tested": "Fizgig, on MOSS-Image: 60:7:30:8:3 was the best of eight schedules, still at 71% likeness at epoch "
                "60 and about 5 points over 60:7:30:15:2. With Muon it now uses 11:7:40:8:3, which it says stopped "
-               "hair darkening late in a run; that one was tuned with a face boost RulzTrainer does not have, and "
+               "hair darkening late in a run; that one was tuned with a face boost RulZ AI Trainer does not have, and "
                "is not measured here. On Krea 2 here 60:7:30:8:3 tied plain: 31.2 combined, one seed of one small "
                "set.",
      "cost": "None beyond the choice."},
@@ -7771,7 +7784,7 @@ class Wizard:
             return
         path = (self.cfg_path.value or "").strip() or f"configs/{cfg.job_name}.yaml"
         if _is_repo_example(path):
-            ui.notify("configs/example.yaml ships with RulzTrainer; save under another name", type="warning")
+            ui.notify("configs/example.yaml ships with RulZ AI Trainer; save under another name", type="warning")
             return
         cfg.save(path)
         ui.notify(f"Saved {path}", type="positive")
@@ -8110,7 +8123,7 @@ def build_history_tab(charts: list):
                 hint("Tick one or more runs above to see their probe images side by side.")
                 return
             if not steps:
-                hint("The ticked runs have no kept probe images (runs from before RulzTrainer kept them, unless their "
+                hint("The ticked runs have no kept probe images (runs from before RulZ AI Trainer kept them, unless their "
                      "job folder still holds them: Import old runs adds those).")
                 return
             missing, items = probe_compare(groups, step, kind)
@@ -8472,14 +8485,14 @@ _FLEET_LOCK = threading.Lock()
 FLEET_STATES = {"running": ("Training", "live"), "starting": ("Starting a run", "live"), "idle": ("Idle", "done"),
                 "unreachable": ("Out of reach", "error"), "gone": ("Stopped or destroyed", ""),
                 "off": ("Not watched", ""), "new": ("Not looked at yet", ""), "rebooting": ("Rebooting", "live"),
-                "updating": ("Updating RulzTrainer", "live")}
+                "updating": ("Updating RulZ AI Trainer", "live")}
 # the tab that Open WebUI opens in the click itself (a tab opened later, once the address is known, is a pop-up that
 # browsers block); open_webui then points it at the instance, or closes it when there is no address
 def fleet_open_tab_js(iid) -> str:
     """The click handler that opens the instance's tab at once, kept per instance so two quick clicks on two cards
     each get their own tab."""
     key = json.dumps(str(iid))
-    return ("() => { const t = window.open('', '_blank'); if (t) { t.document.title = 'RulzTrainer'; "
+    return ("() => { const t = window.open('', '_blank'); if (t) { t.document.title = 'RulZ AI Trainer'; "
             "t.document.body.innerHTML = '<p style=\"font: 15px sans-serif; padding: 24px\">Opening the "
             "instance\u2019s WebUI\u2026</p>'; } (window.rzFleetTabs = window.rzFleetTabs || {})[" + key + "] = t; "
             "emit(); }")
@@ -8603,18 +8616,18 @@ def fleet_event_text(e: dict) -> str:
              "queue_empty": "The fleet's queue is empty",
              "instance_rebooting": f"{on} is rebooting" + (f": {job} was killed" if job else ""),
              "instance_rebooted": f"{on} is back after its reboot",
-             "instance_updated": f"{on} updated RulzTrainer" + (f" from {e['was']}" if e.get("was") else "")
+             "instance_updated": f"{on} updated RulZ AI Trainer" + (f" from {e['was']}" if e.get("was") else "")
              + (f" to {e['version']}" if e.get("version") else "") + (f" · {e['note']}" if e.get("note") else ""),
-             "update_failed": f"{on} could not update RulzTrainer: {e.get('error')}"}
+             "update_failed": f"{on} could not update RulZ AI Trainer: {e.get('error')}"}
     return table.get(kind, str(kind))
 
 
 def fleet_version_line(inst: dict) -> str:
-    """The instance's RulzTrainer on its card: "RulzTrainer 3.15.0 (1a2b3c4d5e) · 3.16.0 is out"."""
+    """The instance's RulZ AI Trainer on its card: "RulZ AI Trainer 3.15.0 (1a2b3c4d5e) · 3.16.0 is out"."""
     trainer, newer, update = inst.get("trainer") or {}, inst.get("newer") or {}, inst.get("update") or {}
     if not trainer:
         return ""
-    text = f"RulzTrainer {trainer.get('version') or '?'}" + (f" ({trainer['commit']})" if trainer.get("commit") else "")
+    text = f"RulZ AI Trainer {trainer.get('version') or '?'}" + (f" ({trainer['commit']})" if trainer.get("commit") else "")
     if update.get("state") == "running":
         return text + " · updating now"
     if newer:
@@ -8635,15 +8648,15 @@ def fleet_update_plan_text(plan: dict) -> tuple[list[tuple[str, str]], bool]:
     def name(v: dict) -> str:
         return (v.get("version") or "?") + (f" ({v['commit']})" if v.get("commit") else "")
 
-    lines = [("", f"Installed: RulzTrainer {name(current)}"),
-             ("", f"Newest ({plan.get('branch') or 'app/rulz-trainer'}): RulzTrainer {name(latest)}")]
+    lines = [("", f"Installed: RulZ AI Trainer {name(current)}"),
+             ("", f"Newest ({plan.get('branch') or 'app/rulz-trainer'}): RulZ AI Trainer {name(latest)}")]
     count = plan.get("changed_count") or 0
     can = True
     if plan.get("unfinished"):
         lines.append(("warning", "Its last update did not finish: this one runs it again, the requirements and the "
                                  "WebUI's restart included."))
     elif plan.get("up_to_date") and not count:
-        lines.append(("", "It already runs the newest RulzTrainer."))
+        lines.append(("", "It already runs the newest RulZ AI Trainer."))
         can = False
     elif plan.get("behind"):
         lines.append(("", f"{plan['behind']} newer commit{'s' if plan['behind'] != 1 else ''} on the branch."))
@@ -8752,7 +8765,7 @@ def build_fleet_tab(form_config=None):
                 look_line = hint("")
             ui.space()
             ui.button("Find instances", icon="travel_explore", on_click=find, color=None) \
-                .props("outline dense no-caps").tooltip("Ask vast.ai which instances are running: new RulzTrainer "
+                .props("outline dense no-caps").tooltip("Ask vast.ai which instances are running: new RulZ AI Trainer "
                                                         "instances join, stopped and destroyed ones are marked")
             ui.button("Look now", icon="refresh", on_click=look_now, color=None).props("flat dense no-caps")
         vast_note = ui.label("").classes("rz-banner warning")
@@ -8761,9 +8774,9 @@ def build_fleet_tab(form_config=None):
              "key on your vast.ai account). This WebUI looks at them every few seconds while it runs; closed, "
              "nothing moves the queue, downloads files or checks the watches unless "
              "python scripts/vast/rulz_fleet.py daemon runs instead. Nothing here rents, stops or destroys an "
-             "instance; an instance's menu can reboot it or update its RulzTrainer when you ask.")
+             "instance; an instance's menu can reboot it or update its RulZ AI Trainer when you ask.")
     grid = ui.element("div").classes("rz-fleet-grid w-full")
-    no_instances = hint("No instances in the fleet yet. Rent one from your RulzTrainer template on vast.ai, then "
+    no_instances = hint("No instances in the fleet yet. Rent one from your RulZ AI Trainer template on vast.ai, then "
                         "Find instances.")
 
     # ------------------------------------------------------------ instances
@@ -8801,11 +8814,11 @@ def build_fleet_tab(form_config=None):
     async def update_trainer(iid: int):
         """Check what an update would change, show it, and on a yes update the instance and restart its WebUI."""
         with ui.dialog() as dlg, ui.card().classes("w-[34rem] max-w-full"):
-            ui.label(f"Update RulzTrainer on instance {iid}").classes("text-base font-medium")
+            ui.label(f"Update RulZ AI Trainer on instance {iid}").classes("text-base font-medium")
             body = ui.column().classes("w-full gap-2")
             with body, ui.row().classes("items-center gap-2 no-wrap"):
                 ui.spinner(size="sm")
-                hint("Asking the instance for the newest RulzTrainer (it fetches the code; nothing changes yet)…")
+                hint("Asking the instance for the newest RulZ AI Trainer (it fetches the code; nothing changes yet)…")
             with ui.row().classes("w-full justify-end gap-2"):
                 ui.button("Cancel", on_click=lambda: dlg.submit(False)).props("flat")
                 go = ui.button("Update and restart its WebUI", icon="system_update_alt",
@@ -8848,9 +8861,9 @@ def build_fleet_tab(form_config=None):
         refresh(force=True)
         now_on = (reply.get("to") if reply.get("state") == "done" else reply.get("current")) or {}
         if reply.get("state") == "current":
-            ui.notify(f"Instance {iid} already runs the newest RulzTrainer.", type="info")
+            ui.notify(f"Instance {iid} already runs the newest RulZ AI Trainer.", type="info")
         else:
-            ui.notify(f"Instance {iid} now runs RulzTrainer {now_on.get('version') or now_on.get('commit') or ''}"
+            ui.notify(f"Instance {iid} now runs RulZ AI Trainer {now_on.get('version') or now_on.get('commit') or ''}"
                       + (f". {reply['note']}" if reply.get("note") else ""),
                       type="positive" if reply.get("restarted") else "warning", multi_line=True)
 
@@ -8894,7 +8907,7 @@ def build_fleet_tab(form_config=None):
             with ui.row().classes("w-full items-center gap-2"):
                 w["stop"] = ui.button("Stop run", icon="stop", color=None).props("outline dense no-caps")
                 w["open"] = ui.button("Open WebUI", icon="open_in_new", color=None).props("outline dense no-caps") \
-                    .tooltip("This instance's own RulzTrainer page in a new tab, signed in through vast.ai's Instance "
+                    .tooltip("This instance's own RulZ AI Trainer page in a new tab, signed in through vast.ai's Instance "
                              "Portal")
                 w["accept"] = ui.switch("Takes queued runs", value=inst.get("accept", True),
                                         on_change=lambda e, i=iid: act(fl.set_instance, i, accept=bool(e.value))
@@ -8902,7 +8915,7 @@ def build_fleet_tab(form_config=None):
                 ui.space()
                 with ui.button(icon="more_vert", color=None).props("flat dense round"):
                     with ui.menu():
-                        w["update_item"] = ui.menu_item("Update RulzTrainer…")
+                        w["update_item"] = ui.menu_item("Update RulZ AI Trainer…")
                         w["reboot_item"] = ui.menu_item("Reboot the instance…")
                         ui.separator()
                         w["watch_item"] = ui.menu_item("")
@@ -9361,7 +9374,7 @@ def build_page(local: bool = True):
     f = Form()
     w = f.w
     theme_colors()
-    ui.page_title("RulzTrainer")
+    ui.page_title("RulZ AI Trainer")
     job_running = reattach_job()
     look = {"light": False}  # this browser's look, read from its localStorage once the page is connected
     form_state: dict = {"text": "", "warned": False}  # persist()'s last saved settings; "pristine": the defaults
@@ -9378,7 +9391,7 @@ def build_page(local: bool = True):
             with ui.row().classes("rz-brand items-center no-wrap gap-2"):
                 ui.element("img").props('src="/assets/logo_dark.png" alt="Rulz"').classes("rz-logo rz-dark-only")
                 ui.element("img").props('src="/assets/logo.png" alt="Rulz"').classes("rz-logo rz-light-only")
-                ui.label("TRAINER").classes("rz-wordmark")
+                ui.label("AI TRAINER").classes("rz-wordmark")
                 ui.label(f"v{__version__}").classes("rz-version")
             # the tabs in the order of the work: set a run up, watch it, look back. Thin rules part the three groups.
             with ui.tabs().props("inline-label no-caps align=left dense outside-arrows mobile-arrows")                     .classes("rz-tabs") as tabs:
@@ -9564,7 +9577,7 @@ def build_page(local: bool = True):
                                 cfg = f.to_config()
                                 path = cfg_path.value.strip() or f"configs/{cfg.job_name}.yaml"
                                 if _is_repo_example(path):
-                                    status_msg.text = "configs/example.yaml ships with RulzTrainer; save under another name."
+                                    status_msg.text = "configs/example.yaml ships with RulZ AI Trainer; save under another name."
                                     return
                                 cfg.save(path)
                                 status_msg.text = f"Saved {path}"
@@ -9812,7 +9825,7 @@ def build_page(local: bool = True):
                                 .tooltip("torch.compile the blocks even with block swap: each block's forward is "
                                          "compiled and the swap's streaming runs outside it (OneTrainer compiles its "
                                          "offloaded blocks this way). Could bring compile's 12-26% to runs that swap; "
-                                         "untested in RulzTrainer, so compare the step time and the compile report "
+                                         "untested in RulZ AI Trainer, so compare the step time and the compile report "
                                          "with a run without it.")
                             w["activation_offload"] = ui.switch("Activation offloading (experimental)",
                                                                 value=d.activation_offload) \
@@ -9822,7 +9835,7 @@ def build_page(local: bool = True):
                                          "(estimate). This sends them to RAM during the forward and streams them "
                                          "back ahead of each block's recomputation, so more blocks can keep their "
                                          "activations or fewer need swapping, for extra PCIe traffic. Untested in "
-                                         "RulzTrainer.")
+                                         "RulZ AI Trainer.")
                         with advanced():
                             with fields():
                                 w["text_encoder_device"] = ui.select(["auto"] + gpus + ["cpu"], value="auto",
@@ -10162,7 +10175,7 @@ def build_page(local: bool = True):
                                 .tooltip("An lr per block size, so every block size moves about as far per step as "
                                          "a block of 32 (OneTrainer's Scaled OFT). Off, a block of 64 steps about "
                                          "twice as far as one of 16 at the same lr, which skews a race of block "
-                                         "sizes. Block 32 is unchanged. Untested in RulzTrainer.")
+                                         "sizes. Block 32 is unchanged. Untested in RulZ AI Trainer.")
                             w["lokr_factor"] = ui.number("LoKr factor", value=d.lokr_factor, min=1, max=64,
                                                          precision=0).classes("w-32") \
                                 .bind_visibility_from(w["network_type"], "value", lambda x: x == "lokr") \
@@ -10581,7 +10594,7 @@ def build_page(local: bool = True):
                                     .props("flat dense").tooltip(
                                         "Fizgig's MOSS-Image LoRA default since 10 November 2026, 11:7:40:8:3: 11% "
                                         "until epoch 7, 40% from epoch 8, every 3rd epoch at 11% at half the learning "
-                                        "rate. Tuned for Muon, together with a face boost RulzTrainer does not have; "
+                                        "rate. Tuned for Muon, together with a face boost RulZ AI Trainer does not have; "
                                         "not measured here")
                                 ui.button("Slide FT", on_click=lambda: w["clean_share"].set_value(CLEAN_SLIDE_FT)) \
                                     .props("flat dense").tooltip("Fizgig's MOSS-Image full fine-tune default, "
@@ -12999,7 +13012,7 @@ def build_page(local: bool = True):
         task_bar.visible = frac is not None
         task_bar.value = frac or 0
 
-    strip_shown = {"title": "RulzTrainer", "running": None}
+    strip_shown = {"title": "RulZ AI Trainer", "running": None}
 
     def pill_tick():
         """The run strip (every tab), the action bar's buttons and the browser tab's title."""
@@ -13010,7 +13023,7 @@ def build_page(local: bool = True):
         job = _job_dir.name if _job_dir is not None and (running or st) else ""
         step, total = int(st.get("step") or 0), int(st.get("total") or 0)
         frac = min(1.0, step / total) if total else 0.0
-        title = "RulzTrainer"
+        title = "RulZ AI Trainer"
         if running:
             stage = str(st.get("stage") or "starting")
             ft = st.get("finetune") or {}
@@ -13020,14 +13033,14 @@ def build_page(local: bool = True):
             run_step.text = f"step {step:,} / {total:,} · {frac * 100:.0f}%{ft_text}" if total else ""
             eta = st.get("eta")
             run_eta.text = f"{eta_text(eta)} left" if eta and stage == "training" else ""
-            title = f"{frac * 100:.0f}% · {job} · RulzTrainer" if total else f"{run_state.text} · {job} · RulzTrainer"
+            title = f"{frac * 100:.0f}% · {job} · RulZ AI Trainer" if total else f"{run_state.text} · {job} · RulZ AI Trainer"
         else:
             run_state.text = {"error": "Failed", "done": "Finished"}.get(state, "Stopped" if st else "Idle")
             run_step.text = (f"step {step:,} / {total:,}" if total else "") if st else \
                 "No run yet: set one up in the Wizard or on the Train tab"
             run_eta.text = ""
             if state:
-                title = f"{run_state.text} · {job} · RulzTrainer"
+                title = f"{run_state.text} · {job} · RulZ AI Trainer"
         run_job.text = job
         run_bar.props(f"color={'positive' if state == 'done' else 'warning' if state == 'error' else 'primary'}")
         act = run_activity(_job_dir, st, time.time(), job_cpu_percent()) if running and _job_dir is not None \
@@ -13293,9 +13306,9 @@ The WebUI does the looking while it runs. Closed, run `python scripts/vast/rulz_
 moves the queue, downloads files or checks the watches. The same file is the command line for all of this
 (`rulz_fleet.py --help`). Nothing here rents, stops or destroys an instance.
 
-**An instance's own controls**: **Open WebUI** on its card opens that instance's RulzTrainer page in a new tab, signed
+**An instance's own controls**: **Open WebUI** on its card opens that instance's RulZ AI Trainer page in a new tab, signed
 in through vast.ai's Instance Portal (the same token as vast.ai's Open button). Its **⋮** menu has **Update
-RulzTrainer…**, which shows the installed and the newest version first, then updates the code (and the requirements
+RulZ AI Trainer…**, which shows the installed and the newest version first, then updates the code (and the requirements
 when they changed) and restarts its WebUI; it waits while a run is going. **Reboot the instance…** has vast.ai stop
 and start its container: the disk is kept, a run going there is killed (the dialog says so first).
 
@@ -13310,7 +13323,7 @@ two at any time; styles and concepts are set up on the Train tab.
 
 ## Quick start
 1. **Datasets**: on the Dataset tab, *Create dataset*, open it and upload images with same-name `.txt` captions (or
-   copy a folder on the machine running RulzTrainer); tick one or more for training. Optional trigger word is
+   copy a folder on the machine running RulZ AI Trainer); tick one or more for training. Optional trigger word is
    prepended.
 2. **Model**: either a Hugging Face repo (Base / SFT, about 30 GB, stored under `models/`) or three single
    ComfyUI-style files: diffusion model, Qwen3.5-9B text encoder and Flux2 VAE.
@@ -13351,7 +13364,7 @@ it: a call it cannot take runs on the next.
 ## Datasets
 The Dataset tab lists every dataset with a few thumbnails: the folders in `datasets/` (where *Create dataset* puts
 new ones) and folders elsewhere added with *Add a folder*. Click one to open it. *Upload* sends images and their
-`.txt` or `.json` captions from the computer the browser runs on to the machine running RulzTrainer (on the same
+`.txt` or `.json` captions from the computer the browser runs on to the machine running RulZ AI Trainer (on the same
 machine that is a plain copy; a file with the same name is replaced). *Copy from a folder* copies the images and
 captions of a folder on that machine (sub-folders kept, files the dataset already has left alone). Each picture has
 its caption and the Face ref / Body ref ticks, and *Train on this dataset* ticks it for training.
@@ -14037,7 +14050,7 @@ def tailscale_park(port: int) -> None:
     rather than answering 502 Bad Gateway. The next start replaces it with the proxy again."""
     exe = _tailscale_exe()
     if exe:
-        note = (f"RulzTrainer is not running on {socket.gethostname()}.\n\nStart run_webui_tailscale.bat there (or "
+        note = (f"RulZ AI Trainer is not running on {socket.gethostname()}.\n\nStart run_webui_tailscale.bat there (or "
                 "python webui.py --tailscale), keep its window open, then reload this page.\n\nTo remove this address "
                 f"for good: tailscale serve --https={port} off")
         subprocess.run([exe, "serve", "--bg", "--yes", f"--https={port}", f"text:{note}"], capture_output=True,
@@ -14111,5 +14124,5 @@ if __name__ in {"__main__", "__mp_main__"}:
         # which reset the job globals, so a reload lost the running job.
         build_page(local=is_local_viewer(request))
 
-    ui.run(host=a.host, port=port, title="RulzTrainer", show=a.open, reload=False, dark=True,
+    ui.run(host=a.host, port=port, title="RulZ AI Trainer", show=a.open, reload=False, dark=True,
            favicon=ASSETS / "icon.png")

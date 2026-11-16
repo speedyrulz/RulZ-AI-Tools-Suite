@@ -85,7 +85,7 @@
     },
     {
       "id": "rulz-trainer",
-      "name": "RulzTrainer",
+      "name": "RulZ AI Trainer",
       "paths": ["apps/RulzTrainer/**"],
       "version": {
         "source": "files",

@@ -42,7 +42,7 @@ export function ReversePage() {
     <div className="h-full overflow-y-auto">
       <div className="mx-auto max-w-5xl space-y-4 px-6 py-5">
         <div>
-          <h1 className="text-base font-semibold">Reverse Engineering</h1>
+          <h1 className="font-[family-name:var(--font-display)] text-base font-semibold">Reverse Engineering</h1>
           <div className="text-xs text-muted">
             Analyse programs with a local model and the REA tools. Sessions are recorded as they run; grade them, then export the
             good ones as fine-tuning data so the model gets better at this.
