@@ -123,7 +123,7 @@ _SDXL = [
     _only("dora", "SDXL's LoRA file is kohya's plain lora_down / lora_up layout; keep DoRA off", False),
     _only("train_text_embedder", "SDXL has no text projection inside its UNet, and its text encoders are not "
                                  "trained", False),
-    _only("turbo_lora", "no such LoRA exists for SDXL here (auto and empty both mean none)", "auto", "", default="auto"),
+    # (turbo_lora is allowed: DMD2's LoRA, 8 steps at CFG 1 with an LCM sampler; "" = Euler at 30 steps, CFG 6)
     _only("sample_lora", "no such LoRA exists for SDXL here (auto and empty both mean none)", "auto", "",
           default="auto"),
     _only("training_adapter", "no such LoRA exists for SDXL here (auto and empty both mean none)", "auto", "",

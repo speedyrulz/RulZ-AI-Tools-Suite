@@ -4079,12 +4079,19 @@ and OpenCLIP bigG) and the VAE stay frozen.
 - **Captions.** Both text encoders read 77 tokens, so `max_token_length` is held at 77 and longer captions are cut.
   An empty caption (caption dropout) and an empty negative prompt are the encoded empty text.
 - **Sizes.** Training resolutions are bucketed in steps of 64 px. The VAE runs in fp32; the UNet trains in bf16.
-- **Samples.** A DDIM-equivalent sampler, 30 steps at CFG 6 by default. Shift does not apply.
+- **Samples and probes.** They render with Tianwei Yin's DMD2 turbo LoRA (`tianweiy/DMD2`,
+  `dmd2_sdxl_4step_lora.safetensors`, downloaded when `turbo_lora` is `auto`), switched on for sampling and off for
+  training: 8 steps at CFG 1 with an LCM sampler (each step jumps to the predicted clean image and re-noises it to the
+  next level). The LoRA also covers the UNet's convolutions, which are applied by forward hooks while sampling.
+  `turbo_lora: ""` turns it off: then samples use a DDIM-equivalent (Euler) sampler, 30 steps at CFG 6. Shift does
+  not apply.
 
 **Where the model comes from.** *Hugging Face source*: the diffusers folder or repo (`unet/`, `text_encoder/`,
 `text_encoder_2/`, `vae/`). *Single files source*: one all-in-one checkpoint in `transformer_file`; the VAE and both
-text encoders are read from the same file unless you set `vae_file` / `text_encoder_file`. Nothing is downloaded from
-Comfy-Org for SDXL (the quantization and download-format choices do not apply). A checkpoint is recognized as SDXL by
+text encoders are read from the same file unless you set `vae_file` / `text_encoder_file`. With `transformer_file`
+empty, `sd_xl_base_1.0_0.9vae.safetensors` (SDXL 1.0 base with the 0.9 VAE baked in, not gated) is downloaded from
+`stabilityai/stable-diffusion-xl-base-1.0`. Nothing is downloaded from Comfy-Org for SDXL (the quantization and
+download-format choices do not apply). A checkpoint is recognized as SDXL by
 its header, so a file named `ponyDiffusionV6XL.safetensors` or `illustrious.safetensors` needs no extra setting.
 
 **What is refused.** Picking SDXL greys these out in the WebUI (Train tab and Wizard) with the reason, and a config
@@ -4094,7 +4101,7 @@ see [Settings a model cannot use](#settings-a-model-cannot-use)): `block_swap`, 
 the `keel_fb` and `hull` optimizers, a Keel face gain above 0, `transformer_quant` or `sample_model_quant` other than
 auto, none, int8 or int8_convrot (so `nvfp4`), `compile_model: true`,
 `loss_type` other than mse, `loss_weighting: sigma_sqrt`, `finetune`, `network_type` other than lora, `dora`,
-`train_text_embedder`, a set `turbo_lora`, `sample_lora` or `training_adapter`, and video clips. Data parallel on two
+`train_text_embedder`, a set `sample_lora` or `training_adapter`, and video clips. Data parallel on two
 GPUs works. The other optimizers (adamw, adamw8bit, adafactor, automagic3 / 4, keel, muon, normuon) work.
 
 **int8 UNet** (since 3.26.0). `transformer_quant: int8` or `int8_convrot` trains the LoRA on a UNet whose transformer
