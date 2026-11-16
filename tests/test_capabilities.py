@@ -46,7 +46,7 @@ SDXL_BAD = [
     ("attn_localize", True, {"trigger_word": "sks"}), ("id_align", True, {}), ("body_align", True, {}),
     ("optimizer", "keel_fb", {}), ("optimizer", "hull", {"hull_rho": 0.01}),
     ("keel_face_gain", 0.5, {"optimizer": "keel"}), ("training_maps", True, {}), ("transformer_quant", "nvfp4", {}),
-    ("compile_model", True, {}), ("loss_type", "band", {}), ("loss_weighting", "sigma_sqrt", {}),
+    ("sample_model_quant", "nvfp4", {}), ("compile_model", True, {}), ("loss_type", "band", {}), ("loss_weighting", "sigma_sqrt", {}),
     ("finetune", True, {}), ("network_type", "lokr", {}), ("dora", True, {}), ("train_text_embedder", True, {}),
     ("turbo_lora", "x.safetensors", {}), ("sample_lora", "x.safetensors", {}),
     ("training_adapter", "x.safetensors", {}), ("checkpoint_keep_blocks", 3, {}),
@@ -104,6 +104,47 @@ def test_sdxl_quant_int8_and_convrot_pass_and_nvfp4_does_not():
     assert caps.allowed_values("sdxl", "transformer_quant", ["auto", "none", "int8", "int8_convrot", "nvfp4"]) == [
         "auto", "none", "int8", "int8_convrot"]
     assert caps.allowed_values("krea2", "transformer_quant", ["nvfp4"]) == ["nvfp4"]  # another family: no rule
+    sdxl(transformer_quant="INT8").validate()  # any case, as the loader takes it
+    for bad in ("fp8", "w4a8"):  # anything unknown stops at the start, not at loading
+        with pytest.raises(ValueError, match="transformer_quant"):
+            sdxl(transformer_quant=bad).validate()
+    sdxl(sample_model_quant="int8_convrot").validate()
+    with pytest.raises(ValueError, match="sample_model_quant"):  # the sample model loads through the same loader
+        sdxl(sample_model_quant="nvfp4").validate()
+
+
+def test_the_sdxl_loader_takes_any_case():
+    from rulztrainer.sdxl import loading
+
+    loading._validate_quant("INT8_CONVROT")
+    assert loading._norm_quant("INT8") == "int8" and loading._norm_quant(None) is None
+    with pytest.raises(ValueError):
+        loading._validate_quant("nvfp4")
+
+
+def test_the_keel_face_gain_rule_follows_the_optimizer_in_the_form(monkeypatch):
+    f = _form(monkeypatch)
+    f.w["optimizer"].value = "adamw"
+    f.w["keel_face_gain"] = Control(0.5)
+    f.apply_family_support("sdxl", notify=True)
+    assert f.w["keel_face_gain"].value == 0.5 and f.w["keel_face_gain"].enabled  # unused with adamw: left alone
+    assert "keel_face_gain" not in f.notified[0]
+    f.w["optimizer"].value = "keel"
+    f.apply_family_support("sdxl")  # what the optimizer's change runs
+    assert f.w["keel_face_gain"].value == 0.0 and not f.w["keel_face_gain"].enabled
+    f.w["optimizer"].value = "adamw"
+    f.apply_family_support("sdxl")
+    assert f.w["keel_face_gain"].enabled
+
+
+def test_a_wizard_copy_of_a_one_choice_select_is_disabled_too(monkeypatch):
+    f = _form(monkeypatch)
+    copy = Control("band", ["mse", "band"])
+    f.family_mirrors["loss_type"] = [copy]
+    f.apply_family_support("sdxl")
+    assert copy.options == ["mse"] and not copy.enabled
+    f.apply_family_support("moss_image")
+    assert copy.enabled and copy.options == ["mse", "band"]
 
 
 def test_keel_face_gain_is_refused_only_with_a_keel_optimizer():
