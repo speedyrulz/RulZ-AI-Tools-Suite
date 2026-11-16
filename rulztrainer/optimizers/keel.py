@@ -4,6 +4,10 @@ probe-gated lookahead and the face-token gain, plus the body share and the magni
 version (optimizer: keel_fb, the same class with body_weight and consensus_mode="magnitude"). With every switch
 off it is Automagic 4 exactly (test_keel asserts it bitwise).
 
+The mechanisms live in _KeelMixin; Keel is the mixin on Automagic 4 and Keel3 (optimizer: keel3 / keel3_fb) the same
+mixin on Automagic 3, whose lr controller votes on the extremes alone and has no sensitivity balance. Everything
+below applies to both; "Automagic 4" in the text below is the base under Keel.
+
 Gauge preconditioner (keel_gauge)
 ---------------------------------
 A LoRA's delta is B A (lora_up [out, r] times lora_down [r, in]), and (B S)(S^-1 A) is the same delta for any
@@ -147,6 +151,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 
 from ..config import KEEL_BAND_LOGIT_RANGE, keel_band_edges
+from .automagic3 import Automagic3
 from .automagic4 import Automagic4
 
 log = logging.getLogger("rulztrainer")
@@ -200,11 +205,13 @@ def consensus_gate(agree: torch.Tensor, votes: int, consensus: float, power: flo
     return a.mul_(1.0 - floor).add_(floor)
 
 
-class Keel(Automagic4):
-    """Automagic 4 plus the gauge preconditioner, the cautious mask, the noise bands and the consensus gate
-    (module docstring).
+class _KeelMixin:
+    """Keel's mechanisms, independent of the lr controller under them: Keel (below) puts them on Automagic 4, Keel3 on
+    Automagic 3. The base supplies the step, the vote and the lr; this adds the gauge preconditioner, the cautious
+    mask, the noise bands and the consensus gate (module docstring). It needs from the base: update_gain,
+    _element_gain(p, i0, i1), _group_lr, _refresh_group_lrs() and the accumulation hook's _make_accum_hook().
 
-    Parameters (beyond Automagic 4's)
+    Parameters (beyond the base optimizer's)
     ---------------------------------
     pairs : [(lora_down, lora_up)]
         The LoRA pairs among the optimizer's parameters (lora.lora_pairs); empty = no preconditioning.
@@ -241,6 +248,8 @@ class Keel(Automagic4):
     body_weight : float >= 0
         The body tokens' weight against the face's in the gain (the face-and-body version; 0 = face only).
     """
+
+    _BASE_NAME = "Automagic 4"  # the lr controller under the mixin (for the log lines)
 
     def __init__(self, params, *args, pairs: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
                  gauge: bool = True, gauge_eps: float = 0.01, cautious: bool = True, bands: int = 8,
@@ -328,7 +337,7 @@ class Keel(Automagic4):
         self._noted: set = set()  # one-time notes already logged
         if self.gauge and not self.pairs:
             log.info("Keel: no LoRA pairs (a LoKr / OFT adapter or a fine-tune): the gauge preconditioner has nothing "
-                     "to do and the step is Automagic 4's")
+                     "to do and the step is %s's", self._BASE_NAME)
         elif self.gauge:
             log.info("Keel: gauge preconditioner on %d LoRA pairs (eps %g)%s", len(self.pairs), self.gauge_eps,
                      ", cautious mask" if self.cautious else "")
@@ -1038,3 +1047,82 @@ class Keel(Automagic4):
                     else:
                         st.pop("face_gain", None)
         self._refresh_band_gains()
+
+
+class Keel(_KeelMixin, Automagic4):
+    """Automagic 4 plus the gauge preconditioner, the cautious mask, the noise bands and the consensus gate
+    (module docstring). Parameters: _KeelMixin's, beyond Automagic 4's."""
+
+
+class Keel3(_KeelMixin, Automagic3):
+    """Keel on Automagic 3 (optimizer: keel3, and keel3_fb with the body share and the magnitude vote): the same
+    mechanisms on Automagic 3's lr controller, whose vote is the extremes-only one (all H signs agree: up, perfect
+    alternation: down), with no sensitivity balance and no vote bound. Parameters: _KeelMixin's, beyond Automagic
+    3's (never Automagic 4's sensitivity_quantile / vote / max_vote). With every switch off it is Automagic 3
+    exactly (test_keel asserts it bitwise).
+
+    Automagic 3 keeps one lr mirror per parameter, all nudged alike; the group lr this class tracks (_group_lr) is
+    the first mirror's, re-read at every step as in Automagic 4, so a state that was loaded, moved by a race or
+    copied by a relay is seen, and a parameter that joins late starts at the group's adapted lr."""
+
+    _BASE_NAME = "Automagic 3"
+
+    def _rebuild_group_index(self) -> None:
+        super()._rebuild_group_index()
+        self._group_lr: List[Optional[torch.Tensor]] = [None] * len(self.param_groups)
+
+    def add_param_group(self, param_group: dict) -> None:
+        super().add_param_group(param_group)
+        if hasattr(self, "_group_lr"):  # after construction: size the per-group lists for the new group
+            self._rebuild_group_index()
+            self._refresh_group_lrs()
+
+    def _refresh_group_lrs(self) -> None:
+        # Automagic 4's refresh without the sensitivity reference: the first mirror of each group is its lr.
+        for gi, group in enumerate(self.param_groups):
+            cur = None
+            for p in group["params"]:
+                st = self.state.get(p)
+                if st and "lr" in st:
+                    cur = st["lr"]
+                    break
+            if cur is not None and cur is not self._group_lr[gi]:
+                self._unify_lrs(group, cur)
+            self._group_lr[gi] = cur
+
+    def _unify_lrs(self, group: dict, first: torch.Tensor) -> None:
+        # The mirrors were replaced since the last step (a load, a race move, a relay): one value again, their median.
+        mirrors = [st["lr"] for p in group["params"] if (st := self.state.get(p)) and "lr" in st]
+        if len(mirrors) < 2:
+            return
+        dev = first.device
+        med = torch.stack([t if t.device == dev else t.to(dev) for t in mirrors]).median()
+        by_dev: dict = {}
+        for t in mirrors:
+            by_dev.setdefault(t.device, []).append(t)
+        for d, ts in by_dev.items():
+            torch._foreach_copy_(ts, [med if med.device == d else med.to(d)] * len(ts))
+
+    def _init_state(self, p: torch.Tensor, group: dict) -> None:
+        super()._init_state(p, group)
+        gi = self._param_group_index.get(p)
+        if gi is None:
+            return
+        if self._group_lr[gi] is None:
+            self._refresh_group_lrs()
+        cur = self._group_lr[gi]
+        if cur is not None:  # a parameter joining late starts at the group's adapted lr, not the configured one
+            st = self.state[p]
+            st["lr"] = cur.detach().to(p.device, torch.float32, copy=True).clamp_(min=group["min_lr"],
+                                                                                max=group["max_lr"])
+
+    def step(self, closure=None):
+        self._refresh_group_lrs()  # the mirrors may have been replaced since the last step (a race relay)
+        return super().step(closure)
+
+    def load_state_dict(self, state_dict):
+        # A state saved by Automagic 4 / Keel carries a sensitivity reference that this class never updates: drop it,
+        # so a later resume under Automagic 4 / Keel measures it afresh instead of restoring a stale one.
+        super().load_state_dict(state_dict)
+        for st in self.state.values():
+            st.pop("sens_ref", None)

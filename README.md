@@ -1125,7 +1125,7 @@ step); otherwise it becomes a per-sample loss weight. `loss_watch_exclude_after:
 at the lowest throttle for N more epochs; exclusions are remembered in `<dataset>/.rulz_cache/excluded.json`
 and cleared by editing the image's caption. Output: `per_image_loss.jsonl` (every observation),
 `per_image_loss.json` (the table), a Monitor table and verdict badges on the Dataset tab. The per-image rate is not
-used with the self-tuning optimizers (`automagic3`, `automagic4`, `keel`, `keel_fb`), whose step normalisation would
+used with the self-tuning optimizers (`automagic3`, `automagic4`, `keel`, `keel_fb`, `keel3`, `keel3_fb`), whose step normalisation would
 absorb the per-image scaling; the watch then only observes. Verdicts need a few epochs to mean
 anything, so this suits typical character sets trained for thousands of steps.
 
@@ -1637,10 +1637,19 @@ says so when the lookahead is on). Race it against `keel`, then its parts one at
 `keel_body_weight`, `keel_band_weights`); not measured yet. Use gradient accumulation of 2 or more, or the vote has
 nothing to compare.
 
+**Keel on Automagic 3** (`optimizer: keel3`, and `keel3_fb` for the face and the body) puts the same mechanisms on
+Automagic 3's learning-rate controller instead of Automagic 4's, for the models where Automagic 4 is unstable (ostris
+advises Automagic 3). The gauge preconditioner, cautious mask, paired sigma, noise bands, consensus gate, lookahead
+and face gain are the same code with the same settings; what changes is the lr: it follows Automagic 3's
+extremes-only vote, with no cap on the most sensitive weights and none of `automagic_vote`,
+`automagic_sensitivity_quantile` or `automagic_max_lr_change` (they do not apply). Its step is slower, as Automagic
+3's is. With every switch off it is `automagic3` to the bit. Not run on a real model yet: race it against `keel` and
+`automagic3` before relying on it (`docs/keel-optimizer.md`, section 6.1).
+
 All of it can be raced (`race` rows with `keel_gauge`, `keel_gauge_eps`, `keel_cautious`, `keel_pair_sigma`,
 `keel_bands`, `keel_band_weights`, `keel_consensus`, `keel_consensus_power`, `keel_consensus_mode`,
 `keel_lookahead` and its three settings, `keel_face_gain` and its two, `keel_body_weight`, and `optimizer` itself:
-`keel` against `keel_fb`), and a Keel state resumes under Automagic 4 and the other way round (the
+`keel` against `keel_fb`, or against `keel3`), and a Keel state resumes under Automagic 4 and the other way round (the
 band statistics start fresh when `keel_bands` changes; the anchor is dropped when the lookahead is off, the face
 gains when the face gain is). Against adamw8bit on one small Krea 2 set, Keel repeated a face gain on two seeds but not
 a body gain, so the Wizard keeps recommending adamw8bit. [Results](docs/experimental-test-results.md) for this and the
@@ -1692,6 +1701,8 @@ These levers change the training objective and data for likeness, all off by def
   above and `docs/keel-optimizer.md`.
 - **Keel (face + body)** (`optimizer: keel_fb`): the same with the body's tokens in the gain and a consensus vote
   weighted by gradient size, for a LoRA that should hold the build as firmly as the face; see *Keel* above.
+- **Keel on Automagic 3** (`optimizer: keel3`, `keel3_fb`): the same on Automagic 3's lr controller, for models where
+  Automagic 4 is unstable; never run on a real model; see *Keel* above.
 
 The face analysis cache is `<dataset>/.rulz_cache/faces.json`; the Train tab has preview buttons for region
 maps and crops.
@@ -4116,7 +4127,7 @@ ComfyUI's `custom_nodes` and load `workflows/RulzTrainer Likeness Scoring.json`;
 |---|---|
 | Gradient checkpointing | on |
 | Batch size | 1 (use gradient accumulation instead) |
-| Optimizer | `adamw8bit`, or `automagic3` / `automagic4` (self-tuning lr, ported from ai-toolkit; 1 byte of state per weight at the default polarity history; Automagic 4's step is as fast as adamw8bit's on a rank-16 LoRA, about 3x slower at rank 64 and 6x on a full fine-tune; Automagic 3's about 10x slower than Automagic 4's), or `keel` / `keel_fb` (Automagic 4 plus identity mechanisms for character LoRAs, `keel_fb` for the face and the body alike; ahead on FaceNet in races on Krea 2 and Qwen-Image 2.1, see the test results), or `muon` (orthogonalized momentum at AdamW's learning rates, Fizgig's default since Nov 2026; one fp32 state per weight; level with adamw8bit on Qwen-Image 2.1 at twice the step time), or `normuon` (Muon with each row's step evened out; experimental, untested) |
+| Optimizer | `adamw8bit`, or `automagic3` / `automagic4` (self-tuning lr, ported from ai-toolkit; 1 byte of state per weight at the default polarity history; Automagic 4's step is as fast as adamw8bit's on a rank-16 LoRA, about 3x slower at rank 64 and 6x on a full fine-tune; Automagic 3's about 10x slower than Automagic 4's), or `keel` / `keel_fb` (Automagic 4 plus identity mechanisms for character LoRAs, `keel_fb` for the face and the body alike; ahead on FaceNet in races on Krea 2 and Qwen-Image 2.1, see the test results), or `keel3` / `keel3_fb` (the same on Automagic 3's lr controller; never run on a real model), or `muon` (orthogonalized momentum at AdamW's learning rates, Fizgig's default since Nov 2026; one fp32 state per weight; level with adamw8bit on Qwen-Image 2.1 at twice the step time), or `normuon` (Muon with each row's step evened out; experimental, untested) |
 | Resolution | 1024 |
 | Text encoder device | `auto` (spreads over all GPUs + CPU during caching only) |
 | Max caption tokens | 512 to 1024 unless you train on very long prompts |
