@@ -34,8 +34,8 @@ def forward_backward(job):
     """Forward + backward of one batch of one configuration on one model copy (the trainer's `work`, with the
     configuration's settings in the job). Returns (loss value, per-image multipliers, None)."""
     from . import lora as lora_mod
+    from .archs import get_arch
     from .losses import elementwise_loss
-    from .trainer import loss_weight
 
     (rmodel, rinj, rdev), batch, latents, embeds, mask, sigma, noise, regions, cur_step, n_total, ctx = job
     cfg = ctx.cfg
@@ -67,7 +67,7 @@ def forward_backward(job):
         pm = regions.prior.to(rdev).float()
         prior = ((pred - base_pred).pow(2) * pm).sum(dim=(1, 2, 3)) / (pm.sum(dim=(1, 2, 3)) * pred.shape[1]).clamp(min=1)
         per = per + cfg.region_prior_weight * prior
-    weights = loss_weight(cfg, sigma)
+    weights = (getattr(ctx, "arch", None) or get_arch(cfg)).loss_weight(cfg, sigma)
     look = ctx.look(batch, cur_step) if getattr(ctx, "look", None) else None
     if look is not None:  # look_warmup: the look filter's outliers ease in
         weights = weights * torch.tensor(look, device=weights.device, dtype=weights.dtype)
@@ -224,7 +224,7 @@ class RaceParallelMixin:
                 if getattr(self, "look_outliers", None):  # look_warmup: this lane's weights for the outliers
                     look = (lambda batch, step, _cfg=cfg, _b=st.get("batcher"): self._look_factors(
                         batch, step, _cfg, _b, _cfg.batch_size * _cfg.gradient_accumulation))
-                ctx = SimpleNamespace(cfg=cfg, loss_watch=st.get("loss_watch"), look=look)
+                ctx = SimpleNamespace(cfg=cfg, loss_watch=st.get("loss_watch"), look=look, arch=self.arch)
                 per_rep: list[list] = [[] for _ in reps]
                 step_sigma = None  # keel_pair_sigma: the lane's one sigma this step
                 for k in job_order(counts):

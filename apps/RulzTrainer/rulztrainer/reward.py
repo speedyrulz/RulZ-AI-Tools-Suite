@@ -109,11 +109,13 @@ def velocity(model, x: torch.Tensor, sigma: float, pos_e, pos_m, neg_e, neg_m, c
 
 @torch.no_grad()
 def sample_group(model, sigmas: torch.Tensor, pos_e, pos_m, neg_e, neg_m, *, cfg_scale: float, noise_level: float,
-                 seeds: list[int], shape: tuple[int, int, int], device, skip=None, progress=None):
+                 seeds: list[int], shape: tuple[int, int, int], device, skip=None, progress=None,
+                 init_scale: float = 1.0):
     """Render len(seeds) images of one prompt with the SDE sampler. Returns (latents per step [T + 1] of [G, C, h, w]
-    fp32 on `device`, std per step [T]). The final latents are the images."""
+    fp32 on `device`, std per step [T]). The final latents are the images. init_scale: what the pure-noise start is
+    multiplied by (Arch.init_noise_scale of the first sigma: 1 unless the schedule starts below sigma 1, as SDXL's)."""
     gens = [torch.Generator("cpu").manual_seed(int(s)) for s in seeds]
-    x = torch.stack([torch.randn(shape, generator=g) for g in gens]).to(device)
+    x = torch.stack([torch.randn(shape, generator=g) for g in gens]).to(device) * init_scale
     sig = [float(s) for s in sigmas]
     cap = sig[1] if len(sig) > 1 else 0.999
     xs, stds = [x], []

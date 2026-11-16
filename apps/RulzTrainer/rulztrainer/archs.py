@@ -35,6 +35,7 @@ ARCH_NAMES += ("minimax_h3",)
 ARCH_NAMES += ("p_h3_image",)
 ARCH_NAMES += ("minimax_h3_image",)
 ARCH_NAMES += ("pan2",)
+ARCH_NAMES += ("sdxl",)
 
 
 def _match_suffix(name: str, suffixes: Iterable[str]) -> bool:
@@ -196,6 +197,55 @@ class Arch:
     def reference_sigmas(self, n: int, gen: torch.Generator, tokens: int) -> torch.Tensor:
         """The family's own training noise-level distribution (timestep_sampling: reference)."""
         raise NotImplementedError(f"{self.name} has no reference timestep recipe")
+
+    # True (with reference_sigmas_exact): the exact sigmas still follow the run's curriculum, so trainer.sample_sigmas
+    # calls reference_sigmas(n, gen, tokens, logit_shift, u=<strata draw or None>, timestep_shift=..., cfg=cfg)
+    reference_exact_curriculum = False
+
+    def reference_exact_note(self, cfg: TrainConfig) -> list[tuple[str, str]]:
+        """What the trainer says once at the start of a run on an exact reference recipe, as (level, text) lines
+        (level: warning or info; the default is the step-distilled families' own wording)."""
+        label = self.label
+        if cfg.timestep_sampling != "reference":
+            return [("warning", f"{label} has one output head per sampling step, each distilled at its one noise "
+                                f"level. timestep_sampling: {cfg.timestep_sampling} trains at noise levels between "
+                                "them, which sampling never uses; timestep_sampling: reference trains on the "
+                                "sampling steps themselves (ai-toolkit's rule)")]
+        out = []
+        if cfg.timestep_shift != 1.0 or cfg.sigma_min > 0.0 or cfg.sigma_max < 1.0:
+            out.append(("warning", f"timestep_sampling: reference trains {label} on its own sampling noise levels "
+                                   "only: timestep_shift and sigma_min / sigma_max do not move them"))
+        if cfg.clean_share:
+            out.append(("info", f"clean_share on {label}: the share is the steps at its last noise level (0.232, "
+                                "where skin, eyes and fine detail are made), the rest split evenly over the other "
+                                "five; even is 16.7%"))
+        return out
+
+    # ---- noise levels and loss: the flow-matching convention (noisy = (1 - s) x0 + s noise, velocity target) for
+    # every family but SDXL, whose facade (rulztrainer.sdxl.model) keeps the convention over a DDPM UNet
+    def sigma_bounds(self, cfg: TrainConfig | None = None) -> tuple[float, float]:
+        """The lowest and highest sigma a training or sampling step may use (trainer.sample_sigmas remaps into it)."""
+        return 0.0, 1.0
+
+    def loss_weight(self, cfg: TrainConfig, sigma: torch.Tensor) -> torch.Tensor:
+        """The per-sample weight on the training loss (loss_weighting) for these sigmas."""
+        from .trainer import loss_weight
+
+        return loss_weight(cfg, sigma)
+
+    def init_noise_scale(self, sigma0: float) -> float:
+        """What a sampler's pure-noise start is multiplied by when it starts at sigma0 (the flow families: 1)."""
+        return 1.0
+
+    def lora_metadata(self) -> dict:
+        """The architecture entries of a saved LoRA's metadata."""
+        return {"modelspec.architecture": self.modelspec}
+
+    weighted_dop = False  # DOP's loss is weighted by loss_weight (the families whose loss weight is part of the loss)
+    supports_kept_blocks = True  # checkpoint_keep_blocks / the memory calibration (blocks that keep their activations)
+    supports_compile = True  # torch.compile of compile_blocks
+    linear_blocks = True  # model.layers is a chain: blocks before the first trained one need no backward (SDXL: a UNet)
+    max_text_tokens: int | None = None  # a text encoder that reads this many tokens only (SDXL: 77)
 
 
 class MossArch(Arch):
@@ -1479,6 +1529,227 @@ class Pan2Arch(Arch):
 
 
 _ARCHS["pan2"] = Pan2Arch
+
+
+class SdxlArch(Arch):
+    """SDXL (Stability AI): a DDPM UNet with two CLIP text encoders, trained here as a LoRA (rulztrainer.sdxl). The
+    trainer's convention (flow matching, velocity target, `model(latents, sigma * 1000, embeds, mask)`, 2x2-patchified
+    latents [B, 16, H/16, W/16]) is kept by a facade around the UNet (sdxl.model.SdxlUNet), which converts to and from
+    the model's epsilon / v-prediction; so this class only adds what the facade's maths changes: the noise levels the
+    schedule covers (sigma_bounds), the loss weight that makes the weighted flow loss the model's own epsilon or
+    v-prediction MSE (loss_weight), and the size of the sampler's pure-noise start (init_noise_scale)."""
+    name = "sdxl"
+    label = "SDXL"
+    modelspec = "stable-diffusion-xl-v1-base"
+    lora_format = "kohya"  # lora_unet_<diffusers path>.lora_down/up + alpha: what ComfyUI, A1111 and kohya read
+    n_blocks = 70  # BasicTransformerBlocks of the base UNet
+    # attention 1 (self) and 2 (cross) of every block, the feed-forward and each Transformer2DModel's projections go
+    # together: the groups name what each projection is
+    GROUPS = {
+        "q": ("attn1.to_q", "attn2.to_q"), "k": ("attn1.to_k", "attn2.to_k"), "v": ("attn1.to_v", "attn2.to_v"),
+        "o": ("attn1.to_out.0", "attn2.to_out.0"),
+        "ffn_up_gate": ("ff.net.0.proj",), "ffn_down": ("ff.net.2",),
+    }
+    PROJ = ("proj_in", "proj_out")
+    target_groups = {"q": "attention query (self and cross)", "k": "attention key (self and cross)",
+                     "v": "attention value (self and cross)", "o": "attention out (self and cross)",
+                     "ffn_up_gate": "feed-forward in (GEGLU)", "ffn_down": "feed-forward out",
+                     "proj": "each transformer's proj_in / proj_out"}
+    default_targets = ARCH_DEFAULT_TARGETS["sdxl"]
+    supports_single_files = True  # the all-in-one checkpoint (CivitAI / Stability's sd_xl_base_1.0.safetensors)
+    default_sample_steps, default_sample_cfg = ARCH_FULL_SAMPLE["sdxl"]
+    latent_tag = "_sdxlvae"
+    size_multiple = 64
+    reference_sigmas_exact = True  # the UNet's own training timesteps, s(t), used as drawn
+    reference_exact_curriculum = True  # ... through the run's logit shift and timestep_shift
+    weighted_dop = True
+    supports_kept_blocks = False  # diffusers' checkpointing is all or nothing
+    supports_compile = False
+    linear_blocks = False
+    max_text_tokens = 77
+
+    def __init__(self):
+        from .sdxl import loading
+
+        self._loading = loading
+        # (model path / file, sdxl_prediction, sdxl_zero_terminal_snr) -> (prediction type, zero terminal SNR) as the
+        # loaded model resolved them (bind_model); a config the model was not loaded for reads its own settings
+        self._bound: dict[tuple, tuple[str, bool]] = {}
+
+    # ---- prediction type: from the loaded model, else the config's own settings
+    @staticmethod
+    def _key(cfg: TrainConfig) -> tuple:
+        file = cfg.transformer_file if cfg.model_source == "files" and cfg.transformer_file else ""
+        return (cfg.model_path, file, cfg.sdxl_prediction, bool(cfg.sdxl_zero_terminal_snr))
+
+    def bind_model(self, cfg: TrainConfig, model) -> None:
+        """Remember what the loaded model predicts (its resolved prediction type and zero-terminal-SNR flag, which
+        sdxl_prediction auto reads from the model's scheduler config or the file), for sigma_bounds and loss_weight."""
+        pred, ztsnr = str(getattr(model, "prediction_type", "epsilon")), bool(getattr(model, "zero_terminal_snr", False))
+        if pred == "epsilon" and ztsnr:  # x0 = (x - b eps) / a has a = 0 at the last timestep: inf / NaN
+            raise ValueError("This SDXL model resolves to epsilon prediction with zero terminal SNR, which cannot "
+                             "predict the clean image at zero SNR: set sdxl_prediction to v_prediction (a zero "
+                             "terminal SNR model is a v-prediction model) or turn sdxl_zero_terminal_snr off")
+        self._bound[self._key(cfg)] = (pred, ztsnr)
+
+    def prediction(self, cfg: TrainConfig) -> tuple[str, bool]:
+        """(prediction type, zero terminal SNR) for a config: the loaded model's when bind_model has seen it, else the
+        config's settings (auto: epsilon)."""
+        got = self._bound.get(self._key(cfg))
+        if got is not None:
+            return got
+        pred = cfg.sdxl_prediction if cfg.sdxl_prediction != "auto" else "epsilon"
+        return pred, bool(cfg.sdxl_zero_terminal_snr)
+
+    def sigma_bounds(self, cfg=None):
+        """The sigmas the schedule covers: s(t = 0) to s(t = 999), which is 1.0 with zero terminal SNR. The loaded
+        model's prediction settings (bind_model); the config's before that."""
+        if cfg is None:
+            return 0.0, 1.0
+        from .sdxl.model import sigma_bounds
+
+        pred, ztsnr = self.prediction(cfg)
+        lo, hi = sigma_bounds(pred, ztsnr)
+        return float(lo), float(hi)
+
+    def loss_weight(self, cfg, sigma):
+        """Epsilon: (1 - s)^2, which turns the facade's velocity error into the epsilon error (a weighted flow MSE is
+        the plain epsilon MSE); v-prediction: (1 - s)^2 + s^2 likewise. loss_weighting min_snr then multiplies the
+        textbook weight: min(SNR, 5) / SNR for epsilon, min(SNR, 5) / (SNR + 1) for v-prediction, SNR = ((1 - s) / s)^2."""
+        pred, _ = self.prediction(cfg)
+        s = sigma.float() if sigma.dtype in (torch.float16, torch.bfloat16) else sigma
+        base = (1 - s) ** 2 if pred == "epsilon" else (1 - s) ** 2 + s ** 2
+        mode = cfg.loss_weighting
+        if mode == "none":
+            return base
+        if mode == "min_snr":
+            snr = ((1 - s) / s) ** 2
+            return base * snr.clamp(max=5.0) / (snr if pred == "epsilon" else snr + 1)
+        raise ValueError(f"loss_weighting {mode} is not available for SDXL (use none or min_snr)")
+
+    def lora_metadata(self):
+        # kohya's keys: the architecture as modelspec names a LoRA, and the base model the A1111 / kohya tools read
+        return {"modelspec.architecture": f"{self.modelspec}/lora", "ss_base_model_version": "sdxl_base_v1-0"}
+
+    def init_noise_scale(self, sigma0):
+        from .sdxl.model import init_noise_scale
+
+        return float(init_noise_scale(float(sigma0)))
+
+    def reference_sigmas(self, n, gen, tokens, logit_shift: float = 0.0, u=None, timestep_shift: float = 1.0,
+                         cfg=None):
+        """The model's own recipe (OneTrainer, ai-toolkit, Fizgig): a uniform integer timestep t in 0..999, trained at
+        its exact noise level s(t) (no 1000-grid rounding, no sigma range). The run's curriculum acts on the uniform
+        draw before it becomes a timestep: the logit shift (likeness_curriculum, clean_share) and timestep_shift.
+        `u`: the draw to use (timestep_buckets' strata) instead of a fresh uniform one."""
+        from .sdxl.model import sigma_of_timestep
+        from .trainer import _shift_logit
+
+        u = torch.rand(n, generator=gen) if u is None else u.float()
+        u = _shift_logit(u, logit_shift)
+        if timestep_shift != 1.0:
+            u = timestep_shift * u / (1 + (timestep_shift - 1) * u)
+        t = (u * 1000).floor().clamp(0, 999).long()
+        ztsnr = self.prediction(cfg)[1] if cfg is not None else False
+        return sigma_of_timestep(t, ztsnr).float()
+
+    def reference_exact_note(self, cfg):
+        if cfg.timestep_sampling != "reference":
+            lo, hi = self.sigma_bounds(cfg)
+            return [("info", f"timestep_sampling: {cfg.timestep_sampling} draws continuous noise levels, remapped "
+                             f"into SDXL's schedule ({lo:.3f} to {hi:.3f}) and rounded to the 1000-step grid; "
+                             "timestep_sampling: reference trains the model's own uniform timesteps at their exact "
+                             "levels (OneTrainer's, ai-toolkit's and Fizgig's rule)")]
+        out = []
+        if cfg.sigma_min > 0.0 or cfg.sigma_max < 1.0:
+            out.append(("warning", "timestep_sampling: reference trains SDXL on its own 1000 timesteps: sigma_min / "
+                                   "sigma_max do not narrow them (use timestep_shift or the logit curriculum)"))
+        out.append(("info", "timestep_sampling: reference on SDXL: a uniform integer timestep 0-999 at its exact noise "
+                            "level, through timestep_shift and the logit curriculum (likeness_curriculum, "
+                            "clean_share)"))
+        return out
+
+    # ---- loading / encoding (rulztrainer.sdxl.loading)
+    def resolve_for_config(self, cfg):
+        return self._loading.resolve_for_config(cfg)
+
+    def get_transformer(self, cfg, model_dir, device=None):
+        return self._loading.get_transformer(cfg, model_dir, device)
+
+    def get_vae(self, cfg, model_dir):
+        return self._loading.get_vae(cfg, model_dir)
+
+    def get_text_encoder(self, cfg, model_dir):
+        return self._loading.get_text_encoder(cfg, model_dir)
+
+    def load_any_transformer(self, path, device, quant="auto", models_dir="models"):
+        return self._loading.load_any_transformer(path, device, quant, models_dir)
+
+    def encode_prompt(self, text_encoder, tokenizer, prompt, max_length):
+        return self._loading.encode_prompt(text_encoder, tokenizer, prompt, max_length)
+
+    def pad_embeds(self, rows):
+        return self._loading.pad_embeds(rows)
+
+    def encode_images(self, vae, images):
+        return self._loading.encode_images(vae, images)
+
+    def decode_latents(self, vae, latents):
+        return self._loading.decode_latents(vae, latents)
+
+    def decode_latents_grad(self, vae, latents):
+        return self._loading.decode_latents_grad(vae, latents)
+
+    def grad_vae(self, vae):
+        return self._loading.grad_vae(vae)
+
+    def sample(self, model, pos_e, pos_m, neg_e, neg_m, **kw):
+        from .sdxl.sampler import sample
+
+        kw.pop("skip_layer", None)  # sample_skip_layer is MOSS-Image's (default 22); like the other families, unused
+        return sample(model, pos_e, pos_m, neg_e, neg_m, **kw)
+
+    def sample_sigmas(self, model, steps, height, width, shift):
+        from .sdxl.sampler import sdxl_sigmas
+
+        return sdxl_sigmas(steps, getattr(model, "prediction_type", "epsilon"),
+                           bool(getattr(model, "zero_terminal_snr", False)))
+
+    # ---- LoRA: the facade's own module names ("unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_q")
+    def lora_module_names(self, model, targets, blocks, include_text_embedder=False):
+        from .lora import _is_linear_like
+
+        targets = set(targets)
+        block_set = None if blocks is None else {int(b) for b in blocks}
+        in_block = [s for t in targets for s in self.GROUPS.get(t, ())]
+        mods = dict(model.named_modules())
+        owner = {id(b): i for i, b in enumerate(model.layers)}  # a block's index = its place in the compute order
+        index_of = {name: owner[id(m)] for name, m in mods.items() if id(m) in owner}
+        names = []
+        for name, module in mods.items():
+            if not _is_linear_like(module):
+                continue
+            parent, _, leaf = name.rpartition(".")
+            if leaf in self.PROJ and f"{parent}.transformer_blocks.0" in index_of:
+                # proj_in / proj_out of a Transformer2DModel go with that transformer's first block
+                idx = index_of[f"{parent}.transformer_blocks.0"]
+                if "proj" in targets and (block_set is None or idx in block_set):
+                    names.append(name)
+                continue
+            if not (in_block and _match_suffix(name, in_block)) or ".transformer_blocks." not in name:
+                continue
+            head, _, rest = name.partition(".transformer_blocks.")
+            idx = index_of.get(f"{head}.transformer_blocks.{rest.split('.', 1)[0]}")
+            if idx is None or (block_set is not None and idx not in block_set):
+                continue
+            names.append(name)
+        return names
+
+    def compile_blocks(self, model):
+        return []
+
+
+_ARCHS["sdxl"] = SdxlArch
 _cache: dict[str, Arch] = {}
 
 
@@ -1531,6 +1802,8 @@ def arch_from_transformer_file(path: str) -> str | None:
                 found = "minimax_h3_image"  # H3's layout without the audio stream (ComfyUI's detection rule)
             elif "context_type_embedding" in names and "transformer_blocks.0.attn.add_q_proj.weight" in names:
                 found = "pan2"
+            elif "label_emb.0.0.weight" in names and any(n.startswith("input_blocks.") for n in names):
+                found = "sdxl"  # the all-in-one checkpoint's UNet (ldm names; `model.diffusion_model.` stripped above)
         except Exception:  # noqa: BLE001
             found = None
         _FILE_ARCH_CACHE[key] = found
@@ -1579,6 +1852,14 @@ def detect_arch(cfg: TrainConfig, model_dir: Path | None) -> Arch:
             cls = json.loads((Path(model_dir) / "transformer" / "config.json").read_text(encoding="utf-8")).get("_class_name")
         except (OSError, ValueError):
             cls = None
+        if cls is None:  # SDXL's diffusers folder has unet/ where the others have transformer/
+            try:
+                ucls = json.loads((Path(model_dir) / "unet" / "config.json").read_text(encoding="utf-8")).get(
+                    "_class_name")
+            except (OSError, ValueError):
+                ucls = None
+            if ucls == "UNet2DConditionModel":
+                cls = ucls
         found = {"BriaFibo2Transformer2DModel": "fibo2", "Krea2Transformer2DModel": "krea2",
                  "MOSImageTransformer": "moss_image", "MOSSImageTransformer": "moss_image",
                  "QwenImage21Transformer2DModel": "qwen_image21",
@@ -1586,7 +1867,7 @@ def detect_arch(cfg: TrainConfig, model_dir: Path | None) -> Arch:
                  "Ideogram4Transformer2DModel": "ideogram4",
                  "MiniMaxH3Transformer3DModel": "minimax_h3", "MiniMaxH3DiTModel": "minimax_h3",
                  "MiniMaxH3ImageTransformer2DModel": "minimax_h3_image",
-                 "PAN2Transformer3DModel": "pan2"}.get(cls)
+                 "PAN2Transformer3DModel": "pan2", "UNet2DConditionModel": "sdxl"}.get(cls)
         if found in (None, "minimax_h3"):
             from .h3image.loading import is_h3_image_dir
 

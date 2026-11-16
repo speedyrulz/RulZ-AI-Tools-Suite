@@ -314,6 +314,12 @@ class Status:
             log.debug("status write skipped: %s", e)
 
 
+def arch_metadata(arch) -> dict:
+    """The architecture entries of a saved LoRA's metadata (Arch.lora_metadata; an arch-like stub: modelspec only)."""
+    own = getattr(arch, "lora_metadata", None)
+    return own() if own is not None else {"modelspec.architecture": arch.modelspec}
+
+
 def _shift_logit(s: torch.Tensor, logit_shift: float) -> torch.Tensor:
     """Apply the curriculum shift in logit space to an arbitrary sigma sample (keeps it in (0, 1))."""
     if logit_shift == 0.0:
@@ -356,9 +362,14 @@ def make_strata(cfg: TrainConfig) -> TimestepStrata | None:
     if cfg.timestep_buckets < 2:
         return None
     if cfg.timestep_sampling == "reference":
-        log.warning("timestep_buckets: the reference sampler draws the model family's own way; its draws are not "
-                    "bucketed")
-        return None
+        try:
+            curriculum = get_arch(cfg).reference_exact_curriculum  # SDXL: its uniform timestep draw is bucketed
+        except Exception:  # noqa: BLE001  (a config the family cannot be guessed for: the plain rule)
+            curriculum = False
+        if not curriculum:
+            log.warning("timestep_buckets: the reference sampler draws the model family's own way; its draws are not "
+                        "bucketed")
+            return None
     log.info("Timestep buckets: %d (every %d draws cover the sampling curve evenly)", cfg.timestep_buckets,
              cfg.timestep_buckets)
     return TimestepStrata(cfg.timestep_buckets)
@@ -371,7 +382,13 @@ def sample_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, logit_shift: f
     mode = cfg.timestep_sampling
     if mode == "reference":
         arch = arch or get_arch(cfg)
-        if arch.reference_sigmas_exact:  # a step-distilled model's own sampling sigmas, used as drawn; clean_share
+        if arch.reference_sigmas_exact:
+            if arch.reference_exact_curriculum:  # SDXL: the model's own timesteps, s(t) exactly, through the run's
+                # curriculum (logit shift, timestep_shift) and the strata's draw
+                u = strata.uniform(n, gen) if strata is not None else None
+                return arch.reference_sigmas(n, gen, tokens, logit_shift, u=u, timestep_shift=cfg.timestep_shift,
+                                             cfg=cfg)
+            # a step-distilled model's own sampling sigmas, used as drawn; clean_share
             # alone moves steps between them (MiniMaxH3ImageArch.reference_sigmas), not the curriculum's shift
             return arch.reference_sigmas(n, gen, tokens, logit_shift if cfg.clean_share else 0.0)
     if strata is not None and mode != "reference":
@@ -404,8 +421,15 @@ def sample_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, logit_shift: f
         s = cfg.timestep_shift * s / (1 + (cfg.timestep_shift - 1) * s)
     if cfg.sigma_min > 0.0 or cfg.sigma_max < 1.0:
         s = cfg.sigma_min + (cfg.sigma_max - cfg.sigma_min) * s
+    # a family whose schedule does not cover (0, 1) (SDXL's epsilon models: about 0.03 to 0.94) has its levels moved
+    # into what it covers, not cut off at the ends
+    lo, hi = (arch or get_arch(cfg)).sigma_bounds(cfg)
+    bounded = (lo, hi) != (0.0, 1.0)
+    if bounded:
+        s = lo + (hi - lo) * s
     # snap to the 1000-step training grid (sigma = k/1000, k in [1,1000])
-    return (s * 1000).round().clamp(1, 1000) / 1000
+    s = (s * 1000).round().clamp(1, 1000) / 1000
+    return s.clamp(lo, hi) if bounded else s  # (the snap can step just outside the bounds)
 
 
 def pairs_sigma(cfg: TrainConfig) -> bool:
@@ -1154,6 +1178,13 @@ class Trainer(RaceParallelMixin):
         self.model_dir = self.arch.resolve_for_config(cfg)
         self.arch = detect_arch(cfg, self.model_dir)
         cfg.model_arch = self.arch.name
+        if self.arch.name == "sdxl":  # found by its folder or file only now: validate() may have guessed another family
+            cfg.validate_sdxl()
+            self.ts_strata = make_strata(cfg)  # (validate_sdxl may move timestep_sampling to reference)
+        if self.arch.max_text_tokens and cfg.max_token_length != self.arch.max_text_tokens:
+            log.info("max_token_length %d -> %d: %s's text encoders read %d tokens", cfg.max_token_length,
+                     self.arch.max_text_tokens, self.arch.label, self.arch.max_text_tokens)
+            cfg.max_token_length = self.arch.max_text_tokens
         log.info("Model architecture: %s", self.arch.label)
         attention.set_backend(cfg.attention_backend, cfg.device)
         log.info("Attention backend: %s%s", attention.backend_name(),
@@ -1197,6 +1228,8 @@ class Trainer(RaceParallelMixin):
         # block swap: loaded in RAM, the swapped blocks' frozen weights stay there and the rest moves to the GPU
         model = self.arch.get_transformer(cfg, self.model_dir, device="cpu" if cfg.block_swap > 0 else None)
         model.gradient_checkpointing = cfg.gradient_checkpointing
+        if hasattr(self.arch, "bind_model"):  # SDXL: what the loaded model predicts (sigma bounds, loss weight)
+            self.arch.bind_model(cfg, model)
         n_quant = Q.configure_int8(model, cfg.int8_matmul, cfg.int8_backward)
         n_fp4 = Q.configure_nvfp4(model, cfg.nvfp4_matmul, cfg.nvfp4_backward)
         if n_quant - n_fp4:
@@ -1225,15 +1258,21 @@ class Trainer(RaceParallelMixin):
                                             blocks=blocks, names=self._lora_names(model, blocks),
                                             kind=cfg.network_type, factor=cfg.lokr_factor,
                                             block=cfg.oft_block_size, constraint=cfg.oft_constraint, dora=cfg.dora)
-            backprop = lora_mod.backprop_blocks(model, injected, blocks)  # blocks the backward runs from (None = all)
+            # blocks the backward runs from (None = all); a UNet's blocks are no chain (skip connections), so the
+            # backward always runs through all of them
+            backprop = (lora_mod.backprop_blocks(model, injected, blocks) if self.arch.linear_blocks else None)
         if blocks is not None:
             log.info("LoRA blocks: %s (%d of %d); %s", lora_mod.format_blocks(blocks), len(blocks), len(model.layers),
                      f"backward skips blocks before {min(blocks) if blocks else 'n/a'}" if backprop is not None else
+                     "the backward runs through every block" if not self.arch.linear_blocks else
                      "LoRA before the blocks too (text fusion / projections), so the backward runs through every block")
         if not injected and not cfg.finetune:
             raise ValueError("No LoRA modules selected: check lora_targets / lora_blocks")
         self._attach_training_adapter(model, log_it=True)
-        if self.arch.reference_sigmas_exact:
+        if self.arch.reference_sigmas_exact and self.arch.reference_exact_curriculum:
+            for level, text in self.arch.reference_exact_note(cfg):  # SDXL: its own wording (Arch.reference_exact_note)
+                (log.warning if level == "warning" else log.info)("%s", text)
+        elif self.arch.reference_sigmas_exact:
             if cfg.timestep_sampling != "reference":
                 log.warning("%s has one output head per sampling step, each distilled at its one noise level. "
                             "timestep_sampling: %s trains at noise levels between them, which sampling never uses; "
@@ -1366,6 +1405,8 @@ class Trainer(RaceParallelMixin):
 
         self._setup_alignment(cfg, items)
         do_compile, why = compiling.decide(cfg.compile_model, cfg.steps - step, self.devices)
+        if do_compile and not self.arch.supports_compile:
+            do_compile, why = False, f"{self.arch.label} runs eagerly (its blocks are not compiled)"
         if self.race_parallel and do_compile:
             do_compile, why = False, "race_parallel trains the model copies in threads at once"
         if self.ft is not None and do_compile:
@@ -1570,7 +1611,7 @@ class Trainer(RaceParallelMixin):
                     base_pred = lora_off_pred() if base_pred is None else base_pred
                     prior = ((pred - base_pred).pow(2) * bg).sum(dim=(1, 2, 3)) / (bg.sum(dim=(1, 2, 3)) * pred.shape[1]).clamp(min=1)
                     per = per + watch.prior_weight * prior
-            weights = loss_weight(cfg, sigma)
+            weights = self.arch.loss_weight(cfg, sigma)
             look = self._look_factors(batch, cur_step, cfg, self.batcher,
                                       cfg.batch_size * cfg.gradient_accumulation * len(self.replicas))
             if look is not None:  # look_warmup: the look filter's outliers ease in
@@ -2145,7 +2186,7 @@ class Trainer(RaceParallelMixin):
         ft = self.ft
         ranks = [int(r) for r in cfg.finetune_extract_ranks]
         meta = {"ss_base_model": cfg.model_path if cfg.model_source == "hf" else Path(cfg.transformer_file).name,
-                "ss_steps": str(step), "modelspec.architecture": self.arch.modelspec, "rulztrainer_config": cfg.to_dict(),
+                "ss_steps": str(step), **arch_metadata(self.arch), "rulztrainer_config": cfg.to_dict(),
                 "rulztrainer_finetune": f"extracted at step {step}, cycle {ft.cycles}", "ss_blocks": cfg.lora_blocks or "all"}
         first = None
         t0 = time.time()
@@ -2204,7 +2245,7 @@ class Trainer(RaceParallelMixin):
                                                                                                cfg.lora_rank)),
                 "ss_network_alpha": str({"lokr": 1.0, "oft": cfg.oft_constraint}.get(cfg.network_type,
                                                                                       cfg.lora_alpha)),
-                "ss_steps": str(step), "modelspec.architecture": self.arch.modelspec,
+                "ss_steps": str(step), **arch_metadata(self.arch),
                 "rulztrainer_config": cfg.to_dict(), "ss_blocks": cfg.lora_blocks or "all"}
         if self.ema is not None:
             meta["rulztrainer_ema"] = f"{cfg.lora_ema:g}"
@@ -2436,6 +2477,8 @@ class Trainer(RaceParallelMixin):
             swapped = set(self.block_swap.indices)
             candidates = [c for c in candidates if c not in swapped]
         self.kept = {}
+        if not self.arch.supports_kept_blocks:  # SDXL: diffusers' checkpointing is all or nothing; no measuring run
+            return
         if not cfg.gradient_checkpointing or cfg.checkpoint_keep_blocks == 0 or not candidates:
             return
         if cfg.checkpoint_keep_blocks > 0:
@@ -2918,8 +2961,7 @@ class Trainer(RaceParallelMixin):
         path = self.job_dir / f"{cfg.job_name}_{v.name}_{'final' if finished else 'dropped'}.safetensors"
         meta = {"ss_network_dim": str({"lokr": v.factor, "oft": v.block}.get(v.kind, v.rank)),
                 "ss_network_alpha": str({"lokr": 1.0, "oft": v.constraint}.get(v.kind, v.alpha)),
-                "modelspec.architecture":
-                self.arch.modelspec, "rulztrainer_race": f"{v.name}: {race_mod.format_overrides(v.overrides)}",
+                **arch_metadata(self.arch), "rulztrainer_race": f"{v.name}: {race_mod.format_overrides(v.overrides)}",
                 "ss_steps": str(v.state.get("step", 0))}
         if v is self.race.active and not self.race_parallel:
             with self._averaged():
@@ -3460,7 +3502,7 @@ class Trainer(RaceParallelMixin):
             path = self.job_dir / f"{cfg.job_name}_holdout_best.safetensors"
             with self._averaged():
                 lora_mod.save_lora(injected, path, metadata={"ss_steps": str(step), "holdout_best": f"{score:.4f}",
-                                                             "modelspec.architecture": self.arch.modelspec},
+                                                             **arch_metadata(self.arch)},
                                    dtype=cfg.lora_save_dtype, fmt=self.arch.lora_format)
         log.info("New best held-out subject score %.1f%% at step %d -> %s", 100 * score, step, path)
         if str(path) not in self.status.data["saved"]:
@@ -3676,7 +3718,12 @@ class Trainer(RaceParallelMixin):
         finally:
             lora_mod.set_multiplier(rinj, 1.0)
         pred = rmodel(noisy, t, emb, mask).float()
-        loss = torch.nn.functional.mse_loss(pred, target)
+        arch = getattr(self, "arch", None)
+        if arch is not None and arch.weighted_dop:  # SDXL: the facade's velocity error is not the model's own loss
+            per = (pred - target).pow(2).mean(dim=tuple(range(1, pred.ndim)))  # without its weight
+            loss = (per * arch.loss_weight(cfg, sigma.to(rdev).float())).mean()
+        else:
+            loss = torch.nn.functional.mse_loss(pred, target)
         (loss * (cfg.dop_weight * len(sel) / max(1, n_batch) / n_total)).backward()
         self.dop_values.append(float(loss.detach()))
 
@@ -4190,7 +4237,8 @@ class Trainer(RaceParallelMixin):
                 with lora_mod.frozen_adapters():
                     xs, stds = RW.sample_group(model, sigmas, pos_e, pos_m, neg_e, neg_m, cfg_scale=cfg.probe_cfg,
                                                noise_level=cfg.reward_noise, seeds=seeds,
-                                               shape=(model.latent_channels, h // 16, w // 16), device=dev, skip=skip)
+                                               shape=(model.latent_channels, h // 16, w // 16), device=dev, skip=skip,
+                                               init_scale=self.arch.init_noise_scale(sig[0]))
                 rewards = []
                 vae = self._home_vae()  # parked again once the group is decoded
                 for k in range(group):
@@ -5001,7 +5049,7 @@ class Trainer(RaceParallelMixin):
         elif actions.get("save_best"):
             path = self.job_dir / f"{cfg.job_name}{self._best_tag()}_best.safetensors"
             lora_mod.save_lora(injected, path, metadata={"ss_steps": str(step), "likeness_best": f"{rec.best:.2f}",
-                                                         "modelspec.architecture": self.arch.modelspec},
+                                                         **arch_metadata(self.arch)},
                                dtype=cfg.lora_save_dtype, fmt=self.arch.lora_format)
         if actions.get("save_best"):
             log.info("New best likeness %.1f%% at step %d -> %s", rec.best, step, path)
@@ -5016,7 +5064,7 @@ class Trainer(RaceParallelMixin):
                     path = self.job_dir / f"{cfg.job_name}{self._best_tag()}_best_{kind}.safetensors"
                     lora_mod.save_lora(injected, path, metadata={"ss_steps": str(step),
                                                                  f"likeness_best_{kind}": f"{score:.2f}",
-                                                                 "modelspec.architecture": self.arch.modelspec},
+                                                                 **arch_metadata(self.arch)},
                                        dtype=cfg.lora_save_dtype, fmt=self.arch.lora_format)
                 log.info("New best %s likeness %.1f%% at step %d -> %s", kind, score, step, path)
                 if str(path) not in self.status.data["saved"]:
