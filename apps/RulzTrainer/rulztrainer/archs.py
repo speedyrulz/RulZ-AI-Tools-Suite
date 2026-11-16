@@ -1564,7 +1564,7 @@ class SdxlArch(Arch):
     reference_exact_curriculum = True  # ... through the run's logit shift and timestep_shift
     weighted_dop = True
     supports_kept_blocks = False  # diffusers' checkpointing is all or nothing
-    supports_compile = False
+    supports_compile = True  # the 70 BasicTransformerBlocks only: diffusers' stage-wide compile took 880 s to warm up
     linear_blocks = False
     max_text_tokens = 77
 
@@ -1746,7 +1746,9 @@ class SdxlArch(Arch):
         return names
 
     def compile_blocks(self, model):
-        return []
+        # block.compile() on each BasicTransformerBlock instance: diffusers' Transformer2DModel (and its gradient
+        # checkpointing) call the modules, so the compiled forward is picked up. The resnets / samplers stay eager.
+        return list(model.layers)
 
 
 _ARCHS["sdxl"] = SdxlArch

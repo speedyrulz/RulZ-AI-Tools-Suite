@@ -205,11 +205,13 @@ def _apply_extras(x, out, extras, extra_biases):
         # the stream once per tensor per layer per denoising step
         first, second = first.to(x.device, x.dtype, non_blocking=True), second.to(x.device, x.dtype, non_blocking=True)
         if kind == "lora":
-            out = out + nn.functional.linear(nn.functional.linear(x, first), second) * scale
+            update = nn.functional.linear(nn.functional.linear(x, first), second)
         else:
-            out = out + lokr_update(x, first, second) * scale
+            update = lokr_update(x, first, second)
+        out = out + (update * scale if scale != 1.0 else update)
     for bias, scale in extra_biases:
-        out = out + bias.to(out.device, out.dtype, non_blocking=True) * scale
+        bias = bias.to(out.device, out.dtype, non_blocking=True)
+        out = out + (bias * scale if scale != 1.0 else bias)
     return out
 
 
@@ -488,14 +490,15 @@ class LoRALinear(nn.Module):
             tokens = self.hull_arm.tokens(h) if self.hull_arm is not None else None
             if tokens is not None:
                 arm = (self.hull_arm.sink, self.lora_down.weight, self.lora_up.weight, *tokens)
-                return HullBackward.apply(h, self.lora_down.weight.to(h.dtype), self.lora_up.weight.to(h.dtype),
-                                          arm) * self.scale
+                u = HullBackward.apply(h, self.lora_down.weight.to(h.dtype), self.lora_up.weight.to(h.dtype), arm)
+                return u * self.scale if self.scale != 1.0 else u
             h = nn.functional.linear(h, self.lora_down.weight.to(h.dtype))
             u = nn.functional.linear(h, self.lora_up.weight.to(h.dtype))
             if self.face_sink is not None and u.requires_grad:
                 self._tap_face(h, u)
-            return u * self.scale
-        return lokr_update(x, self.lokr_w1.to(x.dtype), self.lokr_w2.to(x.dtype)) * self.scale
+            return u * self.scale if self.scale != 1.0 else u
+        u = lokr_update(x, self.lokr_w1.to(x.dtype), self.lokr_w2.to(x.dtype))
+        return u * self.scale if self.scale != 1.0 else u
 
     def _tap_face(self, h: torch.Tensor, u: torch.Tensor) -> None:
         """Keel's face-token gain: a hook on this forward's LoRA output hands the optimizer, in the backward, the
@@ -619,7 +622,9 @@ class LoRALinear(nn.Module):
                 plain = self.base(x)
                 out = plain + (out - plain) * self.multiplier
         else:
-            out = self.base(x) + self._added(x) * self.multiplier
+            out = self.base(x)
+            added = self._added(x)
+            out = out + (added * self.multiplier if self.multiplier != 1.0 else added)
         if self.extras_enabled:
             out = _apply_extras(x, out, *self._live_extras(x))
         elif self.train_down is not None:
