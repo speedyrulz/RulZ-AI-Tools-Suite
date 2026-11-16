@@ -269,6 +269,16 @@ def test_facade_zero_terminal_snr_v_prediction_at_sigma_one_is_finite_and_exact(
     assert seen["t"].tolist() == [999.0]
 
 
+def test_compile_blocks_are_the_facades_basic_transformer_blocks():
+    from diffusers.models.attention import BasicTransformerBlock
+    from rulztrainer.archs import SdxlArch
+
+    m = facade()
+    blocks = SdxlArch().compile_blocks(m)
+    assert blocks and blocks == list(m.layers)
+    assert all(isinstance(b, BasicTransformerBlock) for b in blocks)
+
+
 def test_facade_input_checks_and_skip_layers():
     m = facade()
     lat = torch.randn(1, 16, LAT, LAT)
