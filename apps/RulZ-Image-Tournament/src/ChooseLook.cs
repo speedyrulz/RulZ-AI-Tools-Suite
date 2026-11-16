@@ -27,7 +27,7 @@ namespace RulZ.ImageTournament
             AutoScaleDimensions = new SizeF(96f, 96f);
             AutoScaleMode = AutoScaleMode.Dpi;
             Text = "RulZ Image Tournament";
-            Font = new Font("Segoe UI", 9.5f);
+            Font = Theme.Font(10.5f);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = MinimizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
@@ -40,7 +40,7 @@ namespace RulZ.ImageTournament
             _title = new Label
             {
                 Text = "Choose your look",
-                Font = new Font("Segoe UI", 16f, FontStyle.Bold),
+                Font = Theme.Font(16f, FontStyle.Bold),
                 AutoSize = false,
                 Bounds = new Rectangle(28, 20, 464, 38),
                 UseMnemonic = false,
@@ -54,17 +54,18 @@ namespace RulZ.ImageTournament
 
             _hint = new Label
             {
-                Text = "You can change this later with the \"Light mode\" checkbox at the right end of the toolbar.",
-                AutoSize = false,
-                Bounds = new Rectangle(28, 278, 464, 40),
+                // Broken by hand: at 10.5pt the sentence no longer fits one line, and the label did not wrap it by itself.
+                Text = "You can change this later with the \"Light mode\" checkbox\r\nat the right end of the toolbar.",
+                AutoSize = true,
+                Location = new Point(28, 278),
                 UseMnemonic = false,
             };
-            _continue = new Button
+            _continue = new RoundButton
             {
                 Text = "Continue",
                 FlatStyle = FlatStyle.Flat,
                 UseVisualStyleBackColor = false,
-                Font = new Font("Segoe UI", 10f, FontStyle.Bold),
+                Font = Theme.Font(10.5f, FontStyle.Bold),
                 Bounds = new Rectangle(372, 326, 120, 36),
             };
             _continue.FlatAppearance.BorderSize = 0;
@@ -89,8 +90,9 @@ namespace RulZ.ImageTournament
             _dark.Chrome = _light.Chrome = p;
             _continue.BackColor = p.Accent;
             _continue.ForeColor = Color.White;
-            _continue.FlatAppearance.MouseOverBackColor = Color.FromArgb(200, 0, 11);
-            _continue.FlatAppearance.MouseDownBackColor = Color.FromArgb(170, 0, 9);
+            _continue.FlatAppearance.BorderColor = p.Accent;
+            _continue.FlatAppearance.MouseOverBackColor = p.AccentFillHover;
+            _continue.FlatAppearance.MouseDownBackColor = p.AccentPressed;
             if (IsHandleCreated) NativeMethods.UseDarkTitleBar(Handle, !p.IsLight);
             Invalidate(true);
         }
@@ -200,7 +202,7 @@ namespace RulZ.ImageTournament
                 }
 
                 // The caption.
-                using (var f = new Font("Segoe UI", 12f, FontStyle.Bold))
+                using (var f = Theme.Font(12f, FontStyle.Bold))
                 {
                     var cap = new Rectangle(0, win.Bottom + (int)(8 * k), W, H - win.Bottom - (int)(12 * k));
                     string text = _name + (_look == Palette.Dark ? "  (default)" : "");

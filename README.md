@@ -66,7 +66,7 @@ click, keep it updated, and launch it, all from a single black-and-red window (o
   (it closes, installs over itself and reopens). It also checks your installed apps. Both checks can be turned off in
   Settings.
 - **Close on launch:** an optional setting (off by default) closes the launcher when you open an app.
-- **Launch options:** some apps have switches on their page that change how **Launch** starts them. RulzTrainer's
+- **Launch options:** some apps have switches on their page that change how **Launch** starts them. RulZ AI Trainer's
   *Tailscale remote access* also serves its WebUI over HTTPS to your own Tailscale devices (the same as
   `run_webui_tailscale.bat`). The switch is remembered and applies the next time you press Launch; shortcuts start
   the app without it. Switching it off doesn't clear a `RULZ_TAILSCALE=1` you set in Windows yourself.
@@ -106,7 +106,7 @@ up. The tag prefixes are `rulz-trainer-v`, `image-organizer-v`, `image-tournamen
 `training-captioner-v`, `clip-extractor-v`, `rulz-image-crawler-v`, `image-preparer-v`, `image-grid-v` and `hf-manager-v`; launcher releases keep plain `v1.2.3` tags and the *Latest* badge.
 Pushes and pull requests build every app whose folder changed, so a broken build shows up before it's tagged.
 
-**Apps installed from source** (RulzTrainer, Rulz Training Captioner, RulZ Image Crawler, RulZ Image Preparer, RulZ
+**Apps installed from source** (RulZ AI Trainer, Rulz Training Captioner, RulZ Image Crawler, RulZ Image Preparer, RulZ
 Huggingface Manager) are cloned from a branch that holds just their folder: `app/rulz-trainer`, `app/training-captioner`,
 `app/rulz-image-crawler`, `app/image-preparer` and `app/hf-manager`, rebuilt from `main` on every change by
 `.github/workflows/app-branches.yml`. The branch continues the app's old repository commit for commit, so copies

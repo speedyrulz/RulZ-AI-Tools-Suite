@@ -243,7 +243,7 @@ def cmd_connect(args) -> int:
                                        capture_output=True, stdin=subprocess.DEVNULL).returncode == 0
             if installed:
                 break
-            problem = f"Instance {conn['id']} is up but {args.dir} has no RulzTrainer yet (first boot takes 3-5 minutes)."
+            problem = f"Instance {conn['id']} is up but {args.dir} has no RulZ AI Trainer yet (first boot takes 3-5 minutes)."
         except Unreachable as e:
             problem = str(e)
         if time.time() >= deadline:
@@ -517,7 +517,7 @@ def agent_args(argv: list[str]) -> tuple[list[str], bytes | None]:
 def global_options() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     ap.add_argument("--instance", type=int, default=int(os.environ.get("RULZ_VAST_INSTANCE") or 0) or None,
-                    help="instance id; default: the running RulzTrainer instance")
+                    help="instance id; default: the running RulZ AI Trainer instance")
     ap.add_argument("--key", help="ssh private key; default: ssh's own choice, or RULZ_VAST_KEY")
     ap.add_argument("--dir", default=os.environ.get("RULZ_VAST_DIR") or REMOTE_DIR, help="the install on the instance")
     return ap

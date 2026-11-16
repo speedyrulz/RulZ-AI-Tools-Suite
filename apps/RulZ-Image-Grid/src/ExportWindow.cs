@@ -107,6 +107,7 @@ namespace RulZImageGrid
             foreach (var p in new[] { 100, 75, 50, 25, 10 })
             {
                 var b = Ui.Button(p + "%", (s, e) => SetPercent(p, false));
+                b.Tag = "small"; // radius 6 in Theme.xaml
                 b.MinWidth = 50;
                 b.Padding = new Thickness(6, 3, 6, 3);
                 presets.Children.Add(b);

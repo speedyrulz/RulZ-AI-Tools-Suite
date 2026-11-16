@@ -107,7 +107,7 @@ namespace RulZImageGrid
             {
                 Text = this.value.ToString(),
                 Width = 62,
-                Height = 24,
+                Height = 32,
                 Padding = new Thickness(3, 1, 3, 1),
                 VerticalContentAlignment = VerticalAlignment.Center,
                 HorizontalContentAlignment = HorizontalAlignment.Right,
@@ -149,7 +149,7 @@ namespace RulZImageGrid
                 Content = glyph,
                 FontSize = 6,
                 Width = 18,
-                Height = 12,
+                Height = 16,
                 Padding = new Thickness(0),
                 Focusable = false,
                 Interval = 60,

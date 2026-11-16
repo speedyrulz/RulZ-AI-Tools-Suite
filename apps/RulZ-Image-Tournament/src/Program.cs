@@ -3,8 +3,8 @@ using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("RulZ Image Tournament")]
 [assembly: System.Reflection.AssemblyProduct("RulZ Image Tournament")]
-[assembly: System.Reflection.AssemblyVersion("1.2.1.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.2.1.0")]
+[assembly: System.Reflection.AssemblyVersion("1.3.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.3.0.0")]
 // csc doesn't add this on its own (Visual Studio does). Without it .NET runs the app with the defaults of .NET 4.5:
 // paths over 260 characters blocked, and WinForms' accessibility improvements (screen readers, high-contrast
 // colours) left off. build.ps1 -Test checks it's in the built .exe.

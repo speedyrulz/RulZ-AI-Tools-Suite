@@ -21,10 +21,10 @@ namespace RulZ.ImageTournament
 
         readonly Timer _settle = new Timer { Interval = 200 };
         readonly ImageAttributes _edgeClamp = new ImageAttributes();
-        readonly Font _bold = new Font("Segoe UI", 10f, FontStyle.Bold);
-        readonly Font _small = new Font("Segoe UI", 9f);
-        readonly Font _big = new Font("Segoe UI", 16f);
-        readonly Font _banner = new Font("Segoe UI", 20f, FontStyle.Bold);
+        readonly Font _bold = Theme.Font(10.5f, FontStyle.Bold);
+        readonly Font _small = Theme.Font(9.5f);
+        readonly Font _big = Theme.Font(16f);
+        readonly Font _banner = Theme.Font(20f, FontStyle.Bold);
 
         LoadedImage _left, _right;
         string _message = "", _bannerText;

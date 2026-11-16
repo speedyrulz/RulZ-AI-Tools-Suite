@@ -70,7 +70,7 @@ function destroyTray(): void {
 function isDarkTheme(theme: Theme): boolean {
   return theme === 'dark' || (theme === 'system' && nativeTheme.shouldUseDarkColors)
 }
-const windowBackground = (theme: Theme): string => (isDarkTheme(theme) ? '#000000' : '#ffffff')
+const windowBackground = (theme: Theme): string => (isDarkTheme(theme) ? '#050505' : '#ffffff')
 
 function createWindow(theme: Theme): BrowserWindow {
   const win = new BrowserWindow({

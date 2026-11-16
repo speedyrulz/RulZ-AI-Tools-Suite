@@ -167,7 +167,7 @@ export function Settings() {
         <IconButton label="Back" onClick={back}>
           <ArrowLeft size={21} />
         </IconButton>
-        <h1 className="flex-1 px-1 text-[17px] font-semibold">Settings</h1>
+        <h1 className="font-[family-name:var(--font-display)] flex-1 px-1 text-[17px] font-semibold">Settings</h1>
       </TopBar>
       <div className="px-safe pb-safe min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-lg space-y-5 px-4 py-5">

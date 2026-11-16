@@ -99,7 +99,7 @@ export function PlanList() {
   const done = plan.filter((p) => p.status === 'done').length
   return (
     <section className="px-4 pt-3" aria-label="Plan">
-      <h3 className="flex items-center gap-2 pb-1.5 text-[13px] font-semibold">
+      <h3 className="font-[family-name:var(--font-display)] flex items-center gap-2 pb-1.5 text-[13px] font-semibold">
         Plan
         <Badge>
           {done} of {plan.length} done

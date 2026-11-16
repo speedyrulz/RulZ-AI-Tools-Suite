@@ -70,8 +70,8 @@ function LookCard({ look, selected, onSelect }: { look: Look; selected: boolean;
 /** A tiny drawing of the app in each look (fixed colours, independent of the current theme). */
 function Preview({ dark }: { dark: boolean }) {
   const c = dark
-    ? { bg: '#000000', panel: '#0b0b0b', line: '#3a3a3a', text: '#ededed', border: '#262626' }
-    : { bg: '#ffffff', panel: '#f5f5f7', line: '#d0d0d6', text: '#111114', border: '#d9d9de' }
+    ? { bg: '#050505', panel: '#0c0c0e', line: '#34343b', text: '#f2f2f3', border: '#232328' }
+    : { bg: '#ffffff', panel: '#f5f5f7', line: '#c4c4cb', text: '#111114', border: '#d9d9de' }
   return (
     <div className="flex h-24 overflow-hidden rounded-lg" style={{ background: c.bg, border: `1px solid ${c.border}` }}>
       <div className="flex w-6 flex-col items-center gap-1.5 pt-2" style={{ background: c.panel, borderRight: `1px solid ${c.border}` }}>

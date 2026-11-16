@@ -103,7 +103,7 @@ export function McpPage() {
       <div className="flex min-w-0 flex-1 flex-col">
         <div className="flex items-center gap-3 border-b border-border px-6 py-4">
           <div className="min-w-0 flex-1">
-            <h1 className="text-base font-semibold">MCP servers</h1>
+            <h1 className="font-[family-name:var(--font-display)] text-base font-semibold">MCP servers</h1>
             <div className="text-xs text-muted">
               {external.length} {external.length === 1 ? 'server' : 'servers'} + built-in file tools · {toolCount} {toolCount === 1 ? 'tool' : 'tools'} available to chats ·{' '}
               <span className={totalTokens > TOOL_TOKEN_WARNING ? 'text-warn' : undefined}>

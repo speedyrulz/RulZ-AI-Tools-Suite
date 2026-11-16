@@ -9,7 +9,7 @@ value to race, not a measured one. What has been measured is in [keel-test-resul
 
 ## 1. Goal
 
-A drop-in `optimizer: keel` for RulzTrainer that trains character LoRAs with the highest held-out likeness
+A drop-in `optimizer: keel` for RulZ AI Trainer that trains character LoRAs with the highest held-out likeness
 (the FaceNet gold face score of the probes) at a given step budget, without raising SSCD copy similarity, and
 that keeps the likeness when the LoRA is used on the family's Turbo model, below strength 1, or stacked with a
 style LoRA.
@@ -19,7 +19,7 @@ anything that changes the saved file (the output stays a plain LoRA / LoKr).
 
 ## 2. Why the optimizer, when the loss already knows about identity
 
-Everything identity-shaped in RulzTrainer today acts on the loss, the data or the schedule: region weights,
+Everything identity-shaped in RulZ AI Trainer today acts on the loss, the data or the schedule: region weights,
 the identity loss, `id_align`, DOP, the curriculum, self-training. The optimizer gets one summed gradient per
 step ([trainer.py:1209](../rulztrainer/trainer.py:1209)) and cannot tell the face from the background, photo A
 from photo B, or sigma 0.2 from sigma 0.9.
@@ -283,7 +283,7 @@ g_down <- (B^T B + delta I)^-1 g_down        B = lora_up   [out, r]
 ```
 
 and reports better quality and stability on a 6-image SD 1.5 fine-tune, with equal lrs for both factors
-(so LoRA+ is not needed; RulzTrainer's Automagic already ignores it).
+(so LoRA+ is not needed; RulZ AI Trainer's Automagic already ignores it).
 
 **Mechanism (as built).** `build_optimizer` passes Keel the `(down, up)` pairs from the injected modules
 (`lora.lora_pairs`); the solves run in `step()` on the accumulated gradient, after the trainer's clipping and

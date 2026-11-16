@@ -7,7 +7,7 @@ const config: CapacitorConfig = {
   // The app connects to the computer with ws:// over Tailscale (which encrypts it), so the page itself is
   // served over http to keep that from counting as mixed content.
   server: { androidScheme: 'http' },
-  android: { backgroundColor: '#000000' },
+  android: { backgroundColor: '#050505' },
   plugins: {
     SystemBars: { insetsHandling: 'css', initialViewportFitValueHint: 'cover' }
   }

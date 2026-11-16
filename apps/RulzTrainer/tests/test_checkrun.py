@@ -81,7 +81,7 @@ MESSAGES = {
                            'log.info("torch.compile %s (%s)", "on" if do_compile else "off", why)'],
     "activation_offload": ['"activation_offload is experimental and untested: checkpointed blocks',
                            '"Activation offload: %.2f GB of block inputs sent to RAM in step %d"'],
-    "normuon": ['"normuon is experimental and untested in RulzTrainer"'],
+    "normuon": ['"normuon is experimental and untested in RulZ AI Trainer"'],
     "oft_scaled_lr": ['"Scaled OFT (experimental): %s"', 'f"block {g[\'name\'][5:]} lr {g[\'lr\']:.2e}',
                       '"oft_scaled_lr is ignored with %s (it sets its own step sizes)"'],
     "oom_recovery": ['f"[oom recovery] try {len(tries)} of {cfg.oom_retries}: the last try ran out of {what} at step',
@@ -319,7 +319,7 @@ LINES = {
                            "Compile stats (end of training): 30 frames compiled (30 ok), 28 graphs"],
     "activation_offload": ["activation_offload is experimental and untested: checkpointed blocks' inputs wait",
                            "Activation offload: 1.42 GB of block inputs sent to RAM in step 1"],
-    "normuon": ["normuon is experimental and untested in RulzTrainer"],
+    "normuon": ["normuon is experimental and untested in RulZ AI Trainer"],
     "oft_scaled_lr": ["Scaled OFT (experimental): block 64 lr 7.01e-05 (300 layers)"],
     "oom_recovery": ["[oom recovery] try 1 of 3: the last try ran out of GPU memory at step 0; nothing saved yet"],
     "body_smplx_ratio": ["NLF loaded from nlf_l_multi.torchscript; SMPL-X shape scored on cuda:0",
@@ -635,7 +635,7 @@ def test_the_report_is_written_as_markdown_and_json(tmp_path):
     text = paths["markdown"].read_text(encoding="utf-8")
     assert "| baseline | pass | 30 / 30 | 0.2345 | 11.2 | 1.5 |" in text and "| normuon | fail |" in text
     assert "failed: train.log: normuon is experimental" in text and "### h3_image_likeness: skipped" in text
-    assert "- FAIL: train.log: normuon is experimental and untested in RulzTrainer (no such line)" in text
+    assert "- FAIL: train.log: normuon is experimental and untested in RulZ AI Trainer (no such line)" in text
     assert json.loads(paths["json"].read_text(encoding="utf-8"))["counts"] == rep["counts"]
     words = checkrun.report_text(rep)
     assert "normuon: failed: train.log: normuon is experimental" in words and "1 pass" in words

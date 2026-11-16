@@ -9,19 +9,25 @@ from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPalett
 
 # RulZ brand: logo red #ED000D. Dark (black + red) is the default look; light is white + the same red.
 BRAND_RED = "#ed000d"
+#   surface = panel (cards, lists, side panels), card = panel-2 (raised: buttons, menus, tooltips),
+#   input = panel, select = accent-soft blended over panel, placeholder = progress/slider track.
 DARK = dict(
-    bg="#0b0b0c", surface="#111113", card="#141416", border="#232328",
-    text="#f2f2f3", muted="#a3a3ab", accent="#ed000d", accent_hover="#ff1f2d", on_accent="#ffffff",
-    select="#3a0c10", hover="#1c1c21", danger="#ff4d58", placeholder="#1f1f24", input="#18181c",
-    sidebar="#0c0c0e", side_border="#1e1e22", side_text="#ececef", side_muted="#8c8c95",
-    side_hover="#1c1c21", side_select="#2b0a0d", side_select_text="#ff2b38",
+    bg="#050505", surface="#0c0c0e", card="#141417", border="#232328", border_strong="#34343b",
+    text="#f2f2f3", muted="#a3a3ab", accent="#ed000d", accent_hover="#ff2633", accent_pressed="#c8000b",
+    on_accent="#ffffff", accent_text="#ff6b72",
+    select="#2d0b0e", hover="#1c1c21", danger="#ff5a5f", placeholder="#191919", input="#0c0c0e",
+    danger_text="#ff8a8e", danger_bg="#3a0c0f", danger_border="#6b1418", danger_hover="#4a1014",
+    sidebar="#0c0c0e", side_border="#232328", side_text="#f2f2f3", side_muted="#a3a3ab",
+    side_hover="#1c1c21", side_select="#2d0b0e", side_select_text="#ff6b72",
 )
 LIGHT = dict(
-    bg="#ffffff", surface="#f5f5f7", card="#ffffff", border="#d9d9de",
-    text="#111114", muted="#5f6068", accent="#ed000d", accent_hover="#c8000b", on_accent="#ffffff",
-    select="#fde6e7", hover="#ebebef", danger="#c8000b", placeholder="#ebebef", input="#f5f5f7",
+    bg="#ffffff", surface="#f5f5f7", card="#ebebef", border="#d9d9de", border_strong="#c4c4cb",
+    text="#111114", muted="#5f6068", accent="#ed000d", accent_hover="#c8000b", accent_pressed="#a8000a",
+    on_accent="#ffffff", accent_text="#c8000b",
+    select="#f7e5e7", hover="#e2e2e7", danger="#d4161c", placeholder="#ebebeb", input="#f5f5f7",
+    danger_text="#b4000a", danger_bg="#fdecec", danger_border="#f5b8bb", danger_hover="#fbd8da",
     sidebar="#f5f5f7", side_border="#d9d9de", side_text="#111114", side_muted="#5f6068",
-    side_hover="#ebebef", side_select="#fde6e7", side_select_text="#c8000b",
+    side_hover="#e2e2e7", side_select="#f7e5e7", side_select_text="#c8000b",
 )
 
 C: dict = dict(DARK)  # active palette, filled by apply()
@@ -66,6 +72,29 @@ def icon_pixmap(name: str, color: str, size: int = 20) -> QPixmap:
     p.drawText(QRectF(0, 0, size, size), Qt.AlignCenter, GLYPH.get(name, name))
     p.end()
     return pm
+
+
+@lru_cache(maxsize=1)
+def ui_family() -> str:
+    """Segoe UI Variable Text (Windows 11), else Segoe UI."""
+    families = set(QFontDatabase.families())
+    return "Segoe UI Variable Text" if "Segoe UI Variable Text" in families else "Segoe UI"
+
+
+@lru_cache(maxsize=1)
+def display_family() -> str:
+    """Titles: Segoe UI Variable Display, else Segoe UI."""
+    families = set(QFontDatabase.families())
+    return "Segoe UI Variable Display" if "Segoe UI Variable Display" in families else "Segoe UI"
+
+
+@lru_cache(maxsize=1)
+def mono_family() -> str:
+    families = set(QFontDatabase.families())
+    for fam in ("Cascadia Code", "Cascadia Mono", "Consolas"):
+        if fam in families:
+            return fam
+    return "monospace"
 
 
 def is_dark() -> bool:
@@ -164,8 +193,8 @@ def apply(app, dark: bool | None = None) -> None:
     pal = QPalette()
     pal.setColor(QPalette.Window, QColor(C["bg"]))
     pal.setColor(QPalette.WindowText, QColor(C["text"]))
-    pal.setColor(QPalette.Base, QColor(C["card"]))
-    pal.setColor(QPalette.AlternateBase, QColor(C["surface"]))
+    pal.setColor(QPalette.Base, QColor(C["surface"]))
+    pal.setColor(QPalette.AlternateBase, QColor(C["card"]))
     pal.setColor(QPalette.Text, QColor(C["text"]))
     pal.setColor(QPalette.Button, QColor(C["card"]))
     pal.setColor(QPalette.ButtonText, QColor(C["text"]))
@@ -176,10 +205,8 @@ def apply(app, dark: bool | None = None) -> None:
     pal.setColor(QPalette.PlaceholderText, QColor(C["muted"]))
     pal.setColor(QPalette.Mid, QColor(C["border"]))
     app.setPalette(pal)
-    f = QFont("Segoe UI Variable Text")
-    if f.family() not in QFontDatabase.families():
-        f = QFont("Segoe UI")
-    f.setPointSizeF(10)
+    f = QFont(ui_family())
+    f.setPointSizeF(10.5)
     app.setFont(f)
     app.setStyleSheet(stylesheet())
 
@@ -204,48 +231,60 @@ QMainWindow, #Content, #Page { background: %(bg)s; }
 #SideStatus { color: %(side_muted)s; font-size: 12px; padding: 0 6px; }
 #Sidebar QProgressBar { background: %(side_hover)s; }
 #Sidebar QProgressBar::chunk { background: %(brand)s; }
-#ThemeButton { text-align: left; padding: 7px 14px; border: none; border-radius: 10px; font-size: 13px;
+#ThemeButton { text-align: left; padding: 7px 14px; border: 2px solid transparent; border-radius: 8px; font-size: 13px;
                background: transparent; color: %(side_muted)s; }
 #ThemeButton:hover { background: %(side_hover)s; color: %(side_text)s; }
+#ThemeButton:focus { border: 2px solid %(accent)s; }
 #NavButton {
-    text-align: left; padding: 9px 14px; border: none; border-radius: 10px;
+    text-align: left; padding: 9px 14px; border: 2px solid transparent; border-radius: 8px;
     font-size: 14px; background: transparent; color: %(side_text)s;
 }
 #NavButton:hover { background: %(side_hover)s; }
 #NavButton:checked { background: %(side_select)s; color: %(side_select_text)s; font-weight: 600; }
-#PageTitle { font-size: 24px; font-weight: 700; }
-#H2 { font-size: 16px; font-weight: 600; }
+#NavButton:focus { border: 2px solid %(accent)s; }
+#PageTitle { font-family: "%(display)s"; font-size: 24px; font-weight: 600; }
+#H2 { font-family: "%(display)s"; font-size: 16px; font-weight: 600; }
 #Muted, QLabel[muted="true"] { color: %(muted)s; }
-#Card { background: %(card)s; border: 1px solid %(border)s; border-radius: 12px; }
+#Card { background: %(surface)s; border: 1px solid %(border)s; border-radius: 12px; }
 #SelectionBar { background: %(select)s; border-radius: 12px; }
 #SelectionBar QLabel { font-weight: 600; }
 
 QPushButton {
     background: %(card)s; border: 1px solid %(border)s; border-radius: 8px;
-    padding: 7px 14px; font-weight: 500;
+    padding: 7px 14px; font-weight: 500; min-height: 18px;
 }
-QPushButton:hover { background: %(hover)s; }
+QPushButton:hover { background: %(hover)s; border-color: %(border_strong)s; }
 QPushButton:pressed, QPushButton:checked { background: %(select)s; }
+QPushButton:focus { border: 2px solid %(accent)s; padding: 6px 13px; }
 QPushButton:disabled { color: %(muted)s; }
 QPushButton::menu-indicator { image: none; width: 0; }
 QPushButton[primary="true"] { background: %(accent)s; color: %(on_accent)s; border: 1px solid %(accent)s; }
-QPushButton[primary="true"]:hover { background: %(accent_hover)s; }
-QPushButton[flat="true"] { background: transparent; border: none; }
-QPushButton[flat="true"]:hover { background: %(hover)s; }
-QPushButton[danger="true"] { color: %(danger)s; }
-QToolButton { border: none; border-radius: 18px; padding: 6px; background: transparent; }
+QPushButton[primary="true"]:hover { background: %(accent_hover)s; border-color: %(accent_hover)s; }
+QPushButton[primary="true"]:pressed { background: %(accent_pressed)s; border-color: %(accent_pressed)s; }
+QPushButton[primary="true"]:focus { border: 2px solid %(text)s; padding: 6px 13px; }
+QPushButton[flat="true"] { background: transparent; border: none; border-radius: 6px; color: %(muted)s; }
+QPushButton[flat="true"]:hover { background: %(hover)s; color: %(text)s; }
+QPushButton[flat="true"]:focus { border: 2px solid %(accent)s; padding: 5px 12px; }
+QPushButton[danger="true"] { background: %(danger_bg)s; border: 1px solid %(danger_border)s; color: %(danger_text)s; }
+QPushButton[danger="true"]:hover { background: %(danger_hover)s; border-color: %(danger_border)s; }
+QPushButton[danger="true"]:focus { border: 2px solid %(accent)s; padding: 6px 13px; }
+QPushButton[flat="true"][danger="true"] { background: transparent; border: none; color: %(danger_text)s; }
+QPushButton[flat="true"][danger="true"]:hover { background: %(danger_hover)s; }
+QPushButton[flat="true"][danger="true"]:focus { border: 2px solid %(accent)s; padding: 5px 12px; }
+QToolButton { border: 2px solid transparent; border-radius: 18px; padding: 4px; background: transparent; }
 QToolButton:hover { background: %(hover)s; }
 QToolButton:checked { background: %(select)s; }
+QToolButton:focus { border: 2px solid %(accent)s; }
 QToolButton::menu-indicator { image: none; }
 
 QLineEdit {
-    background: %(input)s; border: 1px solid transparent; border-radius: 16px;
+    background: %(input)s; border: 1px solid %(border)s; border-radius: 8px;
     padding: 7px 14px; font-size: 13px; selection-background-color: %(accent)s;
 }
-QLineEdit:focus { border: 1px solid %(accent)s; background: %(card)s; }
-QLineEdit[plain="true"] { border-radius: 8px; }
+QLineEdit:focus { border: 2px solid %(accent)s; padding: 6px 13px; }
 
-QListWidget { background: %(card)s; border: 1px solid %(border)s; border-radius: 10px; padding: 4px; outline: none; }
+QListWidget { background: %(surface)s; border: 1px solid %(border)s; border-radius: 12px; padding: 4px; outline: none; }
+QListWidget:focus { border: 1px solid %(border_strong)s; }
 QListWidget::item { padding: 6px; border-radius: 8px; }
 QListWidget::item:hover { background: %(hover)s; }
 QListWidget::item:selected { background: %(select)s; color: %(text)s; }
@@ -256,9 +295,10 @@ QProgressBar::chunk { background: %(accent)s; border-radius: 3px; }
 QSlider::groove:horizontal { height: 4px; background: %(placeholder)s; border-radius: 2px; }
 QSlider::sub-page:horizontal { background: %(accent)s; border-radius: 2px; }
 QSlider::handle:horizontal { background: %(accent)s; width: 16px; height: 16px; margin: -6px 0; border-radius: 8px; }
+QSlider::handle:horizontal:focus { background: %(on_accent)s; border: 3px solid %(accent)s; width: 10px; height: 10px; }
 
 
-QMenu { background: %(card)s; border: 1px solid %(border)s; border-radius: 10px; padding: 6px; }
+QMenu { background: %(card)s; border: 1px solid %(border)s; border-radius: 8px; padding: 4px; }
 QMenu::item { padding: 7px 26px 7px 12px; border-radius: 6px; }
 QMenu::item:selected { background: %(hover)s; }
 QMenu::item:disabled { color: %(muted)s; }
@@ -266,51 +306,59 @@ QMenu::separator { height: 1px; background: %(border)s; margin: 5px 8px; }
 QMenu::icon { padding-left: 10px; }
 
 QScrollBar:vertical { background: transparent; width: 12px; margin: 2px; }
-QScrollBar::handle:vertical { background: %(border)s; border-radius: 4px; min-height: 40px; margin: 0 2px; }
+QScrollBar::handle:vertical { background: %(border_strong)s; border-radius: 4px; min-height: 40px; margin: 0 2px; }
 QScrollBar::handle:vertical:hover { background: %(muted)s; }
 QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 QScrollBar:horizontal { height: 0; }
 
 QCheckBox { spacing: 8px; }
-QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid %(muted)s; border-radius: 4px;
+QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid %(border_strong)s; border-radius: 4px;
                        background: %(card)s; }
-QCheckBox::indicator:hover { border-color: %(accent)s; }
+QCheckBox::indicator:hover { border-color: %(muted)s; }
+QCheckBox::indicator:focus { border: 2px solid %(accent)s; width: 14px; height: 14px; }
 QCheckBox::indicator:checked { background: %(accent)s; border-color: %(accent)s; image: url(%(check_img)s); }
+QCheckBox::indicator:checked:focus { border: 2px solid %(text)s; width: 14px; height: 14px; }
 
 QDialog { background: %(bg)s; }
-QToolTip { background: %(card)s; color: %(text)s; border: 1px solid %(border)s; padding: 4px 8px; }
+QToolTip { background: %(card)s; color: %(text)s; border: 1px solid %(border)s; border-radius: 8px; padding: 4px 8px; }
 
 #Chip { background: %(input)s; border: 1px solid %(border)s; border-radius: 13px; padding: 4px 12px;
         font-weight: 500; }
-#Chip:hover { background: %(hover)s; }
+#Chip:hover { background: %(hover)s; border-color: %(border_strong)s; }
 #Chip:checked { background: %(accent)s; color: %(on_accent)s; border-color: %(accent)s; }
+#Chip:focus { border: 2px solid %(accent)s; padding: 3px 11px; }
+#Chip:checked:focus { border: 2px solid %(text)s; }
 QPlainTextEdit { background: %(input)s; border: 1px solid %(border)s; border-radius: 8px; padding: 4px;
                  selection-background-color: %(accent)s; }
-QPlainTextEdit:focus { border: 1px solid %(accent)s; }
+QPlainTextEdit:focus { border: 1px solid %(border_strong)s; }
 QPlainTextEdit:disabled, QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled { color: %(muted)s; }
 QComboBox, QSpinBox, QDoubleSpinBox { background: %(input)s; border: 1px solid %(border)s; border-radius: 8px;
                                       padding: 5px 8px; }
-QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid %(accent)s; }
+QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 2px solid %(accent)s; padding: 4px 7px; }
 QComboBox QLineEdit, QSpinBox QLineEdit, QDoubleSpinBox QLineEdit {  /* not the search-field look above */
     background: transparent; border: none; border-radius: 0; padding: 0; }
 QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
     width: 0; border: none; }
-QComboBox QAbstractItemView { background: %(card)s; border: 1px solid %(border)s; selection-background-color: %(select)s;
+QComboBox QAbstractItemView { background: %(card)s; border: 1px solid %(border)s; border-radius: 8px; selection-background-color: %(select)s;
                               selection-color: %(text)s; }
-QTabWidget::pane { border: 1px solid %(border)s; border-radius: 10px; background: %(card)s; top: -1px; }
+QTabWidget::pane { border: 1px solid %(border)s; border-radius: 12px; background: %(surface)s; top: -1px; }
 QTabBar::tab { background: transparent; padding: 7px 16px; border: none; color: %(muted)s; }
-QTabBar::tab:selected { color: %(accent)s; font-weight: 600; border-bottom: 2px solid %(accent)s; }
+QTabBar::tab:selected { color: %(accent_text)s; font-weight: 600; border-bottom: 2px solid %(accent)s; }
+QTabBar::tab:focus { border: 2px solid %(accent)s; padding: 5px 14px; }
 QRadioButton { spacing: 8px; }
-QRadioButton::indicator { width: 16px; height: 16px; border: 1px solid %(muted)s; border-radius: 9px;
+QRadioButton::indicator { width: 16px; height: 16px; border: 1px solid %(border_strong)s; border-radius: 9px;
                           background: %(card)s; }
-QRadioButton::indicator:hover { border-color: %(accent)s; }
+QRadioButton::indicator:hover { border-color: %(muted)s; }
+QRadioButton::indicator:focus { border: 2px solid %(accent)s; width: 14px; height: 14px; }
 QRadioButton::indicator:checked { width: 8px; height: 8px; border: 5px solid %(accent)s; background: %(on_accent)s; }
+QRadioButton::indicator:checked:focus { border: 5px solid %(accent)s; width: 8px; height: 8px; background: %(accent)s; }
 QPushButton[primary="true"]:disabled { background: %(placeholder)s; border-color: %(border)s; color: %(muted)s; }
-#Warning { background: %(select)s; border: 1px solid %(accent)s; border-radius: 10px; }
-#Segment { background: %(input)s; border-radius: 12px; }
-#Segment QPushButton { border: none; border-radius: 9px; padding: 6px 16px; background: transparent; }
-#Segment QPushButton:checked { background: %(card)s; color: %(accent)s; font-weight: 600; }
+#Warning { background: %(select)s; border: 1px solid %(accent)s; border-radius: 12px; }
+#Segment { background: %(input)s; border: 1px solid %(border)s; border-radius: 10px; }
+#Segment QPushButton { border: 2px solid transparent; border-radius: 8px; padding: 5px 15px; background: transparent; }
+#Segment QPushButton:checked { background: %(card)s; color: %(accent_text)s; font-weight: 600; }
+#Segment QPushButton:focus { border: 2px solid %(accent)s; }
 
 /* Photo viewer – always dark */
 #Viewer { background: #0a0a0b; }
@@ -318,8 +366,8 @@ QPushButton[primary="true"]:disabled { background: %(placeholder)s; border-color
 #ViewerBar QToolButton { color: #f2f3f7; }
 #ViewerBar QToolButton:hover { background: rgba(255,255,255,0.12); }
 #ViewerBar QToolButton:checked { background: rgba(238,1,13,0.45); }
-#InfoPanel { background: %(card)s; border-left: 1px solid %(border)s; }
+#InfoPanel { background: %(surface)s; border-left: 1px solid %(border)s; }
 #InfoPanel QLabel { color: %(text)s; }
 #FaceRow { border-radius: 10px; }
 #FaceRow:hover { background: %(hover)s; }
-""" % dict(C, brand=BRAND_RED, check_img=_check_image())
+""" % dict(C, brand=BRAND_RED, check_img=_check_image(), display=display_family())

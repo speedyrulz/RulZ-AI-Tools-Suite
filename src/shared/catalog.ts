@@ -17,7 +17,7 @@ export const CATEGORIES: { name: string; blurb: string }[] = [
 export const CATALOG: CatalogApp[] = [
   {
     id: 'rulz-trainer',
-    name: 'RulzTrainer',
+    name: 'RulZ AI Trainer',
     tagline: 'LoRA trainer for diffusion models, with a guided WebUI',
     description:
       'Train LoRAs for nine image models (MOSS-Image, Bria FIBO 2.0, Krea 2, Qwen-Image 2.1, FLUX 3 Klein, ' +

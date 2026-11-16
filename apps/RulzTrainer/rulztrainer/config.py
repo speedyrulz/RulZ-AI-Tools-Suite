@@ -33,7 +33,7 @@ ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "flux3_klein", "fl
 OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4", "keel", "keel_fb", "keel3",
               "keel3_fb", "hull", "muon", "normuon")
 # Layer groups Muon's authors, Moonshot and OneTrainer keep on AdamW (embedders, modulation, text projection, final
-# layer): RulzTrainer's muon / normuon orthogonalize them too and warn when they are trained.
+# layer): RulZ AI Trainer's muon / normuon orthogonalize them too and warn when they are trained.
 MUON_EDGE_TARGETS = ("embed", "modulation", "text_in")
 AUTOMAGIC = ("automagic3", "automagic4", "keel", "keel_fb", "keel3", "keel3_fb")  # self-tuning lr: no schedule, no LoRA+,
 #                                                                                   no per-image lr
@@ -194,7 +194,7 @@ ARCH_TRAINING_ADAPTER = {
     # MiniMax H3 (CFG-distilled: musubi-tuner saw one-frame LoRAs break up within ~50 steps without an adapter or a
     # guidance loss): ostris' v3 adapters (rank 32, 0.31 GB each, the same 208 modules and key names as the others),
     # one per base: the fl2va file on FL2VA, the ref2va file ("ref2va_file") on Ref2VA, as Fizgig picks them since
-    # 9.7.0 (it dropped circlestone-labs' image adapter, rank 64, 0.62 GB, FL2VA only, which RulzTrainer used before
+    # 9.7.0 (it dropped circlestone-labs' image adapter, rank 64, 0.62 GB, FL2VA only, which RulZ AI Trainer used before
     # 3.15.0 on both bases; still usable as a path)
     "minimax_h3": {"repo": "ostris/minimax_h3_training_adapter", "file": "minimax_h3_training_adapter_v3.safetensors",
                    "ref2va_file": "minimax_h3_ref2va_training_adapter_v3.safetensors"},
@@ -1711,7 +1711,7 @@ class TrainConfig:
         """load_report for YAML text that is not a file on this computer (a config uploaded in the browser)."""
         data = yaml.safe_load(text) or {}
         if not isinstance(data, dict):
-            raise ValueError(f"{source} is not a RulzTrainer config (expected a mapping of options)")
+            raise ValueError(f"{source} is not a RulZ AI Trainer config (expected a mapping of options)")
         known = [f.name for f in dataclasses.fields(cls)]
         unknown = sorted(k for k in data if k not in known)
         missing = [k for k in known if k not in data]
@@ -1730,7 +1730,7 @@ class TrainConfig:
             text = f.read()
         sep = "" if not text or text.endswith("\n") else "\n"
         with open(path, "a", encoding="utf-8", newline="\n") as f:
-            f.write(f"{sep}# Options added in a newer RulzTrainer version (defaults; edit as needed):\n{block}")
+            f.write(f"{sep}# Options added in a newer RulZ AI Trainer version (defaults; edit as needed):\n{block}")
 
     def to_yaml(self) -> str:
         return yaml.safe_dump(self.to_dict(), sort_keys=False, allow_unicode=True)

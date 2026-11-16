@@ -35,12 +35,12 @@ export function SidePanel() {
       {task?.plan?.length ? <PlanList plan={task.plan} live={task.outcome === 'running'} /> : null}
 
       <section className="flex min-h-0 flex-1 flex-col">
-        <h3 className="px-4 pt-3 pb-1.5 text-[13px] font-semibold">Steps</h3>
+        <h3 className="font-[family-name:var(--font-display)] px-4 pt-3 pb-1.5 text-[13px] font-semibold">Steps</h3>
         <StepList steps={task?.steps ?? []} />
       </section>
 
       <section className="flex max-h-[40%] min-h-[120px] flex-col border-t border-border">
-        <h3 className="flex items-center gap-2 px-4 pt-3 pb-1.5 text-[13px] font-semibold">
+        <h3 className="font-[family-name:var(--font-display)] flex items-center gap-2 px-4 pt-3 pb-1.5 text-[13px] font-semibold">
           Files changed {task?.files.length ? <Badge>{task.files.length}</Badge> : null}
         </h3>
         <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
@@ -78,7 +78,7 @@ function PlanList({ plan, live }: { plan: PlanItem[]; live: boolean }) {
   const done = plan.filter((p) => p.status === 'done').length
   return (
     <section className="flex max-h-[32%] shrink-0 flex-col border-b border-border" aria-label="Plan">
-      <h3 className="flex items-center gap-2 px-4 pt-3 pb-1.5 text-[13px] font-semibold">
+      <h3 className="font-[family-name:var(--font-display)] flex items-center gap-2 px-4 pt-3 pb-1.5 text-[13px] font-semibold">
         Plan
         <Badge>
           {done} of {plan.length} done

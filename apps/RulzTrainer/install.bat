@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 echo ============================================
-echo  RulzTrainer installer
+echo  RulZ AI Trainer installer
 echo ============================================
 echo.
 

@@ -8,25 +8,26 @@ import { forwardRef, useEffect, useRef, useState, type ButtonHTMLAttributes, typ
 import { cn } from '../lib/format'
 import { parseNumberDraft } from '../lib/input'
 
-type Variant = 'primary' | 'secondary' | 'ghost' | 'danger'
+type Variant = 'primary' | 'secondary' | 'ghost' | 'outline' | 'danger'
 
 const VARIANTS: Record<Variant, string> = {
-  primary: 'bg-accent text-accent-fg hover:bg-accent-hover font-medium',
-  secondary: 'bg-panel-2 border border-border hover:bg-hover',
+  primary: 'bg-accent text-accent-fg hover:bg-accent-hover font-medium shadow-[0_6px_20px_-8px_rgb(237_0_13/0.8)] disabled:shadow-none',
+  secondary: 'bg-panel-2 text-text border border-border hover:bg-hover hover:border-border-strong',
+  outline: 'border border-accent/70 text-link hover:bg-accent-soft hover:border-accent',
   ghost: 'hover:bg-hover text-muted hover:text-text',
-  danger: 'bg-danger/90 text-white hover:bg-danger font-medium'
+  danger: 'bg-danger-bg text-danger-text border border-danger-border hover:bg-danger-hover'
 }
 
 export const Button = forwardRef<
   HTMLButtonElement,
-  ButtonHTMLAttributes<HTMLButtonElement> & { variant?: Variant; size?: 'sm' | 'md' }
+  ButtonHTMLAttributes<HTMLButtonElement> & { variant?: Variant; size?: 'sm' | 'md' | 'lg' }
 >(function Button({ variant = 'secondary', size = 'md', className, ...props }, ref) {
   return (
     <button
       ref={ref}
       className={cn(
-        'inline-flex items-center justify-center gap-1.5 rounded-md transition-colors disabled:pointer-events-none disabled:opacity-45 select-none whitespace-nowrap',
-        size === 'sm' ? 'h-7 px-2.5 text-xs' : 'h-8.5 px-3.5 text-[13px]',
+        'inline-flex items-center justify-center font-medium transition-colors disabled:pointer-events-none disabled:opacity-45 select-none whitespace-nowrap',
+        size === 'sm' ? 'h-8 px-3 text-[13px] gap-1.5 rounded-md' : size === 'lg' ? 'h-11 px-6 text-[15px] gap-2 rounded-lg font-semibold' : 'h-9 px-4 text-sm gap-2 rounded-lg',
         VARIANTS[variant],
         className
       )}
@@ -45,8 +46,8 @@ export const IconButton = forwardRef<
         ref={ref}
         aria-label={label}
         className={cn(
-          'inline-flex items-center justify-center rounded-md text-muted transition-colors hover:bg-hover hover:text-text disabled:pointer-events-none disabled:opacity-40',
-          size === 'sm' ? 'size-7' : 'size-8.5',
+          'inline-flex items-center justify-center rounded-lg text-muted transition-colors hover:bg-hover hover:text-text disabled:pointer-events-none disabled:opacity-40',
+          size === 'sm' ? 'size-9' : 'size-9',
           active && 'bg-hover text-text',
           className
         )}
@@ -66,7 +67,7 @@ export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputE
     <input
       ref={ref}
       className={cn(
-        'h-8.5 w-full rounded-md border border-border bg-panel-2 px-2.5 text-[13px] placeholder:text-faint focus:border-accent focus:outline-none',
+        'h-8.5 w-full rounded-lg border border-border bg-panel px-2.5 text-[13px] placeholder:text-faint focus:border-accent focus:outline-none',
         className
       )}
       {...props}
@@ -80,7 +81,7 @@ export const Textarea = forwardRef<HTMLTextAreaElement, TextareaHTMLAttributes<H
       <textarea
         ref={ref}
         className={cn(
-          'w-full resize-y rounded-md border border-border bg-panel-2 px-2.5 py-2 text-[13px] leading-relaxed placeholder:text-faint focus:border-accent focus:outline-none',
+          'w-full resize-y rounded-lg border border-border bg-panel px-2.5 py-2 text-[13px] leading-relaxed placeholder:text-faint focus:border-accent focus:outline-none',
           className
         )}
         {...props}
@@ -93,7 +94,7 @@ export function Select({ className, children, ...props }: SelectHTMLAttributes<H
   return (
     <select
       className={cn(
-        'h-8.5 w-full rounded-md border border-border bg-panel-2 px-2 text-[13px] focus:border-accent focus:outline-none',
+        'h-8.5 w-full rounded-lg border border-border bg-panel px-2 text-[13px] focus:border-accent focus:outline-none',
         className
       )}
       {...props}
@@ -120,7 +121,7 @@ export function Switch({
       checked={checked}
       onCheckedChange={onCheckedChange}
       disabled={disabled}
-      className="relative h-5 w-9 shrink-0 rounded-full bg-track transition-colors data-[state=checked]:bg-accent disabled:opacity-40"
+      className="relative h-5 w-9 shrink-0 rounded-full bg-border-strong transition-colors data-[state=checked]:bg-accent disabled:opacity-40"
     >
       <SwitchPrimitive.Thumb className="block size-4 translate-x-0.5 rounded-full bg-white shadow transition-transform data-[state=checked]:translate-x-[18px]" />
     </SwitchPrimitive.Root>
@@ -168,7 +169,7 @@ export function Tooltip({ content, children, side = 'top' }: { content: ReactNod
         <TooltipPrimitive.Content
           side={side}
           sideOffset={6}
-          className="z-50 max-w-xs rounded-md border border-border bg-panel-2 px-2 py-1 text-xs text-text shadow-lg"
+          className="z-50 max-w-xs rounded-lg border border-border bg-panel px-2 py-1 text-xs text-text shadow-lg"
         >
           {content}
         </TooltipPrimitive.Content>
@@ -202,10 +203,10 @@ export function Dialog({
   return (
     <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
       <DialogPrimitive.Portal>
-        <DialogPrimitive.Overlay className="fixed inset-0 z-40 bg-black/30 dark:bg-black/50 backdrop-blur-[2px]" />
+        <DialogPrimitive.Overlay className="fixed inset-0 z-40 bg-scrim backdrop-blur-[2px]" />
         <DialogPrimitive.Content
           className={cn(
-            'fixed top-1/2 left-1/2 z-50 flex max-h-[88vh] w-[min(560px,calc(100vw-32px))] -translate-x-1/2 -translate-y-1/2 flex-col rounded-xl border border-border bg-panel shadow-2xl focus:outline-none',
+            'fixed top-1/2 left-1/2 z-50 flex max-h-[88vh] w-[min(560px,calc(100vw-32px))] -translate-x-1/2 -translate-y-1/2 flex-col rounded-xl border border-border bg-panel shadow-[0_30px_80px_-20px_var(--shadow)] focus:outline-none',
             className
           )}
           aria-describedby={description ? undefined : undefined}
@@ -213,7 +214,7 @@ export function Dialog({
         >
           <div className="flex items-start justify-between gap-4 border-b border-border px-5 py-3.5">
             <div>
-              <DialogPrimitive.Title className="text-[15px] font-semibold">{title}</DialogPrimitive.Title>
+              <DialogPrimitive.Title className="font-[family-name:var(--font-display)] text-[15px] font-semibold">{title}</DialogPrimitive.Title>
               {description ? (
                 <DialogPrimitive.Description className="mt-0.5 text-xs text-muted">{description}</DialogPrimitive.Description>
               ) : (
@@ -248,7 +249,7 @@ export function DropdownMenu({ trigger, items, align = 'end' }: { trigger: React
         <Menu.Content
           align={align}
           sideOffset={4}
-          className="z-50 min-w-44 rounded-lg border border-border bg-panel p-1 shadow-xl"
+          className="z-50 min-w-44 rounded-lg border border-border bg-panel-2 p-1 shadow-[0_16px_40px_-10px_var(--shadow)]"
         >
           {items.map((item, i) =>
             item === 'sep' ? (
@@ -260,7 +261,7 @@ export function DropdownMenu({ trigger, items, align = 'end' }: { trigger: React
                 onSelect={item.onSelect}
                 className={cn(
                   'flex cursor-default items-center gap-2 rounded-md px-2 py-1.5 text-[13px] outline-none data-[disabled]:opacity-40 data-[highlighted]:bg-hover',
-                  item.danger && 'text-danger'
+                  item.danger && 'text-danger-text'
                 )}
               >
                 {item.icon}
@@ -276,14 +277,14 @@ export function DropdownMenu({ trigger, items, align = 'end' }: { trigger: React
 
 export function Badge({ children, tone = 'neutral', className }: { children: ReactNode; tone?: 'neutral' | 'accent' | 'warn' | 'danger' | 'ok'; className?: string }) {
   const tones = {
-    neutral: 'bg-panel-2 text-muted border-border',
-    accent: 'bg-accent-soft text-accent border-accent/30',
-    warn: 'bg-warn/10 text-warn border-warn/30',
+    neutral: 'bg-subtle text-muted border-subtle-border',
+    accent: 'bg-accent-soft text-accent-text border-accent/40',
+    warn: 'bg-warn/10 text-warn border-warn/25',
     danger: 'bg-danger/10 text-danger border-danger/30',
-    ok: 'bg-ok/10 text-ok border-ok/30'
+    ok: 'bg-ok/10 text-ok border-ok/25'
   }
   return (
-    <span className={cn('inline-flex items-center gap-1 rounded border px-1.5 py-px text-[11px] font-medium whitespace-nowrap', tones[tone], className)}>
+    <span className={cn('inline-flex h-6 items-center gap-1 rounded-full border px-2.5 text-[11.5px] font-medium whitespace-nowrap', tones[tone], className)}>
       {children}
     </span>
   )

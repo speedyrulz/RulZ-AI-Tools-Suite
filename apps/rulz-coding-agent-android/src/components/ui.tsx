@@ -6,13 +6,14 @@ import { cn } from '../lib/format'
 
 // The computer app's controls, sized for fingers: taller buttons and fields, dialogs as sheets from the bottom.
 
-type Variant = 'primary' | 'secondary' | 'ghost' | 'danger'
+type Variant = 'primary' | 'secondary' | 'ghost' | 'outline' | 'danger'
 
 const VARIANTS: Record<Variant, string> = {
-  primary: 'bg-accent text-accent-fg active:bg-accent-hover font-medium',
-  secondary: 'bg-panel-2 border border-border active:bg-hover',
+  primary: 'bg-accent text-accent-fg active:bg-accent-hover font-medium shadow-[0_6px_20px_-8px_rgb(237_0_13/0.8)] disabled:shadow-none',
+  secondary: 'bg-panel-2 text-text border border-border active:bg-hover active:border-border-strong',
+  outline: 'border border-accent/70 text-link active:bg-accent-soft active:border-accent',
   ghost: 'active:bg-hover text-muted',
-  danger: 'bg-danger/90 text-white active:bg-danger font-medium'
+  danger: 'bg-danger-bg text-danger-text border border-danger-border active:bg-danger-hover'
 }
 
 export const Button = forwardRef<HTMLButtonElement, ButtonHTMLAttributes<HTMLButtonElement> & { variant?: Variant; size?: 'sm' | 'md' | 'lg' }>(
@@ -57,7 +58,7 @@ export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputE
     <input
       ref={ref}
       className={cn(
-        'h-11 w-full rounded-lg border border-border bg-panel-2 px-3 text-[15px] placeholder:text-faint focus:border-accent focus:outline-none',
+        'h-11 w-full rounded-lg border border-border bg-panel px-3 text-[15px] placeholder:text-faint focus:border-accent focus:outline-none',
         className
       )}
       {...props}
@@ -106,7 +107,7 @@ export function Switch({
       checked={checked}
       onCheckedChange={onCheckedChange}
       disabled={disabled}
-      className="relative h-7 w-12 shrink-0 rounded-full bg-track transition-colors data-[state=checked]:bg-accent disabled:opacity-40"
+      className="relative h-7 w-12 shrink-0 rounded-full bg-border-strong transition-colors data-[state=checked]:bg-accent disabled:opacity-40"
     >
       <SwitchPrimitive.Thumb className="block size-6 translate-x-0.5 rounded-full bg-white shadow transition-transform data-[state=checked]:translate-x-[22px]" />
     </SwitchPrimitive.Root>
@@ -138,10 +139,10 @@ export function Sheet({
   return (
     <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
       <DialogPrimitive.Portal>
-        <DialogPrimitive.Overlay className="fixed inset-0 z-40 bg-black/40 dark:bg-black/60" />
+        <DialogPrimitive.Overlay className="fixed inset-0 z-40 bg-scrim backdrop-blur-[2px]" />
         <DialogPrimitive.Content
           className={cn(
-            'sheet pb-safe fixed inset-x-0 bottom-0 z-50 flex flex-col border-t border-border bg-panel shadow-2xl focus:outline-none',
+            'sheet pb-safe fixed inset-x-0 bottom-0 z-50 flex flex-col border-t border-border bg-panel shadow-[0_30px_80px_-20px_var(--shadow)] focus:outline-none',
             full ? 'pt-safe top-0' : 'max-h-[90dvh] rounded-t-2xl'
           )}
           onPointerDownOutside={dismissable ? undefined : (e) => e.preventDefault()}
@@ -155,7 +156,7 @@ export function Sheet({
               </DialogPrimitive.Close>
             )}
             <div className={cn('min-w-0 flex-1', full && 'pt-2.5')}>
-              <DialogPrimitive.Title className="text-[17px] font-semibold break-words">{title}</DialogPrimitive.Title>
+              <DialogPrimitive.Title className="font-[family-name:var(--font-display)] text-[17px] font-semibold break-words">{title}</DialogPrimitive.Title>
               {description ? (
                 <DialogPrimitive.Description className="mt-0.5 text-[13px] text-muted">{description}</DialogPrimitive.Description>
               ) : (
@@ -178,14 +179,14 @@ export function Sheet({
 
 export function Badge({ children, tone = 'neutral', className }: { children: ReactNode; tone?: 'neutral' | 'accent' | 'warn' | 'danger' | 'ok'; className?: string }) {
   const tones = {
-    neutral: 'bg-panel-2 text-muted border-border',
-    accent: 'bg-accent-soft text-accent border-accent/30',
-    warn: 'bg-warn/10 text-warn border-warn/30',
+    neutral: 'bg-subtle text-muted border-subtle-border',
+    accent: 'bg-accent-soft text-accent-text border-accent/40',
+    warn: 'bg-warn/10 text-warn border-warn/25',
     danger: 'bg-danger/10 text-danger border-danger/30',
-    ok: 'bg-ok/10 text-ok border-ok/30'
+    ok: 'bg-ok/10 text-ok border-ok/25'
   }
   return (
-    <span className={cn('inline-flex items-center gap-1 rounded border px-1.5 py-px text-[11px] font-medium whitespace-nowrap', tones[tone], className)}>{children}</span>
+    <span className={cn('inline-flex h-6 items-center gap-1 rounded-full border px-2.5 text-[11.5px] font-medium whitespace-nowrap', tones[tone], className)}>{children}</span>
   )
 }
 

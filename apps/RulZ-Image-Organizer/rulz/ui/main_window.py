@@ -105,6 +105,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(300, self.scanner.scan)
         else:
             self.navigate(self.LIBRARY)
+        self.pages.currentWidget().setFocus()  # start on the content, not on a sidebar button
 
     # ---- sidebar -----------------------------------------------------------
     def _build_sidebar(self) -> QWidget:
@@ -129,6 +130,7 @@ class MainWindow(QMainWindow):
         for i, (text, glyph) in enumerate((("Photos", "photos"), ("People", "people"), ("Library", "library"))):
             btn = QPushButton(f"  {text}")
             btn.setObjectName("NavButton")
+            btn.setFocusPolicy(Qt.TabFocus)  # a click doesn't ring it; Tab still reaches it
             btn.setCheckable(True)
             btn.setCursor(Qt.PointingHandCursor)
             btn.setIconSize(btn.iconSize() * 1.1)
@@ -177,6 +179,7 @@ class MainWindow(QMainWindow):
         self.theme_btn = QPushButton()
         self.theme_btn.setObjectName("ThemeButton")
         self.theme_btn.setCursor(Qt.PointingHandCursor)
+        self.theme_btn.setFocusPolicy(Qt.TabFocus)
         self.theme_btn.setToolTip("Switch between dark and light (Ctrl+Shift+L)")
         self.theme_btn.clicked.connect(lambda: self.set_theme(not theme.is_dark()))
         lay.addWidget(self.theme_btn)
@@ -187,6 +190,7 @@ class MainWindow(QMainWindow):
     def _side_button(text: str, slot) -> QPushButton:
         b = QPushButton(text)
         b.setObjectName("ThemeButton")  # the sidebar's quiet button look
+        b.setFocusPolicy(Qt.TabFocus)
         b.setCursor(Qt.PointingHandCursor)
         b.clicked.connect(slot)
         return b

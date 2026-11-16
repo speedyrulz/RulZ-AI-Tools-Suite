@@ -46,7 +46,7 @@ describe('catalog', () => {
     }
   })
 
-  it('starts RulzTrainer with RULZ_TAILSCALE=1 only while its Tailscale option is on', () => {
+  it('starts RulZ AI Trainer with RULZ_TAILSCALE=1 only while its Tailscale option is on', () => {
     const trainer = findApp('rulz-trainer')!
     expect(launchEnv(trainer, ['tailscale'])).toEqual({ RULZ_TAILSCALE: '1' })
     expect(launchEnv(trainer, [])).toEqual({})

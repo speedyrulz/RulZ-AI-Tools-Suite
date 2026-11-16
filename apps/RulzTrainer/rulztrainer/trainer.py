@@ -514,7 +514,7 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None, ref_norms=None, scales
                         "OneTrainer keep embedders, the timestep modulation, the text projection and the final layer "
                         "on AdamW. Race it against %s without them if they matter.", name, ", ".join(edge), name)
         if name == "normuon":
-            log.info("normuon is experimental and untested in RulzTrainer")
+            log.info("normuon is experimental and untested in RulZ AI Trainer")
         return Muon(params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay, normuon=name == "normuon")
     if name == "adafactor":
         from transformers.optimization import Adafactor

@@ -39,6 +39,6 @@ def test_browse_shortcuts_exist_once_and_include_the_project(monkeypatch, tmp_pa
     monkeypatch.setenv("WORKSPACE", str(ws))
     shortcuts = webui.browse_shortcuts()
     names = [n for n, _ in shortcuts]
-    assert names[0] == "RulzTrainer" and "workspace" in names and "ComfyUI models" in names
+    assert names[0] == "RulZ AI Trainer" and "workspace" in names and "ComfyUI models" in names
     paths = [p.resolve() for _, p in shortcuts]
     assert len(paths) == len(set(paths)) and all(p.is_dir() for _, p in shortcuts)
