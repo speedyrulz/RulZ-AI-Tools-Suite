@@ -36,6 +36,11 @@ def test_real_knowledge(tmp_path):
         from rulztrainer.config import TrainConfig
     except ImportError as exc:
         pytest.skip(f'Trainer config unavailable: {exc}')
+    try:
+        import torch  # noqa: F401  TrainConfig.validate() imports it
+        full = True
+    except ImportError:
+        full = False  # CI: the type checks still run; validate() needs the trainer's own venv
     k = load(ROOT)
     errors = validate(k, set(KEYS))
     assert not errors, '\n'.join(errors)
@@ -54,7 +59,9 @@ def test_real_knowledge(tmp_path):
                                 kind = KEYS[key]
                                 if kind in ('list', 'int', 'float', 'bool'):
                                     assert type(value).__name__ == kind, (key, value, kind)
-                            TrainConfig.from_dict(cfg).validate()
+                            tc = TrainConfig.from_dict(cfg)
+                            if full:
+                                tc.validate()
                         except Exception as exc:
                             failures.append(f'{model}/{goal}/{focus}/{count}/{vram}: {exc}')
     assert not failures, '\n'.join(failures)
