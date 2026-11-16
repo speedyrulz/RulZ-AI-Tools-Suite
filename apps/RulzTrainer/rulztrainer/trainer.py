@@ -28,7 +28,7 @@ from . import profiling
 from . import race as race_mod
 from .ema import LoraEMA
 from . import quant as Q
-from .config import AUTOMAGIC, KEEL, MUON_EDGE_TARGETS, TrainConfig, keel_band_weights, keel_consensus_mode
+from .config import AUTOMAGIC, KEEL, KEEL_FB, KEEL_ON_A3, MUON_EDGE_TARGETS, TrainConfig, keel_band_weights, keel_consensus_mode
 from .config import side_to_mp
 from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, dropout_text_path,
                       items_for_side, load_batch,
@@ -552,10 +552,11 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None, ref_norms=None, scales
                   weight_decay=cfg.weight_decay, polarity_history=cfg.automagic_polarity_history,
                   clip_threshold=cfg.automagic_clip_threshold, fused=False)
         if name in KEEL:
-            from .optimizers.keel import Keel
+            from .optimizers.keel import Keel, Keel3
 
-            fb = name == "keel_fb"  # the face-and-body version: the body share and the magnitude vote
-            opt = Keel(params, pairs=pairs, gauge=cfg.keel_gauge, gauge_eps=cfg.keel_gauge_eps,
+            fb = name in KEEL_FB  # the face-and-body version: the body share and the magnitude vote
+            on_a3 = name in KEEL_ON_A3  # Keel on Automagic 3: none of Automagic 4's sensitivity / vote / max-vote settings
+            opt = (Keel3 if on_a3 else Keel)(params, pairs=pairs, gauge=cfg.keel_gauge, gauge_eps=cfg.keel_gauge_eps,
                        cautious=cfg.keel_cautious, bands=cfg.keel_bands,
                        band_weights=keel_band_weights(cfg.keel_band_weights, cfg.keel_bands),
                        consensus=cfg.keel_consensus, consensus_power=cfg.keel_consensus_power,
@@ -564,11 +565,11 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None, ref_norms=None, scales
                        lookahead_lr=cfg.keel_lookahead_lr, lookahead_grace=cfg.keel_lookahead_grace,
                        face_gain=cfg.keel_face_gain, face_gain_max=cfg.keel_face_gain_max,
                        face_gain_beta=cfg.keel_face_gain_beta, body_weight=cfg.keel_body_weight if fb else 0.0,
-                       sensitivity_quantile=cfg.automagic_sensitivity_quantile, vote=cfg.automagic_vote,
-                       max_vote=cfg.automagic_max_lr_change, **kw)
+                       **({} if on_a3 else dict(sensitivity_quantile=cfg.automagic_sensitivity_quantile,
+                                                vote=cfg.automagic_vote, max_vote=cfg.automagic_max_lr_change)), **kw)
             if fb and cfg.keel_lookahead and cfg.face_weight != cfg.body_weight:
-                log.info("keel_fb: the lookahead follows the probes' combined score, weighted face %g / body %g "
-                         "(face_weight, body_weight); set them equal for an equal focus", cfg.face_weight,
+                log.info("%s: the lookahead follows the probes' combined score, weighted face %g / body %g "
+                         "(face_weight, body_weight); set them equal for an equal focus", name, cfg.face_weight,
                          cfg.body_weight)
             return opt
         if name == "automagic4":
@@ -2411,7 +2412,8 @@ class Trainer(RaceParallelMixin):
                 log.info("Training state was saved with %s; continuing with %s (the adapted lr and sign history carry "
                          "over%s)", saved_opt, self.cfg.optimizer,
                          "; the sensitivity reference is measured on the first step"
-                         if self.cfg.optimizer.lower() in ("automagic4", *KEEL) and saved_opt == "automagic3" else "")
+                         if self.cfg.optimizer.lower() in ("automagic4", "keel", "keel_fb")
+                         and saved_opt in ("automagic3", *KEEL_ON_A3) else "")
             else:
                 raise ValueError(f"Training state was saved with optimizer {saved_opt} but the config says "
                                  f"{self.cfg.optimizer}; set optimizer: {saved_opt} to resume it (only Automagic 3, "

@@ -27,7 +27,7 @@ from fastapi import Request
 from nicegui import app, background_tasks, run, ui
 
 from rulztrainer.archs import get_arch
-from rulztrainer.config import (AUTOMAGIC, KEEL, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
+from rulztrainer.config import (AUTOMAGIC, KEEL, KEEL_FB, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
                                 MODEL_PRESETS, ARCH_SAMPLE_LORA, VIDEO_ARCHS, VIDEO_EXTS,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
 from rulztrainer import __version__, bodysim, facesim, history, lookfilter, machine, oom_recovery, promptcheck
@@ -5898,7 +5898,7 @@ def h3_recommendations(cfg: TrainConfig, r: dict, goal: str | None, gpus: list[d
         r["lora_rank"] = (rank, "musubi-tuner's H3 examples train rank 16; DiffSynth-Studio's 32")
         r["lora_alpha"] = (float(rank), "alpha = rank: H3 LoRAs are saved without alpha (the layout ComfyUI, diffusers "
                                         "and musubi-tuner read at alpha = rank)")
-        if cfg.optimizer != "automagic3":
+        if cfg.optimizer not in ("automagic3", "keel3", "keel3_fb"):  # Automagic 3's own start rate stays
             r["learning_rate"] = (1e-4, "musubi-tuner's and DiffSynth-Studio's H3 LoRA rate")
     r["timestep_sampling"] = ("reference", "H3's own: one uniform base time per step, the video sigma on the shift-12 "
                                            "curve (the audio sigma follows on shift 3), as the released schedulers "
@@ -6263,7 +6263,8 @@ EXPERIMENTS = [
     {"key": "optimizer", "group": "Adapter and optimizer", "title": "Optimizer", "off": "adamw8bit",
      "control": "select", "options": {"adamw8bit": "adamw8bit (default)", "adamw": "adamw", "adafactor": "adafactor",
                                       "automagic3": "automagic3", "automagic4": "automagic4", "keel": "keel",
-                                      "keel_fb": "keel_fb", "muon": "muon", "normuon": "normuon (untested)"},
+                                      "keel_fb": "keel_fb", "keel3": "keel3 (Keel on Automagic 3)",
+                                      "keel3_fb": "keel3_fb (face and body, on Automagic 3)", "muon": "muon", "normuon": "normuon (untested)"},
      "evidence": "mixed",
      "short": "Muon or a self-tuning optimizer instead of adamw8bit.",
      "what": "adamw8bit is AdamW with its state in 8 bits (adamw keeps it in full precision; adafactor is lighter). "
@@ -6271,7 +6272,9 @@ EXPERIMENTS = [
              "learning rates; normuon (untested) is muon with each row's step evened out, OneTrainer's default "
              "Muon. automagic3 and automagic4 tune their own learning rate as they go; automagic4 adds "
              "smaller steps for the most sensitive weights. keel is automagic4 with extra machinery aimed at a "
-             "character's identity, and keel_fb the same for the face and the body alike.",
+             "character's identity, and keel_fb the same for the face and the body alike. keel3 and keel3_fb are those "
+             "two on automagic3's learning-rate controller instead of automagic4's (the one ostris advises where "
+             "automagic4 is unstable): the same machinery, no sensitive-weight step cap, no vote setting.",
      "tested": "keel against adamw8bit, two seeds on one small set on Krea 2 at gradient accumulation 1: a repeated "
                "face gain (FaceNet 52.7 and 54.3 against 44 to 49), no repeated body gain, and faces very alike "
                "across seeds. keel_fb tied keel on one seed. On a body-only set, single learning-rate groups beat "
@@ -6283,7 +6286,7 @@ EXPERIMENTS = [
                "over Adam. On Qwen-Image 2.1 (rank 32 at 1e-4, one run each on one set of 62 photos): keel led "
                "adamw8bit and muon by 12 to 15 combined points with the best FaceNet, but the highest copy score of "
                "the three (0.61); muon tied adamw8bit at about twice the time a step. normuon has never run in a real "
-               "training here.",
+               "training here. keel3 and keel3_fb have never run on a real model.",
      "cost": "automagic4 took 1.6 s a step against automagic3's 2.2 s. The learning-rate schedule, LoRA+ and the "
              "per-image learning rate do not apply to the automagic family. Keel's consensus gate wants gradient "
              "accumulation of 2 or more. muon keeps one full-precision number per weight (less than adamw, a "
@@ -10198,6 +10201,8 @@ def build_page(local: bool = True):
                                  "schedule and warmup are ignored. Automagic 4 also caps the step of the most "
                                  "sensitive weights and its rate holds on noise instead of drifting up. Keel is "
                                  "Automagic 4 plus the LoRA gauge preconditioner and the cautious mask below. "
+                                 "keel3 / keel3_fb put Keel on Automagic 3 instead: no sensitivity cap, no Vote "
+                                 "or Max lr change setting below (never run on a real model). "
                                  "Keel, from real tests: use one lr for every layer; the Max lr made no measurable "
                                  "difference from 3e-4 to 1e-3; and 1000 steps was not yet enough, so plan on more. "
                                  "The other Keel settings are not measured yet (docs/keel-test-results.md).")
@@ -10226,7 +10231,7 @@ def build_page(local: bool = True):
                                              "with a polarity history of 16. With Keel, use one lr: it beat by_type by "
                                              "4.4 body points over 8 seeds on one body-only set (p = 0.03).")
                             with fields().bind_visibility_from(w["optimizer"], "value",
-                                                               lambda x: x in ("automagic4", *KEEL)):
+                                                               lambda x: x in ("automagic4", "keel", "keel_fb")):
                                 w["automagic_sensitivity_quantile"] = ui.number("Sensitivity quantile",
                                                                                 value=d.automagic_sensitivity_quantile,
                                                                                 min=0.05, max=1, step=0.05) \
@@ -10283,7 +10288,7 @@ def build_page(local: bool = True):
                                     .tooltip("A multiplier on the step's update per band: empty = 1 everywhere, "
                                              "identity = a hump over the face bands (sigma 0.12 to 0.5), subject = "
                                              "a plateau over the face's and the body's bands alike (sigma 0.18 to "
-                                             "0.82, for keel_fb), or one number per band, comma-separated.")
+                                             "0.82, for keel_fb / keel3_fb), or one number per band, comma-separated.")
                                 w["keel_consensus"] = ui.number("Consensus gate", value=d.keel_consensus, min=0, max=1,
                                                                 step=0.1, format="%.2f").classes("w-32") \
                                     .tooltip("Cross-photo consensus (the AND-mask, ICLR 2021): each weight's update "
@@ -10299,7 +10304,7 @@ def build_page(local: bool = True):
                                     .tooltip("The exponent on the agreement share: higher is stricter on partial "
                                              "agreement (2: a 3-of-4 split counts as 0.25 agreement, before the "
                                              "floor).")
-                                w["keel_consensus_mode"] = ui.select({"auto": "auto (sign for keel, magnitude for keel_fb)",
+                                w["keel_consensus_mode"] = ui.select({"auto": "auto (sign for keel / keel3, magnitude for the _fb names)",
                                                                       "sign": "sign: one vote per gradient",
                                                                       "magnitude": "magnitude: votes weighted by size"},
                                                                      value=d.keel_consensus_mode,
@@ -10335,7 +10340,7 @@ def build_page(local: bool = True):
                                              "gradient that comes from the face's tokens / the median pair's share) "
                                              "to this power, so the weights serving the face move more and the "
                                              "background's less. Needs region maps with faces (face detection). "
-                                             "0 = off; not measured yet, so race it at 0.5 and 1. keel_fb measures the "
+                                             "0 = off; not measured yet, so race it at 0.5 and 1. keel_fb / keel3_fb measure the "
                                              "body's tokens too (Body weight).")
                                 w["keel_face_gain_max"] = ui.number("Face gain limit", value=d.keel_face_gain_max,
                                                                     min=1, max=10, step=0.5, format="%.1f") \
@@ -10345,17 +10350,17 @@ def build_page(local: bool = True):
                                     .classes("w-32") \
                                     .tooltip("How much of the previous gain each step keeps (0.9: one batch without "
                                              "a face barely moves it).")
-                            with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x == "keel_fb"):
+                            with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x in KEEL_FB):
                                 w["keel_body_weight"] = ui.number("Body weight", value=d.keel_body_weight, min=0, max=4,
                                                                   step=0.25, format="%.2f").classes("w-32") \
-                                    .tooltip("keel_fb: the body tokens' weight against the face's in the token gain "
+                                    .tooltip("keel_fb / keel3_fb: the body tokens' weight against the face's in the token gain "
                                              "(the person's cells outside the face box, from the person masks). Each "
                                              "region's share is measured against its own median pair and the two are "
                                              "combined as a weighted geometric mean, so a step of person-only photos "
                                              "moves the gain by the body alone and face crops by the face alone. 1 = "
                                              "equal; 0 = face only. Needs Face gain above 0 (off by default: then "
-                                             "keel_fb differs from keel by the consensus vote alone). Set the probes' "
-                                             "face and body weights equal too. Not measured yet: race keel_fb against "
+                                             "the _fb names differ from their plain versions by the consensus vote alone). Set the probes' "
+                                             "face and body weights equal too. Not measured yet: race keel_fb / keel3_fb against "
                                              "keel with gradient accumulation of 2 or more, or the two are alike.")
                         with advanced("Timesteps, loss weighting and gradients"):
                             with fields():
@@ -13321,7 +13326,7 @@ yet: race them. Tested so far (`docs/keel-test-results.md`, one small body-only 
 beat *by_type* by 4.4 body points, *Max lr* at 1e-3, 5e-4 and 3e-4 tied at 1000 steps, and every run was still rising
 at the end. Use one rate and plan on more than 1000 steps.
 
-`keel_fb` is Keel for the face and the body alike, for a LoRA that should hold the build as firmly as the face: the
+`keel_fb` (and `keel3_fb`) is Keel for the face and the body alike, for a LoRA that should hold the build as firmly as the face: the
 token gain measures the body's tokens too (the person outside the face box, from the person masks; *Body weight*
 sets their weight against the face's, each region against its own median pair) and the consensus gate votes by
 magnitude, since under the sign vote a face crop's tiny, random-signed gradient for a body-serving weight counts as
@@ -13330,6 +13335,13 @@ is off by default in both, so with the defaults `keel_fb` differs from `keel` by
 or 1) to bring the body share in. Set the probes' face and body weights (`face_weight`, `body_weight`, 0.7 / 0.3 by
 default) equal with it, since the lookahead and the best / stop decisions follow their combined score. Race it against
 `keel`, with gradient accumulation of 2 or more: not measured yet.
+
+`keel3` and `keel3_fb` are `keel` and `keel_fb` on Automagic 3's learning-rate controller instead of Automagic 4's: the
+gauge preconditioner, cautious mask, noise bands, consensus gate, lookahead and token gain are the same, but the rate
+follows Automagic 3's extremes-only vote (only unanimous sign windows vote up and perfectly alternating ones down), with
+no cap on the most sensitive weights and no *Vote*, *Sensitivity quantile* or *Max lr change* setting. Automagic 3 is
+the version ostris advises where Automagic 4 is unstable; its step is slower. Never run on a real model: race them
+against `keel` before relying on them.
 
 ## Adapters: LoRA, LoKr, OFT and DoRA
 The *Adapter* field (Train tab, LoRA section) picks what each layer learns. **LoRA**: a rank-r pair. **LoKr**: a
