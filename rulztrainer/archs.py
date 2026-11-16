@@ -1674,7 +1674,7 @@ class SdxlArch(Arch):
         return self._loading.resolve_for_config(cfg)
 
     def get_transformer(self, cfg, model_dir, device=None):
-        return self._loading.get_transformer(cfg, model_dir, device)
+        return self._loading.get_transformer(cfg, model_dir, device, quant=cfg.transformer_quant)
 
     def get_vae(self, cfg, model_dir):
         return self._loading.get_vae(cfg, model_dir)

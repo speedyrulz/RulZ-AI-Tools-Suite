@@ -9,7 +9,9 @@ from pathlib import Path
 
 import yaml
 
+from . import capabilities as _capabilities
 from . import promptcheck as _promptcheck
+from .capabilities import FRAME_KEYS, VIDEO_FAMILIES
 
 MODEL_PRESETS = {
     "MOSS-Image-Base": "OpenMOSS-Team/MOSS-Image-Base",
@@ -371,7 +373,7 @@ ARCH_DEFAULT_TARGETS["pan2"] = _CORE_TARGETS
 ARCH_FULL_SAMPLE["pan2"] = (50, 2.5)
 # families that train on video clips (train_frames) and render samples and probes as clips (sample_frames,
 # probe_frames). MiniMax H3 is the video + audio model, not MiniMax-H3-Image or P-H3-Image (stills only).
-VIDEO_ARCHS = ("pan2", "minimax_h3")
+VIDEO_ARCHS = VIDEO_FAMILIES  # (defined in capabilities.py, with the rest of what each family cannot do)
 
 # SDXL (Stability AI's UNet, rulztrainer.sdxl): LoRA on the UNet only, as OneTrainer, ai-toolkit and Fizgig train it. Its
 # text encoders (CLIP-L and OpenCLIP bigG) read 77 tokens, so max_token_length is held at SDXL_TOKENS. The default
@@ -616,7 +618,7 @@ class TrainConfig:
     #                           character LoRAs: docs/keel-optimizer.md) | keel_fb (Keel for the face and the body
     #                           alike: the body share in the token gain, the magnitude vote in the consensus gate)
     #                           | keel3 / keel3_fb (the same two on Automagic 3's lr controller, the stabler one: its
-    #                           extremes-only vote, no sensitivity balance; 3.26.0, never run on a real model)
+    #                           extremes-only vote, no sensitivity balance; 3.27.0, never run on a real model)
     #                           | hull | muon (orthogonalized momentum, step matched to AdamW's: AdamW's rates apply)
     #                           | normuon (muon with each row's step evened out; experimental, untested)
     weight_decay: float = 0.01
@@ -1228,13 +1230,9 @@ class TrainConfig:
     def validate(self) -> None:
         if min(self.sample_frames, self.probe_frames, self.train_frames) < 1:
             raise ValueError("sample_frames, probe_frames and train_frames must be 1 (a still) or more")
-        if max(self.sample_frames, self.probe_frames) > 1 and self.arch_name() not in VIDEO_ARCHS:
-            raise ValueError(f"sample_frames / probe_frames above 1 need a video model ({', '.join(VIDEO_ARCHS)}): "
-                             f"{self.arch_name()} renders stills")
+        for msg in _capabilities.violations(self.arch_name(), self, keys=FRAME_KEYS).values():
+            raise ValueError(msg)  # the video-only frame settings (capabilities.py)
         if self.train_frames > 1:
-            if self.arch_name() not in VIDEO_ARCHS:
-                raise ValueError(f"train_frames above 1 (video clip training) needs a video model "
-                                 f"({', '.join(VIDEO_ARCHS)}): {self.arch_name()} trains on stills")
             if self.train_video_mode not in ("fps", "spread"):
                 raise ValueError(f"train_video_mode must be fps or spread, got {self.train_video_mode!r}")
             if self.isolation:
@@ -1245,6 +1243,8 @@ class TrainConfig:
                              f"{self.sdxl_prediction!r}")
         if not isinstance(self.sdxl_zero_terminal_snr, bool):
             raise ValueError(f"sdxl_zero_terminal_snr must be true or false, got {self.sdxl_zero_terminal_snr!r}")
+        for msg in _capabilities.violations(self.family(), self).values():
+            raise ValueError(msg)  # every family's table (capabilities.py), the same one the WebUI greys out
         if self.family() == "sdxl":
             self.validate_sdxl()
         if self.optimizer.lower() == "hull":
@@ -1479,54 +1479,11 @@ class TrainConfig:
     def validate_sdxl(self) -> None:
         """What an SDXL run cannot do (v1 is a LoRA on the UNet): each refusal names the setting, none is a silent
         no-op. "auto" settings that name nothing for SDXL (transformer_quant, compile_model, the downloads, the
-        checkpointing's kept blocks) resolve to off; a fresh SDXL config trips none of these."""
+        checkpointing's kept blocks) resolve to off; a fresh SDXL config trips none of these. The refusals are the
+        table in capabilities.py (transformer_quant: auto, none, int8 or int8_convrot); the rest here is rewritten, not refused."""
         no = ValueError
-        if self.block_swap:
-            raise no("block_swap: SDXL's UNet is not swapped block by block (its 2.6B weights fit a 12 GB card): set "
-                     "block_swap to 0")
-        if self.multi_gpu == "model_split":
-            raise no("multi_gpu model_split: the UNet cannot be split across GPUs here (use off or data_parallel)")
-        if self.activation_offload:
-            raise no("activation_offload: not available for SDXL (diffusers' checkpointing is all or nothing): turn "
-                     "it off")
-        for key in ("attn_localize", "id_align", "body_align"):
-            if getattr(self, key):
-                raise no(f"{key}: reads the transformer blocks' attention and states, which SDXL's UNet does not "
-                         f"expose that way: turn {key} off")
-        if self.optimizer.lower() in (*KEEL_FB, "hull"):
-            raise no(f"optimizer {self.optimizer}: not available for SDXL (keel_fb, keel3_fb and hull read the face-token taps "
-                     "and region gains of the transformer blocks); use adamw, adamw8bit, adafactor, automagic3/4, "
-                     "keel, keel3, muon or normuon")
-        if self.optimizer.lower() in KEEL and self.keel_face_gain > 0:
-            raise no("keel_face_gain: the face-token gain hooks the transformer blocks' outputs, which SDXL does not "
-                     "have in that form: set keel_face_gain to 0")
-        if self.training_maps:
-            raise no("training_maps: its attention heat maps are read inside the transformer blocks, which SDXL's UNet "
-                     "does not expose that way: turn training_maps off")
-        if str(self.transformer_quant or "auto") not in ("auto", "none"):
-            raise no(f"transformer_quant {self.transformer_quant!r}: SDXL's UNet trains in bf16; use auto or none")
-        if self.compile_model is True:
-            raise no("compile_model: true is not available for SDXL (the UNet is not compiled; auto and false run "
-                     "it eagerly)")
-        if self.loss_type != "mse":
-            raise no(f"loss_type {self.loss_type}: not available for SDXL (its loss is the model's own epsilon / "
-                     "v-prediction MSE); use mse")
-        if self.loss_weighting == "sigma_sqrt":
-            raise no("loss_weighting sigma_sqrt: a flow-matching weight with no meaning for SDXL's epsilon / "
-                     "v-prediction loss; use none or min_snr")
-        if self.finetune:
-            raise no("finetune: SDXL trains a LoRA only here: turn finetune off")
-        if self.network_type != "lora" or self.dora:
-            raise no("network_type / dora: SDXL's LoRA file is kohya's plain lora_down / lora_up layout: use "
-                     "network_type lora and turn dora off")
-        if self.train_text_embedder:
-            raise no("train_text_embedder: SDXL has no text projection inside its UNet, and its text encoders are not "
-                     "trained: turn train_text_embedder off")
-        for key in ("turbo_lora", "sample_lora", "training_adapter"):
-            if str(getattr(self, key) or "") not in ("", "auto"):
-                raise no(f"{key}: no such LoRA exists for SDXL here (auto and empty both mean none): clear {key}")
-        if self.checkpoint_keep_blocks > 0:
-            raise no("checkpoint_keep_blocks: SDXL's checkpointing is all or nothing (diffusers'): use -1 or 0")
+        for msg in _capabilities.violations("sdxl", self).values():  # the table in capabilities.py (the WebUI
+            raise no(msg)  # greys the same settings out)
         if self.max_token_length != SDXL_TOKENS:
             self.max_token_length = SDXL_TOKENS  # CLIP's 77 tokens: the text cache and the prompt checks read this
         if self.sdxl_zero_terminal_snr and self.sdxl_prediction == "epsilon":
