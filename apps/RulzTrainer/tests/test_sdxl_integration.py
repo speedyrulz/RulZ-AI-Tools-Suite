@@ -164,6 +164,7 @@ REFUSALS = [
     ({"body_align": True}, "body_align"),
     ({"optimizer": "keel", "keel_face_gain": 0.5}, "keel_face_gain"),
     ({"optimizer": "keel_fb"}, "keel_fb"),
+    ({"optimizer": "keel3_fb"}, "keel3_fb"),
     ({"optimizer": "hull", "hull_rho": 0.01}, "hull"),
     ({"training_maps": True}, "training_maps"),
     ({"transformer_quant": "nvfp4"}, "transformer_quant"),

@@ -45,13 +45,13 @@ FAMILY_MODEL = {"moss_image": ("moss", "MOSSImageTransformer"), "fibo2": ("fibo"
 #   adamw8bit  bitsandbytes AdamW8bit: two 8-bit moments (its block scales, a few % more, are left out)     2
 #   adafactor  transformers Adafactor without beta1: factored row + column second moments for a matrix,
 #              a vanishing share of its elements                                                            0
-#   automagic3 / automagic4 / keel / keel_fb: the sign history, polarity_history bits per element
+#   automagic3 / automagic4 / keel / keel_fb / keel3 / keel3_fb: the sign history, polarity_history bits per element
 #              (H / 8 bytes), plus factored row / column moments                                     history / 8
-#   keel / keel_fb with keel_lookahead: plus an fp32 anchor copy of the weights                             +4
+#   keel / keel_fb / keel3 / keel3_fb with keel_lookahead: plus an fp32 anchor copy of the weights                             +4
 #   hull       fp32 momentum "m" per element (per-channel "v" left out)                                     4
 #   muon / normuon: fp32 momentum buffer (normuon's per-row second moment left out)                         4
 OPTIMIZER_STATE_BYTES = {"adamw": 8.0, "adamw8bit": 2.0, "adafactor": 0.0, "hull": 4.0, "muon": 4.0, "normuon": 4.0}
-_AUTOMAGIC = ("automagic3", "automagic4", "keel", "keel_fb")
+_AUTOMAGIC = ("automagic3", "automagic4", "keel", "keel_fb", "keel3", "keel3_fb")
 WEIGHT_BYTES, GRAD_BYTES, EMA_BYTES = 4.0, 4.0, 4.0  # fp32 adapter weight, its gradient, the average's fp32 shadow
 
 # The run the flat step allowance (webui.STEP_HEADROOM_GB) was set for: TrainConfig's defaults
@@ -63,7 +63,7 @@ def optimizer_state_bytes(optimizer: str, polarity_history: int = 8, lookahead: 
     name = str(optimizer or "adamw").lower()
     if name in _AUTOMAGIC:
         state = max(1, int(polarity_history or 8)) / 8.0
-        return state + (4.0 if lookahead and name in ("keel", "keel_fb") else 0.0)
+        return state + (4.0 if lookahead and name in ("keel", "keel_fb", "keel3", "keel3_fb") else 0.0)
     return OPTIMIZER_STATE_BYTES.get(name, 8.0)
 
 

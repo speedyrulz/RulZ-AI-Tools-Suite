@@ -384,6 +384,36 @@ and the lookahead's decision score (`face_weight` 0.7 / `body_weight` 0.3, a con
 with `keel_fb`; the log says so when the lookahead is on). The gauge preconditioner, the cautious mask, the band
 normalisation itself, paired sigma, the hook and the lookahead's mechanics are region-neutral.
 
+### 6.1 Keel on Automagic 3 (`keel3`, `keel3_fb`)
+
+`optimizer: keel3` is Keel on Automagic 3's lr controller instead of Automagic 4's, and `optimizer: keel3_fb` is its
+face-and-body version (body share in the gain, magnitude vote), related to `keel3` as `keel_fb` is to `keel`. Why:
+Automagic 4 is unstable on some models (ostris advises Automagic 3; the trainer warns when `automagic4` is chosen),
+so Keel's mechanisms are offered on the stabler controller. In the code Keel's body is a mixin (`_KeelMixin` in
+`optimizers/keel.py`) that `Keel` puts on `Automagic4` and `Keel3` on `Automagic3`: the gauge preconditioner, the
+cautious mask, paired sigma and the noise bands, the consensus gate (both votes), the lookahead and the face-token
+gain (with the body share in `keel3_fb`) are the same code, with the same settings and defaults.
+
+What differs, all of it from Automagic 3 and not from Keel:
+
+- The lr follows Automagic 3's extremes-only vote: only a window of all-agreeing signs votes up and a window of
+  perfect alternation votes down, weighted by the update's size; the pooled vote moves the lr by `exp(vote)` with no
+  cap (no `max_vote`). Automagic 4's graded vote and its `automagic_vote`, `automagic_max_lr_change` and
+  `automagic_sensitivity_quantile` settings do not apply to `keel3` / `keel3_fb`.
+- No sensitivity balance: the step of the most sensitive weights is not capped.
+- Automagic 3's step is whole-tensor (no bucketing, no row slabs): slower than Automagic 4's, and the fine-tune
+  memory table counts it as `automagic3` (18 bytes per weight).
+- The band weight and the consensus gate / face gain reach Automagic 3's update at the places they reach Automagic 4's:
+  the gate before the sign history (the vote sees the gated size), the band weight after the vote and before weight
+  decay (`Automagic3.update_gain` and `_element_gain`, which are neutral on plain `automagic3`).
+
+With every switch off `keel3` is Automagic 3 to the bit (test_keel asserts it), and `keel3_fb` with the magnitude
+vote and the gain off the same. A state resumes between `automagic3`, `keel3`, `automagic4` and `keel` (the extras
+start empty; Automagic 4 and Keel measure their sensitivity reference on the first step).
+
+Not measured: `keel3` and `keel3_fb` have never been run on a real model or GPU; only the CPU tests ran. Race them
+against `keel` and `automagic3` (one change at a time) before relying on them.
+
 ## 7. State, resume, race
 
 - `state_dict()` adds per parameter: `band_ms` and `band_n` ([bands + 1] fp32, built), `anchor` and

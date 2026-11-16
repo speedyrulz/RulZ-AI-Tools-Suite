@@ -102,11 +102,11 @@ _SDXL = [
                       "that way", False),
     _only("body_align", "it reads the transformer blocks' attention and states, which SDXL's UNet does not expose "
                         "that way", False),
-    _forbid("optimizer", "keel_fb and hull read the face-token taps and region gains of the transformer blocks; use "
-                         "adamw, adamw8bit, adafactor, automagic3/4, keel, muon or normuon", "keel_fb", "hull",
-            default="adamw8bit"),
+    _forbid("optimizer", "keel_fb, keel3_fb and hull read the face-token taps and region gains of the transformer "
+                         "blocks; use adamw, adamw8bit, adafactor, automagic3/4, keel, keel3, muon or normuon",
+            "keel_fb", "keel3_fb", "hull", default="adamw8bit"),
     _only("keel_face_gain", "the face-token gain hooks the transformer blocks' outputs, which SDXL does not have in "
-                            "that form", 0.0, when=("optimizer", ("keel", "keel_fb"))),
+                            "that form", 0.0, when=("optimizer", ("keel", "keel_fb", "keel3", "keel3_fb"))),
     _only("training_maps", "its attention heat maps are read inside the transformer blocks, which SDXL's UNet does "
                            "not expose that way", False),
     _only("transformer_quant", "nvfp4 is not available for SDXL's UNet; use auto, none, int8 or int8_convrot (the "

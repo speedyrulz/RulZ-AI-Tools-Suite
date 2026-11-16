@@ -1292,7 +1292,7 @@ def test_keel_fb_is_keel_with_the_body_share_and_the_magnitude_vote():
     from rulztrainer import race as R
     from rulztrainer.finetune import BYTES_PER_PARAM
 
-    assert "keel_fb" in OPTIMIZERS and "keel_fb" in AUTOMAGIC and KEEL == ("keel", "keel_fb")
+    assert "keel_fb" in OPTIMIZERS and "keel_fb" in AUTOMAGIC and KEEL == ("keel", "keel_fb", "keel3", "keel3_fb")
     assert keel_consensus_mode("auto", "keel") == "sign" and keel_consensus_mode("auto", "keel_fb") == "magnitude"
     assert keel_consensus_mode("sign", "keel_fb") == "sign" and keel_consensus_mode("Magnitude", "keel") == "magnitude"
     with pytest.raises(ValueError, match="keel_consensus_mode"):
@@ -1346,3 +1346,249 @@ def test_keel_fb_with_its_switches_off_is_automagic4_bitwise():
     for i in range(4):
         assert _step(ma, pa, oa, i) == _step(mb, pb, ob, i)
     assert all(torch.equal(a, b) for a, b in zip(pa, pb))
+
+
+
+# ---------------------------------------------------------------- Keel on Automagic 3 (keel3, keel3_fb)
+
+
+def test_keel3_with_its_switches_off_is_automagic3_bitwise():
+    from rulztrainer.optimizers.automagic3 import Automagic3
+    from rulztrainer.optimizers.keel import Keel3
+
+    ma, _, pa = _model(40)
+    mb, injb, pb = _model(40)
+    mc, injc, pc = _model(40)
+    oa = build_optimizer(_cfg(optimizer="automagic3"), pa)
+    ob = build_optimizer(_cfg(optimizer="keel3", keel_gauge=False), pb, pairs=lora_mod.lora_pairs(injb))  # bands unseen
+    oc = build_optimizer(_cfg(optimizer="keel3_fb", keel_gauge=False, keel_bands=1), pc,
+                         pairs=lora_mod.lora_pairs(injc))
+    assert isinstance(ob, Keel3) and isinstance(oc, Keel3) and isinstance(oa, Automagic3)
+    assert not isinstance(oa, Keel3) and not isinstance(ob, Keel) and not hasattr(ob, "sensitivity_quantile")
+    assert ob.consensus_mode == "sign" and oc.consensus_mode == "magnitude" and oc.body_weight == 1.0
+    assert len(ob._hook_handles) == len(pb)
+    for i in range(8):
+        la = _step(ma, pa, oa, i)
+        assert la == _step(mb, pb, ob, i) == _step(mc, pc, oc, i, sigma=0.3)
+    assert all(torch.equal(a, b) and torch.equal(a, c) for a, b, c in zip(pa, pb, pc))
+    assert current_lr(oa, None) == current_lr(ob, None) == current_lr(oc, None)
+
+
+def test_keel3_gauge_bands_and_consensus_change_the_step_and_stay_finite():
+    ma, _, pa = _model(41)
+    mb, injb, pb = _model(41)
+    oa = build_optimizer(_cfg(optimizer="automagic3"), pa)
+    cfg = _cfg(optimizer="keel3", keel_band_weights="identity", keel_consensus=0.5)
+    ob = build_optimizer(cfg, pb, pairs=lora_mod.lora_pairs(injb))
+    for i in range(12):
+        _step(ma, pa, oa, i)
+        _step(mb, pb, ob, i, sigma=(0.3 if i % 2 else 0.9))
+    assert any(not torch.equal(a, b) for a, b in zip(pa, pb))
+    assert all(torch.isfinite(p).all() for p in pb)
+    assert cfg.automagic_min_lr <= current_lr(ob, None) <= cfg.automagic_max_lr
+    share = ob.cautious_share()
+    assert share is not None and 0.0 < share <= 1.0
+    rel, counts = ob.band_stats()
+    assert counts[band_of(0.3, 8)] == 6 and counts[band_of(0.9, 8)] == 6
+    assert ob.update_gain is None  # cleared after every step
+    assert not any("sens_ref" in st for st in ob.state.values())  # Automagic 3 has no sensitivity reference
+
+
+def test_update_gain_scales_the_step_and_not_the_decay_on_automagic3():
+    from rulztrainer.optimizers.automagic3 import Automagic3
+
+    torch.manual_seed(4)
+    p0 = torch.randn(8, 6)
+    g = torch.randn(8, 6)
+    runs = {}
+    for gain in (None, 0.5):
+        for wd in (0.0, 0.1):
+            p = torch.nn.Parameter(p0.clone())
+            opt = Automagic3([p], lr=1e-3, fused=False, weight_decay=wd, polarity_history=4)
+            assert opt.update_gain is None and opt._element_gain(p) is None
+            for _ in range(2):
+                p.grad = g.clone()
+                opt.update_gain = gain
+                opt.step()
+            runs[gain, wd] = p0 - p.detach()
+    assert torch.allclose(runs[0.5, 0.0], runs[None, 0.0] * 0.5, rtol=0.03, atol=2e-7)
+    assert runs[None, 0.0].abs().max() > 5e-4
+    # the decay is not scaled by the gain: the difference the decay makes is the same at both gains
+    d_none = runs[None, 0.1] - runs[None, 0.0]
+    d_half = runs[0.5, 0.1] - runs[0.5, 0.0]
+    assert torch.allclose(d_none, d_half, rtol=0.05, atol=2e-7) and d_none.abs().max() > 1e-7
+
+
+def test_keel3_consensus_gate_and_element_gain_reach_automagic3s_update():
+    from rulztrainer.optimizers.keel import Keel3
+
+    torch.manual_seed(9)
+    p0 = torch.randn(8, 8)
+    base = torch.rand(8, 8) + 0.5
+    disagree = torch.zeros(8, 8, dtype=torch.bool)
+    disagree[:4] = True
+    g1 = base.clone()
+    g2 = torch.where(disagree, -0.5 * base, base)
+    moved = {}
+    for consensus in (0.0, 0.5, 1.0):
+        p = torch.nn.Parameter(p0.clone())
+        opt = Keel3([p], lr=1e-3, fused=False, bands=1, consensus=consensus, weight_decay=0.0, polarity_history=4)
+        for _ in range(2):
+            _micro_batches(p, [g1, g2], opt)
+            opt.step()
+        moved[consensus] = (p0 - p.detach()).abs()
+    assert (moved[0.0] > 0).all()
+    assert torch.allclose(moved[0.5][~disagree], moved[0.0][~disagree], rtol=0.03, atol=2e-7)
+    assert torch.allclose(moved[0.5][disagree], moved[0.0][disagree] * 0.5, rtol=0.03, atol=2e-7)
+    assert torch.equal(moved[1.0][disagree], torch.zeros_like(moved[1.0][disagree]))
+    # a hand-set face gain (the token gain's route into _element_gain) scales the second step the same way
+    runs = {}
+    for fg in (1.0, 0.25):
+        p = torch.nn.Parameter(p0.clone())
+        opt = Keel3([p], lr=1e-3, fused=False, bands=1, consensus=0.0, weight_decay=0.0, polarity_history=4,
+                    face_gain=1.0)
+        _micro_batches(p, [g1], opt)
+        opt.step()
+        mid = p.detach().clone()
+        opt.state[p]["face_gain"] = torch.tensor(fg)
+        _micro_batches(p, [g1], opt)
+        opt.step()
+        runs[fg] = (mid - p.detach()).abs()
+    assert runs[1.0].max() > 0 and torch.allclose(runs[0.25], runs[1.0] * 0.25, rtol=0.03, atol=2e-7)
+
+
+def test_keel3_band_weight_is_the_update_gain_of_the_step():
+    from rulztrainer.optimizers.keel import Keel3
+
+    torch.manual_seed(11)
+    p0 = torch.randn(8, 6)
+    g = torch.rand(8, 6) + 0.5
+    moved = {}
+    for weights in (None, [0.5] * 4):
+        p = torch.nn.Parameter(p0.clone())
+        opt = Keel3([p], lr=1e-3, fused=False, bands=4, band_weights=weights, consensus=0.0, weight_decay=0.0,
+                    polarity_history=4)
+        for _ in range(2):
+            opt.zero_grad()
+            opt.observe(0.5)
+            (p * g).sum().backward()
+            opt.step()
+        moved[weights is not None] = (p0 - p.detach()).abs()
+    assert torch.allclose(moved[True], moved[False] * 0.5, rtol=0.03, atol=2e-7)
+
+
+def test_keel3_lookahead_pulls_and_the_state_round_trips(tmp_path):
+    ma, inja, pa = _model(42)
+    cfg = _cfg(optimizer="keel3", keel_lookahead=True, keel_lookahead_grace=0)
+    opt = build_optimizer(cfg, pa, pairs=lora_mod.lora_pairs(inja))
+    for s in range(3):
+        _step(ma, pa, opt, s, sigma=0.3)
+    assert opt.on_probe(55.0, 1.0) == "anchor"
+    anchor = [opt.state[p]["anchor"].clone() for p in pa]
+    for s in range(3, 6):
+        _step(ma, pa, opt, s, sigma=0.3)
+    before = [p.detach().clone() for p in pa]
+    assert any(not torch.equal(a, b) for a, b in zip(anchor, before))
+    lr_before = [float(opt.state[p]["lr"]) for p in pa]
+    assert opt.on_probe(50.0, 1.0) == "pull"
+    for p, x, a in zip(pa, before, anchor):
+        assert torch.allclose(p.detach(), torch.lerp(x, a, 0.5), atol=1e-7)
+    for p, lr in zip(pa, lr_before):
+        assert float(opt.state[p]["lr"]) == pytest.approx(max(lr * 0.7, cfg.automagic_min_lr), rel=1e-5)
+    # save / load round trip: lr, band statistics and the anchor come back exactly
+    torch.save(opt.state_dict(), tmp_path / "keel3.pt")
+    saved = torch.load(tmp_path / "keel3.pt", weights_only=False)
+    mb, injb, pb = _model(42)
+    ob = build_optimizer(cfg, pb, pairs=lora_mod.lora_pairs(injb))
+    ob.load_state_dict(saved)
+    assert abs(current_lr(ob, None) - current_lr(opt, None)) < 1e-6 * current_lr(opt, None)
+    assert ob.anchor_score == 55.0
+    for a, b in zip(pa, pb):
+        assert torch.equal(ob.state[b]["anchor"], opt.state[a]["anchor"])
+        assert torch.equal(ob.state[b]["band_ms"], opt.state[a]["band_ms"])
+    _step(mb, pb, ob, 7, sigma=0.3)
+    assert all(torch.isfinite(p).all() for p in pb)
+    # a keel3 state resumes under automagic3, automagic4 and keel, and an automagic3 state under keel3
+    for name in ("automagic3", "automagic4", "keel"):
+        m, inj, p = _model(42)
+        o = build_optimizer(_cfg(optimizer=name), p, pairs=lora_mod.lora_pairs(inj))
+        o.load_state_dict(saved)
+        _step(m, p, o, 8)
+        assert all(torch.isfinite(t).all() for t in p)
+    m3, inj3, p3 = _model(42)
+    o3 = build_optimizer(_cfg(optimizer="automagic3"), p3)
+    for s in range(3):
+        _step(m3, p3, o3, s)
+    o4 = build_optimizer(cfg, p3, pairs=lora_mod.lora_pairs(inj3))
+    o4.load_state_dict(o3.state_dict())
+    assert abs(current_lr(o4, None) - current_lr(o3, None)) < 1e-6 * current_lr(o3, None)
+    _step(m3, p3, o4, 9, sigma=0.3)
+    # a keel (Automagic 4) state under keel3 drops its sensitivity reference, which keel3 would never update
+    mk, injk, pk = _model(42)
+    ok = build_optimizer(_cfg(optimizer="keel"), pk, pairs=lora_mod.lora_pairs(injk))
+    for s in range(3):
+        _step(mk, pk, ok, s, sigma=0.3)
+    assert any("sens_ref" in st for st in ok.state.values())
+    o5 = build_optimizer(cfg, pk, pairs=lora_mod.lora_pairs(injk))
+    o5.load_state_dict(ok.state_dict())
+    assert not any("sens_ref" in st for st in o5.state.values())
+
+
+def test_keel3_late_joining_parameter_starts_at_the_groups_lr():
+    from rulztrainer.optimizers.keel import Keel3
+
+    torch.manual_seed(12)
+    a = torch.nn.Parameter(torch.randn(6, 4))
+    b = torch.nn.Parameter(torch.randn(6, 4))
+    opt = Keel3([a, b], lr=1e-3, min_lr=1e-6, fused=False, bands=1, consensus=0.0, polarity_history=2)
+    for _ in range(6):  # b has no gradient: only a trains and its lr moves
+        a.grad = torch.randn(6, 4)
+        opt.step()
+    lr_a = float(opt.state[a]["lr"])
+    assert lr_a != pytest.approx(1e-3, rel=1e-2) and b not in opt.state
+    a.grad, b.grad = torch.randn(6, 4), torch.randn(6, 4)
+    opt.step()
+    # b started at a's adapted lr (the two are nudged alike from then on), not at the 1e-3 start
+    assert float(opt.state[b]["lr"]) == pytest.approx(float(opt.state[a]["lr"]), rel=1e-6)
+
+
+def test_keel3_config_and_trainer_wiring():
+    from rulztrainer import race as R
+    from rulztrainer.finetune import BYTES_PER_PARAM
+    from rulztrainer.optimizers.keel import Keel3
+    from rulztrainer.runplan import optimizer_state_bytes
+
+    for name in ("keel3", "keel3_fb"):
+        assert name in OPTIMIZERS and name in AUTOMAGIC and name in KEEL
+        _cfg(optimizer=name).validate()
+        assert pairs_sigma(_cfg(optimizer=name))
+        assert optimizer_state_bytes(name, 8, True) == optimizer_state_bytes("keel", 8, True) == 5.0
+    assert keel_consensus_mode("auto", "keel3") == "sign" and keel_consensus_mode("auto", "keel3_fb") == "magnitude"
+    assert BYTES_PER_PARAM["keel3"] == BYTES_PER_PARAM["keel3_fb"] == BYTES_PER_PARAM["automagic3"]
+    with pytest.raises(ValueError, match="keel_body_weight"):
+        _cfg(optimizer="keel3_fb", keel_body_weight=-0.5).validate()
+    fb = _cfg(optimizer="keel3_fb", keel_face_gain=1.0)
+    assert fb.wants_person_masks() and fb.wants_regions()
+    assert not _cfg(optimizer="keel3_fb").wants_person_masks()
+    assert _cfg(optimizer="keel3", keel_face_gain=1.0).wants_regions()
+    assert not _cfg(optimizer="keel3", keel_face_gain=1.0).wants_person_masks()
+    TrainConfig(race=True, probe_every=10, face_refs=["ref.png"], steps=60, race_configs=[
+        {"name": "a", "optimizer": "keel"}, {"name": "b", "optimizer": "keel3"},
+        {"name": "c", "optimizer": "keel3_fb", "keel_consensus_mode": "sign"}]).validate()
+    assert "optimizer" in R.RACE_KEYS["LR & optimizer"]
+    # build_optimizer: the class and the settings resolved per name; Automagic 4's settings never reach it
+    model, injected, params = _model(43)
+    pairs = lora_mod.lora_pairs(injected)
+    fbo = build_optimizer(_cfg(optimizer="keel3_fb", keel_face_gain=1.0, automagic_vote="extremes",
+                               automagic_max_lr_change=0.2), params, pairs=pairs)
+    assert isinstance(fbo, Keel3) and fbo.consensus_mode == "magnitude" and fbo.body_weight == 1.0
+    plain = build_optimizer(_cfg(optimizer="keel3", keel_face_gain=1.0, keel_body_weight=2.0), params, pairs=pairs)
+    assert isinstance(plain, Keel3) and plain.consensus_mode == "sign" and plain.body_weight == 0.0
+    assert not hasattr(plain, "max_vote") and not hasattr(plain, "vote") and not isinstance(plain, Automagic4)
+    for i in range(3):
+        _step(model, params, plain, i, sigma=0.3)
+    fbo.load_state_dict(plain.state_dict())
+    _step(model, params, fbo, 3, sigma=0.3)
+    plain.load_state_dict(fbo.state_dict())
+    _step(model, params, plain, 4, sigma=0.3)
+    assert all(torch.isfinite(t).all() for t in params)

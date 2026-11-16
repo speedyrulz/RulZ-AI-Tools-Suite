@@ -30,14 +30,18 @@ MODEL_PRESETS = {
     "MiniMax-H3-Ref2VA": "MiniMaxAI/MiniMax-H3#ref2va",
 }
 ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "flux3_klein", "flux2_klein", "minimax_h3")
-OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4", "keel", "keel_fb", "hull", "muon",
-              "normuon")
+OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4", "keel", "keel_fb", "keel3",
+              "keel3_fb", "hull", "muon", "normuon")
 # Layer groups Muon's authors, Moonshot and OneTrainer keep on AdamW (embedders, modulation, text projection, final
 # layer): RulzTrainer's muon / normuon orthogonalize them too and warn when they are trained.
 MUON_EDGE_TARGETS = ("embed", "modulation", "text_in")
-AUTOMAGIC = ("automagic3", "automagic4", "keel", "keel_fb")  # self-tuning lr: no schedule, no LoRA+, no per-image lr
-KEEL = ("keel", "keel_fb")  # Keel and its face-and-body version: one class (optimizers/keel.py), keel_fb with the
+AUTOMAGIC = ("automagic3", "automagic4", "keel", "keel_fb", "keel3", "keel3_fb")  # self-tuning lr: no schedule, no LoRA+,
+#                                                                                   no per-image lr
+KEEL = ("keel", "keel_fb", "keel3", "keel3_fb")  # Keel and its face-and-body version, on Automagic 4 (keel, keel_fb) or
+#                             Automagic 3 (keel3, keel3_fb): one mixin (optimizers/keel.py), the _fb names with the
 #                             body share in the token gain and the magnitude vote in the consensus gate
+KEEL_FB = ("keel_fb", "keel3_fb")  # the face-and-body versions
+KEEL_ON_A3 = ("keel3", "keel3_fb")  # Keel on Automagic 3: no sensitivity balance, no vote setting, no max lr change
 KEEL_CONSENSUS_MODES = ("auto", "sign", "magnitude")
 KEEL_BAND_LOGIT_RANGE = 4.0  # Keel's noise bands span logit(sigma) in [-range, range] (sigma 0.018 to 0.982)
 
@@ -78,13 +82,13 @@ def keel_band_weights(spec: str, bands: int) -> list[float] | None:
 
 
 def keel_consensus_mode(spec: str, optimizer: str) -> str:
-    """keel_consensus_mode resolved for an optimizer: auto = sign for keel, magnitude for keel_fb. Raises ValueError
+    """keel_consensus_mode resolved for an optimizer: auto = sign for keel / keel3, magnitude for keel_fb / keel3_fb. Raises ValueError
     on a bad spec."""
     s = (spec or "auto").strip().lower()
     if s not in KEEL_CONSENSUS_MODES:
         raise ValueError(f"keel_consensus_mode must be auto, sign or magnitude, got {spec!r}")
     if s == "auto":
-        return "magnitude" if (optimizer or "").lower() == "keel_fb" else "sign"
+        return "magnitude" if (optimizer or "").lower() in KEEL_FB else "sign"
     return s
 
 
@@ -613,6 +617,8 @@ class TrainConfig:
     optimizer: str = "adamw"  # adamw | adamw8bit | adafactor | automagic3 | automagic4 | keel (Automagic 4 for
     #                           character LoRAs: docs/keel-optimizer.md) | keel_fb (Keel for the face and the body
     #                           alike: the body share in the token gain, the magnitude vote in the consensus gate)
+    #                           | keel3 / keel3_fb (the same two on Automagic 3's lr controller, the stabler one: its
+    #                           extremes-only vote, no sensitivity balance; 3.27.0, never run on a real model)
     #                           | hull | muon (orthogonalized momentum, step matched to AdamW's: AdamW's rates apply)
     #                           | normuon (muon with each row's step evened out; experimental, untested)
     weight_decay: float = 0.01
@@ -1631,7 +1637,7 @@ class TrainConfig:
         """Person masks in the region maps: the region-weighted loss's person weight, attention localization's
         subject, body alignment, the face-and-body Keel's token gain (its body share)."""
         return bool(self.region_weights or self.attn_localize or self.body_align
-                    or (self.optimizer.lower() == "keel_fb" and self.keel_face_gain > 0 and self.keel_body_weight > 0))
+                    or (self.optimizer.lower() in KEEL_FB and self.keel_face_gain > 0 and self.keel_body_weight > 0))
 
     def resolved_cache_dir(self) -> Path:
         """The run's cache (text embeddings, face analysis, loss-watch exclusions): cache_dir, else the first

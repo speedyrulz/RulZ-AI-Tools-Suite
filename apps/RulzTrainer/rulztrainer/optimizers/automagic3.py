@@ -207,6 +207,9 @@ class Automagic3(torch.optim.Optimizer):
                 f"Note: start lr {lr} is high; the controller will correct it "
                 f"(the pooled vote will walk it down)."
             )
+        # A multiplier on this step's update (not on the weight decay), set per step by a subclass (Keel on Automagic 3:
+        # the noise-band weight) and None otherwise; applied after the vote, which a positive gain leaves unchanged.
+        self.update_gain = None
         defaults = dict(
             lr=lr,
             min_lr=min_lr,
@@ -416,6 +419,12 @@ class Automagic3(torch.optim.Optimizer):
 
         return _hook
 
+    def _element_gain(self, p: torch.Tensor, i0: int = 0, i1=None):
+        # An elementwise multiplier on p's update (rows i0:i1 of a 2-D tensor when given; a 0-dim tensor for the whole
+        # tensor), applied after the clamp and before the sign history so the vote sees the gated magnitude, or None:
+        # a hook for a subclass (Keel on Automagic 3: the consensus gate and the face-token gain).
+        return None
+
     # -------------------------------------------------------------- per-param
 
     @torch.no_grad()
@@ -491,6 +500,9 @@ class Automagic3(torch.optim.Optimizer):
         # distorting the model. Cap each element to clip_threshold (a true
         # max-norm trust region) so no single weight can take an outsized step.
         update.clamp_(-group["clip_threshold"], group["clip_threshold"])
+        gain = self._element_gain(p)  # None unless a subclass gates the update (Keel on Automagic 3)
+        if gain is not None:
+            update.mul_(gain)
 
         # Direction-consistency lr control (the vote rule -- see the class
         # docstring). The second-moment scale, RMS clip and clamp are all
@@ -550,6 +562,9 @@ class Automagic3(torch.optim.Optimizer):
                     self._group_den[gi].add_(den)
 
         state["step"] += 1
+
+        if self.update_gain is not None:
+            update.mul_(self.update_gain)
 
         wd = group["weight_decay"]
 
