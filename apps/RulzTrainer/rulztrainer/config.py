@@ -591,7 +591,10 @@ class TrainConfig:
     #                           | hull | muon (orthogonalized momentum, step matched to AdamW's: AdamW's rates apply)
     #                           | normuon (muon with each row's step evened out; experimental, untested)
     weight_decay: float = 0.01
-    automagic_min_lr: float = 1e-8  # automagic3/4: hard floor for the adapted lr
+    automagic_min_lr: float = 2e-5  # automagic3/4 and keel: hard floor for the adapted lr. Was 1e-8 to 3.23.0:
+    #                                 the community saw Automagic's lr sink to 1e-5 and below and learning stop
+    #                                 (ostris; Qwen-Image 2.1, FLUX.3, MOSS, FIBO 2, Ideogram), fixed with a floor of
+    #                                 2e-5 to 3e-5. A floor at or above learning_rate drops to a fifth of it
     automagic_max_lr: float = 1e-3  # automagic3/4: hard ceiling for the adapted lr (about 10x the start lr)
     automagic_polarity_history: int = 8  # automagic3/4: sign-history window (2-64)
     automagic_clip_threshold: float = 1.0  # automagic3/4: update trust region

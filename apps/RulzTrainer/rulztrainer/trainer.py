@@ -524,7 +524,7 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None, ref_norms=None, scales
                 params = [p for g in params for p in g["params"]]
             else:  # automagic_groups: by_type, each layer type adapts its own lr from the shared start
                 params = [{"params": g["params"]} for g in params]
-        kw = dict(lr=cfg.learning_rate, min_lr=cfg.automagic_min_lr, max_lr=cfg.automagic_max_lr,
+        kw = dict(lr=cfg.learning_rate, min_lr=automagic_floor(cfg), max_lr=cfg.automagic_max_lr,
                   weight_decay=cfg.weight_decay, polarity_history=cfg.automagic_polarity_history,
                   clip_threshold=cfg.automagic_clip_threshold, fused=False)
         if name in KEEL:
@@ -550,6 +550,9 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None, ref_norms=None, scales
         if name == "automagic4":
             from .optimizers.automagic4 import Automagic4
 
+            log.warning("automagic4 is unstable on some models: ostris (its author) advises automagic3 until a rework "
+                        "(8 Nov 2026), and a P-H3-Image run it ruined trained fine on automagic3")
+
             return Automagic4(params, sensitivity_quantile=cfg.automagic_sensitivity_quantile, vote=cfg.automagic_vote,
                               max_vote=cfg.automagic_max_lr_change, **kw)
         from .optimizers.automagic3 import Automagic3
@@ -561,6 +564,27 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None, ref_norms=None, scales
 def limit_step_mult(cfg: TrainConfig, mult: float) -> float:
     """A step's lr multiplier: nothing loss-driven may raise Hull's step."""
     return min(mult, 1.0) if cfg.optimizer.lower() == "hull" else mult
+
+
+def automagic_floor(cfg: TrainConfig) -> float:
+    """The adapted lr's floor for automagic3/4 and keel: automagic_min_lr, or a fifth of learning_rate when the
+    floor is not below it (a start lr under the floor would otherwise be pushed up to it)."""
+    floor = float(cfg.automagic_min_lr)
+    if floor >= cfg.learning_rate:
+        floor = cfg.learning_rate * 0.2
+        log.info("automagic_min_lr %g is not below learning_rate %g: the adapted lr's floor is %g",
+                 cfg.automagic_min_lr, cfg.learning_rate, floor)
+    return floor
+
+
+LR_FLOOR_WARN_STEPS = 100  # steps the adapted lr sits on its floor before the run says so
+
+
+def lr_at_floor(optimizer, lr_now: float) -> bool:
+    """True when a self-tuning optimizer's average adapted lr is on (within 5% of) its floor."""
+    groups = getattr(optimizer, "param_groups", None) or []
+    floor = groups[0].get("min_lr") if groups else None
+    return floor is not None and lr_now <= float(floor) * 1.05
 
 
 def current_lr(optimizer, scheduler) -> float:
@@ -685,6 +709,7 @@ class Trainer(RaceParallelMixin):
         self.probe_worker = None  # probeworker.ProbeProcess: probes render on a second GPU (probe_async)
         self.race_base = None  # the run's own config when racing (the configurations change parts of it)
         self.race_rows = None  # [(name, config, overrides)] of the race
+        self._lr_floor_steps, self._lr_floor_warned = 0, False  # steps a self-tuning lr has sat on its floor
         self.race_layouts = None  # [(blocks, LoRA module names)] per configuration
         self.race_union_names = None  # the LoRA wrappers: every configuration's modules together
         self.race_region_dirs: dict[str, Path | None] = {}  # configuration -> its own region-map folder
@@ -1085,6 +1110,20 @@ class Trainer(RaceParallelMixin):
             out.append((te2, tok2, d))
         return out
 
+    # MiniMax H3 trained on stills only: the first 20 blocks carry motion. Training all 50 on photos cut motion by
+    # about half in the community's tests (johndopamine, davidsnow1; Fizgig skips blocks 0-19 for photos)
+    H3_STILL_BLOCKS = "20-49"
+
+    def _h3_still_blocks(self, cfg: TrainConfig, clips: list) -> None:
+        """A MiniMax H3 run with no clips and no lora_blocks trains blocks 20-49 (lora_blocks "all" keeps every
+        block). Not on a resume or a race, whose LoRA layout is already set."""
+        if (self.arch.name != "minimax_h3" or clips or (cfg.lora_blocks or "").strip() or cfg.resume_from
+                or cfg.resume_state or cfg.race or self.race_rows):
+            return
+        cfg.lora_blocks = self.H3_STILL_BLOCKS
+        log.info("MiniMax H3 on stills only: training blocks %s to keep the video model's motion (set lora_blocks "
+                 "to all to train every block)", self.H3_STILL_BLOCKS)
+
     def run(self):
         try:
             self._run()
@@ -1141,6 +1180,7 @@ class Trainer(RaceParallelMixin):
         # held-out photos, the look filter; their batches train on the plain loss (load_batch gives them no regions)
         clips = [it for it in items if it.frames > 1]
         items = [it for it in items if it.frames <= 1]
+        self._h3_still_blocks(cfg, clips)
         log.info("Dataset: %d images%s in %s", len({it.image for it in items}),
                  f" and {len(clips)} video clips of {clips[0].frames} frames" if clips else "",
                  ", ".join(spec.path for spec in cfg.dataset_specs()))
@@ -1801,6 +1841,13 @@ class Trainer(RaceParallelMixin):
             total_steps = self.race.estimate["total"] if self.race is not None else cfg.steps - start_step
             eta = elapsed / done_steps * max(0, total_steps - compute_done)
             lr_now = current_lr(optimizer, scheduler)
+            if cfg.optimizer.lower() in AUTOMAGIC and not self._lr_floor_warned:
+                self._lr_floor_steps = self._lr_floor_steps + 1 if lr_at_floor(optimizer, lr_now) else 0
+                if self._lr_floor_steps >= LR_FLOOR_WARN_STEPS:
+                    self._lr_floor_warned = True
+                    log.warning("%s's adapted lr has sat on its floor (%.3g) for %d steps: learning may have "
+                                "stalled. Check the samples; raise automagic_min_lr or switch to adamw if it has",
+                                cfg.optimizer, lr_now, LR_FLOOR_WARN_STEPS)
             id_extra = {}
             if step_id:
                 n_id = sum(r[1] for r in step_id)

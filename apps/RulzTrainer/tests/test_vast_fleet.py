@@ -1046,7 +1046,7 @@ def test_a_sent_config_keeps_its_small_numbers():
 
     from rulztrainer.config import TrainConfig
 
-    cfg = TrainConfig(datasets=[{"path": "a"}], learning_rate=5e-05)
+    cfg = TrainConfig(datasets=[{"path": "a"}], learning_rate=5e-05, automagic_min_lr=1e-08)  # the old default
     sent = fleet_module.config_bytes(cfg.to_dict())
     back = yaml.safe_load(sent.decode("utf-8"))
     assert back == cfg.to_dict()  # every number a number again
