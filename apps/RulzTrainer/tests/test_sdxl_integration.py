@@ -143,6 +143,8 @@ def test_fresh_sdxl_config_validates_and_clamps_the_text_length():
     assert cfg.resolved_lora_targets() == list(arch_by_name("sdxl").default_targets)
     sdxl_cfg(timestep_sampling="reference", loss_weighting="min_snr", isolation=True).validate()
     sdxl_cfg(optimizer="keel", compile_model=False, transformer_quant="none", checkpoint_keep_blocks=0).validate()
+    for quant in ("int8", "int8_convrot"):  # the UNet's transformer-block linears quantize (sdxl/loading.py)
+        sdxl_cfg(transformer_quant=quant).validate()
 
 
 def test_prediction_settings_are_checked():
@@ -164,7 +166,7 @@ REFUSALS = [
     ({"optimizer": "keel_fb"}, "keel_fb"),
     ({"optimizer": "hull", "hull_rho": 0.01}, "hull"),
     ({"training_maps": True}, "training_maps"),
-    ({"transformer_quant": "int8"}, "transformer_quant"),
+    ({"transformer_quant": "nvfp4"}, "transformer_quant"),
     ({"compile_model": True}, "compile_model"),
     ({"train_frames": 4}, "train_frames"),
     ({"loss_type": "band"}, "loss_type"),

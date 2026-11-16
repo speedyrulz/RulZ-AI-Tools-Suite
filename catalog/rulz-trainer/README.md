@@ -651,7 +651,7 @@ the file was there):
 | P-H3-Image | [PrunaAI/P-H3-Image-Comfy](https://huggingface.co/PrunaAI/P-H3-Image-Comfy) | int8_convrot 21.2 GB, bf16 40.5 GB (both pruned; the w4a8 file reads when you set it yourself) | Qwen3-VL-4B + text connector int8_convrot 5.1 GB, bf16 9.1 GB | `p-h3-image_vae_bf16` (5.6 GB) |
 | MiniMax-H3-Image | [Comfy-Org/MiniMax-H3-Image](https://huggingface.co/Comfy-Org/MiniMax-H3-Image) | int8_convrot 21.0 GB, bf16 40.2 GB, w4a8 12.5 GB (all pruned; w4a8 holds int8 weights once read) | MiniMax H3's Qwen3-VL-32B files, from Comfy-Org/MiniMax-H3 (the same bytes) | `minimax_h3_image_vae_fp16` (1.2 GB) |
 | PAN 2 | none published: make them once from [IFM/PAN2](https://huggingface.co/IFM/PAN2) with `scripts/pan2/convert_pan2.py` and set all three file fields | see [PAN 2](#pan-2) | Qwen3.5-9B (30 of its 32 layers), from the same converter | Wan 2.2 VAE, from the same converter |
-| SDXL (and fine-tunes) | none: nothing is downloaded from Comfy-Org. Set `transformer_file` to one all-in-one `.safetensors` checkpoint (for example `sd_xl_base_1.0.safetensors`), or use the Hugging Face source | the checkpoint's UNet (about 5 GB in bf16; no quantized form) | both CLIP text encoders (CLIP-L and OpenCLIP bigG, about 1.6 GB), read from the checkpoint unless `text_encoder_file` is set | the checkpoint's VAE, kept in fp32, unless `vae_file` is set |
+| SDXL (and fine-tunes) | none: nothing is downloaded from Comfy-Org. Set `transformer_file` to one all-in-one `.safetensors` checkpoint (for example `sd_xl_base_1.0.safetensors`), or use the Hugging Face source | the checkpoint's UNet (about 5 GB in bf16; `transformer_quant` int8 / int8_convrot quantizes its transformer blocks while loading, about 3 GB) | both CLIP text encoders (CLIP-L and OpenCLIP bigG, about 1.6 GB), read from the checkpoint unless `text_encoder_file` is set | the checkpoint's VAE, kept in fp32, unless `vae_file` is set |
 
 To use files you already have, set `transformer_file`, `text_encoder_file` and `vae_file` (the WebUI's optional file
 fields): only the ones left empty are downloaded. Fused-qkv ("repacked") files are split back automatically. The
@@ -883,6 +883,26 @@ again on PyTorch's pick; the log says so. Set `attention_backend: torch` to skip
 covers training steps only: a sample or probe render that hits the error still fails. The backend's name is also part
 of torch.compile's cache keys from v3.6.2 on, so a run with another backend never gets the first one's graphs back
 from the compile cache (older cache files compile once more).
+
+## Settings a model cannot use
+
+Since 3.26.0, picking a model in the WebUI greys out the settings that model cannot use, on the Train tab and in the
+Wizard, with an orange line under the setting: *Not available for SDXL: ...*. Picking another model turns them back on.
+One table (`rulztrainer/capabilities.py`) holds every rule, and the run-start check reads the same table, so the WebUI
+and a run cannot disagree. There are two kinds:
+
+- **Refused**: the run would fail or train something other than you asked. The setting is put back to its default
+  (once, with a message naming it), a choice list loses the values the model refuses (for SDXL the optimizer list has
+  no `keel_fb` or `hull`, the quantization list no `nvfp4`), and a config file that sets one stops the run at the start
+  with the reason. Today these are SDXL's (see [SDXL](#sdxl)) and clip frames above 1 on a model that is not a video
+  model (only MiniMax H3 and PAN 2 are).
+- **Ignored**: the model never reads the setting, so it does nothing there. It is greyed out but keeps its value, so a
+  switch to another model and back loses nothing. These are the sampling **Shift** and skip-layer guidance (only
+  MOSS-Image reads them), SDXL's prediction and zero-terminal-SNR settings on every other model, the clip mode on a
+  model that trains on stills, and text-encoder quantization on SDXL.
+
+Configuration-race rows are not greyed out (they are free text); a row that sets a refused value is stopped by the same
+check when the race starts.
 
 ## Training resolutions and resolution step-up
 
@@ -4056,13 +4076,22 @@ text encoders are read from the same file unless you set `vae_file` / `text_enco
 Comfy-Org for SDXL (the quantization and download-format choices do not apply). A checkpoint is recognized as SDXL by
 its header, so a file named `ponyDiffusionV6XL.safetensors` or `illustrious.safetensors` needs no extra setting.
 
-**What is refused.** Each of these stops the run at the start with a message naming the setting: `block_swap`,
-`multi_gpu: model_split`, `activation_offload`, `checkpoint_keep_blocks` above 0, `attn_localize`, `id_align`,
-`body_align`, `training_maps`, the `keel_fb` and `hull` optimizers, a Keel face gain above 0, `transformer_quant`
-other than auto or none, `compile_model: true`, `loss_type` other than mse, `loss_weighting: sigma_sqrt`,
-`finetune`, `network_type` other than lora, `dora`, `train_text_embedder`, a set `turbo_lora`, `sample_lora` or
-`training_adapter`, and video clips. Data parallel on two GPUs works. The other optimizers (adamw, adamw8bit,
-adafactor, automagic3 / 4, keel, muon, normuon) work.
+**What is refused.** Picking SDXL greys these out in the WebUI (Train tab and Wizard) with the reason, and a config
+file that sets one stops the run at the start with a message naming the setting (since 3.26.0 both read one table,
+see [Settings a model cannot use](#settings-a-model-cannot-use)): `block_swap`, `multi_gpu: model_split`,
+`activation_offload`, `checkpoint_keep_blocks` above 0, `attn_localize`, `id_align`, `body_align`, `training_maps`,
+the `keel_fb` and `hull` optimizers, a Keel face gain above 0, `transformer_quant: nvfp4`, `compile_model: true`,
+`loss_type` other than mse, `loss_weighting: sigma_sqrt`, `finetune`, `network_type` other than lora, `dora`,
+`train_text_embedder`, a set `turbo_lora`, `sample_lora` or `training_adapter`, and video clips. Data parallel on two
+GPUs works. The other optimizers (adamw, adamw8bit, adafactor, automagic3 / 4, keel, muon, normuon) work.
+
+**int8 UNet** (since 3.26.0). `transformer_quant: int8` or `int8_convrot` trains the LoRA on a UNet whose transformer
+blocks hold int8 weights: the plain linear layers of their attention and feed-forward (640 wide and up). The
+convolutions, norms, embeddings and each transformer's `proj_in` / `proj_out` stay bf16, so the saving is about 2 GB
+of the UNet's 5 GB. The sample model follows `sample_model_quant` the same way. The LoRA file is unchanged (same keys
+as on the bf16 UNet). `nvfp4` is refused, and the CLIP text encoders are not quantized (`text_encoder_quant` is
+greyed out). Unit-tested on small random UNets only: not run on the real model or a GPU, and the quality cost is not
+measured.
 
 **The LoRA file.** Saved in kohya's format: `lora_unet_<UNet module path with underscores>.lora_down.weight`,
 `.lora_up.weight` and `.alpha`, the layout ComfyUI's *Load LoRA* node, AUTOMATIC1111 and kohya's own scripts read.

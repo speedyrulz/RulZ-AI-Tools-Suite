@@ -319,14 +319,41 @@ def grad_vae(vae):
 # ---------------------------------------------------------------- loaders
 
 
+def _validate_quant(quant):
+    if quant not in (None, "none", "auto", "int8", "int8_convrot"):
+        raise ValueError(f"SDXL UNet quantization {quant!r} is unsupported; use none, auto, int8 or int8_convrot")
+
+
+def _quantize_unet(unet, quant, device):
+    _validate_quant(quant)
+    if quant in (None, "none", "auto"):
+        return unet
+    from .. import quant as Q
+    from ..moss.single_file import quant_target
+
+    target = quant_target(device)
+    Q.quantize_module_linears(unet, quant, min_dim=512, log=log,
+                              name_filter=lambda name: "transformer_blocks." in name,
+                              work_device=target.get("work_device"))
+    return unet
+
+
 def load_unet_dir(model_dir: Path, device, prediction_type: str = "epsilon", zero_terminal_snr: bool = False,
-                  dtype=torch.bfloat16) -> SdxlUNet:
+                  dtype=torch.bfloat16, quant: str = "auto") -> SdxlUNet:
+    _validate_quant(quant)
     from diffusers import UNet2DConditionModel
 
     d = Path(model_dir) / "unet"
     variant = _variant(d, "unet")
     unet = UNet2DConditionModel.from_pretrained(str(d), torch_dtype=dtype, variant=variant)
-    model = SdxlUNet(unet, prediction_type, zero_terminal_snr)
+    model = SdxlUNet(_quantize_unet(unet, quant, device), prediction_type, zero_terminal_snr)
+    return model.to(device).eval().requires_grad_(False)
+
+
+def load_unet_file(path, device, prediction_type="epsilon", zero_terminal_snr=False, quant="auto"):
+    _validate_quant(quant)
+    unet = sf.load_unet_file(path, "cpu")
+    model = SdxlUNet(_quantize_unet(unet, quant, device), prediction_type, zero_terminal_snr)
     return model.to(device).eval().requires_grad_(False)
 
 
@@ -395,20 +422,21 @@ def resolve_for_config(cfg: TrainConfig) -> Path | None:
     return resolve_model_dir(cfg.model_path, cfg.models_dir)
 
 
-def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None = None, **ignored) -> SdxlUNet:
-    """bf16, frozen. Extra keyword arguments (model split, block-swap staging, quantization hints the other families
-    take) are accepted and ignored: SDXL loads whole and unquantized."""
+def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None = None,
+                    quant: str = "auto", **ignored) -> SdxlUNet:
+    """Load a frozen UNet, optionally quantizing its transformer-block linears."""
+    _validate_quant(quant)
     dev = device or cfg.device
     path = _checkpoint(cfg, "transformer_file")
     if path:
         if not Path(path).is_file():
             raise FileNotFoundError(f"transformer_file does not exist: {path!r}")
         pred, ztsnr = resolve_prediction(cfg, path)
-        model = SdxlUNet(sf.load_unet_file(path, "cpu"), pred, ztsnr).to(dev).eval().requires_grad_(False)
+        model = load_unet_file(path, dev, pred, ztsnr, quant)
     else:
         d = _need_dir(model_dir, "checkpoint")
         pred, ztsnr = resolve_prediction(cfg, d)
-        model = load_unet_dir(d, dev, pred, ztsnr)
+        model = load_unet_dir(d, dev, pred, ztsnr, quant=quant)
     log.info("Loaded SDXL UNet: %d transformer blocks, %s prediction%s", len(model.layers), pred,
              ", zero terminal SNR" if ztsnr else "")
     return model
@@ -440,15 +468,15 @@ def get_text_encoder(cfg: TrainConfig, model_dir: Path | None):
 
 
 def load_any_transformer(path: str, device, quant: str = "auto", models_dir: str = "models") -> SdxlUNet:
-    """A UNet from a single .safetensors file, a diffusers folder, or a HF repo id (prediction type auto-detected;
-    `quant` is accepted for the shared signature and ignored)."""
+    """A UNet from a single file, diffusers folder, or HF repo id."""
+    _validate_quant(quant)
     class _Auto:
         sdxl_prediction, sdxl_zero_terminal_snr = "auto", False
 
     p = Path(path).expanduser()
     if p.is_file():
         pred, ztsnr = resolve_prediction(_Auto, p)
-        return SdxlUNet(sf.load_unet_file(p, "cpu"), pred, ztsnr).to(device).eval().requires_grad_(False)
+        return load_unet_file(p, device, pred, ztsnr, quant)
     d = p if p.is_dir() else resolve_model_dir(path, models_dir)
     pred, ztsnr = resolve_prediction(_Auto, d)
-    return load_unet_dir(d, device, pred, ztsnr)
+    return load_unet_dir(d, device, pred, ztsnr, quant=quant)
