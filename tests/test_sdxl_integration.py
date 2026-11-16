@@ -1,5 +1,6 @@
 """SDXL in the trainer's registry, config, noise levels, loss weights and LoRA layer choice (CPU only). The family's
 own package (rulztrainer.sdxl) is tested in test_sdxl.py; this covers what the trainer does around it."""
+import dataclasses
 import json
 import math
 import types
@@ -173,7 +174,6 @@ REFUSALS = [
     ({"loss_type": "band"}, "loss_type"),
     ({"loss_weighting": "sigma_sqrt"}, "sigma_sqrt"),
     ({"finetune": True}, "finetune"),
-    ({"turbo_lora": "x.safetensors"}, "turbo_lora"),
     ({"sample_lora": "x.safetensors"}, "sample_lora"),
     ({"training_adapter": "x.safetensors"}, "training_adapter"),
     ({"checkpoint_keep_blocks": 3}, "checkpoint_keep_blocks"),
@@ -207,14 +207,21 @@ def test_single_file_downloads_for_sdxl(tmp_path):
     f = tmp_path / "sd_xl_base_1.0.safetensors"
     f.write_bytes(b"")
     cfg = TrainConfig(model_arch="sdxl", model_source="files", transformer_file=str(f))
-    assert planned_downloads(cfg) == []  # one all-in-one file: nothing fetched, VAE / text encoders = the same file
-    out = resolve_downloads(cfg)
+    turbo = ("turbo_lora", "tianweiy/DMD2", "dmd2_sdxl_4step_lora.safetensors")
+    # one all-in-one file: only the DMD2 turbo LoRA is fetched, VAE / text encoders = the same file
+    assert planned_downloads(cfg) == [turbo]
+    assert planned_downloads(TrainConfig(model_arch="sdxl", model_source="files", transformer_file=str(f),
+                                         turbo_lora="")) == []
+    # no file set: the base 1.0 checkpoint with the 0.9 VAE is downloaded
+    assert planned_downloads(TrainConfig(model_arch="sdxl", model_source="files")) == [
+        ("transformer_file", "stabilityai/stable-diffusion-xl-base-1.0", "sd_xl_base_1.0_0.9vae.safetensors"), turbo]
+    with pytest.raises(ValueError, match="PAN 2|pan2"):
+        planned_downloads(TrainConfig(model_arch="pan2", model_source="files"))
+    sep = TrainConfig(model_arch="sdxl", model_source="files", transformer_file=str(f), vae_file="vae.safetensors")
+    assert planned_downloads(sep) == [turbo]
+    out = resolve_downloads(dataclasses.replace(cfg, turbo_lora=""))
     assert (out.turbo_lora, out.sample_lora, out.training_adapter) == ("", "", "")
     assert out.vae_file == "" and out.text_encoder_file == ""
-    with pytest.raises(ValueError, match="transformer_file"):
-        planned_downloads(TrainConfig(model_arch="sdxl", model_source="files"))
-    sep = TrainConfig(model_arch="sdxl", model_source="files", transformer_file=str(f), vae_file="vae.safetensors")
-    assert planned_downloads(sep) == []
 
 
 def test_runplan_builds_the_family_on_meta():

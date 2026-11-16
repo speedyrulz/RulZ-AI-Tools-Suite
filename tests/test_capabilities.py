@@ -48,7 +48,7 @@ SDXL_BAD = [
     ("keel_face_gain", 0.5, {"optimizer": "keel"}), ("training_maps", True, {}), ("transformer_quant", "nvfp4", {}),
     ("sample_model_quant", "nvfp4", {}), ("compile_model", True, {}), ("loss_type", "band", {}), ("loss_weighting", "sigma_sqrt", {}),
     ("finetune", True, {}), ("network_type", "lokr", {}), ("dora", True, {}), ("train_text_embedder", True, {}),
-    ("turbo_lora", "x.safetensors", {}), ("sample_lora", "x.safetensors", {}),
+    ("sample_lora", "x.safetensors", {}),
     ("training_adapter", "x.safetensors", {}), ("checkpoint_keep_blocks", 3, {}),
     ("sample_frames", 4, {}), ("probe_frames", 4, {}), ("train_frames", 4, {}),
 ]
@@ -232,7 +232,8 @@ def test_switching_to_sdxl_greys_out_resets_and_explains_then_switching_back_fre
     w = f.w
     reset = f.apply_family_support("sdxl", notify=True)
     assert set(reset) >= {"training_maps", "activation_offload", "block_swap", "transformer_quant", "multi_gpu",
-                          "compile_model", "optimizer", "turbo_lora", "loss_type"}
+                          "compile_model", "optimizer", "loss_type"}
+    assert "turbo_lora" not in reset  # SDXL has DMD2's turbo LoRA: the control stays free
     assert (w["training_maps"].value, w["activation_offload"].value, w["block_swap"].value) == (False, False, 0)
     assert not w["training_maps"].enabled and not w["activation_offload"].enabled and not w["block_swap"].enabled
     assert w["lora_rank"].enabled  # no rule
@@ -243,7 +244,7 @@ def test_switching_to_sdxl_greys_out_resets_and_explains_then_switching_back_fre
     assert set(w["multi_gpu"].options) == {"off", "data_parallel"} and w["multi_gpu"].value == "off"
     assert set(w["compile_model"].options) == {"auto", False} and w["compile_model"].value == "auto"
     assert "hull" not in w["optimizer"].options and w["optimizer"].value == "adamw8bit"
-    assert w["turbo_mode"].value == "auto" and set(w["turbo_mode"].options) == {"auto", "none"}
+    assert w["turbo_mode"].value == "file" and set(w["turbo_mode"].options) == {"auto", "none", "file"}
     assert w["loss_type"].options == ["mse"] and w["loss_type"].value == "mse" and not w["loss_type"].enabled
     assert f.family_notes["training_maps"][0].text == "Not available for SDXL: " + caps.rules_for("sdxl")[
         "training_maps"].reason
