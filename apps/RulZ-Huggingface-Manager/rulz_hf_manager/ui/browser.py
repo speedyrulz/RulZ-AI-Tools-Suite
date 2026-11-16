@@ -91,7 +91,7 @@ def file_icon(name: str, is_dir: bool) -> str:
         return 'settings'
     if s == '.pdf':
         return 'picture_as_pdf'
-    return 'draft'
+    return 'insert_drive_file'  # not 'draft': Material Icons has no such glyph, the blank text spilled over the checkbox
 
 
 def is_text_file(name: str) -> bool:

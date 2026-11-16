@@ -48,7 +48,7 @@ def _scan(path: Path, folders_only: bool, show_hidden: bool) -> list[dict]:
                     'size': None if is_dir else st.st_size,
                     'modified': fmt_date(datetime.fromtimestamp(st.st_mtime)),
                     'created': fmt_date(datetime.fromtimestamp(c)) if (c := created_time(st)) else '',
-                    'icon': 'folder' if is_dir else 'draft',
+                    'icon': 'folder' if is_dir else 'insert_drive_file',
                 })
             except OSError:
                 continue
@@ -114,10 +114,14 @@ async def pick_local(mode: str = 'any', title: str | None = None, start: str | P
                     .props('flat dense virtual-scroll binary-state-sort') \
                     .classes('w-full flex-1 rulz-table rz-fill-table')
                 table.bind_filter_from(search, 'value')
+                # virtual-scroll puts a QVirtualScroll between this cell and the table, so $parent is not the
+                # component that listens for 'enter'; walk up to the first one that does. Keep it a plain arrow
+                # function: Vue evaluates "(() => ...)()" at every render as if it were the handler itself.
                 table.add_slot('body-cell-name', r'''
                     <q-td :props="props">
                       <div class="row items-center no-wrap q-gutter-x-sm cursor-pointer rulz-name"
-                           @click="$parent.$emit('enter', props.row)">
+                           @click="() => { let p = $parent; while (p && !(p.$attrs && p.$attrs.onEnter)) p = p.$parent;
+                                           if (p) p.$emit('enter', props.row); }">
                         <q-icon :name="props.row.icon" size="20px" :class="props.row.is_dir ? 'rz-ic-dir' : 'rz-ic-file'"/>
                         <span>{{ props.row.name }}</span>
                       </div>
