@@ -586,3 +586,15 @@ def test_the_face_scorer_hands_back_the_boxes_of_the_image_it_scored():
     assert fs.score("a.png").faces == 1 and fs.calls == 1
     assert fs.boxes("a.png") == [(10.0, 20.0, 110.0, 220.0)] and fs.calls == 1  # no second detection
     assert fs.boxes("b.png") == [(10.0, 20.0, 110.0, 220.0)] and fs.calls == 2  # another image: detected
+
+
+def test_a_saved_preset_fills_in_the_next_runs_trigger_and_subject():
+    written = "ohwx, a close-up of a tall man with a beard, ohwxish lamp {braces} kept"
+    template = P.templatize(written, "ohwx", "a tall man with a beard")
+    assert template == "{trigger}, a close-up of {subject}, ohwxish lamp {braces} kept"  # whole words only
+    assert P.fill(template, "zkw", "a woman") == "zkw, a close-up of a woman, ohwxish lamp {braces} kept"
+    assert P.fill(template) == f"{P.DEFAULT_TRIGGER}, a close-up of {P.DEFAULT_SUBJECT}, ohwxish lamp {{braces}} kept"
+    # a prompt built without a trigger word or subject holds the defaults: those go back to placeholders
+    built = P.build("headshot_neutral")
+    assert P.templatize(built) == P.preset("headshot_neutral").template
+    assert P.templatize(P.fill(template, "x", "y"), "x", "y") == template  # a round trip changes nothing

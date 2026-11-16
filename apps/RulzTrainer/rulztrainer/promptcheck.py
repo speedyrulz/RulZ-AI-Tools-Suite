@@ -222,6 +222,25 @@ def build(key: str, trigger: str = "", subject: str = "") -> str:
                                        subject=" ".join(str(subject or "").split()) or DEFAULT_SUBJECT)
 
 
+def fill(template: str, trigger: str = "", subject: str = "") -> str:
+    """A saved preset's template (the user's own, from the WebUI) with {trigger} and {subject} filled in, as build()
+    does. Plain replacement, not str.format: a prompt of one's own may hold other braces."""
+    return str(template or "").replace("{trigger}", " ".join(str(trigger or "").split()) or DEFAULT_TRIGGER) \
+        .replace("{subject}", " ".join(str(subject or "").split()) or DEFAULT_SUBJECT)
+
+
+def templatize(prompt: str, trigger: str = "", subject: str = "") -> str:
+    """The reverse of fill(): a written prompt with its trigger word (a whole word) and subject turned back into
+    {trigger} and {subject}, so a preset saved from one run fills in the next run's own. Empty ones stand for the
+    defaults fill() writes."""
+    text = " ".join(str(prompt or "").split())
+    trigger = " ".join(str(trigger or "").split()) or DEFAULT_TRIGGER
+    subject = " ".join(str(subject or "").split()) or DEFAULT_SUBJECT
+    for word, slot in sorted([(trigger, "{trigger}"), (subject, "{subject}")], key=lambda t: -len(t[0])):
+        text = re.sub(rf"(?<![\w{{]){re.escape(word)}(?![\w}}])", lambda _m, s=slot: s, text)
+    return text
+
+
 # ---------------------------------------------------------------- what a probe checks
 
 
