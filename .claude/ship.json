@@ -244,6 +244,20 @@
       },
       "release": { "expectAssets": [] },
       "wiki": { "pages": ["HF-Manager*.md"] }
+    },
+    {
+      "id": "trainer-optimizer",
+      "name": "RulZ AI Trainer Optimizer",
+      "paths": ["apps/RulZ-AI-Trainer-Optimizer/**"],
+      "version": {
+        "source": "files",
+        "files": [
+          { "path": "apps/RulZ-AI-Trainer-Optimizer/rulz_optimizer/__init__.py", "regex": "^__version__\\s*=\\s*\"([^\"]+)\"" },
+          { "path": "apps/RulZ-AI-Trainer-Optimizer/pyproject.toml", "regex": "^version\\s*=\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "release": { "expectAssets": [] },
+      "wiki": { "pages": ["Trainer-Optimizer*.md"] }
     }
   ],
   "notes": "Ship finished, tested work straight through without a 'ship it?' question; when CI is pending, wait in the background (gh pr checks <n> --watch) and merge yourself: main has no required checks, so never use auto-merge. Still stop if CI fails or the work is unverified, and say in the closing message what was never tried with a real model or app. The main checkout often holds other sessions' uncommitted work: never commit it; work in a worktree off origin/main. Run the changed app's own tests before shipping (CI runs them too: apps.yml per app, ci.yml for the launcher); worktree tests can use ../../../node_modules. Launcher tag: release.yml does not compare the tag with package.json, so all three version fields must agree before pushing v<version>; moving a pushed tag needs the user's OK. App releases are never marked Latest (that badge is the launcher's). If an app README changes, re-run tools/sync_catalog.py so catalog/*/README.md keeps up (that makes it a launcher change too). Android: also raise versionCode in apps/rulz-coding-agent-android/android/app/build.gradle by 1 (not a version field); tag builds need the ANDROID_DEBUG_KEYSTORE repo secret, still unset at 0.6.0, so check gh secret list first: without it the Apps run fails at the key check and the APK is built locally and uploaded with gh release create --latest=false (recipe in memory android-app-in-suite)."

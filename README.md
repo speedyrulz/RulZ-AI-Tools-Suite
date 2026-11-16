@@ -20,6 +20,7 @@ click, keep it updated, and launch it, all from a single black-and-red window (o
 | App | What it does | How it installs |
 | --- | --- | --- |
 | [RulzTrainer](apps/RulzTrainer) | LoRA trainer for nine image models (MOSS-Image, FIBO 2.0, Krea 2, Qwen-Image 2.1, MiniMax-H3-Image and more) and two video models (MiniMax H3, PAN 2), with a guided WebUI | From source, then its `install.bat` (venv + CUDA PyTorch) |
+| [RulZ AI Trainer Optimizer](apps/RulZ-AI-Trainer-Optimizer) | Recommends starting settings for a character LoRA in RulZ AI Trainer from community reports and measured runs, exports or queues the config (on this PC or vast.ai), reads finished runs and proposes fixes, and asks Claude Code, Codex, Grok Build or Antigravity for a second opinion | From source (venv) |
 | [RulZ Image Organizer](apps/RulZ-Image-Organizer) | Offline face grouping and search for your photo library | Portable release zip |
 | [RulZ Image Tournament](apps/RulZ-Image-Tournament) | Finds your favorite image, two at a time | Portable release zip (a single .exe) |
 | [RulZ LLM Suite](apps/rulz-llm-suite) | Local LLMs with llama.cpp: models, chat, MCP tools, API server, reverse engineering | Its setup program, run silently |
@@ -84,7 +85,7 @@ To run it from source instead, double-click `install.bat` (needs Node.js 22+), t
 ## The apps
 
 Every app's source is in `apps/`, one folder each, imported from its former repository with the full history
-(those repositories are archived; RulZ Image Crawler, RulZ Image Preparer, RulZ Image Grid and RulZ Huggingface Manager never had one). Their guides are in the [wiki](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki),
+(those repositories are archived; RulZ Image Crawler, RulZ Image Preparer, RulZ Image Grid, RulZ Huggingface Manager and RulZ AI Trainer Optimizer never had one). Their guides are in the [wiki](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki),
 one section per app. Each app builds and runs on its own, as before: see the README in its folder.
 
 **Releasing an app.** Bump the version in the app's source, then push a tag named after the app:
@@ -103,15 +104,15 @@ Push app tags one at a time: GitHub starts no workflow for any of them when more
 
 GitHub Actions (`.github/workflows/apps.yml`) builds it and publishes the release here, where the launcher picks it
 up. The tag prefixes are `rulz-trainer-v`, `image-organizer-v`, `image-tournament-v`, `llm-suite-v`, `coding-agent-v`,
-`training-captioner-v`, `clip-extractor-v`, `rulz-image-crawler-v`, `image-preparer-v`, `image-grid-v` and `hf-manager-v`; launcher releases keep plain `v1.2.3` tags and the *Latest* badge.
+`training-captioner-v`, `clip-extractor-v`, `rulz-image-crawler-v`, `image-preparer-v`, `image-grid-v`, `hf-manager-v` and `trainer-optimizer-v`; launcher releases keep plain `v1.2.3` tags and the *Latest* badge.
 Pushes and pull requests build every app whose folder changed, so a broken build shows up before it's tagged.
 
-**Apps installed from source** (RulZ AI Trainer, Rulz Training Captioner, RulZ Image Crawler, RulZ Image Preparer, RulZ
-Huggingface Manager) are cloned from a branch that holds just their folder: `app/rulz-trainer`, `app/training-captioner`,
-`app/rulz-image-crawler`, `app/image-preparer` and `app/hf-manager`, rebuilt from `main` on every change by
+**Apps installed from source** (RulZ AI Trainer, RulZ AI Trainer Optimizer, Rulz Training Captioner, RulZ Image Crawler,
+RulZ Image Preparer, RulZ Huggingface Manager) are cloned from a branch that holds just their folder: `app/rulz-trainer`,
+`app/trainer-optimizer`, `app/training-captioner`, `app/rulz-image-crawler`, `app/image-preparer` and `app/hf-manager`, rebuilt from `main` on every change by
 `.github/workflows/app-branches.yml`. The branch continues the app's old repository commit for commit, so copies
 cloned from there update with a fast-forward (the launcher switches them over on their next update). Image Crawler,
-Image Preparer and Huggingface Manager had no repository of their own, so their branches start at their import into the suite. A tag for a source app publishes a
+Image Preparer, Huggingface Manager and Trainer Optimizer had no repository of their own, so their branches start at their import into the suite. A tag for a source app publishes a
 release with the change notes and no files; installs still come from the branch.
 
 ## Development

@@ -1,0 +1,395 @@
+# SDXL (Stability AI's UNet; also Pony, Illustrious, NoobAI and other SDXL fine-tunes): character LoRA starting recipe.
+# THERE IS NO 2026 COMMUNITY RECIPE AND NO RULZ AI TRAINER RUN ON REAL SDXL WEIGHTS: the base settings come from public guides.
+# Public file: no handles, no personal details, no dataset names. Shared sources are in general.yaml.
+id: sdxl
+name: SDXL
+kind: image
+updated: 2026-11-16
+summary: >-
+  SDXL is the old bar, not a model people are still tuning: there is no October or November 2026 character recipe, and
+  RulZ AI Trainer's SDXL support (3.23.0, a LoRA on the UNet only) has never run on real weights or a GPU. The starting
+  numbers are the shared advice of three public guides: 20-30 curated photos, captions that describe only what varies (never
+  the face, hair or build), rank 16-32, a UNet learning rate near 1e-4, 1024 px with buckets and about 1,500-3,000 steps,
+  then a checkpoint and a LoRA strength (0.6-0.9) chosen as a pair. Captions are cut to 77 CLIP tokens, so keep them short.
+  Whether the DMD2 4-step LoRA can be stacked on a character LoRA is untested by anyone; the file samples without it.
+model_preset: SDXL-Base-1.0
+model_path: stabilityai/stable-diffusion-xl-base-1.0
+facts:
+  - text: "No evidence from 2026-10 or 2026-11 for a person on SDXL: people mention it as the old bar. The only community numbers are older: a dim of about 8 for a character (one user, 2026-01; it can work on even less) and a 2,000-step run plus a separate DMD2 4-step LoRA at inference giving one user his best likeness and quality (2025-11, not compared to the LoRA alone). One regular says SDXL likeness 'could max out at a level we would not accept for realism'; another that it is stable and holds 8+ characters in a rank-32 LoRA but bleeds at inference."
+    confidence: REP
+    sources: [atk_sdxl_dim8_2026_01, atk_sdxl_dmd2_2025_11, atk_sdxl_bleed_2026_06]
+  - text: "Guides agree: 20-30 curated frames ('twenty perfect frames beat forty with drift'), captions only for what varies and never face, hair or build, a unique rare trigger, rank 16-32, UNet LR about 1e-4 with the text encoders frozen for a first baseline (or text encoder 5e-5, or Prodigy), cosine schedule, 1024 px with buckets, 1,500-3,000 total steps, LoRA strength 0.6-0.9 at generation with checkpoint and strength tuned as a pair. Alpha is dim/2 in one guide and equal to dim in others (disputed). Three guides, written for the Illustrious and Pony fine-tunes as much as for base SDXL."
+    confidence: CONF
+    sources: [web_sdxl_guide_2026, web_illustrious_guides_2026]
+  - text: "Prodigy (LR 1, cosine) against AdamW is disputed and Prodigy needs more VRAM; min-SNR gamma was suggested in one Illustrious guide; Illustrious can be more learning-rate-sensitive. A LoRA works best on the checkpoint it was trained on and its derivatives: an Illustrious LoRA does not transfer well to base SDXL 1.0, so train on the checkpoint you will generate with (RulZ AI Trainer takes an all-in-one checkpoint through transformer_file)."
+    confidence: DISP
+    sources: [web_sdxl_guide_2026, web_illustrious_guides_2026]
+  - text: "A test on a Pony model with 153 images: BF16 rank 16/16, 1024 px, 1,000 steps at 1e-4 works; NF4 with rank 8 at 512 px also; strength 0.8-1.2 works and 2.0 breaks anatomy."
+    confidence: REP
+    sources: [web_academia_pony_2026_11]
+  - text: "Overfitting signs: a razor-sharp face but memorised poses, lighting and backgrounds; the LoRA resists prompts outside the set; late checkpoints look best on the first few tests and worse across a larger set. Fix: an earlier checkpoint and wider captions and data. Samples that look washed out: recheck the prediction type, the VAE and the precision before changing the rank."
+    confidence: REP
+    sources: [web_sdxl_guide_2026, web_offlinecreator_2026]
+  - text: "SDXL's CLIP encoders pin a LoRA to a trigger more than LLM text encoders do, which overfit more easily when captions are thin; thin captions are a risk the other way on newer models (an older development-channel remark)."
+    confidence: REP
+    sources: [atk_llm_te_2026_02]
+  - text: "RulZ AI Trainer trains a LoRA on the UNet only, in kohya's lora_down/lora_up format, with the model's own epsilon or v-prediction loss wrapped as flow matching (never run on real weights). Captions are held at CLIP's 77 tokens (max_token_length is forced), timesteps default to the model's own uniform DDPM steps ('reference'), and the table in capabilities.py refuses LoKr, OFT, DoRA, full fine-tunes, block swap, multi-GPU model split, training maps, keel_fb, keel3_fb and hull, NVFP4, the text encoder training, and sigma_sqrt loss weighting."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  - text: "DMD2 / turbo / LCM stacking: no source tested a DMD2 or LCM LoRA stacked with a character LoRA for likeness. General advice is DMD2 4-step at about 0.7-1.0 and the character LoRA at 0.6-0.8, adding LoRAs one at a time with a fixed seed, and comparing the character alone against the character plus DMD2 on the same seed. RulZ AI Trainer's default samples and probes use DMD2 (8 steps, CFG 1, an LCM sampler); this file turns that off for judging."
+    confidence: GUESS
+    sources: [web_dmd2_2026, atk_sdxl_dmd2_2025_11]
+  - text: "Memory: the UNet is 2.6B parameters (about 5 GB in bf16) and trains on a 12 GB card; int8 or int8_convrot would cut it to about 3 GB if a card is short (NVFP4 is not available); the two CLIP encoders are about 1.6 GB together; there is no block swap for SDXL."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+base:
+  network_type:
+    value: lora
+    why: "The only network RulZ AI Trainer allows for SDXL (kohya's plain lora_down/lora_up layout); the guides all train a LoRA."
+    confidence: DOC
+    sources: [doc_trainer_3_28, web_sdxl_guide_2026]
+  lora_rank:
+    value: 16
+    why: "Rank 16-32 in all three guides and 16 in a Pony test; dim 8 worked for one user. No SDXL run here."
+    confidence: CONF
+    sources: [web_sdxl_guide_2026, web_illustrious_guides_2026, web_academia_pony_2026_11, atk_sdxl_dim8_2026_01]
+  lora_alpha:
+    value: 16.0
+    why: "Both sides: one guide uses alpha = dim/2 and others alpha = dim; alpha equal to rank keeps the scale at 1 and is the wizard's choice."
+    confidence: DISP
+    sources: [web_sdxl_guide_2026, web_illustrious_guides_2026, doc_trainer_3_28]
+  optimizer:
+    value: adamw8bit
+    why: "AdamW is the common baseline; Prodigy (LR 1) is the disputed alternative that needs more VRAM; it is the wizard's pick."
+    confidence: DISP
+    sources: [web_sdxl_guide_2026, doc_trainer_3_28]
+  learning_rate:
+    value: 1.0e-4
+    why: "UNet LR about 1e-4 in all guides and the Pony test."
+    confidence: CONF
+    sources: [web_sdxl_guide_2026, web_illustrious_guides_2026, web_academia_pony_2026_11]
+  lr_scheduler:
+    value: cosine
+    why: "Cosine in the guides that state a schedule (the trainer's default is constant)."
+    confidence: CONF
+    sources: [web_sdxl_guide_2026, web_illustrious_guides_2026]
+  timestep_sampling:
+    value: reference
+    why: "The model's own uniform DDPM timesteps, as OneTrainer, AI Toolkit and Fizgig train SDXL; the general logit-normal draws noise levels SDXL was not trained on."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  batch_size:
+    value: 1
+    why: "The wizard's value; no SDXL evidence on batch size for a person."
+    confidence: GUESS
+    sources: [doc_trainer_3_28]
+  resolutions:
+    value: [1.0]
+    why: "1024 px with aspect buckets in all guides (SDXL's native size)."
+    confidence: CONF
+    sources: [web_sdxl_guide_2026, web_illustrious_guides_2026]
+  isolation:
+    value: false
+    why: "DOP has not been run on SDXL here and costs 1.5-2x the time; SDXL bleeds at inference rather than in training."
+    confidence: GUESS
+    sources: [atk_sdxl_bleed_2026_06]
+  turbo_lora:
+    value: ""
+    why: "Judge the character LoRA alone first: no source stacked DMD2 with a character LoRA, and the guides say to add LoRAs one at a time. The trainer's default (DMD2, 8 steps, CFG 1, LCM) is a speed choice, not a likeness one."
+    confidence: GUESS
+    sources: [web_dmd2_2026]
+  sample_steps:
+    value: 30
+    why: "The usual SDXL sampler without a turbo LoRA (Euler on the model's own schedule)."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  sample_cfg:
+    value: 6.0
+    why: "The trainer's SDXL guidance without a turbo LoRA."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_steps:
+    value: 30
+    why: "Without a turbo LoRA a probe needs the full steps."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_cfg:
+    value: 6.0
+    why: "As the samples."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_size:
+    value: 1024
+    why: "SDXL's native size; the trainer's default probe size of 512 px is outside the range the model renders well. A guess: no SDXL probe has been run."
+    confidence: GUESS
+    sources: [web_sdxl_guide_2026]
+  probe_seeds:
+    value: 4
+    why: "A single probe swings about 10 points between seeds on other models; four seeds give a curve you can read."
+    confidence: MEAS
+    sources: [meas_region_2026_11, meas_krea_race_2026_11]
+  likeness_framing:
+    value: true
+    why: "Counts a body render with no body as zero so best-checkpoint tracking is not fooled by lost framing."
+    confidence: MEAS
+    sources: [meas_region_2026_11]
+  copy_check:
+    value: "on"
+    why: "Logs the copy score with the probes so a memorised checkpoint shows (overfit SDXL LoRAs memorise poses and backgrounds)."
+    confidence: MEAS
+    sources: [meas_krea_race_2026_11, web_sdxl_guide_2026]
+steps:
+  epochs: 80
+  min: 1200
+  max: 3000
+  round_to: 50
+  why: "The guides give 1,500-3,000 total steps for 20-30 curated photos and a Pony test used 1,000 on 153 images; 80 epochs of that gives about 1,600-2,400. The scaling with set size is a guess; probes every ~10% and checkpoints decide, and no SDXL run has been made here."
+  confidence: REP
+  sources: [web_sdxl_guide_2026, web_illustrious_guides_2026, web_academia_pony_2026_11]
+adjust:
+  - id: tiny_dataset
+    when: {images_max: 14}
+    set:
+      lora_rank: {value: 8, why: "A small set overfits a big adapter; dim 8 worked for a character for one user.", confidence: REP, sources: [atk_sdxl_dim8_2026_01]}
+      lora_alpha: {value: 8.0, why: "Alpha equals rank.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "Under 15 images the LoRA is stiff and copies pose and background ('twenty perfect frames beat forty with drift'); add varied frames first. The step minimum is 1,200, so a 10-image set runs 120 epochs: stop at the first good probe."
+  - id: small_dataset
+    when: {images_min: 15, images_max: 40}
+    set:
+      holdout_images: {value: 3, why: "Three held-out photos let the sweeps show where the subject stops being learned (measured on a Qwen-Image 2.1 fine-tune; never run on SDXL).", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "A sweep every 4 epochs costs little on a small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "The base recipe is made for 20-30 curated photos."
+  - id: large_dataset
+    when: {images_min: 80}
+    set:
+      lora_rank: {value: 32, why: "More data supports a bigger adapter; guides run 16-32.", confidence: REP, sources: [web_sdxl_guide_2026]}
+      lora_alpha: {value: 32.0, why: "Alpha equals rank.", confidence: DOC, sources: [doc_trainer_3_28]}
+      holdout_images: {value: 8, why: "Up to a fifth of the set may be held out; eight photos give a steadier held-out curve.", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "As for the small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "80+ images: the cap (3,000 steps) gives under 38 epochs; a Pony test used 1,000 steps for 153 images. Curating to 20-30 better frames is the guides' advice."
+  - id: goal_quick
+    when: {goal: quick}
+    set:
+      probe_seeds: {value: 2, why: "A first test needs a rough read only.", confidence: GUESS, sources: []}
+    note: "A quick test: SDXL is small and fast; a 1,000-step run at 1e-4 worked for a Pony test. Judge at strength 0.8-1.0."
+  - id: goal_likeness
+    when: {goal: likeness}
+    set:
+      probe_seeds: {value: 6, why: "More probe seeds make the best checkpoint reliable.", confidence: MEAS, sources: [meas_krea_race_2026_11]}
+    note: "For the closest likeness tune the checkpoint and the LoRA strength as a pair (0.6-0.9), and consider an inpainting or face-detail pass: SDXL's realism ceiling is low."
+  - id: focus_face
+    when: {focus: face}
+    set:
+      crop_augment: {value: face, why: "Close-ups teach the face's detail; bust crops would mostly teach the build.", confidence: DOC, sources: [doc_trainer_3_28]}
+      face_weight: {value: 1.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+      body_weight: {value: 0.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: focus_face_body
+    when: {focus: face_body}
+    set:
+      crop_augment: {value: face+bust, why: "Close-ups for the face and head-and-shoulders crops between them and the whole photos.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "Faces are small in full-body frames at 1024 px; keep the face sharp in some far shots and expect to fix distant faces with a detail pass."
+  - id: low_median_mp
+    when: {median_mp_max: 0.4}
+    set:
+      resolutions: {value: [0.5625], why: "The photos are under 0.4 MP: training above their size only upscales them; 768 px is the smallest size SDXL trains well at. Upscale the photos first if you can.", confidence: GUESS, sources: [web_sdxl_guide_2026]}
+  - id: no_captions
+    when: {has_captions: false}
+    set:
+      caption_dropout: {value: 0.0, why: "Most images have no caption file, so there is nothing to drop.", confidence: GUESS, sources: []}
+    note: "Write short captions (77 CLIP tokens) of only what varies: pose, clothes, place, light, camera; never the person's face, hair or build; add a unique rare trigger."
+  - id: vram_24
+    when: {vram_max_gb: 24}
+    set:
+      gradient_checkpointing: {value: true, why: "The 5 GB UNet trains on a 12 GB card; checkpointing keeps it that way at 1024 px.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "SDXL fits a 24 GB card without any memory setting; there is no block swap for it."
+  - id: vram_16
+    when: {vram_max_gb: 16}
+    set:
+      gradient_checkpointing: {value: true, why: "Saves most activation memory; the UNet fits any card that trains it.", confidence: DOC, sources: [doc_trainer_3_28]}
+      batch_size: {value: 1, why: "Batch 1 keeps the step small.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "If a card is still short use int8 or int8_convrot for the UNet (never run on real weights): there is no block swap or NVFP4 for SDXL."
+evaluate:
+  strength: "0.6-0.9 (0.8-1.2 worked in a Pony test; 2.0 breaks anatomy). Tune the checkpoint and the strength as a pair."
+  sampler: "Euler (or the model's usual sampler) for the character alone; add a DMD2 4-step LoRA only afterwards, one LoRA at a time with a fixed seed."
+  steps: "About 30 for the character alone; DMD2 uses 4-8 steps with an LCM sampler."
+  cfg: "About 6 for the character alone; 1 with DMD2."
+  notes:
+    - "Compare the character alone with the character plus DMD2 on the same seed before trusting a stack: nobody has tested whether DMD2 changes likeness."
+    - "Overfitting shows as a razor-sharp face with memorised poses and backgrounds: test a prompt outside the set, and a larger prompt set, because late checkpoints look best on the first few tests."
+    - "Washed-out samples: check the prediction type (sdxl_prediction), the VAE and the precision before changing the rank."
+    - "Trained on an Illustrious or Pony checkpoint? Generate on that checkpoint and its derivatives."
+flaws:
+  - symptom: no_likeness
+    causes:
+      - "captions that describe the face, hair or build, or a trigger that is missing or common"
+      - "too few or inconsistent photos (20-30 curated frames beat 40 with drift)"
+      - "a base mismatch: an Illustrious or Pony LoRA used on base SDXL"
+    fixes:
+      - action: "Caption only what varies (pose, clothes, place, light, camera), give a unique rare trigger, cull to 20-30 curated frames, and generate on the checkpoint you trained on."
+        why: "The shared advice of three guides; no SDXL run here."
+        confidence: CONF
+        sources: [web_sdxl_guide_2026, web_illustrious_guides_2026]
+      - set: {learning_rate: {op: max, value: 1.0e-4}, lora_rank: {op: max, value: 16}}
+        why: "UNet LR about 1e-4 and rank 16-32 are what the guides give; raise a lower rate or rank to them."
+        confidence: CONF
+        sources: [web_sdxl_guide_2026, web_illustrious_guides_2026]
+      - action: "Judge at LoRA strength 0.8-1.0 and across several checkpoints; a LoRA may need strength before steps."
+        why: "Checkpoint and strength are tuned as a pair."
+        confidence: REP
+        sources: [web_sdxl_guide_2026, web_academia_pony_2026_11]
+  - symptom: memorized
+    causes:
+      - "too many steps, or too few varied frames: a razor-sharp face with memorised poses, lighting and backgrounds"
+    fixes:
+      - action: "Use an earlier checkpoint and widen the captions and the data; late checkpoints look best on the first few tests and worse across a larger set."
+        why: "The guides' own overfitting description and fix."
+        confidence: REP
+        sources: [web_sdxl_guide_2026]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "A lower rate peaks later and flatter; measured on another model (the train-to-held-out gap halved at 5e-5), never run on SDXL."
+        confidence: GUESS
+        sources: [meas_region_2026_11]
+  - symptom: same_pose_outfit
+    causes:
+      - "the same pose, lighting or background in many photos, or captions that never name them"
+    fixes:
+      - action: "Vary pose, outfit and background in the set, caption those things, and use an earlier checkpoint."
+        why: "Uncaptioned repeats bind to the trigger; the guides say caption what varies."
+        confidence: REP
+        sources: [web_sdxl_guide_2026, atk_captions_2026_06]
+  - symptom: washed_colors
+    causes:
+      - "the wrong prediction type, VAE or precision rather than the rank"
+    fixes:
+      - action: "Check sdxl_prediction (auto, epsilon or v_prediction; zero terminal SNR needs v_prediction), the VAE and the precision before changing the rank."
+        why: "The one numbers-free guide's advice for washed-out samples."
+        confidence: REP
+        sources: [web_offlinecreator_2026]
+  - symptom: too_strong
+    causes:
+      - "strength above 1: 2.0 breaks anatomy"
+    fixes:
+      - action: "Use the LoRA at 0.6-0.9 and pick the checkpoint and the strength as a pair."
+        why: "Two sources."
+        confidence: REP
+        sources: [web_sdxl_guide_2026, web_academia_pony_2026_11]
+  - symptom: identity_bleed
+    causes:
+      - "SDXL bleeds at inference even in a multi-character rank-32 LoRA"
+    fixes:
+      - action: "Use a lower LoRA strength, separate LoRAs for separate people, or fix a face afterwards with an inpainting pass using the same LoRA."
+        why: "One heavy user's finding, plus the cross-model inpainting fix."
+        confidence: REP
+        sources: [atk_sdxl_bleed_2026_06, atk_distance_multires_2026_01]
+      - set: {isolation: {value: true}}
+        why: "DOP keeps the face off other people on other models (about 1.5-2x the time); never run on SDXL."
+        confidence: GUESS
+        sources: [atk_dop_reg_2026_08]
+  - symptom: wrong_at_distance
+    causes:
+      - "the face is small at 1024 px in far shots"
+    fixes:
+      - action: "Keep the face sharp in some far shots in the set and fix distant faces with an inpainting or face-detail pass using the same LoRA; a high-resolution bucket (1.25-1.5 MP) is untested."
+        why: "Cross-model finding, nothing SDXL-specific."
+        confidence: REP
+        sources: [atk_distance_multires_2026_01]
+  - symptom: plastic_skin
+    causes:
+      - "a DMD2 or other turbo LoRA at full strength changed the skin or the identity"
+    fixes:
+      - set: {turbo_lora_strength: {value: 0.7}}
+        why: "General guidance puts DMD2 at 0.7-1.0 with the character at 0.6-0.8; compare alone and stacked on the same seed. Untested for likeness."
+        confidence: GUESS
+        sources: [web_dmd2_2026]
+      - action: "Judge and generate with the character LoRA alone first (turbo_lora empty)."
+        why: "Nobody tested the stack."
+        confidence: GUESS
+        sources: [web_dmd2_2026]
+  - symptom: ignores_prompt
+    causes:
+      - "captions are cut at 77 CLIP tokens (max_token_length is forced), so a long caption loses its tail"
+    fixes:
+      - action: "Write short captions: trigger plus the 3-6 things that vary; put the important words first."
+        why: "The trainer holds captions at CLIP's 77 tokens."
+        confidence: DOC
+        sources: [doc_trainer_3_28]
+  - symptom: soft_blurry
+    causes:
+      - "probes or samples rendered at 512 px, below SDXL's range"
+    fixes:
+      - set: {probe_size: {value: 1024}}
+        why: "SDXL renders well at 1024; a 512 probe judges a worse picture than you will use. A guess for the probe; the guides train at 1024."
+        confidence: GUESS
+        sources: [web_sdxl_guide_2026]
+  - symptom: out_of_memory
+    causes:
+      - "a card under 12 GB at 1024 px"
+    fixes:
+      - set: {transformer_quant: {value: int8_convrot}, gradient_checkpointing: {value: true}}
+        why: "int8 cuts the 5 GB UNet to about 3 GB; no block swap or NVFP4 exists for SDXL. Never run on real weights."
+        confidence: GUESS
+        sources: [doc_trainer_3_28]
+open_questions:
+  - "Nothing here has run on real SDXL weights, a GPU or a ComfyUI/A1111 LoRA load in RulZ AI Trainer; the first run is the test."
+  - "Does a DMD2 or LCM LoRA stack with a character LoRA without changing likeness? No source tested it; the file samples without it."
+  - "Alpha: dim/2 or equal to dim; and whether min-SNR loss weighting helps SDXL characters (suggested in one Illustrious guide)."
+  - "Whether the text encoders should be trained (RulZ AI Trainer refuses it) for a person; the guides use 5e-5 or freeze them for the first baseline."
+  - "Whether to use Prodigy instead of AdamW; no SDXL test here."
+  - "How many steps a larger set needs; the 1,500-3,000 range is for 20-30 photos."
+sources:
+  atk_sdxl_dim8_2026_01:
+    kind: community
+    where: "AI Toolkit Discord #general"
+    date: "2026-01"
+    people: 1
+    url: null
+    note: "'I train SDXL characters at literal dim 8', it can work on even less; said in reaction to rank 32 on newer models."
+  atk_sdxl_dmd2_2025_11:
+    kind: community
+    where: "AI Toolkit Discord #training"
+    date: "2025-11"
+    people: 1
+    url: null
+    note: "A 2,000-step run plus a separate DMD2 4-step LoRA gave his best likeness and quality so far; the recipe he used was not copied out and the stack was not compared with the LoRA alone."
+  atk_sdxl_bleed_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #training-images"
+    date: "2026-06"
+    people: 1
+    url: null
+    note: "SDXL is stable and can hold 8+ characters in a rank-32 LoRA but bleeds at inference; likeness could max out below what realism needs."
+  atk_llm_te_2026_02:
+    kind: community
+    where: "AI Toolkit Discord #development"
+    date: "2026-02"
+    people: 2
+    url: null
+    note: "An older thread: LLM text encoders do not pin a LoRA to a trigger as SDXL's CLIP did, so thin captions overfit more easily on newer models. The month is approximate."
+  web_sdxl_guide_2026:
+    kind: web
+    where: "SDXL character LoRA guide on GitHub"
+    date: "2026-06"
+    people: null
+    url: https://github.com/mikeabakumoff/sdxl-character-lora-guide
+    note: "Undated 2026 page. 20-30 curated frames, captions only for what varies, rank 16-32, alpha dim/2, UNet 1e-4, text encoder 5e-5 or Prodigy, cosine, 1024 with buckets, 1,500-3,000 steps, strength 0.6-0.9; overfitting signs."
+  web_illustrious_guides_2026:
+    kind: web
+    where: "Two Japanese Illustrious character-LoRA guides on note.com (and an older Civitai guide)"
+    date: "2026-06"
+    people: null
+    url: https://note.com/nifty_laelia5468/n/n1dac732a39ea
+    note: "Rank 16-32, UNet 1e-4, 1024, 1,500-3,000 steps agree with the GitHub guide; a LoRA trained on Illustrious transfers badly to base SDXL; min-SNR gamma suggested in one; the second guide is note.com/reocoffee/n/n9744ca3ad878. Aggregated into one source."
+  web_academia_pony_2026_11:
+    kind: web
+    where: "AcademiaSD LoRAlab trainer studio, test on a Pony model"
+    date: "2026-11"
+    people: null
+    url: https://github.com/AcademiaSD/AcademiaSD_LoRAlab-TrainerStudio
+    note: "153 images, BF16 rank 16/16, 1024, 1,000 steps, 1e-4; NF4 rank 8 at 512 px; strength 0.8-1.2 works, 2.0 breaks anatomy. Defaults tested to work, not tuned."
+  web_dmd2_2026:
+    kind: web
+    where: "DMD2 and LCM stacking pages (diffus.me, willitrunai, aiofm.info)"
+    date: "2026-06"
+    people: null
+    url: null
+    note: "DMD2 4-step LoRA at about 0.7-1.0 and a character LoRA at 0.6-0.8, one LoRA at a time with a fixed seed; no page tested DMD2 stacked with a character LoRA for likeness."

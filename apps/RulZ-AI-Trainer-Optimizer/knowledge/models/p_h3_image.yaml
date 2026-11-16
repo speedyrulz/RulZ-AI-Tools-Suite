@@ -1,0 +1,311 @@
+# P-H3-Image (Pruna's step-distilled MiniMax-H3 image model): character LoRA starting recipe.
+# Public file: no handles, no personal details, no dataset names. Shared sources are in general.yaml.
+id: p_h3_image
+name: P-H3-Image (Pruna)
+kind: image
+updated: 2026-11-16
+summary: >-
+  There is no proven recipe for a person on this model: Pruna documents no LoRA trainer for it, and the community
+  evidence is one developer adding direct training with a training adapter, one reporter's about-100-image test where
+  automagic v4 fried the run and v3 did not, and reports that H3 LoRAs work at low strength. Everything below is
+  borrowed from the MiniMax-H3 family and marked GUESS: treat the first run as an experiment, train with the P-H3
+  adapter, stay on AdamW or automagic v3 (never v4), and save and probe often.
+model_preset: P-H3-Image
+model_path: PrunaAI/P-H3-Image
+facts:
+  - text: "P-H3-Image is Pruna's step-distilled H3 image model (an 8-step sigma grid, no guidance). Pruna's documented LoRA trainers cover P-Image and P-Image-Edit only; there is no official character recipe for P-H3-Image."
+    confidence: DOC
+    sources: [web_pruna_docs_2026, doc_trainer_3_28]
+  - text: "The AI Toolkit author was adding direct P-H3 training with a training adapter because the model is step-distilled (2026-11-03/04). RulZ AI Trainer's training_adapter auto uses ostris' P-H3-Image adapter. This establishes the mechanism, not a success rate."
+    confidence: REP
+    sources: [atk_ph3_adapter_2026_11, doc_trainer_3_28]
+  - text: "Automagic v4 completely fried a P-H3-Image run on about 100 images where automagic v3 did not (a direct comparison by one user; the concept is not stated); the AI Toolkit author later said v4 was unstable and to stay on v3. A positive v4 report from another user used a different model and batch sizes and does not contradict it. RulZ AI Trainer warns when automagic4 is used."
+    confidence: CONF
+    sources: [atk_ph3_v4_2026_11, atk_automagic4_2026_11]
+  - text: "Existing H3 LoRAs appear to work in P-H3 editing at low strength, and one user loads P-H3's own LoRA first and his after it. These show compatibility at inference, not that a character trained on H3 or H3-Image transfers well."
+    confidence: REP
+    sources: [atk_ph3_compat_2026_11]
+  - text: "A community pDMD 2-step rank-128 LoRA exists for P-H3-Image but is labelled a training record, not recommended; a turbo LoRA was also merged into the transformer for 6 steps. Neither is a character recipe."
+    confidence: REP
+    sources: [web_akhaliq_ph3_2026]
+  - text: "RulZ AI Trainer's P-H3-Image support (the int8 file with Pruna's LoRA merged in, the Qwen3-VL-4B text encoder, the 8-step grid, ostris' adapter, H3's own shift-12 timestep draw) has not been run on the real model in our tests; the H3-Image and H3 ports it builds on have. Check the step-0 sample first."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  - text: "Everything else for H3-Image that may transfer (rank 16 at 1e-4, 1 MP, close-ups, saving often because the family burns early) is evidence for the sibling models, not for this one. Do not copy H3-Image's six head sigmas, 1024 crop, rank or epoch count as if they were tested here."
+    confidence: GUESS
+    sources: []
+base:
+  network_type:
+    value: lora
+    why: "Plain LoRA, as for every H3-family recipe; nothing was tried on this model."
+    confidence: GUESS
+    sources: []
+  lora_rank:
+    value: 16
+    why: "Borrowed from the H3 family (rank 16 won a controlled comparison on H3 and is in every H3 recipe)."
+    confidence: GUESS
+    sources: []
+  lora_alpha:
+    value: 16.0
+    why: "Alpha equals rank, as for the H3 family."
+    confidence: GUESS
+    sources: []
+  training_adapter:
+    value: auto
+    why: "Ostris' P-H3-Image adapter (auto downloads it): the model is step-distilled and the author added direct training because of it; trained bare a LoRA drifts."
+    confidence: DOC
+    sources: [atk_ph3_adapter_2026_11, doc_trainer_3_28]
+  timestep_sampling:
+    value: reference
+    why: "H3's own draw (one uniform base time per step on the shift-12 curve), as AI Toolkit trains the model; the other samplers were not tried."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  optimizer:
+    value: adamw
+    why: "AdamW is what the H3-family runs in RulZ AI Trainer used. If you choose an Automagic, take v3: it is the only one that did not fry a P-H3 run, and v4 did."
+    confidence: GUESS
+    sources: [atk_ph3_v4_2026_11]
+  learning_rate:
+    value: 1.0e-4
+    why: "Borrowed from the H3 family (1e-4 in the web recipes and in the measured H3-Image run); no P-H3 learning rate is known."
+    confidence: GUESS
+    sources: []
+  lr_scheduler:
+    value: constant
+    why: "Constant, as in the H3-family recipes."
+    confidence: GUESS
+    sources: []
+  batch_size:
+    value: 1
+    why: "Batch 1 is the community default for characters."
+    confidence: GUESS
+    sources: []
+  resolutions:
+    value: [1.0]
+    why: "1 MP, the H3 family's canvas in RulZ AI Trainer; the model's own preferred resolution for training is not stated."
+    confidence: GUESS
+    sources: [doc_trainer_3_28]
+  model_file_quant:
+    value: int8_convrot
+    why: "PrunaAI's int8 file (21.2 GB, already pruned, Pruna's LoRA merged in); the layers the LoRA trains are the full model's."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  text_encoder_file_quant:
+    value: int8_convrot
+    why: "The 5.1 GB int8 Qwen3-VL-4B with its text connector: it caches the captions first, then unloads."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  gradient_checkpointing:
+    value: true
+    why: "Needed for a 21 GB model on a consumer card."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  sample_steps:
+    value: 8
+    why: "The checkpoint's own 8-sigma grid; the model is distilled for 8 steps."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  sample_cfg:
+    value: 1.0
+    why: "Guidance-distilled: no CFG."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  sample_before_training:
+    value: true
+    why: "The port has not been run on the real model in our tests: a wrong picture at step 0 is a setup problem, not a training problem."
+    confidence: GUESS
+    sources: [doc_trainer_3_28]
+  probe_steps:
+    value: 8
+    why: "Probes sample as the previews do."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_cfg:
+    value: 1.0
+    why: "Guidance-distilled: no CFG."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_seeds:
+    value: 4
+    why: "A single probe swings about 10 points; four seeds make a curve you can read."
+    confidence: MEAS
+    sources: [meas_region_2026_11, meas_krea_race_2026_11]
+  likeness_framing:
+    value: true
+    why: "Counts a body render with no body as zero so the best-checkpoint tracker is not fooled by lost framing."
+    confidence: MEAS
+    sources: [meas_region_2026_11]
+  copy_check:
+    value: "on"
+    why: "Logs the copy score with the probes so a memorised checkpoint is visible."
+    confidence: MEAS
+    sources: [meas_krea_race_2026_11]
+steps:
+  epochs: 30
+  min: 600
+  max: 1500
+  round_to: 50
+  why: "Borrowed from the sibling image model, which burns early (useful epochs 10-20 of 30); the only P-H3 test used about 100 images and its step count is not stated. Probes every 25 steps and checkpoints every 100 let the peak choose the stop."
+  confidence: GUESS
+  sources: []
+adjust:
+  - id: tiny_dataset
+    when: {images_max: 14}
+    set:
+      lora_rank: {value: 8, why: "Under 15 images a big rank overfits; low rank is the H3-family trend.", confidence: GUESS, sources: []}
+      lora_alpha: {value: 8.0, why: "Alpha equals rank.", confidence: GUESS, sources: []}
+      crop_augment: {value: face+bust, why: "Face and bust crops add close-up variety to a set too small to have it.", confidence: GUESS, sources: []}
+    note: "A very small set on a model with no proven recipe: stop at the first good probe and expect a stiff LoRA."
+  - id: small_dataset
+    when: {images_min: 15, images_max: 40}
+    set:
+      holdout_images: {value: 3, why: "Three held-out photos let the sweeps show where the subject stops being learned; measured on another model, never on this one.", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "A sweep every 4 epochs costs little on a small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+  - id: large_dataset
+    when: {images_min: 80}
+    set:
+      holdout_images: {value: 8, why: "Up to a fifth of the set may be held out; eight photos give a steadier held-out curve.", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "As for the small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "The only P-H3 test used about 100 images; the step cap (1,500) gives under 19 epochs. Culling to 30-60 varied images is more reliable than adding steps."
+  - id: goal_quick
+    when: {goal: quick}
+    set:
+      resolutions: {value: [0.5], why: "Half a megapixel keeps a test short.", confidence: GUESS, sources: []}
+      probe_seeds: {value: 2, why: "A first test needs a rough read only.", confidence: GUESS, sources: []}
+    note: "A first look at whether the adapter and the pipeline work: stop at the first good probe."
+  - id: goal_likeness
+    when: {goal: likeness}
+    set:
+      probe_seeds: {value: 6, why: "More probe seeds make the best checkpoint reliable.", confidence: MEAS, sources: [meas_krea_race_2026_11]}
+    note: "No P-H3-specific likeness lever is known; do not copy the H3-Image per-epoch clean-end schedule, which was never tried here."
+  - id: focus_face
+    when: {focus: face}
+    set:
+      crop_augment: {value: face, why: "Close-ups teach the face's detail on every H3-family model.", confidence: GUESS, sources: []}
+      face_weight: {value: 1.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+      body_weight: {value: 0.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: focus_face_body
+    when: {focus: face_body}
+    set:
+      crop_augment: {value: face+bust, why: "Close-ups for the face plus head-and-shoulders crops between them and the whole photos.", confidence: GUESS, sources: []}
+  - id: low_median_mp
+    when: {median_mp_max: 0.4}
+    set:
+      resolutions: {value: [0.5], why: "The photos are under 0.4 MP: training above their size only upscales them.", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: vram_24
+    when: {vram_max_gb: 24}
+    set:
+      block_swap: {value: 8, why: "The 21.2 GB int8 file plus a step does not fit 24 GB: the trainer's H3-family plan is about 4 of 50 blocks (0.39 GB each); 8 leaves room. An estimate, not a measurement.", confidence: GUESS, sources: [doc_trainer_3_28]}
+    note: "Keep 64 GB of system RAM: block-swapped weights wait there."
+  - id: vram_16
+    when: {vram_max_gb: 16}
+    set:
+      block_swap: {value: 26, why: "At 16 GB the trainer's plan is about 25 of 50 blocks swapped; 26 for margin. An estimate, not a measurement.", confidence: GUESS, sources: [doc_trainer_3_28]}
+      resolutions: {value: [0.5], why: "Half a megapixel halves the tokens per step.", confidence: GUESS, sources: []}
+evaluate:
+  strength: "1.0 at first; H3 LoRAs were used at low strength in P-H3 editing, so test 0.6-1.0 and compare on fixed seeds."
+  sampler: "The model's own 8-step sigma grid (the checkpoint is distilled for 8 steps). One user loads P-H3's LoRA first, then his; keep the load order the same when comparing."
+  steps: "8 (RulZ AI Trainer's own previews use the model's 8-step grid)."
+  cfg: "1.0: guidance-distilled, no CFG."
+  notes:
+    - "Check the step-0 sample first: this model's support has not been run on the real weights in our tests, so a wrong picture there is a setup problem."
+    - "Save every 100 steps and probe every 25; the sibling image model burns within about 1,000-1,250 steps."
+    - "Compare checkpoints on fixed seeds, and test a prompt unlike every training image."
+    - "If you try an Automagic, use v3: v4 fried the one run that was compared."
+flaws:
+  - symptom: nan_or_diverged
+    causes:
+      - "automagic v4 fried the run (the only direct comparison)"
+    fixes:
+      - set: {optimizer: {value: adamw}}
+        why: "v4 fried a P-H3 run where v3 did not; AdamW is the H3-family choice. Automagic v3 is the other option."
+        confidence: CONF
+        sources: [atk_ph3_v4_2026_11, atk_automagic4_2026_11]
+  - symptom: burned
+    causes:
+      - "automagic v4"
+      - "overtraining (the sibling image model burns within about 1,000-1,250 steps)"
+    fixes:
+      - set: {optimizer: {value: adamw}}
+        why: "Automagic v4 completely fried the compared P-H3 run."
+        confidence: CONF
+        sources: [atk_ph3_v4_2026_11]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "Halving the rate was the only change that helped in our nine-run test on another model; no P-H3 evidence."
+        confidence: GUESS
+        sources: [meas_region_2026_11]
+      - action: "Use an earlier checkpoint: save every 100 steps and compare fixed seeds."
+        why: "Cheapest fix on every model."
+        confidence: CONF
+        sources: [atk_overfit_tells_2026_01]
+  - symptom: no_likeness
+    causes:
+      - "a setup problem: the step-0 sample is wrong, or the adapter was not applied"
+      - "the same causes as the H3 family (trigger missing, too few close-ups)"
+    fixes:
+      - action: "Check the step-0 sample and that training_adapter auto found the P-H3 adapter; then follow the general fixes (trigger in every caption, close-ups, 20-35 varied images)."
+        why: "The P-H3 support has not been run on the real model in our tests."
+        confidence: DOC
+        sources: [doc_trainer_3_28]
+      - action: "Do not expect an H3 or H3-Image LoRA to carry over; train on P-H3 itself (H3 LoRAs only worked at low strength in editing)."
+        why: "Compatibility at inference is not character training."
+        confidence: REP
+        sources: [atk_ph3_compat_2026_11]
+  - symptom: out_of_memory
+    causes:
+      - "the 21.2 GB model plus a step on a 16-24 GB card"
+    fixes:
+      - set: {block_swap: {op: add, value: 8}, resolutions: {value: [0.5]}}
+        why: "More blocks' frozen weights wait in pinned system RAM, and half a megapixel halves the tokens per step. An estimate, not a measurement."
+        confidence: GUESS
+        sources: [doc_trainer_3_28]
+  - symptom: lr_collapsed
+    causes:
+      - "an Automagic run's learning rate sank to the floor"
+    fixes:
+      - set: {optimizer: {value: adamw}}
+        why: "AdamW has no such collapse; v3 is the only Automagic known to work here."
+        confidence: CONF
+        sources: [atk_automagic_floor_2026_10, atk_ph3_v4_2026_11]
+open_questions:
+  - "A proven person recipe: dataset size and framing, captions, rank, learning rate, steps, batch, weight decay."
+  - "Which timestep draw is best on this model (the trainer uses H3's shift-12 curve)."
+  - "How much an H3 or H3-Image character LoRA transfers and whether a warm start helps."
+  - "Memory use with the 5.1 GB text encoder and the adapter on a 16-24 GB card (the plan is an estimate)."
+  - "Whether the sibling H3-Image findings (early burn, higher-resolution render, the clean-end schedule) hold here."
+sources:
+  atk_ph3_adapter_2026_11:
+    kind: community
+    where: "AI Toolkit Discord #new_models (the trainer's author)"
+    date: "2026-11"
+    people: 1
+    url: null
+    note: "Adding direct P-H3 training with an adapter because the model is step-distilled; an adapter for P-H3 exists."
+  atk_ph3_v4_2026_11:
+    kind: community
+    where: "AI Toolkit Discord #new_models"
+    date: "2026-11"
+    people: 2
+    url: null
+    note: "A direct comparison on about 100 images: automagic v4 fried the run, v3 did not; the trainer's author said v4 was unstable and to stay on v3."
+  atk_ph3_compat_2026_11:
+    kind: community
+    where: "AI Toolkit Discord #new_models and #minimax_h3"
+    date: "2026-11"
+    people: 2
+    url: null
+    note: "Existing H3 LoRAs work in P-H3 editing at low strength; P-H3's own LoRA loaded first, then the user's."
+  web_pruna_docs_2026:
+    kind: official
+    where: "Pruna AI documentation, P-Image LoRA trainers"
+    date: "2026-11"
+    people: null
+    url: "https://docs.pruna.ai/en/stable/docs_pruna_endpoints/general/p_image_loras.html"
+    note: "Pruna's trainers cover P-Image and P-Image-Edit only; no documented way to train P-H3-Image directly."
+  web_akhaliq_ph3_2026:
+    kind: web
+    where: "Hugging Face model page of a community pDMD 2-step LoRA for P-H3-Image"
+    date: "2026-11"
+    people: null
+    url: "https://huggingface.co/akhaliq/p-h3-image-pdmd-2step-lora"
+    note: "Rank-128 pDMD 2-step LoRA labelled a training record, not recommended; not a character recipe."
