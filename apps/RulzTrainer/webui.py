@@ -304,6 +304,46 @@ def save_form_state(text: str) -> bool:
         return False
 
 
+PROBE_PRESETS_FILE = ROOT / "configs" / "probe_presets.json"  # the user's own probe prompt presets (git-ignored)
+MY_PRESET = "my:"  # the select key of one of them: "my:<kind>:<name>"
+
+
+def load_probe_presets() -> list[dict]:
+    """The probe prompt presets saved on the Train tab: [{"name", "kind" (face / body), "template", "expect"}] (a
+    file that is missing or cannot be read: none)."""
+    try:
+        data = json.loads(PROBE_PRESETS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    out = []
+    for p in data if isinstance(data, list) else []:
+        if isinstance(p, dict) and p.get("kind") in ("face", "body") and str(p.get("name") or "").strip() \
+                and str(p.get("template") or "").strip():
+            out.append({"name": str(p["name"]).strip(), "kind": p["kind"], "template": str(p["template"]),
+                        "expect": str(p.get("expect") or "")})
+    return out
+
+
+def save_probe_presets(presets: list[dict]) -> bool:
+    """Write the file whole or not at all. False: it could not be written."""
+    tmp = PROBE_PRESETS_FILE.with_name(f"{PROBE_PRESETS_FILE.name}.{os.getpid()}.tmp")
+    try:
+        PROBE_PRESETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(presets, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, PROBE_PRESETS_FILE)
+        return True
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        return False
+
+
+def probe_preset_options(kind: str) -> dict:
+    """The face or body probe preset select's options: the built-in presets, then the user's own."""
+    return {**{p.key: p.label for p in promptcheck.presets_of(kind)},
+            **{f"{MY_PRESET}{kind}:{p['name']}": f"{p['name']} (yours)" for p in load_probe_presets()
+               if p["kind"] == kind}}
+
+
 def config_file_name(job_name: str) -> str:
     """A job name as a file name that is safe on every system."""
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", job_name).strip(" .")
@@ -1682,7 +1722,7 @@ class DatasetPicker:
         if key in self.rows:
             return self.rows[key]
         with self.box:
-            with ui.row().classes("w-full items-center gap-3 no-wrap") as row:
+            with ui.row().classes("rz-tips w-full items-center gap-3 no-wrap") as row:
                 use = ui.checkbox(Path(path).name or path).classes("w-56 min-w-0").tooltip(path)
                 info = ui.label(path).classes("rz-hint flex-grow min-w-0 truncate")
                 res = ui.select(MP_OPTIONS, multiple=True, value=[], label="Own resolutions (none: the run's)") \
@@ -2988,14 +3028,23 @@ class SectionNav:
 
 def inline_descriptions(root) -> None:
     """Shows the tooltip of every setting under `root` as a description beside the setting (the Train tab): the two
-    become one row, hidden together with the setting. Buttons keep their tooltips."""
+    become one row, hidden together with the setting. Buttons keep their tooltips, and so does anything inside an
+    "rz-tips" element (the dataset table's rows: a description beside each of their narrow fields squeezes the row
+    into one-word columns)."""
     from nicegui.elements.mixins.value_element import ValueElement
+
+    def keeps_tip(el) -> bool:
+        while el is not None:
+            if "rz-tips" in el.classes:
+                return True
+            el = el.parent_slot.parent if el.parent_slot is not None else None
+        return False
 
     elements = {el.html_id: el for el in root.descendants(include_self=True)}
     for tip in [el for el in elements.values() if isinstance(el, ui.tooltip)]:
         target = tip.props.get("target")  # NiceGUI 3 places the tooltip beside its element; 2 inside it
         target = elements.get(target.lstrip("#")) if isinstance(target, str) else tip.parent_slot.parent
-        if not isinstance(target, ValueElement):
+        if not isinstance(target, ValueElement) or keeps_tip(target):
             continue
         control = target.parent_slot.parent if "rz-path" in target.parent_slot.parent.classes else target
         slot = control.parent_slot
@@ -11183,14 +11232,26 @@ def build_page(local: bool = True):
                                 "What the preset prompts call the person, next to the trigger word: a few words "
                                 "such as 'a young woman with long dark brown hair'. Empty = a dataset's class (LoRA "
                                 "Isolation), else 'a person'. Only the presets read it.")
-                            face_preset = ui.select({p.key: p.label for p in promptcheck.presets_of("face")},
-                                                    label="Face probe preset", clearable=True).classes("w-72") \
-                                .tooltip("Writes a ready-made headshot prompt, with your trigger word and subject, "
-                                         "into the face probe prompt above and sets what it should show. Pick one, "
-                                         "then edit the prompt freely.")
-                            body_preset = ui.select({p.key: p.label for p in promptcheck.presets_of("body")},
-                                                    label="Body probe preset", clearable=True).classes("w-72") \
-                                .tooltip("The same for the body probe prompt: full-body and waist-up prompts.")
+                            preset_selects, preset_deletes = {}, {}
+                            for key, label, tip in (
+                                    ("face", "Face probe preset",
+                                     "Writes a ready-made headshot prompt, with your trigger word and subject, into "
+                                     "the face probe prompt above and sets what it should show. Pick one, then edit "
+                                     "the prompt freely. The save button keeps the prompt as one of your own presets."),
+                                    ("body", "Body probe preset",
+                                     "The same for the body probe prompt: full-body and waist-up prompts, and the "
+                                     "ones you saved.")):
+                                with ui.row().classes("rz-tips items-center gap-1 no-wrap"):
+                                    preset_selects[key] = ui.select(probe_preset_options(key), label=label,
+                                                                    clearable=True).classes("w-72").tooltip(tip)
+                                    ui.button(icon="bookmark_add", on_click=lambda _, k=key: save_probe_preset(k)) \
+                                        .props("flat dense round") \
+                                        .tooltip(f"Save the {key} probe prompt as a preset of your own")
+                                    preset_deletes[key] = ui.button(
+                                        icon="delete", on_click=lambda _, k=key: delete_probe_preset(k)) \
+                                        .props("flat dense round").tooltip("Delete the picked preset of your own")
+                                    preset_deletes[key].visible = False
+                            face_preset, body_preset = preset_selects["face"], preset_selects["body"]
                         with fields():
                             w["probe_face_expect"] = ui.select(expect_options, value=d.probe_face_expect,
                                                                label="Face probe should show").classes("w-72") \
@@ -11219,11 +11280,71 @@ def build_page(local: bool = True):
                                                                min=1, max=16, precision=0).classes("w-48")
 
                         def use_preset(e, key: str) -> None:
+                            preset_deletes[key].visible = str(e.value or "").startswith(MY_PRESET)
                             if not e.value:
                                 return
-                            w[f"probe_{key}_prompt"].value = promptcheck.build(
-                                e.value, w["trigger_word"].value or "", w["probe_subject"].value or "")
+                            trigger, subject = w["trigger_word"].value or "", w["probe_subject"].value or ""
+                            if str(e.value).startswith(MY_PRESET):
+                                mine = next((p for p in load_probe_presets()
+                                             if f"{MY_PRESET}{p['kind']}:{p['name']}" == e.value), None)
+                                if mine is None:  # deleted from another page meanwhile
+                                    ui.notify("That preset is no longer saved", type="warning")
+                                    return
+                                w[f"probe_{key}_prompt"].value = promptcheck.fill(mine["template"], trigger, subject)
+                                w[f"probe_{key}_expect"].value = mine["expect"]
+                                return
+                            w[f"probe_{key}_prompt"].value = promptcheck.build(e.value, trigger, subject)
                             w[f"probe_{key}_expect"].value = promptcheck.preset(e.value).expect
+
+                        def refresh_presets(key: str, value=None) -> None:
+                            preset_selects[key].set_options(probe_preset_options(key), value=value)
+                            preset_deletes[key].visible = str(value or "").startswith(MY_PRESET)
+
+                        async def save_probe_preset(key: str) -> None:
+                            prompt = " ".join(str(w[f"probe_{key}_prompt"].value or "").split())
+                            if not prompt:
+                                ui.notify(f"Write a {key} probe prompt first, then save it", type="warning")
+                                return
+                            trigger, subject = w["trigger_word"].value or "", w["probe_subject"].value or ""
+                            template = promptcheck.templatize(prompt, trigger, subject)
+                            with ui.dialog() as dlg, ui.card().classes("w-[34rem] max-w-full gap-3"):
+                                ui.label(f"Save the {key} probe prompt as a preset").classes("text-base font-medium")
+                                hint("Your trigger word and subject are kept as placeholders, so the preset fills in "
+                                     "each run's own: " + template)
+                                name = ui.input("Preset name").classes("w-full").props("autofocus")
+                                name.on("keydown.enter", lambda: dlg.submit(name.value))
+                                with ui.row().classes("w-full justify-end gap-2"):
+                                    ui.button("Cancel", on_click=lambda: dlg.submit(None)).props("flat")
+                                    ui.button("Save", icon="bookmark_add",
+                                              on_click=lambda: dlg.submit(name.value)).props("unelevated")
+                            got = await dlg
+                            dlg.delete()
+                            got = " ".join(str(got or "").split())
+                            if not got:
+                                return
+                            presets = load_probe_presets()
+                            replaced = any(p["kind"] == key and p["name"] == got for p in presets)
+                            presets = [p for p in presets if not (p["kind"] == key and p["name"] == got)]
+                            presets.append({"name": got, "kind": key, "template": template,
+                                            "expect": w[f"probe_{key}_expect"].value or ""})
+                            if not save_probe_presets(presets):
+                                ui.notify(f"Could not write {PROBE_PRESETS_FILE}", type="negative")
+                                return
+                            refresh_presets(key, f"{MY_PRESET}{key}:{got}")
+                            ui.notify(f"{'Replaced' if replaced else 'Saved'} the {key} probe preset '{got}'",
+                                      type="positive")
+
+                        def delete_probe_preset(key: str) -> None:
+                            value = str(preset_selects[key].value or "")
+                            if not value.startswith(MY_PRESET):
+                                return
+                            presets = load_probe_presets()
+                            kept = [p for p in presets if f"{MY_PRESET}{p['kind']}:{p['name']}" != value]
+                            if len(kept) != len(presets) and not save_probe_presets(kept):
+                                ui.notify(f"Could not write {PROBE_PRESETS_FILE}", type="negative")
+                                return
+                            refresh_presets(key)  # the prompt it wrote stays in the prompt box
+                            ui.notify(f"Deleted the {key} probe preset '{value.split(':', 2)[2]}'")
 
                         face_preset.on_value_change(lambda e: use_preset(e, "face"))
                         body_preset.on_value_change(lambda e: use_preset(e, "body"))

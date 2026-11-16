@@ -2377,6 +2377,15 @@ The two classic ones are the identity recipe's prompts, unchanged. The others ar
 way the current models are captioned, and name plain everyday clothes. Changing a probe prompt changes what the
 likeness score measures, so keep one pair for runs you want to compare.
 
+**Presets of your own** (since 3.25.0). The bookmark button beside each preset list saves the probe prompt in the box
+above as a preset of your own, under a name you give it, with what it should show. The trigger word (as a whole word)
+and the subject in it are saved as placeholders, so picking it in a later run writes that run's own; the dialog shows
+what is saved. Your presets follow the built-in ones, marked *(yours)*, and the delete button beside the list removes
+the picked one (the prompt it wrote stays in the box). Saving under a name the list already has replaces it. They are
+kept in `configs/probe_presets.json` on the machine running the WebUI, so every browser sees the same list; a page
+opened before a preset was saved lists it after a reload. Extra prompts to check (`probe_checks`) offer the built-in
+presets only.
+
 **Extra prompts to check (`probe_checks`).** Presets (or prompts of your own) rendered at every probe and read by the
 check, **without entering the likeness score**, so its scale stays as it is. They cover poses and framings the two
 likeness prompts do not: a LoRA can keep a sitting full-body prompt and lose a walking one. Each costs
