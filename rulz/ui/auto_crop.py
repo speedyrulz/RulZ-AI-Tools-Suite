@@ -235,10 +235,11 @@ class MaskPreview(QWidget):
                          QRectF(target.left(), r.top(), r.left() - target.left(), r.height()),
                          QRectF(r.right(), r.top(), target.right() - r.right(), r.height())):
                 p.fillRect(part, shade)
-            p.setPen(QPen(QColor(C["text"]), 2, Qt.DashLine))
+            # Drawn over the picture and a black shade, so white in both themes.
+            p.setPen(QPen(QColor("#f2f2f3"), 2, Qt.DashLine))
             p.drawRect(r)
         if self._message:
-            p.setPen(QColor(C["text"]))
+            p.setPen(QColor("#f2f2f3"))
             band = QRectF(0, self.height() - 34, self.width(), 30)
             p.fillRect(band.adjusted(8, 0, -8, 0), QColor(0, 0, 0, 170))
             p.drawText(band, Qt.AlignCenter, self._message)
