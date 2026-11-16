@@ -1258,7 +1258,7 @@ class Fleet:
                 raise Refused(f"{job} is running on instance {iid}: a reboot kills it without a final save. Stop the "
                               "run first, or force the reboot.")
             if self._updating(inst, snap) and not force:
-                raise Refused(f"Instance {iid} is updating its RulzTrainer: a reboot now can leave the update half "
+                raise Refused(f"Instance {iid} is updating its RulZ AI Trainer: a reboot now can leave the update half "
                               "done.")
             sending = inst.get("dispatching")
             if sending and self.now() - sending.get("since", 0) < DISPATCH_STALE and not force:
@@ -1856,7 +1856,7 @@ def cmd_update(fleet: Fleet, args) -> int:
     if args.check:
         show(fleet.check_update(args.id))
         return 0
-    print(f"[fleet] updating instance {args.id}: fetching the newest RulzTrainer, installing what changed, restarting "
+    print(f"[fleet] updating instance {args.id}: fetching the newest RulZ AI Trainer, installing what changed, restarting "
           "its WebUI", file=sys.stderr, flush=True)
     show(fleet.update_trainer(args.id, discard=args.discard, force=args.force, reinstall=args.reinstall))
     return 0
@@ -1964,7 +1964,7 @@ def parser() -> argparse.ArgumentParser:
     p = command("stop", cmd_stop)
     p.add_argument("name", help="a running job's name, or an instance id")
     p.add_argument("--kill", action="store_true", help="kill the process: no final save")
-    p = command("update", cmd_update, "update an instance's RulzTrainer to the newest and restart its WebUI")
+    p = command("update", cmd_update, "update an instance's RulZ AI Trainer to the newest and restart its WebUI")
     p.add_argument("id")
     p.add_argument("--check", action="store_true", help="only say what would change (versions, changed files)")
     p.add_argument("--discard", action="store_true",

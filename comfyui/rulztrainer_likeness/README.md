@@ -1,13 +1,13 @@
-# RulzTrainer likeness scoring for ComfyUI
+# RulZ AI Trainer likeness scoring for ComfyUI
 
-Score any images against a person's reference photos exactly as the RulzTrainer trainer scores its likeness probes
+Score any images against a person's reference photos exactly as the RulZ AI Trainer trainer scores its likeness probes
 and samples: the same face model, the same held-out gold face (AdaFace, or FaceNet), the same body score, the same normalized
 scale and the same face / body weights.
-The nodes import the trainer's own scoring code from a RulzTrainer checkout, so the numbers are the trainer's.
+The nodes import the trainer's own scoring code from a RulZ AI Trainer checkout, so the numbers are the trainer's.
 
 ## Install
 
-Link this folder into ComfyUI's `custom_nodes` from the RulzTrainer checkout (it finds the checkout through the
+Link this folder into ComfyUI's `custom_nodes` from the RulZ AI Trainer checkout (it finds the checkout through the
 link), then restart ComfyUI:
 
 ```bash
@@ -20,7 +20,7 @@ A copied folder instead needs the checkout's path in `repo_path.txt` (one line) 
 
 ComfyUI's Python needs `insightface`, `onnxruntime` (or `onnxruntime-gpu`), `mediapipe`, `transformers` and, for
 .xlsx files, `openpyxl` (`requirements.txt`). mediapipe 1.1 or newer is recommended: 1.0.0 and 1.0.1 crash on some
-image widths when reading the person mask, which RulzTrainer works around by padding those images by up to 3 pixels,
+image widths when reading the person mask, which RulZ AI Trainer works around by padding those images by up to 3 pixels,
 so their body scores can differ from other machines by a hair.
 
 The first run downloads InsightFace `buffalo_l` (into `~/.insightface`), DINOv2 base (into the Hugging Face cache),
@@ -30,7 +30,7 @@ Load `workflows/RulzTrainer Likeness Scoring.json` for a ready-made workflow.
 
 ## Nodes
 
-**RulzTrainer Likeness References**: who the person is.
+**RulZ AI Trainer Likeness References**: who the person is.
 - `reference_paths` / `reference_images`: references for both scores (image files or folders, one per line, and/or
   connected images).
 - `face_paths` / `face_images` and `body_paths` / `body_images`: separate face or body references. Given, they replace
@@ -50,7 +50,7 @@ Load `workflows/RulzTrainer Likeness Scoring.json` for a ready-made workflow.
   without raising the likeness; the gold face shows when that happens. `off` skips it. With a run's scale
   loaded, pick the run's own gold scorer: a run's FaceNet scale is not used for AdaFace scores (or the reverse).
 
-**RulzTrainer Likeness Score**: scores the images and averages them.
+**RulZ AI Trainer Likeness Score**: scores the images and averages them.
 - `images` and/or `image_paths`: one image, a batch, files or folders.
 - `face_weight` / `body_weight`: 0.7 / 0.3 as in the trainer.
 - `normalize` (on): the trainer's scale. 0 = what a stranger scores. The references' own level (a typical
@@ -60,7 +60,7 @@ Load `workflows/RulzTrainer Likeness Scoring.json` for a ready-made workflow.
   its own scale, shaped like the face's. The 0 is a default stranger score unless:
   - `baseline_paths` / `baseline_images`: images from the base model without the LoRA. Their mean score is the 0,
     as the trainer's step-0 probe sets it.
-  - `trainer_run`: a RulzTrainer job folder. Its `likeness.jsonl` gives the exact scale that run used.
+  - `trainer_run`: a RulZ AI Trainer job folder. Its `likeness.jsonl` gives the exact scale that run used.
   - `face_floor`, `body_floor`, `face_ceiling`, `body_ceiling`, `gold_floor`, `gold_ceiling`: raw values typed in
     (-1 = automatic). A typed ceiling is the final one, as the trainer logs it (already stretched).
 
@@ -81,7 +81,7 @@ gold face and body scores; each average is then normalized and they are combined
 a usable body, simply has no score of that kind (a headshot has no body score: the body window needs shoulders and
 hips).
 
-**RulzTrainer Likeness Export**: with `export_spreadsheet` on, writes to ComfyUI's output folder, under
+**RulZ AI Trainer Likeness Export**: with `export_spreadsheet` on, writes to ComfyUI's output folder, under
 `filename_prefix` (`likeness/likeness`, with a counter added), in the `format` picked (`xlsx` or `csv`):
 - an `.xlsx` with three sheets:
   - **Summary**: the averages, the mean, lowest, highest and spread of the images' own scores, and the scale used.

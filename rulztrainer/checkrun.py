@@ -133,7 +133,7 @@ CASES: tuple[Case, ...] = (
          note="It should lower the peak VRAM against the baseline at some cost in step time: both are in the notes."),
     Case("normuon", "The NorMuon optimizer (optimizer: normuon)",
          overrides={"optimizer": "normuon"},
-         expect={"log": [r"normuon is experimental and untested in RulzTrainer"]},
+         expect={"log": [r"normuon is experimental and untested in RulZ AI Trainer"]},
          compare="baseline"),
     Case("oft_scaled_lr", "Scaled OFT learning rate (oft_scaled_lr) on OFT blocks of 64",
          overrides={"network_type": "oft", "oft_block_size": 64, "oft_scaled_lr": True, "dora": False,
@@ -877,8 +877,8 @@ def _failed(res: dict) -> list[str]:
 
 def markdown(rep: dict) -> str:
     """The report as Markdown: the table, then every case's checks."""
-    lines = [f"# RulzTrainer check run {rep['tag']}", "",
-             f"RulzTrainer {rep.get('version')}, {rep.get('family')}, queued to "
+    lines = [f"# RulZ AI Trainer check run {rep['tag']}", "",
+             f"RulZ AI Trainer {rep.get('version')}, {rep.get('family')}, queued to "
              f"{'the vast.ai fleet' if rep.get('mode') == 'fleet' else 'the WebUI queue'}"
              + (f", block swap planned for a {rep['vram_gb']:g} GB card" if rep.get("vram_gb") else "") + ". "
              + ", ".join(f"{n} {v}" for v, n in sorted(rep["counts"].items())) + ".", ""]
@@ -948,7 +948,7 @@ EVERY_RUN = ("status.json says the run finished without an error, at its last st
 
 
 def list_text(family: str = "") -> str:
-    lines = ["RulzTrainer check run: the cases (python -m rulztrainer.checkrun queue --config FILE --dry-run shows "
+    lines = ["RulZ AI Trainer check run: the cases (python -m rulztrainer.checkrun queue --config FILE --dry-run shows "
              "them planned on a config)", ""]
     for case in CASES:
         if family and case.families and family not in case.families:
@@ -979,7 +979,7 @@ def plan_text(manifest: dict, dry_run: bool = True) -> str:
     where = "the vast.ai fleet's queue" if manifest["mode"] == "fleet" else "the WebUI's queue"
     lines = [f"Check run {manifest['tag']}: {len(queued)} of {len(cases)} cases for {where}"
              + (" (dry run: nothing is queued)" if dry_run else ""),
-             f"RulzTrainer {manifest['version']}, {manifest['family']}, output folder {manifest['output_dir']}"
+             f"RulZ AI Trainer {manifest['version']}, {manifest['family']}, output folder {manifest['output_dir']}"
              + (f", block swap planned for a {manifest['vram_gb']:g} GB card" if manifest.get("vram_gb") else
                 ", no card size given (--vram): the block swap plan cases are left out"), ""]
     plain = next((e["plain"] for e in queued if e["name"] == "baseline"), queued[0]["plain"] if queued else {})
@@ -1021,7 +1021,7 @@ def report_text(rep: dict) -> str:
                      f"{res['loss']:.4f}" if res["loss"] is not None else "", _cell(res["peak_gb"]),
                      _cell(res["step_seconds"])))
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
-    lines = [f"Check run {rep['tag']} ({rep.get('family')}, RulzTrainer {rep.get('version')})", ""]
+    lines = [f"Check run {rep['tag']} ({rep.get('family')}, RulZ AI Trainer {rep.get('version')})", ""]
     lines += ["  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip() for row in rows]
     lines.append("")
     for res in rep["results"]:

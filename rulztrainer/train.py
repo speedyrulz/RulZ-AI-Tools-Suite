@@ -25,7 +25,7 @@ from .trainer import Trainer  # noqa: E402
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="RulzTrainer: LoRA trainer for MOSS-Image")
+    ap = argparse.ArgumentParser(description="RulZ AI Trainer: LoRA trainer for MOSS-Image")
     ap.add_argument("--config", required=True, help="YAML config path")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                     help="Override a config value (JSON parsed when possible)")

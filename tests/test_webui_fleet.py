@@ -90,9 +90,9 @@ def test_the_fleet_is_one_object_for_the_whole_webui(tmp_path, monkeypatch):
 
 def test_the_cards_version_line_says_what_runs_and_what_is_newer():
     trainer = {"version": "3.16.0", "commit": "1a2b3c4d5e"}
-    assert webui.fleet_version_line({"trainer": trainer}) == "RulzTrainer 3.16.0 (1a2b3c4d5e)"
+    assert webui.fleet_version_line({"trainer": trainer}) == "RulZ AI Trainer 3.16.0 (1a2b3c4d5e)"
     assert webui.fleet_version_line({"trainer": trainer, "newer": {"version": "3.17.0", "behind": 4}}) == \
-        "RulzTrainer 3.16.0 (1a2b3c4d5e) · 3.17.0 is out"
+        "RulZ AI Trainer 3.16.0 (1a2b3c4d5e) · 3.17.0 is out"
     assert webui.fleet_version_line({"trainer": trainer, "newer": {"version": "3.16.0", "behind": 1}}).endswith(
         "· 1 newer commit")
     assert webui.fleet_version_line({"trainer": trainer, "update": {"state": "running"}}).endswith("updating now")
@@ -106,13 +106,13 @@ def test_the_update_dialog_says_versions_changes_and_whether_it_can_go():
             "changed": ["webui.py"], "changed_count": 1, "installs": True, "job_running": False}
     lines, can = webui.fleet_update_plan_text(plan)
     texts = [t for _, t in lines]
-    assert can and texts[0] == "Installed: RulzTrainer 3.16.0 (aaa)" and "3.17.0 (bbb)" in texts[1]
+    assert can and texts[0] == "Installed: RulZ AI Trainer 3.16.0 (aaa)" and "3.17.0 (bbb)" in texts[1]
     assert "3 newer commits on the branch." in texts and any("requirements changed" in t for t in texts)
     assert ("warning", "1 file was changed on the instance (by rulz_remote.py sync?): webui.py. The update replaces "
                        "it with the newest release's.") in lines
     lines, can = webui.fleet_update_plan_text(dict(plan, job_running=True, job="a"))
     assert not can and lines[-1][0] == "warning" and lines[-1][1].startswith("a is running there")
     lines, can = webui.fleet_update_plan_text(dict(plan, up_to_date=True, changed=[], changed_count=0, behind=0))
-    assert not can and "It already runs the newest RulzTrainer." in [t for _, t in lines]
+    assert not can and "It already runs the newest RulZ AI Trainer." in [t for _, t in lines]
     lines, can = webui.fleet_update_plan_text(dict(plan, checkout=False, behind=None, changed=[], changed_count=0))
     assert can and any("not a git checkout" in t for _, t in lines)

@@ -1,4 +1,4 @@
-"""ComfyUI nodes: RulzTrainer likeness scoring (references, score, export). The scoring itself is in core.py."""
+"""ComfyUI nodes: RulZ AI Trainer likeness scoring (references, score, export). The scoring itself is in core.py."""
 from __future__ import annotations
 
 import hashlib
@@ -14,7 +14,7 @@ from . import core
 from rulztrainer import facesim
 
 log = logging.getLogger("rulztrainer")
-REPO_DIR: Path | None = None  # set by __init__: the RulzTrainer checkout (its models/ folder holds the pose model)
+REPO_DIR: Path | None = None  # set by __init__: the RulZ AI Trainer checkout (its models/ folder holds the pose model)
 CATEGORY = "RulzTrainer/likeness"
 NA = -1.0  # a FLOAT output with no score (no face found, no body references, ...)
 
@@ -196,7 +196,7 @@ class RZLikenessReferences:
         if refs.face is None and refs.body is None:
             raise ValueError("No usable reference: no face and no body was found in any of them\n" + refs.describe())
         info = refs.describe()
-        log.info("RulzTrainer likeness references:\n%s", info)
+        log.info("RulZ AI Trainer likeness references:\n%s", info)
         return (refs, info)
 
 
@@ -227,7 +227,7 @@ class RZLikenessScore:
                                    "score becomes the 0 of the scale, as the trainer's step-0 probe does (else a "
                                    "default stranger score). " + PATHS_TIP}),
                 "trainer_run": ("STRING", {"default": "", "tooltip":
-                                "Optional: a RulzTrainer job folder: use the exact scale that run used (its "
+                                "Optional: a RulZ AI Trainer job folder: use the exact scale that run used (its "
                                 "likeness.jsonl), for numbers that match its probes. Weights stay the ones set here."}),
                 "face_floor": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 100.0, "step": 0.1, "tooltip":
                                "Raw face score that counts as 0 (-1: from the run, the baseline, or the default)."}),
@@ -297,13 +297,13 @@ class RZLikenessScore:
                                  gold_floor, gold_ceiling)
         gold_select = bool(job and job.get("gold_select")) if overall_face == "auto" else overall_face == "gold"
         if gold_select and not refs.has_gold:
-            log.warning("RulzTrainer likeness: the references have no gold face (gold_face off, or it found no "
+            log.warning("RulZ AI Trainer likeness: the references have no gold face (gold_face off, or it found no "
                         "reference face); the overall score uses ArcFace's face")
         core.apply_scale(rows, scale, face_weight, body_weight, gold_select)
         summary = core.summarize(rows, scale, face_weight, body_weight, gold_select)
         text = core.summary_text(summary, refs)
         details = core.details_text(rows)
-        log.info("RulzTrainer likeness: %s | %s (%.1fs)\n%s", text.replace("\n", " | "), scale.describe(),
+        log.info("RulZ AI Trainer likeness: %s | %s (%.1fs)\n%s", text.replace("\n", " | "), scale.describe(),
                  time.time() - t0, details)
         report = {"rows": rows, "summary": summary, "scale": scale, "refs": refs, "baseline": base_rows}
         return (report, text, details, _f(summary["overall"]), _f(summary["face"]), _f(summary["body"]),
@@ -343,7 +343,7 @@ class RZLikenessExport:
         base = Path(folder) / f"{name}_{counter:05}"
         files = core.export(report["rows"], report["summary"], report["scale"], report["refs"], base, format)
         text = "\n".join(str(f) for f in files)
-        log.info("RulzTrainer likeness: spreadsheet written to %s", text.replace("\n", ", "))
+        log.info("RulZ AI Trainer likeness: spreadsheet written to %s", text.replace("\n", ", "))
         return {"ui": {"text": [text]}, "result": (text,)}
 
 
@@ -353,7 +353,7 @@ NODE_CLASS_MAPPINGS = {
     "RZLikenessExport": RZLikenessExport,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "RZLikenessReferences": "RulzTrainer Likeness References",
-    "RZLikenessScore": "RulzTrainer Likeness Score",
-    "RZLikenessExport": "RulzTrainer Likeness Export",
+    "RZLikenessReferences": "RulZ AI Trainer Likeness References",
+    "RZLikenessScore": "RulZ AI Trainer Likeness Score",
+    "RZLikenessExport": "RulZ AI Trainer Likeness Export",
 }

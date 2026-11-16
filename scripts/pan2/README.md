@@ -67,7 +67,7 @@ These load in a ComfyUI build that has PAN 2 support (model code, the `pan2` tex
 diffusers-layout Wan VAEs). Stock ComfyUI without that support will not recognise them. One such build is
 <https://github.com/speedyrulz/ComfyUI>.
 
-RulzTrainer reads the same files to train PAN 2 LoRAs (`model_source: files`; see "PAN 2" in the trainer's README).
+RulZ AI Trainer reads the same files to train PAN 2 LoRAs (`model_source: files`; see "PAN 2" in the trainer's README).
 
 - Diffusion model: Load Diffusion Model
 - Text encoder: Load CLIP, type `pan2`

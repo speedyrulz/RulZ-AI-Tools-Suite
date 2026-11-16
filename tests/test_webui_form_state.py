@@ -157,7 +157,7 @@ def test_parse_report_reports_like_load_report(tmp_path):
 
 
 def test_parse_report_refuses_what_is_not_a_config():
-    with pytest.raises(ValueError, match="notes.yaml is not a RulzTrainer config"):
+    with pytest.raises(ValueError, match="notes.yaml is not a RulZ AI Trainer config"):
         TrainConfig.parse_report("- a\n- b\n", "notes.yaml")
 
 

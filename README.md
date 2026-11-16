@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-# RulzTrainer
+# RulZ AI Trainer
 
 A simple diffusion-model LoRA trainer with a WebUI. Supported models:
 
@@ -82,13 +82,13 @@ pip install -r requirements.txt
 Requires Python 3.10+ (`install.bat` asks for 3.10 to 3.12), a CUDA build of PyTorch 2.9+, diffusers 0.41+ and
 transformers 5.3+ (Qwen3.5 support).
 
-**No telemetry.** Importing RulzTrainer sets `ORT_DISABLE_TELEMETRY=1` and `HF_HUB_DISABLE_TELEMETRY=1` before
+**No telemetry.** Importing RulZ AI Trainer sets `ORT_DISABLE_TELEMETRY=1` and `HF_HUB_DISABLE_TELEMETRY=1` before
 anything loads onnxruntime or Hugging Face's libraries, so the WebUI and every job it starts inherit them, and it
 calls onnxruntime's own switch on Windows where InsightFace loads. onnxruntime's Linux builds from 1.29 otherwise
 report a device ID and machine details to Microsoft (found by Fizgig). A value you set yourself wins.
 
 **Downloads.** Hugging Face's hf_xet raises its parallel connections up to 64 while a model file downloads, which
-saturates a home connection; RulzTrainer sets `HF_XET_FIXED_DOWNLOAD_CONCURRENCY=8` (found by OneTrainer), which
+saturates a home connection; RulZ AI Trainer sets `HF_XET_FIXED_DOWNLOAD_CONCURRENCY=8` (found by OneTrainer), which
 still fills a fast link. Set the variable yourself for another number.
 
 ## Run the WebUI
@@ -198,13 +198,13 @@ use when the WebUI runs on another computer. Every setting and the *Advanced* sw
 To use the WebUI from your other devices (laptop, phone), start it with Tailscale. On Windows, double-click
 `run_webui_tailscale.bat` or run `run_webui.bat 7870 tailscale`. On Linux, run `./run_webui.sh 7870 127.0.0.1 tailscale`.
 `python webui.py --tailscale` and `RULZ_TAILSCALE=1` do the same. In the RulZ AI Tools Suite launcher (1.13.0 or newer),
-turn on *Tailscale remote access* on RulzTrainer's page and press *Launch*.
+turn on *Tailscale remote access* on RulZ AI Trainer's page and press *Launch*.
 
 It runs `tailscale serve`, so the WebUI stays bound to `127.0.0.1`. Tailscale publishes it over HTTPS at
 `https://<machine>.<tailnet>.ts.net:7870`, and only devices logged in to your tailnet can open it. The URL is printed
 on start. It uses its own HTTPS port, so an existing `tailscale serve` on the default port (ComfyUI, for example) is
 not touched. When the WebUI stops (Ctrl+C, closing its console window, logging off), the address switches to a short
-"RulzTrainer is not running" notice instead of a 502 error, and the next start brings the WebUI back on it.
+"RulZ AI Trainer is not running" notice instead of a 502 error, and the next start brings the WebUI back on it.
 Only a hard kill (Task Manager, a crash) leaves the 502. `tailscale serve --https=7870 off` removes the address for good.
 
 Requirements: Tailscale installed and logged in on this machine, and HTTPS certificates turned on for the tailnet
@@ -251,7 +251,7 @@ every instance and land in `/etc/environment`, where the WebUI and the training 
 boot `provision.sh` clones the repo into `/workspace/RulzTrainer`, installs the requirements into the image's
 `/venv/main` (its torch is reused) and registers the WebUI as a supervisor service; this takes 3-5 minutes and
 shows in the Instance Portal's log viewer. Then click *Open* on the instance: the Instance Portal lists
-**RulzTrainer** (the WebUI, proxied by Caddy on port 7870 with the portal's token / basic auth, so it is never open
+**RulZ AI Trainer** (the WebUI, proxied by Caddy on port 7870 with the portal's token / basic auth, so it is never open
 to the internet unauthenticated), Jupyter (file browser + terminal for uploads and downloads) and the tunnel links.
 
 Datasets: on the WebUI's Dataset tab, *Create dataset*, open it and upload images and `.txt` captions from your own
@@ -266,7 +266,7 @@ with it; stopping keeps it). Downloaded model files stay on the instance disk be
 Face's cache, a diffusers folder in `models/`).
 
 Every path field's Browse button opens a browser of the instance's own disk inside the page (folders, and files of
-the field's type with their sizes; shortcuts to RulzTrainer's `models` / `datasets` / `output`, `/workspace`, home and
+the field's type with their sizes; shortcuts to RulZ AI Trainer's `models` / `datasets` / `output`, `/workspace`, home and
 a ComfyUI `models` folder when there is one), so single model files, the dataset and the config are picked instead of
 typed. The same browser opens for any viewer that is not at the machine's own desktop; there the system dialog opens.
 
@@ -332,7 +332,7 @@ fork or branch. `Dockerfile` builds an image with the install baked in (`FROM va
 same supervisor wiring) for faster instance starts: build, push and use it as the template image; the provisioning
 variable is then unnecessary.
 
-**Working on an instance from your own computer.** `scripts/vast/rulz_remote.py` reaches the RulzTrainer on an instance
+**Working on an instance from your own computer.** `scripts/vast/rulz_remote.py` reaches the RulZ AI Trainer on an instance
 over ssh: its runs, logs and likeness probes, starting and stopping runs, and fetching their files. It is made for an
 AI assistant with a shell as much as for you: tell Claude Code that an instance is up and ask it to run a test, and it
 can start the run, watch it and read the probes itself. You need the `vastai` CLI with your API key and an ssh key
@@ -377,7 +377,7 @@ and write the same files in `~/.rulz_vast/fleet`. The tab is not shown when the 
 
 - **One page for every instance.** Each instance has a card: its run, progress, loss, time left, cost so far, the last
   likeness probe, a small loss and likeness chart, disk and GPU. *Find instances* asks vast.ai which instances are
-  running; new RulzTrainer ones join by themselves, stopped and destroyed ones are marked.
+  running; new RulZ AI Trainer ones join by themselves, stopped and destroyed ones are marked.
 - **A queue over the instances.** A queued run goes to the first instance with nothing running and nothing waiting in
   its own queue, and when an instance finishes its run it takes the next one. A run can be tied to one instance. A local
   dataset folder can be sent first when the instance does not have it; the settings' paths into that folder are pointed
@@ -404,9 +404,9 @@ and write the same files in `~/.rulz_vast/fleet`. The tab is not shown when the 
   `gpu_mem_mb`). It fires once per run, or with `--repeat` every time the number comes back to that side. `wait`
   blocks until a watch fires or a run ends and prints the events, so an AI assistant sets its lines, starts `wait` in
   the background and is woken by the event instead of checking by hand.
-- **Each instance's own controls.** *Open WebUI* on a card opens that instance's RulzTrainer page in a new tab, signed
+- **Each instance's own controls.** *Open WebUI* on a card opens that instance's RulZ AI Trainer page in a new tab, signed
   in through vast.ai's Instance Portal (the link carries the portal's token, as vast.ai's Open button does; it is asked
-  of the instance each time and never kept). The card's **⋮** menu has *Update RulzTrainer…*: it first shows the
+  of the instance each time and never kept). The card's **⋮** menu has *Update RulZ AI Trainer…*: it first shows the
   installed and the newest version (the `app/rulz-trainer` branch the instance was cloned from) and anything changed
   on the instance, then puts the newest code in place, installs the requirements when they changed, renews the WebUI's
   supervisor files and restarts the WebUI. It waits while a run is going, and a dropped connection does not stop it half
@@ -440,14 +440,14 @@ python scripts/vast/rulz_fleet.py webui 1234 --open        # its own WebUI in th
 | `wait`, `events` | Blocks until an event that needs a look (`--on KIND` picks others, `--timeout S` exits 2); the list of what happened. Each reader (`--reader NAME`) is given every event once |
 | `daemon`, `tick` | The loop that does the work; one look |
 | `stop NAME`, `stop NAME --kill` | The WebUI's Stop or Kill on the instance that runs that job |
-| `update ID`, `update ID --check` | The instance's RulzTrainer to the newest, its WebUI restarted. `--discard` replaces files changed there (by `rulz_remote.py sync`), `--force` updates under a running job, `--reinstall` installs the requirements anyway |
+| `update ID`, `update ID --check` | The instance's RulZ AI Trainer to the newest, its WebUI restarted. `--discard` replaces files changed there (by `rulz_remote.py sync`), `--force` updates under a running job, `--reinstall` installs the requirements anyway |
 | `reboot ID` | vast.ai stops and starts its container. `--kill` even while a run goes (it is killed, no final save); `--force` past every guard (a run, an update, a run being sent, a reboot under way) |
 | `webui ID` | The address of its own WebUI with the portal's sign-in token; `--open` opens it in the browser here |
 
 Something has to keep looking for the queue, the downloads and the watches to work: the WebUI on your computer,
 `daemon`, or a `wait` while it blocks. Only one of them looks at a time (a lock file); the others read what it wrote.
 Like `rulz_remote.py`, the fleet never rents, stops or destroys an instance (it reboots one, or updates its
-RulzTrainer, only when told to), a run it starts goes through that instance's own WebUI queue, and an instance left
+RulZ AI Trainer, only when told to), a run it starts goes through that instance's own WebUI queue, and an instance left
 running keeps billing. An instance's disk goes with the instance:
 what the rules have not downloaded by then is gone.
 
@@ -476,7 +476,7 @@ section) and samples with its own turbo LoRA by default where it has one ([Turbo
   `logsnr` is the style-friendly sampler ([arXiv 2411.14793](https://arxiv.org/abs/2411.14793), via musubi-tuner):
   the log signal-to-noise ratio is drawn from N(`logsnr_mean`, `logsnr_std`), -6 and 2 as the paper recommends, so
   most steps are very noisy (median sigma about 0.95), where a style's colours and strokes are learned. It is meant for
-  style LoRAs; RulzTrainer's `style` mode tilts the same way more gently.
+  style LoRAs; RulZ AI Trainer's `style` mode tilts the same way more gently.
 - **Timestep buckets** (`timestep_buckets`, 0 = off; after musubi-tuner's `num_timestep_buckets`). Free draws land
   on the sampling curve by luck: 10 of them cover only about 6.5 of its 10 tenths on average, so a short run or a
   small dataset can train some noise levels twice and miss others. With `timestep_buckets: N` the curve is cut into N
@@ -492,7 +492,7 @@ section) and samples with its own turbo LoRA by default where it has one ([Turbo
 - **Clean-end share** (`clean_share`, after Fizgig's MOSS-Image "Slide"; off by default). It sets the share of
   training steps at the clean end, where sigma is below 0.5 and faces and fine detail are refined, and it can change
   by epoch.
-  - **Where the curve starts.** RulzTrainer's default logit-normal puts 50% of steps there, MOSS's own pretraining
+  - **Where the curve starts.** RulZ AI Trainer's default logit-normal puts 50% of steps there, MOSS's own pretraining
     curve (`timestep_sampling: reference`) about 11%.
   - **How it hits the target.** The sampled curve is moved along the logit axis until the share is hit after
     `timestep_shift`, `sigma_min` / `sigma_max` and the 1000-step grid; its shape stays. The run logs each change.
@@ -523,8 +523,8 @@ section) and samples with its own turbo LoRA by default where it has one ([Turbo
     reverse, `30:7:60:8:3` (composition first, then likeness), and on 10 November `11:7:40:8:3`, which starts at about
     the model's own share. Fizgig reports that starting at 11 stopped the hair darkening late in a run and gave higher
     late likeness. It tuned that schedule together with its Element boost (the face and hair counting 9x early in the
-    run), which RulzTrainer does not have, and still offers `60:7:30:8:3` as slower to train but known to work well.
-  - **Unmeasured here**, but for one Krea 2 run of `60:7:30:8:3` that tied the plain run. RulzTrainer's default
+    run), which RulZ AI Trainer does not have, and still offers `60:7:30:8:3` as slower to train but known to work well.
+  - **Unmeasured here**, but for one Krea 2 run of `60:7:30:8:3` that tied the plain run. RulZ AI Trainer's default
     already starts at 50%, so race `clean_share: "60:7:30:8:3"` (or `"11:7:40:8:3"` with `optimizer: muon`) against
     `""` on your own data. It works with every model and timestep mode. On MiniMax-H3-Image, whose steps train only at
     its 6 fixed levels, the share is the steps at its last level (0.232); the *H3 Image 40* button fills in Fizgig's
@@ -696,7 +696,7 @@ Accepted weight formats: bf16 / fp16 / fp32, fp8 (upcast) and ComfyUI's scaled f
 ComfyUI `int8_tensorwise` with or without ConvRot (Hadamard rotation), ComfyUI's grouped `w4a8` / `w6a8` int files
 (read as the int8 ConvRot weights they decode to, so they save download size, not memory), and ComfyUI `nvfp4`.
 The int8 and nvfp4 formats are decoded exactly as comfy_kitchen does (verified against the HF weights: re-quantizing them with
-RulzTrainer reproduces the ComfyUI file bit for bit).
+RulZ AI Trainer reproduces the ComfyUI file bit for bit).
 
 *Diffusion model quant* / *Text encoder quant*:
 
@@ -1138,7 +1138,7 @@ An outlier is above `loss_watch_high` x the median and also above the median + `
 interquartile range of the dataset's residuals (with 4 images or more). Late in a run almost no image still improves
 by 3% an epoch, so without the fence every hard image ends up throttled: Fizgig replayed 39 real runs and found
 about a third of each dataset throttled, most of them images that kept getting easier at the full rate; it added
-the fence and stopped its throttle at x0.25 on 9 November 2026, and RulzTrainer follows since 3.7.1 (before: no
+the fence and stopped its throttle at x0.25 on 9 November 2026, and RulZ AI Trainer follows since 3.7.1 (before: no
 fence, and a third rung at x0.125). `loss_watch_fence: 0` is the old rule. With batch
 size 1 and no gradient accumulation this is a true per-image learning rate (the optimizer lr is scaled for that
 step); otherwise it becomes a per-sample loss weight. `loss_watch_exclude_after: N` benches an image that stays
@@ -1426,7 +1426,7 @@ from start to finish and told nothing:** with the person described in the captio
 taking the trigger word out changes almost nothing. Expect it to mean something only with short captions.
 
 Details: the maps use the weight average (`lora_ema`) as samples and probes do, run without gradients in eval mode
-with the RNG put back, and with compiled blocks run eagerly. RulZ Trainer's trigger map normalises over the caption's
+with the RNG put back, and with compiled blocks run eagerly. RulZ AI Trainer's trigger map normalises over the caption's
 tokens (`attn_localize`'s own measure), Fizgig's over every token, so their values differ. A full fine-tune has no
 *Where the LoRA acts* map (no adapter to switch off); a configuration race has no maps. A failed capture turns the maps
 off for the rest of the run and training goes on. Output, in the job folder: `training_maps/probes.json`,
@@ -1477,7 +1477,7 @@ trains every picture model's LoRA presets on these settings since 6 Nov 2026.
 - **Resume.** The state is one `momentum_buffer` per weight, as in `torch.optim.Muon`; a state of another optimizer is
   refused with a message.
 - **Embedders and the final layer.** Muon's authors, Moonshot and OneTrainer keep the layers outside the blocks
-  (image / timestep embedders, the timestep modulation, the text projection, the final layer) on AdamW. RulzTrainer
+  (image / timestep embedders, the timestep modulation, the text projection, the final layer) on AdamW. RulZ AI Trainer
   only trains them when `lora_targets` names `embed`, `modulation` or `text_in`, and then orthogonalizes them like the
   rest, with a warning in the log: race it against the same run without them if they matter.
 
@@ -1680,7 +1680,7 @@ layer (`automagic_groups: single`) beat `by_type` by 4.4 body points (p = 0.03),
 and 3e-4 tied at 1000 steps with every racer still improving. Use `single`, keep or lower the ceiling as you prefer, and
 plan on more than 1000 steps. The other Keel settings have no results yet.
 
-**For ai-toolkit users** (MiniMax H3 and FLUX Klein were trained there before RulzTrainer had its own ports):
+**For ai-toolkit users** (MiniMax H3 and FLUX Klein were trained there before RulZ AI Trainer had its own ports):
 `rulztrainer/optimizers/automagic4.py` depends only
 on `automagic3.py` next to it and keeps ai-toolkit's constructor (`step_target` is accepted and ignored), so copying it
 over `ai-toolkit/toolkit/optimizers/automagic4.py` gives ai-toolkit the fixed controller, including in its fused mode
@@ -2700,7 +2700,7 @@ data"; ~20% slower steps; files ~1/64 of the weights, about 400 MB on a 12B mode
   (`transformer.<module>` for the families saved in the diffusers / PEFT layout, FIBO 2.0, Krea 2 and Qwen-Image 2.1;
   `diffusion_model.<module>` for the others). ComfyUI's LoRA loader takes both for MOSS-Image and Krea 2 (it maps the
   diffusers stems); diffusers has no LoKr loader and ComfyUI has no map for FIBO 2.0's diffusers names, so a FIBO 2.0
-  LoKr loads only back into RulzTrainer. The metadata carries `ss_network_module: lycoris.kohya` and
+  LoKr loads only back into RulZ AI Trainer. The metadata carries `ss_network_module: lycoris.kohya` and
   `ss_network_args: {"algo": "lokr", "factor": N}`.
 - A LoKr file (Fizgig's, ai-toolkit's, LyCORIS) also works as a sampling-only `turbo_lora` / `sample_lora`;
   low-rank-stored factors (`lokr_w2_a/b`) are rebuilt, Tucker (`lokr_t2`) is not.
@@ -2991,11 +2991,11 @@ dataset to open it:
 ![An open dataset: each picture with its Face ref / Body ref / Baseline ticks and its caption](docs/screenshots/07-dataset.png)
 
 - *Upload* sends images, video clips and their `.txt` or `.json` captions from the computer the browser runs on to the
-  machine running RulzTrainer, a vast.ai instance included; on the same machine that is a plain copy. Files keep their
+  machine running RulZ AI Trainer, a vast.ai instance included; on the same machine that is a plain copy. Files keep their
   names and a file with the same name is replaced; other kinds of files are skipped and listed. Since 3.16.0 files go
   one at a time in 8 MB pieces: when the connection drops, the piece is sent again after a pause and the files already
   sent stay. The box shows each file and the megabytes sent; keep the page open until it says *Uploaded*.
-- *Copy from a folder* copies the images and captions of a folder on the machine running RulzTrainer into the dataset,
+- *Copy from a folder* copies the images and captions of a folder on the machine running RulZ AI Trainer into the dataset,
   sub-folders kept; files the dataset already has are left alone.
 - The grid shows every picture with its caption, saved to the `.txt` file as you type, and the *Face ref* / *Body ref*
   ticks; *Train on this dataset* ticks the dataset for training.
@@ -3057,7 +3057,7 @@ scan includes its sub-folders), is refused.
 
 ## FIBO 2.0 (Bria): training on dev, using the LoRA on Edit Turbo
 
-RulzTrainer also trains LoRAs for [briaai/Fibo-2.0-dev](https://huggingface.co/briaai/Fibo-2.0-dev), Bria's 8B
+RulZ AI Trainer also trains LoRAs for [briaai/Fibo-2.0-dev](https://huggingface.co/briaai/Fibo-2.0-dev), Bria's 8B
 single-stream DiT (44 blocks, Qwen3-VL-4B text encoder, the same Flux2 VAE as MOSS-Image). Pick **FIBO-2.0-dev** as
 the model, or any diffusers folder / repo id whose transformer is a `BriaFibo2Transformer2DModel` (the architecture is
 detected from the model; `model_arch: auto`). The repo is gated: accept its terms on Hugging Face and `hf auth login`.
@@ -3092,7 +3092,7 @@ detected from the model; `model_arch: auto`). The repo is gated: accept its term
   Bria's module names, plus the adapter config in the file metadata, alpha / rank folded into `lora_B` as for
   Krea 2). ComfyUI runs FIBO 2.0 from Comfy-Org's single files, but in its own fused layout (`attention.qkv`,
   `feed_forward.w13`), and its LoRA loader has no map from Bria's names onto it, so these files are not expected to
-  load there (not tried; nothing in RulzTrainer writes ComfyUI's FIBO layout). Use the LoRA in diffusers:
+  load there (not tried; nothing in RulZ AI Trainer writes ComfyUI's FIBO layout). Use the LoRA in diffusers:
 
   ```python
   import torch
@@ -3121,14 +3121,14 @@ above. On a 16 GB card the bf16 transformer needs offloading (`pipe.enable_seque
 | diffusers on **Edit Turbo**, "make the person smile" edit, base vs LoRA | 9 % vs 14 % |
 
 The LoRA file loads into diffusers' transformer without warnings, and with the same LoRA the diffusers model and
-RulzTrainer's produce bit-identical outputs. Note what an edit does, though: Edit Turbo conditions on the source
+RulZ AI Trainer's produce bit-identical outputs. Note what an edit does, though: Edit Turbo conditions on the source
 image, so a text-to-image LoRA shifts an edit toward the trained identity only partly; it does not replace the face
 in a photo of someone else. Replacing identities in edits needs edit-pair training (not supported yet). Generation
 with the LoRA (dev, or Turbo given no source image) carries the full identity.
 
 ## Krea 2: training on Raw, using the LoRA on Turbo
 
-RulzTrainer trains LoRAs for [krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw), Krea's 12B single-stream DiT
+RulZ AI Trainer trains LoRAs for [krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw), Krea's 12B single-stream DiT
 (28 blocks with grouped-query attention, a Qwen3-VL-4B text encoder whose twelve tapped layers are fused per token, and
 the 16-channel Qwen-Image VAE). Pick **Krea-2-Raw** as the model, or any diffusers folder / repo id whose transformer
 is a `Krea2Transformer2DModel` (detected from the model). The repo is gated: accept the Krea 2 Community License on
@@ -3191,7 +3191,7 @@ pipeline's (cosine 0.99989) as the pipeline is to itself at another padding leng
 
 ## Qwen-Image 2.1
 
-RulzTrainer trains text-to-image LoRAs for [Qwen/Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1), Qwen's
+RulZ AI Trainer trains text-to-image LoRAs for [Qwen/Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1), Qwen's
 7B single-stream DiT (32 blocks, one modulation shared by every block, a Qwen3-VL-8B text encoder read at its last
 layer before the final norm, and its own RGBA VAE: 16x, 64 channels). Pick **Qwen-Image-2.1** as the model. Edit LoRAs
 (before / after pairs with reference images) are not supported yet.
@@ -3250,7 +3250,7 @@ split onto both halves, and the training adapter (on while training, off while s
 
 ## FLUX.2 Klein 9B
 
-RulzTrainer trains text-to-image LoRAs for Black Forest Labs' FLUX.2 Klein 9B
+RulZ AI Trainer trains text-to-image LoRAs for Black Forest Labs' FLUX.2 Klein 9B
 ([black-forest-labs/FLUX.2-klein-base-9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B)): 9B weights,
 8 double and 24 single blocks, the Qwen3-8B text encoder and the Flux2 VAE of MOSS-Image / FIBO 2.0 / FLUX 3 Klein. Pick
 **FLUX-2-Klein-9B-Base** as the model; **FLUX-2-Klein-9B** is the 4-step distilled model, for samples. Its keys are the
@@ -3295,7 +3295,7 @@ Qwen3-8B encoder, and a trained LoRA in ComfyUI.**
 
 ## FLUX 3 Klein
 
-RulzTrainer trains text-to-image LoRAs for Black Forest Labs' FLUX 3 Image Klein
+RulZ AI Trainer trains text-to-image LoRAs for Black Forest Labs' FLUX 3 Image Klein
 ([black-forest-labs/flux-3-image-klein-base](https://huggingface.co/black-forest-labs/flux-3-image-klein-base)): a 5.5B
 DiT in which the caption and the image each pass through 5 blocks of their own, then 28 joint blocks over both
 (parallel attention + SwiGLU blocks, per-mode timestep modulation, 4-axis RoPE), with the Qwen3-VL-4B text encoder of
@@ -3368,7 +3368,7 @@ diffusers' Flux3 pipeline computes.
 
 ## Ideogram 4
 
-RulzTrainer trains LoRAs for [Ideogram 4](https://github.com/ideogram-oss/ideogram4), Ideogram's 9.3B flow-matching
+RulZ AI Trainer trains LoRAs for [Ideogram 4](https://github.com/ideogram-oss/ideogram4), Ideogram's 9.3B flow-matching
 DiT: 34 single-stream blocks over one text + image sequence (width 4608, 18 heads of 256, SwiGLU 12288, a 512-wide
 AdaLN, q/k RMSNorm, 3-axis interleaved MRoPE), conditioned on 13 layers of Qwen3-VL-8B-Instruct side by side
 (53,248 features per token) and decoding through the Flux2 VAE. Pick **Ideogram-4** as the model.
@@ -3453,7 +3453,7 @@ run on a GPU.
 
 ## MiniMax H3
 
-RulzTrainer trains **one-frame (image) LoRAs** for [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3),
+RulZ AI Trainer trains **one-frame (image) LoRAs** for [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3),
 MiniMax's open-weight video + audio model (released 3 August 2026): the 33B dense single-stream H3-Omni-Transformer
 (50 blocks, about 13B of its parameters in the AdaLN branches), Qwen3-VL-32B read after its 50th layer, a 16x / 4x
 video VAE with 24 channels (f16t4d24) and a stereo audio VAE. Your pictures train as one-frame videos, the way
@@ -3504,7 +3504,7 @@ What is modeled on evidence, and what is not:
   full model's, so they train (DiffSynth-Studio trains the same file). Full files (and the diffusers repo) are pruned
   the same way on load (a rank-8 basis of the curve, musubi-tuner's `--prune_adaln`; `RULZ_H3_FULL_ADALN=1` keeps
   them full, 13B parameters more). How much the pruning changes the result is musubi-tuner's measurement (at parity
-  with the published pruned files), not RulzTrainer's.
+  with the published pruned files), not RulZ AI Trainer's.
 - **Text features** follow diffusers' `MiniMaxH3TextEncoderStep` for a T2VA prompt: the caption verbatim, no chat
   template, no special tokens (an empty caption is a single space), the state after decoder layer 50 before any norm.
   H3's own tokenizer is required (it adds `<d>`, `</d>`, `<|cutoff|>`, `<|lyrics_start|>`); it is downloaded from
@@ -3593,7 +3593,7 @@ sampler against the released `MiniMaxH3Scheduler` pair, and detection, caches, b
 
 ## P-H3-Image
 
-RulzTrainer trains **text-to-image LoRAs** for [PrunaAI/P-H3-Image](https://huggingface.co/PrunaAI/P-H3-Image):
+RulZ AI Trainer trains **text-to-image LoRAs** for [PrunaAI/P-H3-Image](https://huggingface.co/PrunaAI/P-H3-Image):
 PrunaAI's fine-tune of MiniMax H3 for stills, which renders in 8 steps with no guidance (released November 2026). It
 is H3's 33B transformer (with Pruna's LoRA merged in), a Qwen3-VL-4B text encoder with a learned text connector, and
 a VAE that decodes one frame. Pick the **P-H3-Image** preset. Experimental: nothing has been measured on it yet, and
@@ -3654,7 +3654,7 @@ wizard.
 
 ## MiniMax-H3-Image
 
-RulzTrainer trains **text-to-image LoRAs** for
+RulZ AI Trainer trains **text-to-image LoRAs** for
 [MiniMaxAI/MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image), MiniMax's own image model (released
 3 November 2026): the H3 transformer (33B, 50 blocks) without its audio stream, distilled to render in 6 steps with
 no guidance, at 4 to 20 megapixels. It keeps H3's Qwen3-VL-32B text encoder unchanged and has its own image VAE (16x,
@@ -3713,7 +3713,7 @@ from diffusers' `minimax_h3_image` modular pipeline, ComfyUI's `MiniMaxH3ImageMo
   pictures in an epoch). Fizgig reports its best likeness on three people's sets with it: the face shape came earliest
   and the backgrounds stayed clean; Automagic 4 at its ceiling beat Automagic 3 and Muon most on a set with few
   headshots, and 0.5 MP did not hold up against 0.25 MP. **Not measured here yet**: the race above (1 MP, AdamW) is
-  the only H3 Image comparison RulzTrainer has.
+  the only H3 Image comparison RulZ AI Trainer has.
 - **Training adapter.** The model is step- and guidance-distilled, so `training_adapter: auto` downloads ostris'
   [minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter)
   `minimax_h3_image_training_adapter_v1.safetensors` (rank 16, 0.16 GB, `diffusion_model.*.lora_A/B`, no alpha, on
@@ -3794,13 +3794,13 @@ and measured here, so the rest are things to try, not defaults):
 
 - **More steps on the last noise level.** Its presets put 40% of the steps on the nearly clean level (sigma 0.232),
   where skin, eyes and fine detail are made, and share the rest evenly over the five levels above. It says a higher
-  share gives more detail and likeness, a lower one more layout. RulzTrainer draws the six levels evenly (about 17%
+  share gives more detail and likeness, a lower one more layout. RulZ AI Trainer draws the six levels evenly (about 17%
   each, ai-toolkit's rule); since v3.11.0 `clean_share: "40"` gives Fizgig's split (see *Clean-end share* above),
   which tied the even draw in its one race here.
 - **Its own training adapter**,
   [ShootTheSound/Fizgig-MiniMax-H3-Image-Training-Adapter](https://huggingface.co/ShootTheSound/Fizgig-MiniMax-H3-Image-Training-Adapter)
   (0.15 GB, trained on 7,600 photos and 1,000 of the model's own renders, published for any trainer). Fizgig reports
-  caricatures without an adapter and photographic skin with its own. RulzTrainer uses ostris' adapter; the two have
+  caricatures without an adapter and photographic skin with its own. RulZ AI Trainer uses ostris' adapter; the two have
   not been compared, and Fizgig's file has not been tried with `training_adapter`.
 - **Optimizer and size.** Its presets train on Automagic v3 at 0.5 MP, started at 2.8e-4, which gave its best
   previews (the rate eased down about 20% over the first 400 steps); 2.8e-4 also held at 1 MP in one test run.
@@ -3809,7 +3809,7 @@ and measured here, so the rest are things to try, not defaults):
   faster on a card of 40 GB or more (23.4 GB at 0.25 MP, 30.6 GB at 1 MP).
 - **Samples against ComfyUI.** The int8 file asks for INT8 attention in every block, which ComfyUI uses. Fizgig
   measured its own renders 22 dB (PSNR) from ComfyUI's without it and 27 dB with it, at 2048 px on the same LoRA,
-  prompt and seed. RulzTrainer's samples and probes do not use INT8 attention, so expect a gap of the first kind
+  prompt and seed. RulZ AI Trainer's samples and probes do not use INT8 attention, so expect a gap of the first kind
   between a sample here and the same seed in ComfyUI.
 - **Sliders from prompts did not work** on this model for Fizgig (a smile slider moved clothes and light instead):
   a change of prompt rearranges the whole picture.
@@ -3834,7 +3834,7 @@ header against the port, and detection, downloads, caches and the wizard.
 
 ## PAN 2
 
-RulzTrainer trains **LoRAs for [IFM/PAN2](https://huggingface.co/IFM/PAN2)**, IFM's 29B video model (44 joint
+RulZ AI Trainer trains **LoRAs for [IFM/PAN2](https://huggingface.co/IFM/PAN2)**, IFM's 29B video model (44 joint
 blocks, 4096 wide; Qwen3.5-9B text encoder; the Wan 2.2 VAE, 16x with 48 channels), **on still images**. Each image is
 a one-frame video, which is how IFM's own trainer mixes images into video training
 ([docs/data.md](https://github.com/ifm-ai/PAN2/blob/main/docs/data.md): images are encoded as one-frame videos and
@@ -4059,7 +4059,7 @@ Not run: clip training with block swap or two GPUs, `train_video_mode: spread`, 
 
 ## SDXL
 
-RulzTrainer trains **LoRAs for SDXL** (Stability AI's 2.6B UNet with two CLIP text encoders), and for the SDXL
+RulZ AI Trainer trains **LoRAs for SDXL** (Stability AI's 2.6B UNet with two CLIP text encoders), and for the SDXL
 fine-tunes most checkpoints are made from (Illustrious, Pony, NoobAI and so on). Pick the **SDXL-Base-1.0** preset
 (`stabilityai/stable-diffusion-xl-base-1.0`, about 7 GB to download), or point `transformer_file` at one all-in-one
 `.safetensors` checkpoint. Added in 3.23.0. Experimental.
@@ -4123,7 +4123,7 @@ Diffusion Model*. Current ComfyUI builds run MOSS-Image, Krea 2, Qwen-Image 2.1,
 Ideogram 4, MiniMax H3, P-H3-Image and MiniMax-H3-Image natively, so no plugin is needed (SDXL LoRAs load in the
 same node: see [SDXL](#sdxl)). Two exceptions:
 
-- **FIBO 2.0**: ComfyUI runs the model, but its LoRA loader does not map the diffusers layout RulzTrainer saves FIBO
+- **FIBO 2.0**: ComfyUI runs the model, but its LoRA loader does not map the diffusers layout RulZ AI Trainer saves FIBO
   LoRAs in; use them in diffusers (see [FIBO 2.0](#fibo-20-bria-training-on-dev-using-the-lora-on-edit-turbo)).
 - **PAN 2**: stock ComfyUI does not know the model; use a build with PAN 2 support (see [PAN 2](#pan-2)).
 

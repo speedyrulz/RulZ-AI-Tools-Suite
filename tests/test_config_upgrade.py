@@ -38,7 +38,7 @@ def test_append_missing_keeps_the_file_and_adds_every_new_option(tmp_path):
     cfg, missing, _ = TrainConfig.load_report(p)
     TrainConfig.append_missing(p, cfg, missing)
     text = p.read_text(encoding="utf-8")
-    assert text.startswith(OLD.rstrip("\n") + "\n# Options added in a newer RulzTrainer version")
+    assert text.startswith(OLD.rstrip("\n") + "\n# Options added in a newer RulZ AI Trainer version")
     assert "# tuned by hand" in text  # comments and the user's values untouched
     data = yaml.safe_load(text)
     assert data["learning_rate"] == 0.0002 and data["removed_option"] == 5
@@ -52,7 +52,7 @@ def test_append_missing_keeps_the_file_and_adds_every_new_option(tmp_path):
 def test_load_report_rejects_non_mapping(tmp_path):
     p = tmp_path / "list.yaml"
     p.write_text("- a\n- b\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="not a RulzTrainer config"):
+    with pytest.raises(ValueError, match="not a RulZ AI Trainer config"):
         TrainConfig.load_report(p)
 
 

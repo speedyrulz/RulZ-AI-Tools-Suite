@@ -1,6 +1,6 @@
-"""RulzTrainer likeness scoring for ComfyUI: the trainer's own face / body scoring on any images.
+"""RulZ AI Trainer likeness scoring for ComfyUI: the trainer's own face / body scoring on any images.
 
-The nodes import the scoring code from a RulzTrainer checkout, so scores match the trainer's exactly. The checkout is
+The nodes import the scoring code from a RulZ AI Trainer checkout, so scores match the trainer's exactly. The checkout is
 found, in order: the RULZTRAINER_DIR environment variable; repo_path.txt next to this file (one line, the checkout's
 folder); the checkout this folder lives in (when custom_nodes/ holds a link to it); an installed `rulztrainer`."""
 import os
@@ -33,7 +33,7 @@ def _find_repo() -> Path | None:
 
 REPO = _find_repo()
 if REPO is None:
-    raise ImportError("RulzTrainer likeness nodes: the RulzTrainer checkout was not found. Link this folder from the "
+    raise ImportError("RulZ AI Trainer likeness nodes: the RulZ AI Trainer checkout was not found. Link this folder from the "
                       "checkout into custom_nodes, set RULZTRAINER_DIR, or write the checkout's path into "
                       f"{HERE / 'repo_path.txt'}")
 if str(REPO) not in sys.path:

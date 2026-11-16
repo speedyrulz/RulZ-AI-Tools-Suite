@@ -14,7 +14,7 @@ if not "%~1"=="" set PORT=%~1
 set EXTRA=
 if /i "%~2"=="tailscale" set EXTRA=--tailscale
 
-echo Starting RulzTrainer WebUI on http://127.0.0.1:%PORT%  (close this window to stop)
+echo Starting RulZ AI Trainer WebUI on http://127.0.0.1:%PORT%  (close this window to stop)
 echo.
 "venv\Scripts\python.exe" webui.py --port %PORT% --open %EXTRA%
 if errorlevel 1 (
