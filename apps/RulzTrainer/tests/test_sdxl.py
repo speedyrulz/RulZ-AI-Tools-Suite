@@ -67,6 +67,40 @@ def embeds(batch=2, seed=1):
     return torch.randn(batch, M.TEXT_ROWS, TEXT_D, generator=g)
 
 
+@pytest.mark.parametrize("fmt", ["int8", "int8_convrot"])
+def test_sdxl_transformer_linear_quant_and_lora(fmt, tmp_path):
+    from rulztrainer import lora, quant as Q
+
+    ref = M.SdxlUNet(tiny_unet(dtype=torch.bfloat16)).requires_grad_(False)
+    model = M.SdxlUNet(tiny_unet(dtype=torch.bfloat16)).requires_grad_(False)
+    eligible = {n for n, m in model.named_modules() if isinstance(m, torch.nn.Linear)
+                and "transformer_blocks." in n and Q.can_quantize(m.weight, fmt, 16)}
+    assert eligible
+    assert Q.quantize_module_linears(model, fmt, min_dim=16,
+                                     name_filter=lambda n: "transformer_blocks." in n) == len(eligible)
+    assert {n for n, m in model.named_modules() if isinstance(m, Q.QuantLinear)} == eligible
+    x = torch.randn(1, 16, LAT, LAT).bfloat16()
+    cond = embeds(1).bfloat16()
+    with torch.no_grad():
+        expected, actual = ref(x, 400.0, cond), model(x, 400.0, cond)
+    assert torch.allclose(actual, expected, atol=0.03, rtol=0.05)
+
+    names = sorted(eligible)
+    a = lora.inject_lora(ref, 2, 2, [], names=names)
+    b = lora.inject_lora(model, 2, 2, [], names=names)
+    lora.save_lora(a, tmp_path / "ref.safetensors", fmt="kohya")
+    lora.save_lora(b, tmp_path / "quant.safetensors", fmt="kohya")
+    assert set(safetensors_torch.load_file(tmp_path / "ref.safetensors")) == set(
+        safetensors_torch.load_file(tmp_path / "quant.safetensors"))
+    model(x, 400.0, cond).square().mean().backward()
+    assert all(m.lora_up.weight.grad is not None for m in b.values())
+
+
+def test_sdxl_quant_loader_rejects_nvfp4_before_loading():
+    with pytest.raises(ValueError, match="SDXL.*nvfp4"):
+        SL.load_any_transformer("missing", "cpu", "nvfp4")
+
+
 # ---------------------------------------------------------------- schedule
 
 

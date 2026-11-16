@@ -1033,15 +1033,17 @@ def linear_compute_dtype(m: nn.Module) -> torch.dtype:
     return d if d is not None else m.weight.dtype
 
 
-def quantize_module_linears(model: nn.Module, fmt: str, min_dim: int = 1024, log=None) -> int:
+def quantize_module_linears(model: nn.Module, fmt: str, min_dim: int = 1024, log=None,
+                            name_filter=None, work_device=None) -> int:
     """Replace eligible nn.Linear modules in-place with QuantLinear. Returns count."""
     if fmt in ("none", "auto", None):
         return 0
     count = 0
     for name, module in list(model.named_modules()):
-        if not isinstance(module, nn.Linear) or not can_quantize(module.weight, fmt, min_dim):
+        if (not isinstance(module, nn.Linear) or (name_filter is not None and not name_filter(name))
+                or not can_quantize(module.weight, fmt, min_dim)):
             continue
-        qw = quantize_weight(module.weight.data, fmt)
+        qw = quantize_weight(module.weight.data.to(work_device or module.weight.device), fmt)
         ql = QuantLinear(qw, module.bias.data if module.bias is not None else None, module.weight.dtype)
         parent_name, _, child = name.rpartition(".")
         parent = model.get_submodule(parent_name) if parent_name else model
