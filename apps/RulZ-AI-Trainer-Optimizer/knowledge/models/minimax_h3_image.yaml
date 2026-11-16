@@ -1,0 +1,445 @@
+# MiniMax-H3-Image (the official still-image model): character LoRA starting recipe.
+# Public file: no handles, no personal details, no dataset names. Shared sources are in general.yaml.
+id: minimax_h3_image
+name: MiniMax-H3-Image
+kind: image
+updated: 2026-11-16
+summary: >-
+  A new model (released about 2026-11-10) with thin evidence: single-user runs reach about 80% identity from about 30
+  images, and it learns and burns fast (useful epochs 10-20 of 30, overcooked by about 1,000-1,250 steps with AdamW),
+  so save often and judge early checkpoints. It is a 6-step distilled model with one output head per step: train with
+  the six exact sigmas (timestep_sampling reference) and ostris' image training adapter, not the H3 video adapter.
+  Train close-ups at 1 MP and render at 2-4 MP: the 16x VAE redraws small faces and our LoRAs got sharper at 4 MP.
+model_preset: MiniMax-H3-Image
+model_path: MiniMaxAI/MiniMax-H3-Image
+facts:
+  - text: "Official image model, made for 4-20 MP (target about 16 MP, sides divisible by 32). It is CFG- and step-distilled with the six sampling steps baked in, each through its own output head. Inference is a 6-step schedule at CFG 1."
+    confidence: CONF
+    sources: [bano_h3i_2026_11, atk_ostris_h3i_2026_11]
+  - text: "Train on the six exact sampling sigmas (timestep_sampling reference, drawn evenly, each through its own head): ostris says the six heads are tied to specific training sigmas. Other samplers train at noise levels the model's sampling never uses; RulZ AI Trainer warns about that."
+    confidence: CONF
+    sources: [atk_ostris_h3i_2026_11, web_fizgig_2026_11, doc_trainer_3_28]
+  - text: "Use the image model's own training adapter (ostris' minimax_h3_image_training_adapter_v1, what training_adapter auto downloads); smaller training resolutions work with it, long runs may hit limits. The H3 video adapters and circlestone's H3 image adapter (for H3 itself) are different files."
+    confidence: REP
+    sources: [atk_ostris_h3i_2026_11, doc_trainer_3_28]
+  - text: "Evidence for a character is thin. About 80% identity (the user's own judgement, not as good as Krea 2) from about 30 images at 1024 with automagic v3 at 3,000 steps; the Fizgig trainer's author says its H3-Image likeness is the best of any model, with epochs 10-20 useful and epoch 30 nearly overcooked; one AdamW run had 80% at about 1,000 steps and overcooked by 1,250; a 31-close-up-image run at 512 px was good at 800-1,000 steps. No disclosed batch, rank mix or framing mix."
+    confidence: REP
+    sources: [bano_h3i_2026_11, atk_h3i_burn_2026_11, web_musetta_2026_11]
+  - text: "It burns before it learns on some sets (one user: burns where MOSS-Image worked on the same images): checkpoint often, from the first epochs, not only at 3,000 steps."
+    confidence: REP
+    sources: [atk_h3i_burn_2026_11, bano_h3i_2026_11]
+  - text: "Framing: close-ups worked; a full-body 32-image set failed at 512 px because the face was too small. The 16x VAE redraws small faces, and the model is made for 4 MP and up, so a 1 MP training image and a 512 px probe are below its range."
+    confidence: REP
+    sources: [web_musetta_2026_11, meas_h3image_2026_11]
+  - text: "Measured in RulZ AI Trainer (rented RTX 5090, int8 file, NVFP4 text encoder, rank 16, lr 1e-4, reference timesteps, 1 MP, 4 probe seeds): the port works, step-0 samples and probes were clean and photographic and the prompt check passed 4 of 4; 0.65-0.85 s/step with 26 of 50 blocks checkpoint-kept at a 28.0 GB peak of 31 GB. Even draw vs 40% of steps at the last level (clean_share 40): a tie over 1,000 steps (smoothed combined 28.5 vs 29.3). The 4-bit w4a8 file holds the same 22 GB, so it saves only download."
+    confidence: MEAS
+    sources: [meas_h3image_2026_11]
+  - text: "Rendering the same two 1 MP-trained LoRAs at 1, 2 and 4 MP gave the same person, sharper detail at 4 MP (combined 33.6/35.0 at 1 MP, 33.4/33.2 at 2 MP, 40.3/37.4 at 4 MP; about 6-7 s per 6-step 4 MP render at 22 GB)."
+    confidence: MEAS
+    sources: [meas_h3image_2026_11]
+  - text: "ComfyUI's dynamic VRAM mode applies H3-Image LoRAs about 15% weaker; if a LoRA looks weak in ComfyUI, raise the strength or turn dynamic VRAM off."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  - text: "A video LoRA from H3 transfers only partly (about 70% likeness): retrain; starting from the video LoRA was proposed but not shown better. A LoRA trained on H3 video at 16 MP rendered weaker than at 1 MP on the video model (not an image-model training rule)."
+    confidence: REP
+    sources: [bano_h3i_2026_11]
+  - text: "Inference sampler: er_sde with the simple scheduler at 4-6 steps is the most recommended, LCM at 4-6 and Euler have fans, and some samplers overcook at a nominal 6 because they use extra evaluations; one user ran er_sde at 12. Custom 5-step sigmas (1.0, 0.9675, 0.8875, 0.75, 0.5328, 0) looked cleaner for one user. Compare fixed seeds and effective model evaluations before blaming the training."
+    confidence: DISP
+    sources: [bano_h3i_2026_11]
+  - text: "Memory: rank 16 ran out of memory on a 24 GB 3090 with 64 GB RAM in AI Toolkit; the same user later trained rank 64 after a trainer update (the exact fix was not identified). A 12 GB card trained 512 px close-ups in AI Toolkit (384 px on OOM) at about 11.7 GB. Update the trainer before blaming rank."
+    confidence: REP
+    sources: [atk_h3i_oom_2026_11, web_musetta_2026_11]
+  - text: "Two other recipes exist: AcademiaSD's defaults (1,500 steps, LR 4e-4, rank 16 / alpha 32, previews every 40 steps at 1024; a face test used 14 images at 768 px) and the Fizgig trainer's likeness preset (clean-end share by epoch, automagic v4 at 2.5e-4, 0.25 MP, 30 epochs, peak about epoch 15). Neither is measured here beyond the even-vs-40 tie."
+    confidence: REP
+    sources: [web_academiasd_2026_11, web_fizgig_2026_11]
+  - text: "Licence: the MiniMax-H3-Image Community License differs from H3's (it excludes some regions without MiniMax's authorization and needs one above 1M USD revenue or for hosted services). Check it before use."
+    confidence: DOC
+    sources: [off_h3i_license]
+base:
+  network_type:
+    value: lora
+    why: "Plain LoRA in every recipe found; no LoKr evidence for this model."
+    confidence: REP
+    sources: [web_musetta_2026_11, meas_h3image_2026_11]
+  lora_rank:
+    value: 16
+    why: "Rank 16 in two web recipes and in our measured run. Alpha 32 (AcademiaSD) and rank 64 (one working run after an AI Toolkit update) also exist; low rank is the trend for one person."
+    confidence: CONF
+    sources: [web_musetta_2026_11, web_sepiablue_h3i_2026, meas_h3image_2026_11]
+  lora_alpha:
+    value: 16.0
+    why: "Alpha equals rank in the recipes and in the measured run (AcademiaSD uses 2x)."
+    confidence: CONF
+    sources: [web_musetta_2026_11, meas_h3image_2026_11]
+  training_adapter:
+    value: auto
+    why: "Ostris' image training adapter v1 (auto downloads it): the model is step- and guidance-distilled and a LoRA trained bare may drift. It matched 208 modules on the real model."
+    confidence: DOC
+    sources: [atk_ostris_h3i_2026_11, meas_h3image_2026_11, doc_trainer_3_28]
+  timestep_sampling:
+    value: reference
+    why: "The six exact sampling sigmas, each through its own output head, as AI Toolkit and the Fizgig trainer train the model. It ran in RulZ AI Trainer's measured run; the other samplers train at levels the model never samples."
+    confidence: CONF
+    sources: [atk_ostris_h3i_2026_11, web_fizgig_2026_11, meas_h3image_2026_11]
+  optimizer:
+    value: adamw
+    why: "Both sides: AdamW at 1e-4 is what the measured run used (and what two other users ran for 800-1,000 steps), while one user got about 80% identity with automagic v3 at 3,000 steps and the Fizgig preset uses automagic v4 at 2.5e-4. Automagic v4 fried the sibling P-H3-Image model, so stay on v3 if you choose automagic."
+    confidence: DISP
+    sources: [meas_h3image_2026_11, atk_h3i_burn_2026_11, bano_h3i_2026_11, web_fizgig_2026_11]
+  learning_rate:
+    value: 1.0e-4
+    why: "Rank 16 at 1e-4 is in the two web recipes and the measured run; AcademiaSD uses 4e-4 and Fizgig 2.5e-4 with automagic v4. The model learns and burns quickly: likeness near 500 steps and good at 800-1,000 at 1e-4."
+    confidence: DISP
+    sources: [web_musetta_2026_11, web_sepiablue_h3i_2026, web_academiasd_2026_11, meas_h3image_2026_11]
+  lr_scheduler:
+    value: constant
+    why: "Constant in the web recipes and AcademiaSD's defaults."
+    confidence: REP
+    sources: [web_academiasd_2026_11]
+  batch_size:
+    value: 1
+    why: "Batch 1 in every recipe and the measured run."
+    confidence: CONF
+    sources: [web_musetta_2026_11, meas_h3image_2026_11]
+  resolutions:
+    value: [1.0]
+    why: "Train at 1 MP (the measured run; one user's 1024 autocrop). 512 px close-ups worked at 12 GB, and the Fizgig preset trains at 0.25 MP; the model itself renders 4 MP and up, so higher is better when your photos are that large."
+    confidence: DISP
+    sources: [meas_h3image_2026_11, bano_h3i_2026_11, web_musetta_2026_11, web_fizgig_2026_11]
+  model_file_quant:
+    value: int8_convrot
+    why: "Comfy-Org's pruned int8 file (21 GB): one RTX 5090 holds it whole, and the layers the LoRA trains are the full model's."
+    confidence: MEAS
+    sources: [meas_h3image_2026_11]
+  text_encoder_file_quant:
+    value: nvfp4_awq
+    why: "The NVFP4 text encoder was used in the measured run; it caches the captions first, then unloads."
+    confidence: MEAS
+    sources: [meas_h3image_2026_11]
+  gradient_checkpointing:
+    value: true
+    why: "Needed for a 21 GB model on a consumer card."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  sample_steps:
+    value: 6
+    why: "The model's own 6-step schedule, one output head per step."
+    confidence: DOC
+    sources: [doc_trainer_3_28, atk_ostris_h3i_2026_11]
+  sample_cfg:
+    value: 1.0
+    why: "Guidance-distilled: no CFG."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  sample_before_training:
+    value: true
+    why: "A wrong picture at step 0 means a port or setup problem, not a training problem; the first real test of this model needs it."
+    confidence: MEAS
+    sources: [meas_h3image_2026_11]
+  probe_steps:
+    value: 6
+    why: "Probes sample as the previews do."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_cfg:
+    value: 1.0
+    why: "Guidance-distilled: no CFG."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_size:
+    value: 1024
+    why: "The model is made for 4 MP and up and its 16x VAE redraws small faces, so 512 px probes are below its range and may read the face low. Not measured: the first run's 512 px probes were nearly identical between the two settings it compared."
+    confidence: GUESS
+    sources: [meas_h3image_2026_11]
+  probe_seeds:
+    value: 4
+    why: "A single probe swings about 10 points; the measured race used 4 seeds."
+    confidence: MEAS
+    sources: [meas_h3image_2026_11, meas_region_2026_11]
+  likeness_framing:
+    value: true
+    why: "Counts a body render with no body as zero so the best-checkpoint tracker is not fooled by lost framing."
+    confidence: MEAS
+    sources: [meas_region_2026_11]
+  copy_check:
+    value: "on"
+    why: "Logs the copy score with the probes so a memorised checkpoint is visible."
+    confidence: MEAS
+    sources: [meas_krea_race_2026_11]
+steps:
+  epochs: 30
+  min: 600
+  max: 1500
+  round_to: 50
+  why: "About 30 epochs of a 20-50 image set (600-1,500 steps): likeness near 500 steps, good at 800-1,000, useful epochs 10-20 and nearly overcooked at 30, overcooked by 1,250 with AdamW. One automagic v3 run used 3,000 steps for about 80% identity; probes every 25 steps and checkpoints every 100 let the peak choose the stop."
+  confidence: CONF
+  sources: [web_musetta_2026_11, bano_h3i_2026_11, atk_h3i_burn_2026_11, meas_h3image_2026_11]
+adjust:
+  - id: tiny_dataset
+    when: {images_max: 14}
+    set:
+      lora_rank: {value: 8, why: "Under 15 images a big rank overfits; low rank is the trend for one person (H3 family evidence, none specific to this model).", confidence: GUESS, sources: [web_musetta_2026_11]}
+      lora_alpha: {value: 8.0, why: "Alpha equals rank.", confidence: GUESS, sources: [web_musetta_2026_11]}
+      crop_augment: {value: face+bust, why: "Close-ups worked (31 close-up images in the best web recipe); face and bust crops add them to a set too small to have them.", confidence: GUESS, sources: [web_musetta_2026_11]}
+    note: "A 14-image set at 30 epochs would be 420 steps, so the minimum of 600 applies (about 43 epochs): stop at the first good probe."
+  - id: small_dataset
+    when: {images_min: 15, images_max: 40}
+    set:
+      holdout_images: {value: 3, why: "Three held-out photos let the sweeps show where the subject stops being learned; measured on another model, never on this one.", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "A sweep every 4 epochs costs little on a small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "The base recipe is made for about 30 images."
+  - id: large_dataset
+    when: {images_min: 80}
+    set:
+      holdout_images: {value: 8, why: "Up to a fifth of the set may be held out; eight photos give a steadier held-out curve.", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "As for the small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "80+ images: the cap (1,500 steps) gives under 19 epochs, right for a model that overcooks by epoch 30. Culling to 30-60 varied images is more reliable than adding steps."
+  - id: goal_quick
+    when: {goal: quick}
+    set:
+      resolutions: {value: [0.5], why: "Half a megapixel keeps a test short; 512 px close-ups gave good likeness at 800-1,000 steps in one recipe.", confidence: REP, sources: [web_musetta_2026_11]}
+      probe_seeds: {value: 2, why: "A first test needs a rough read only.", confidence: GUESS, sources: []}
+    note: "A quick test: likeness shows near 500 steps; stop at the first good probe."
+  - id: goal_likeness
+    when: {goal: likeness}
+    set:
+      clean_share: {value: "16.67,75,33.33,75,50,75,75", why: "The Fizgig trainer's H3-Image likeness recipe: the share of steps on the cleanest noise level by epoch (16.67 climbing to 75); its author reports top-end likeness on three datasets. RulZ AI Trainer's own comparison (even vs 40%) was a tie, so this is untested here.", confidence: REP, sources: [web_fizgig_2026_11, meas_h3image_2026_11]}
+      probe_seeds: {value: 6, why: "More probe seeds make the best checkpoint reliable.", confidence: MEAS, sources: [meas_krea_race_2026_11]}
+    note: "The Fizgig preset also uses automagic v4 at 2.5e-4 and 0.25 MP, which RulZ AI Trainer does not copy because automagic v4 fried a sibling model."
+  - id: focus_face
+    when: {focus: face}
+    set:
+      crop_augment: {value: face, why: "Close-ups teach the face's detail; the 16x VAE redraws small faces, so the face needs pixels.", confidence: REP, sources: [web_musetta_2026_11, meas_h3image_2026_11]}
+      face_weight: {value: 1.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+      body_weight: {value: 0.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: focus_face_body
+    when: {focus: face_body}
+    set:
+      crop_augment: {value: face+bust, why: "Close-ups for the face plus head-and-shoulders crops between them and the whole photos; a full-body set at 512 px failed because the face was too small, so keep close-ups in the set.", confidence: REP, sources: [web_musetta_2026_11]}
+    note: "Keep both close-ups and full-body shots: close-ups alone cannot teach the body and a full-body-only set at low resolution loses the face."
+  - id: low_median_mp
+    when: {median_mp_max: 0.4}
+    set:
+      resolutions: {value: [0.5], why: "The photos are under 0.4 MP: training above their size only upscales them.", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: vram_24
+    when: {vram_max_gb: 24}
+    set:
+      block_swap: {value: 8, why: "The 21 GB model plus a 1 MP step peaked at 28 GB on a 32 GB card even with checkpointing; at 24 GB the trainer's plan is about 4 blocks of 50 (0.39 GB each); 8 leaves room. An estimate, not a measurement.", confidence: GUESS, sources: [meas_h3image_2026_11, doc_trainer_3_28]}
+    note: "Keep 64 GB of system RAM; block-swapped weights wait there. A 24 GB 3090 with 64 GB RAM ran out of memory at rank 16 in AI Toolkit before an update."
+  - id: vram_16
+    when: {vram_max_gb: 16}
+    set:
+      block_swap: {value: 26, why: "At 16 GB the trainer's plan is about 25 of the 50 blocks swapped; 26 for margin. An estimate, not a measurement.", confidence: GUESS, sources: [doc_trainer_3_28]}
+      resolutions: {value: [0.5], why: "Half a megapixel halves the tokens per step; a 12 GB card trained 512 px close-ups.", confidence: REP, sources: [web_musetta_2026_11]}
+evaluate:
+  strength: "1.0 (1.0-1.3). ComfyUI's dynamic VRAM mode applies H3-Image LoRAs about 15% weaker, so a LoRA that looks weak there may only need a higher strength."
+  sampler: "ComfyUI: er_sde with the simple scheduler at 4-6 steps is the most recommended (LCM 4-6 or Euler also work); a nominal 6 can overcook with samplers that use extra evaluations. Skip the last sigma against eyelash and tiling artifacts, and try the custom 5-step sigmas (1.0, 0.9675, 0.8875, 0.75, 0.5328, 0). RulZ AI Trainer's own previews use the model's 6-step schedule."
+  steps: "6 (the model is a 6-step model). Render at 2-4 MP for detail: the same LoRA was sharper at 4 MP than at 1 MP."
+  cfg: "1.0: guidance-distilled, no CFG."
+  notes:
+    - "Save every 100 steps and look from the first epochs: the model burns early, useful epochs were 10-20 of 30."
+    - "Check the step-0 sample first: it should be a clean photographic image; if not, it is a setup problem, not training."
+    - "Compare checkpoints at fixed seeds with the same sampler; a crispy look at 6 steps can be the sampler, not the training."
+    - "Test a prompt unlike every training image and a distant shot; the 16x VAE redraws small faces, so judge faces at 2-4 MP."
+    - "A face_refs picture without a detectable face silently disables the probes."
+flaws:
+  - symptom: no_likeness
+    causes:
+      - "a port or setup problem (the step-0 sample is already wrong)"
+      - "a full-body-only set at low resolution: the face is too small"
+      - "the wrong adapter (the H3 video adapter is not interchangeable)"
+    fixes:
+      - action: "Check the step-0 sample first (sample_before_training): a wrong picture at step 0 is a setup problem. Then check training_adapter auto picked the image adapter."
+        why: "The first real test of this model; adapters are not interchangeable."
+        confidence: MEAS
+        sources: [meas_h3image_2026_11, atk_ostris_h3i_2026_11]
+      - action: "Add close-ups with the face large; a 31-close-up set at 512 px worked and a 32-image full-body set failed."
+        why: "Face too small at low resolution."
+        confidence: REP
+        sources: [web_musetta_2026_11]
+      - action: "Retrain from the images; an H3 video LoRA only transfers to about 70% likeness."
+        why: "One user's comparison."
+        confidence: REP
+        sources: [bano_h3i_2026_11]
+  - symptom: slow_likeness
+    causes:
+      - "run stopped too early (likeness was near 500 steps and 800-1,000 preferred in one recipe)"
+    fixes:
+      - set: {steps: {op: mul, value: 1.3}}
+        why: "A 1,800-2,000 step run may improve likeness (AcademiaSD); the rate stays at the usual 1e-4."
+        confidence: REP
+        sources: [web_academiasd_2026_11, web_musetta_2026_11]
+  - symptom: peaked_early
+    causes:
+      - "the model burns early: overcooked by 1,000-1,250 steps with AdamW, nearly at epoch 30"
+    fixes:
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "Halving the rate was the only change that helped in our nine-run test on another model; this model overcooks within about 1,000 steps at 1e-4."
+        confidence: REP
+        sources: [atk_h3i_burn_2026_11, meas_region_2026_11]
+      - action: "Take the checkpoint from epochs 10-20 (about 300-600 steps for 30 images); save every 100 steps."
+        why: "Useful epochs 10-20; epoch 30 nearly overcooked."
+        confidence: REP
+        sources: [bano_h3i_2026_11]
+  - symptom: burned
+    causes:
+      - "overtraining (the model burns fast)"
+      - "the sampler: effective evaluations above 6 overcook a 6-step model"
+      - "automagic v4 (fried the sibling P-H3-Image run)"
+    fixes:
+      - action: "First compare the checkpoint at fixed seeds with LCM at 4 vs 6 steps and er_sde with simple at 4-6, and try the custom 5-step sigmas; the crispy look at 6 steps is often the sampler, not the training."
+        why: "Several users saw crispy skin and hair at nominal 6 steps with some samplers; one ran er_sde at 12."
+        confidence: DISP
+        sources: [bano_h3i_2026_11]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "The model overcooks within about 1,000 steps at 1e-4."
+        confidence: REP
+        sources: [atk_h3i_burn_2026_11]
+      - set: {optimizer: {value: adamw}}
+        why: "Automagic v4 fried the sibling model where v3 did not; AdamW is what was measured here."
+        confidence: CONF
+        sources: [web_fizgig_2026_11, meas_h3image_2026_11]
+  - symptom: noisy_grainy
+    causes:
+      - "the sampler (crispy skin and hair at 6 steps)"
+    fixes:
+      - action: "Try custom 5-step sigmas 1.0, 0.9675, 0.8875, 0.75, 0.5328, 0 or skip the last sigma; they looked cleaner than the nominal 6-step schedule for one user."
+        why: "A single report."
+        confidence: REP
+        sources: [bano_h3i_2026_11]
+  - symptom: soft_blurry
+    causes:
+      - "rendering at 1 MP: the 16x VAE redraws small faces"
+    fixes:
+      - action: "Render at 2-4 MP: the same LoRAs gave the same person with sharper detail at 4 MP (about 6-7 s per render on a 32 GB card)."
+        why: "Measured on two LoRAs."
+        confidence: MEAS
+        sources: [meas_h3image_2026_11]
+  - symptom: wrong_at_distance
+    causes:
+      - "the 16x VAE redraws small faces; the model is made for 4-20 MP"
+    fixes:
+      - action: "Render at 2-4 MP and add distant shots to the set with the face still sharp; a face-detail pass (inpaint with the same LoRA) can repair what is left."
+        why: "Face-size is the weak point of a 16x VAE."
+        confidence: MEAS
+        sources: [meas_h3image_2026_11, atk_distance_multires_2026_01]
+      - set: {resolutions: {value: [1.0, 1.5]}}
+        why: "More pixels for small faces; the model renders 4 MP and up."
+        confidence: GUESS
+        sources: [bano_h3i_2026_11]
+  - symptom: needs_high_strength
+    causes:
+      - "ComfyUI's dynamic VRAM mode applies the LoRA about 15% weaker"
+    fixes:
+      - action: "Raise the strength to 1.15-1.3 or turn ComfyUI's dynamic VRAM off before retraining."
+        why: "Documented effect, with a ComfyUI issue open."
+        confidence: DOC
+        sources: [doc_trainer_3_28]
+  - symptom: out_of_memory
+    causes:
+      - "21 GB model plus a step on a 16-24 GB card"
+      - "an old trainer build (rank 16 ran out of memory on 24 GB, then rank 64 worked after an update)"
+    fixes:
+      - set: {block_swap: {op: add, value: 8}, resolutions: {value: [0.5]}, text_encoder_file_quant: {value: nvfp4_awq}}
+        why: "Block swap, half a megapixel and the smallest text encoder; a 12 GB card ran 512 px close-ups."
+        confidence: REP
+        sources: [web_musetta_2026_11, atk_h3i_oom_2026_11]
+      - action: "Update the trainer first and keep 64 GB of system RAM; the one report of rank 16 running out of memory was later solved by an update whose exact fix is unknown."
+        why: "A single report."
+        confidence: REP
+        sources: [atk_h3i_oom_2026_11]
+  - symptom: nan_or_diverged
+    causes:
+      - "automagic v4 (LR climbs, then noise)"
+    fixes:
+      - set: {optimizer: {value: adamw}}
+        why: "Automagic v4 fried a sibling model's run; use AdamW or automagic3."
+        confidence: CONF
+        sources: [atk_automagic4_2026_11, meas_h3image_2026_11]
+  - symptom: color_shift
+    causes:
+      - "model-specific cast: a red hue above about 0.75 MP in image edit mode"
+    fixes:
+      - action: "In edit mode keep references under about 0.75 MP or accept the red shift; for text-to-image LoRAs compare with the base model on the same seed."
+        why: "Reported once."
+        confidence: REP
+        sources: [bano_h3i_2026_11]
+open_questions:
+  - "Optimal rank, alpha, LoKr factor, blocks, caption dropout and close/medium/full-body mix for a person: no evidence."
+  - "Training well below 16 MP: does 0.25-0.5 MP (Fizgig) or 1 MP (here) or higher give the best likeness?"
+  - "Adapter vs a contrastive-guidance loss for a character on this model."
+  - "Automagic v3 at 3,000 steps vs AdamW at 1,000 steps for the same set."
+  - "Whether Fizgig's likeness-optimization schedule beats the even draw (our even-vs-40 comparison was a tie)."
+  - "Whether 512 px probes read the face low compared with 1,024 px."
+  - "Whether an H3 video LoRA is a useful warm start."
+sources:
+  bano_h3i_2026_11:
+    kind: community
+    where: "banodoco Discord #minimax_h3_image"
+    date: "2026-11"
+    people: 4
+    url: null
+    note: "About 80% identity from about 30 images at 1024 autocrop with automagic v3 and 3,000 steps; epochs 10-20 useful and 30 nearly overcooked in the Fizgig trainer; sampler comparisons; a video LoRA transferring about 70%."
+  atk_h3i_oom_2026_11:
+    kind: community
+    where: "AI Toolkit Discord #training and #minimax_h3_image"
+    date: "2026-11"
+    people: 1
+    url: null
+    note: "Rank 16 ran out of memory on a 24 GB card with 64 GB RAM; a later update ran rank 64 and the user reported a successful run."
+  atk_ostris_h3i_2026_11:
+    kind: community
+    where: "AI Toolkit Discord #new_models (the trainer's author)"
+    date: "2026-11"
+    people: 1
+    url: null
+    note: "Six output heads tied to specific training sigmas; an image-specific training adapter; smaller training resolutions work with it, long runs may hit limits."
+  atk_h3i_burn_2026_11:
+    kind: community
+    where: "AI Toolkit Discord #training"
+    date: "2026-11"
+    people: 2
+    url: null
+    note: "About 80% likeness at about 1,000 steps and overcooked by 1,250 (AdamW, sigmoid timesteps); another user saw it burn before learning where MOSS-Image worked on the same set."
+  web_musetta_2026_11:
+    kind: web
+    where: "musetta.ai H3 character LoRA tutorial for 12 GB cards (AI Toolkit)"
+    date: "2026-11"
+    people: null
+    url: "https://musetta.ai/blog/minimax-h3-character-lora-training-12gb-ai-toolkit"
+    note: "31 close-up images at 512 px (384 on OOM), rank 16/16, LR 1e-4, adamw8bit, batch 1, 1,000 steps (likeness near 500, 800 good, 1,000 preferred), num_frames 1; a 32-image full-body set failed because the face was too small."
+  web_sepiablue_h3i_2026:
+    kind: web
+    where: "note.com H3-Image LoRA article"
+    date: "2026-09"
+    people: null
+    url: "https://note.com/sepiablue/n/nf0763f854580"
+    note: "The same close-up recipe (512 px, rank 16, LR 1e-4, about 1,000 steps); possibly the same author's lineage as the page above, so do not count it as independent."
+  web_academiasd_2026_11:
+    kind: web
+    where: "AcademiaSD LoRAlab trainer studio, changelog and defaults"
+    date: "2026-11"
+    people: null
+    url: "https://github.com/AcademiaSD/AcademiaSD_LoRAlab-TrainerStudio"
+    note: "Defaults tested to work, not tuned: 1,500 steps, LR 4e-4, constant with 50 warm-up, rank 16 / alpha 32, previews every 40 steps at 1024; a face test used 14 images at 768 px."
+  web_fizgig_2026_11:
+    kind: web
+    where: "Fizgig trainer repository (H3-Image likeness optimization preset)"
+    date: "2026-11"
+    people: 1
+    url: "https://github.com/shootthesound/Fizgig"
+    note: "Clean-end share by epoch (16.67 climbing to 75), automagic v4 at 2.5e-4 with the max LR capped at 2.5e-4, 0.25 MP, 30 epochs with a peak about epoch 15; the author claims top-end likeness on three datasets; INT8 attention gave 27 dB vs 22 dB in samples."
+  off_h3i_license:
+    kind: official
+    where: "MiniMax-H3-Image Community License (as noted in RulZ AI Trainer's records)"
+    date: "2026-11"
+    people: null
+    url: null
+    note: "Excludes some regions without MiniMax's authorization; needed above 1M USD revenue or for hosted services."
+  meas_h3image_2026_11:
+    kind: measured
+    where: "RulZ AI Trainer own runs on rented RTX 5090 and 48 GB cards (MiniMax-H3-Image int8 and w4a8, a small fictional test set)"
+    date: "2026-11"
+    people: null
+    url: null
+    note: "First real run (the port works), even vs 40% last-level share tie over 1,000 steps, the w4a8 file trained once, and the 1/2/4 MP render check. Not run: block swap, model split, training above 1 MP."

@@ -1,0 +1,584 @@
+# Krea 2: character LoRA starting recipe.
+# Public file: no handles, no personal details, no dataset names. Shared sources are in general.yaml.
+id: krea2
+name: Krea 2
+kind: image
+updated: 2026-11-16
+summary: >-
+  Train on Raw and judge on Raw with the turbo LoRA at about 0.45-0.7: Turbo is a sampling aid, and a LoRA trained on
+  the distilled weights looks plastic and low in variety. Krea 2 learns a person fast (likeness often by 500-1,500
+  steps on 20-35 photos) and burns when pushed (one report: about 4,000 steps), so save every 100-250 steps and pick an
+  early checkpoint. Captions decide the fine detail: describe everything except the person's own traits, keep the trigger
+  in every caption, and never name moles, tattoos or pores. Our own races found OFT far ahead of a plain LoRA (+12 on two
+  seeds) at the price of memorised clothing and framing, so OFT is the likeness option and a LoRA is the balanced one.
+model_preset: Krea-2-Raw
+model_path: krea/Krea-2-Raw
+facts:
+  - text: "Train on Raw; use the Turbo checkpoint or the turbo LoRA only for sampling. A LoRA trained on Raw works on Turbo, while Turbo-trained LoRAs looked worse and less varied than a Raw run. One user trains and generates on Turbo with short captions and raises strength toward 1.0 instead of training longer (one thumbs-up). RulZ AI Trainer has no Krea 2 training adapter, so Raw is the supported base."
+    confidence: CONF
+    sources: [bano_krea_raw_2026_09, web_hf_krea_turbo_2026_07, web_earngenix_2026_08, atk_distilled_guard_2026_09]
+  - text: "Krea 2 learns fast: 4-6 images showed likeness under 500 steps, 18-37 images in 1,100-1,500, 30-40 images in 30-50 epochs; one user finds any set size 'incredible' by 2,500. But a hard 100+ image set can show nothing at 500, and a 300+ image set first showed similarity at 2,500-2,750. 80 face images trained to 3,000 steps made the person look older."
+    confidence: CONF
+    sources: [bano_krea_steps_2026_09, bano_krea_tiny_2026_11, atk_steps_per_image_2026_06]
+  - text: "Captions are the lever for fine detail: write long natural sentences about everything that is NOT the person (clothes, pose, place, light, camera), put the trigger early in every caption, and leave out the person's physical traits. Moles, tattoos, pores and scars that were never named in a caption were learned from close-ups at odd angles; one named caption broke the detail. The teacher's mix was about 60% very long (near the token cap), 20% medium, 10% short."
+    confidence: CONF
+    sources: [bano_krea_captions_2026_10, atk_captions_2026_06, web_caption_what_changes]
+  - text: "Dataset: 20-35 varied images (close-up, half-body, full-body, left, right, above, below) is the sweet spot and culling beats adding (170 images were no better than 30). Ten full-body shots in 40 did not teach body shape; a LoRA built only from head shots guesses the body. Include a few high-resolution close-ups at odd angles for skin marks."
+    confidence: CONF
+    sources: [atk_dataset_size_2026_07, atk_dataset_mix_2026_06, bano_krea_captions_2026_10]
+  - text: "Use a trigger that reads like a real name with no digits or symbols: gibberish triggers such as 'm@d4 woman' print as text on signs and shirts (about 1% of renders even then). A trigger kept in every training caption helps complex scenes even if you do not prompt it."
+    confidence: CONF
+    sources: [atk_trigger_text_2026_07, bano_krea_captions_2026_10]
+  - text: "Network: LoRA rank 8-32 or LoKr full-rank factor 4-8 all gave faces; the teacher says rank can be surprisingly low. In our own races a plain LoRA (rank 32, AdamW 1e-4, 0.25 MP, 2,000 steps) pooled to a combined likeness of about 31 (sd 2.7); LoKr 8 tied it on the face and lost on the body; OFT scored +12 on two seeds (face and body, 8 of 8 probe seeds), was still rising at step 2,000 and went over the copy limit once. OFT pulled training-photo clothing into headshots and stretched two seeds. DoRA and Keel gained 3-6 points on one seed each."
+    confidence: MEAS
+    sources: [meas_krea_race_2026_11, bano_krea_rank_2026_10, atk_rank_lokr_2026]
+  - text: "Optimizer: automagic v3 at 1e-4 (weight decay 1e-5) is the community default (six users); AdamW 8-bit at 1e-4 also works (our measured reference). Automagic's effective LR can fall below 1e-5 and stop learning, and automagic v4 is considered unsafe. RulZ AI Trainer's automagic floor is 2e-5 since 3.24.0 (our Keel numbers used 1e-8). One user's v4 variant stopped on a magnitude measure instead of a step count."
+    confidence: DISP
+    sources: [atk_krea_optimizer_2026_09, atk_automagic_floor_2026_10, atk_automagic4_2026_11, meas_krea_race_2026_11]
+  - text: "Timestep: sigmoid, which is RulZ AI Trainer's logit_normal at its default scale (the same bell curve). Among about 15 settings one user tried, linear was clearly worse for likeness; sigmoid gives the best face composition and weighted the best fine detail. A recipe with 'Linear Balanced' also exists."
+    confidence: CONF
+    sources: [atk_timestep_2026_07, web_earngenix_2026_08]
+  - text: "Resolution: mixed 512/768/1024 buckets are the common advice and 1024-only gave softer faces; one writeup says avoid 768 because Krea's training used 256/512/1024. Sizes of 512 alone transfer to 1024 for some users. Our races trained at 0.25 MP only and still reached likeness."
+    confidence: DISP
+    sources: [bano_krea_raw_2026_09, atk_soft_faces_2026_06, web_earngenix_2026_08, meas_krea_race_2026_11]
+  - text: "Identity bleed and DOP: LoKr did not stop everyone in a scene from getting the face. DOP worked 'amazingly' on one model and badly twice on Krea 2 (one build would not load with it); Isolation (RulZ AI Trainer's DOP) scored 54.5 and then 32.0 on two runs of one set and its face probes collapsed to one scene. Two similar people in one LoRA bled; a 460-image cast of ten characters did not."
+    confidence: DISP
+    sources: [atk_dop_reg_2026_08, meas_krea_race_2026_11, bano_krea_multi_2026_06]
+  - text: "Judge in ComfyUI on Raw plus the turbo LoRA, not by the trainer sample alone; trainer samples have looked wrong while the file was fine. Two-step Raw-then-turbo sampling looked underbaked next to plain turbo."
+    confidence: CONF
+    sources: [atk_trainer_vs_comfy_2026_08, bano_krea_raw_2026_09, bano_krea_diffguide_2026_10]
+  - text: "Memory and speed: int8 showed no quality gap to bf16 (two users). Measured here on a 32 GB card: Raw in int8 at 0.25 MP, rank 32, peaked at 20.7 GB; a trigger-attention capture cost 2.2 s; Krea's own text-fusion and attention-gate layers are in the default targets because boosting them lifted likeness 2-7 points in another trainer's tests. The model's safety training sits in the text projector, which any normal LoRA erases."
+    confidence: MEAS
+    sources: [meas_krea_race_2026_11, doc_trainer_3_28]
+base:
+  network_type:
+    value: lora
+    why: "Plain LoRA loads everywhere and was the common community choice (rank 8-32 or LoKr 4-8). OFT beat it by 12 points in our races but pulls training clothing into headshots, so it is set for the likeness goal instead."
+    confidence: CONF
+    sources: [bano_krea_rank_2026_10, atk_rank_lokr_2026, meas_krea_race_2026_11]
+  lora_rank:
+    value: 16
+    why: "Reported ranks run 8-32 (one user at 8 for 1,200-2,500 steps, 16 is OneTrainer's default and a web default, 32 the wizard's) and the teacher says to start small. Rank is not the lever: the plain rank-32 reference and the rank-16 and 8 reports all reached a face."
+    confidence: CONF
+    sources: [bano_krea_rank_2026_10, atk_rank_lokr_2026, web_earngenix_2026_08]
+  lora_alpha:
+    value: 16.0
+    why: "Alpha equals rank so the adapter's scale stays 1."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  optimizer:
+    value: adamw8bit
+    why: "Both sides: automagic v3 at 1e-4 is the community's favourite, but its effective LR can sink below 1e-5 and stall; AdamW 8-bit at 1e-4 is our measured reference (pooled likeness 31, sd 2.7) and also worked for users (800-2,000 steps)."
+    confidence: DISP
+    sources: [atk_krea_optimizer_2026_09, atk_automagic_floor_2026_10, meas_krea_race_2026_11]
+  learning_rate:
+    value: 1.0e-4
+    why: "Automagic users start at 1e-4, AdamW users ran 1e-4 to 2e-4, and 1e-4 is our measured reference."
+    confidence: CONF
+    sources: [atk_krea_optimizer_2026_09, meas_krea_race_2026_11, bano_krea_steps_2026_09]
+  lr_scheduler:
+    value: constant
+    why: "Constant is the trainer's default and what the reference runs used; a cosine run at 2e-4 also worked for one user."
+    confidence: MEAS
+    sources: [meas_krea_race_2026_11]
+  timestep_sampling:
+    value: logit_normal
+    why: "The same bell curve as the sigmoid that users prefer for likeness (linear was clearly worse in a 15-setting test); it is what our reference runs used."
+    confidence: CONF
+    sources: [atk_timestep_2026_07, meas_krea_race_2026_11]
+  batch_size:
+    value: 1
+    why: "Batch 1; AI Toolkit does not scale the LR with batch, so a bigger batch needs 1.5-2.5x the steps and dulls likeness for characters."
+    confidence: CONF
+    sources: [atk_lr_scaling_2026_11, bano_krea_steps_2026_09]
+  caption_dropout:
+    value: 0.05
+    why: "0.05 was used by two recipes and is the trainer's default (the trigger stays in a dropped caption). There is no Krea identity A/B for caption dropout."
+    confidence: REP
+    sources: [web_imagelora_2026_10]
+  resolutions:
+    value: [0.25, 0.5, 1.0]
+    why: "A mix of about 512, 768 and 1024 px (0.25, 0.5 and 1 MP): mixed buckets are the common advice, 1024-only gave softer faces, and far shots need smaller sizes. Our races trained at 0.25 MP alone."
+    confidence: CONF
+    sources: [bano_krea_raw_2026_09, atk_soft_faces_2026_06, atk_distance_multires_2026_01]
+  isolation:
+    value: false
+    why: "DOP is disputed on Krea 2 (it worked on another model, was bad twice here and once would not load) and our Isolation runs repeated badly (54.5 then 32.0) with memorised face scenes. Turn it on only for bleed onto other people."
+    confidence: MEAS
+    sources: [meas_krea_race_2026_11, atk_dop_reg_2026_08]
+  turbo_lora:
+    value: auto
+    why: "Samples and probes use Comfy-Org's Krea 2 turbo LoRA on Raw; the LoRA being trained is never mixed into it."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  turbo_lora_strength:
+    value: 0.6
+    why: "Raw plus the turbo LoRA at 0.45-0.7 (0.6 at CFG 1 with 10-12 steps, or 0.45 at CFG 2.5 with 16 steps) keeps Raw's variety and skin; full-strength turbo looks plastic."
+    confidence: CONF
+    sources: [atk_plastic_turbo_2026_10, bano_krea_raw_2026_09]
+  sample_steps:
+    value: 12
+    why: "10-12 steps at turbo 0.6 and CFG 1 is the recipe quoted by a regular; the trainer's default for the LoRA at full strength is 8."
+    confidence: REP
+    sources: [atk_plastic_turbo_2026_10]
+  sample_cfg:
+    value: 1.0
+    why: "CFG 1 with the turbo LoRA (about 1-3 in the community; 2.5 pairs with strength 0.45)."
+    confidence: CONF
+    sources: [bano_krea_raw_2026_09, atk_plastic_turbo_2026_10]
+  probe_steps:
+    value: 12
+    why: "Probes are rendered as the samples are, so the face score sees the same look you judge."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_cfg:
+    value: 1.0
+    why: "As the samples."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_seeds:
+    value: 4
+    why: "A single probe swings about 10 points between seeds; four seeds give a curve you can read (our races used eight)."
+    confidence: MEAS
+    sources: [meas_krea_race_2026_11, meas_region_2026_11]
+  likeness_framing:
+    value: true
+    why: "Counts a body render with no body as zero so best-checkpoint tracking is not fooled by lost framing (it was in 8 of 9 runs on another model)."
+    confidence: MEAS
+    sources: [meas_region_2026_11]
+  copy_check:
+    value: "on"
+    why: "Logs the copy score with the probes so a memorised checkpoint shows (copy 0.6-0.7 marked the memorised rows in our races)."
+    confidence: MEAS
+    sources: [meas_krea_race_2026_11]
+steps:
+  epochs: 50
+  min: 1000
+  max: 3000
+  round_to: 50
+  why: "Both sides: 18-37 image sets reached likeness in 1,100-1,500 steps (about 40-60 epochs) and the cap leaves room for the 2,000 steps of our reference, but one user saw burn from about 4,000 and another saw 8,000 still fine, while hard or large sets can need 2,500 or more. Fifty epochs with probes every ~10% lets the likeness peak decide where to stop."
+  confidence: DISP
+  sources: [bano_krea_steps_2026_09, atk_burn_2026_08, bano_krea_tiny_2026_11, meas_krea_race_2026_11]
+adjust:
+  - id: tiny_dataset
+    when: {images_max: 14}
+    set:
+      lora_rank: {value: 8, why: "A small set overfits a big adapter and copies its background; rank 8 held likeness for one user at 1,200-2,500 steps and 4-6 images reached likeness in under 500.", confidence: REP, sources: [atk_rank_lokr_2026, bano_krea_steps_2026_09]}
+      lora_alpha: {value: 8.0, why: "Alpha equals rank.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "Under 10 images the LoRA is stiff and copies the background and expression; add photos before tuning. The step minimum is 1,000, so a 10-image set trains 100 epochs: stop at the first good probe (likeness can show under 500 steps)."
+  - id: small_dataset
+    when: {images_min: 15, images_max: 40}
+    set:
+      holdout_images: {value: 3, why: "Three held-out photos let the sweeps show where the subject stops being learned; on a Qwen-Image 2.1 fine-tune that peak came at 35-50% of the run, before the probes agreed. Never run on Krea 2.", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "A sweep every 4 epochs costs little on a small set (24 s for 62 pictures).", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "The base recipe is made for this size (20-35 varied images)."
+  - id: large_dataset
+    when: {images_min: 80}
+    set:
+      lora_rank: {value: 32, why: "More data supports a bigger adapter (one user), and a rank-32 AdamW 1e-4 run was still improving at 4,000 steps.", confidence: REP, sources: [atk_rank_lokr_2026, bano_krea_rank_2026_10]}
+      lora_alpha: {value: 32.0, why: "Alpha equals rank.", confidence: DOC, sources: [doc_trainer_3_28]}
+      holdout_images: {value: 8, why: "Up to a fifth of the set may be held out; eight photos give a steadier held-out curve.", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "As for the small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "80+ images: the step cap (3,000) already gives under 40 epochs. Culling to 30-60 varied images is usually better than adding steps (170 images were no better than 30); a 300+ image set first showed similarity at 2,500-2,750 steps."
+  - id: goal_quick
+    when: {goal: quick}
+    set:
+      learning_rate: {value: 2.0e-4, why: "AdamW 8-bit at 2e-4 reached likeness in about 800 steps for one user; twice our reference rate is the quick trade.", confidence: REP, sources: [atk_krea_optimizer_2026_09]}
+      resolutions: {value: [0.25, 0.5], why: "Two small sizes keep the first test short; our races trained at 0.25 MP.", confidence: MEAS, sources: [meas_krea_race_2026_11]}
+      probe_seeds: {value: 2, why: "A first test needs a rough read only.", confidence: GUESS, sources: []}
+    note: "A quick test: expect likeness at about 500-1,000 steps and burn soon after if you keep going."
+  - id: goal_likeness
+    when: {goal: likeness}
+    set:
+      network_type: {value: oft, why: "OFT scored +12 combined on two seeds (face and body, 8 of 8 probe seeds), was ahead from step 600 and still rising at 2,000; the wizard recommends it for a person on Krea 2. It pulls training-photo clothing into headshots, stretched two seeds and once exceeded the copy limit (0.59); it loads in ComfyUI, not diffusers.", confidence: MEAS, sources: [meas_krea_race_2026_11]}
+      probe_seeds: {value: 6, why: "More probe seeds make the best checkpoint reliable.", confidence: MEAS, sources: [meas_krea_race_2026_11]}
+    note: "OFT is the strongest measured option but not tried together with captions that vary clothes; if training clothing shows up in headshots, use the lora network for the balanced goal."
+  - id: focus_face
+    when: {focus: face}
+    set:
+      crop_augment: {value: face, why: "Close-ups teach the face's detail; bust crops would mostly teach the build.", confidence: DOC, sources: [doc_trainer_3_28]}
+      face_weight: {value: 1.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+      body_weight: {value: 0.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: focus_face_body
+    when: {focus: face_body}
+    set:
+      crop_augment: {value: face+bust, why: "Close-ups for the face and head-and-shoulders crops between them and the whole photos; the build comes from the whole photos.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "Body shape needs full-body shots: 10 full-body photos in 40 were not enough to teach height and build. Add standing full-body pictures with varied crops, not more close-ups."
+  - id: low_median_mp
+    when: {median_mp_max: 0.4}
+    set:
+      resolutions: {value: [0.25], why: "The photos are under 0.4 MP: training above their size only upscales them (soft sources tank quality from the first save).", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: no_captions
+    when: {has_captions: false}
+    set:
+      caption_dropout: {value: 0.0, why: "Most images have no caption file, so there is nothing to drop.", confidence: REP, sources: [atk_captions_2026_06]}
+    note: "Three users trained Krea 2 characters on trigger-only or no captions, but four others and the teacher caption everything except the person's traits; write long captions first. A captioner (Qwen3-VL 4B) plus a hand pass that deletes the person's own traits works."
+  - id: vram_24
+    when: {vram_max_gb: 24}
+    set:
+      transformer_quant: {value: int8_convrot, why: "int8 (13.5 GB) shows no quality gap to bf16 (25 GB); a 0.25 MP rank-32 step peaked at 20.7 GB.", confidence: MEAS, sources: [meas_krea_race_2026_11, doc_trainer_3_28]}
+      resolutions: {value: [0.25, 0.5], why: "Drop the 1 MP bucket: tokens and activations scale with it; the measured 20.7 GB peak was at 0.25 MP.", confidence: GUESS, sources: [meas_krea_race_2026_11]}
+    note: "Add the 1 MP bucket back only if the step fits. The trainer's wizard plans block swap from your card on the Train tab."
+  - id: vram_16
+    when: {vram_max_gb: 16}
+    set:
+      transformer_quant: {value: nvfp4, why: "NVFP4 is 8 GB against int8's 13.5 GB; the trainer picks int8 only from 22 GB. Slower (fp4 weights are expanded each step).", confidence: DOC, sources: [doc_trainer_3_28]}
+      text_encoder_quant: {value: int8, why: "Halves the 9 GB text encoder so it fits on the card for caching.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "Untested here on a 16 GB card. One user could not fit ConvRot int8 but ran NVFP4."
+evaluate:
+  strength: "1.0 first; if the likeness is weak raise it toward 1.2-1.5 before training longer. A LoRA trained on Raw usually needs more strength on Turbo."
+  sampler: "ComfyUI: Raw plus the Krea 2 turbo LoRA at 0.45-0.7. Raw alone needs CFG 3-5 and 30-45 steps. Do not judge by a two-step Raw-then-turbo pass."
+  steps: "10-12 steps at turbo 0.6 (CFG 1), or 16 steps at turbo 0.45 (CFG 2.5); 15-20 turbo steps gave better likeness than 8 for one user."
+  cfg: "1 with the turbo LoRA at 0.6; 2.5 at 0.45; 3-5 on Raw alone."
+  notes:
+    - "Save every 100-250 steps. Checkpoints are not monotonic and likeness often gets better while the model is overcooking, so the best-looking one may be overbaked."
+    - "Test with a prompt unlike every training photo (other clothes, other place), a full-body shot, a profile, and a second person in the frame."
+    - "High-resolution renders (7-10 MP) expose peach-fuzz skin from slight overtraining; a 1.5x hires pass raised face match for one user."
+    - "Judge the exported file in ComfyUI, not only the trainer's samples, and look for texture burn with a prompt that names textures (pores, rough concrete)."
+flaws:
+  - symptom: plastic_skin
+    causes:
+      - "sampling the Turbo checkpoint, or the turbo LoRA at full strength"
+      - "slight overtraining (peach fuzz visible at high resolution)"
+      - "a LoRA trained on Turbo"
+      - "a dataset smoothed or denoised before training"
+    fixes:
+      - set: {turbo_lora_strength: {value: 0.6}, sample_steps: {value: 12}, sample_cfg: {value: 1.0}}
+        why: "Generate on Raw with the turbo LoRA at 0.45-0.7 (CFG 1-2.5, 10-16 steps); four users fixed plastic and low-variety turbo output this way."
+        confidence: CONF
+        sources: [atk_plastic_turbo_2026_10, bano_krea_raw_2026_09]
+      - action: "Use an earlier checkpoint, about 60-70% of the step where the skin turned fuzzy; peach-fuzz skin at 7-10 MP is a sign of slight overtraining. Keep some natural grain in the dataset (denoised or Topaz-processed photos carry smoothness)."
+        why: "One report plus the general overfit signs; the burn onset for one user was about 4,000 steps."
+        confidence: REP
+        sources: [bano_krea_burn_2026_07, atk_dataset_quality_2026_06, atk_burn_2026_08]
+      - action: "If the LoRA was trained on the Turbo weights, retrain on Raw (preset Krea-2-Raw)."
+        why: "Turbo-adapter training looked worse than a Raw run."
+        confidence: CONF
+        sources: [bano_krea_raw_2026_09, atk_distilled_guard_2026_09]
+  - symptom: burned
+    causes:
+      - "too many steps: texture burn (wallpaper pattern on skin, random birthmarks, a freckle grid) started around 4,000 steps for one user"
+      - "learning rate too high for the set size"
+      - "sampling with too much turbo strength or high CFG"
+    fixes:
+      - action: "Take a checkpoint from 1,500-2,500 steps (save every 500 at least) and test with texture prompts. The onset is disputed: another user's 8,000-step run was still fine."
+        why: "Two users, different thresholds."
+        confidence: DISP
+        sources: [atk_burn_2026_08]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "Half the rate halved the train-to-held-out gap on a Qwen-Image 2.1 fine-tune; not measured on Krea 2."
+        confidence: GUESS
+        sources: [meas_region_2026_11]
+      - action: "Check whether the burn is the sampler: lower the turbo LoRA strength or the CFG before blaming the weights."
+        why: "Overcooked looks were reported from sampler settings as well as from training."
+        confidence: REP
+        sources: [atk_plastic_turbo_2026_10]
+  - symptom: soft_blurry
+    causes:
+      - "1024-only training"
+      - "lower detail on turbo"
+      - "a soft or upscaled source set"
+    fixes:
+      - set: {resolutions: {value: [0.25, 0.5, 1.0]}}
+        why: "Train 768 and 1024 together; 1024-only gave soft faces for several users."
+        confidence: CONF
+        sources: [atk_soft_faces_2026_06, bano_krea_raw_2026_09]
+      - action: "Add a 1.5x hires-fix pass at inference (it raised one user's face match from about 40% to higher); weighted timesteps gave the best fine detail for one user."
+        why: "Two reports."
+        confidence: REP
+        sources: [atk_soft_faces_2026_06, atk_timestep_2026_07]
+  - symptom: no_likeness
+    causes:
+      - "trigger or name missing from some captions"
+      - "bad or conflicting captions, or a very large set"
+      - "learning rate too low (an automagic LR that sank below 1e-5)"
+      - "too early: a hard set can show nothing at 500 steps"
+      - "the LoRA was trained on Turbo"
+    fixes:
+      - action: "Put the trigger in every caption, check the captions do not describe the person's own traits, cull the set to 20-30 varied images, and do not stop a large set at 500 steps. One user went from nothing at 2,500 steps to the right direction at 250 after these changes."
+        why: "Reported by several users with a result."
+        confidence: CONF
+        sources: [atk_krea_nolikeness_2026_06, bano_krea_tiny_2026_11, bano_krea_captions_2026_10]
+      - set: {network_type: {value: oft}}
+        why: "OFT was +12 over a plain LoRA on two seeds in our races (face and body). It can pull training clothing into headshots."
+        confidence: MEAS
+        sources: [meas_krea_race_2026_11]
+      - set: {optimizer: {value: automagic3}, automagic_min_lr: {value: 2.0e-5}, learning_rate: {value: 1.0e-4}}
+        why: "If an AdamW run shows nothing, automagic v3 at 1e-4 with its floor is the community's default; check its logged learning rate does not sag below 1e-5."
+        confidence: REP
+        sources: [atk_krea_optimizer_2026_09, atk_automagic_floor_2026_10]
+  - symptom: slow_likeness
+    causes:
+      - "learning rate or rank low for the set"
+      - "a hard set that needs more steps"
+    fixes:
+      - set: {network_type: {value: oft}}
+        why: "OFT led from step 600 and was still rising at 2,000 in two races."
+        confidence: MEAS
+        sources: [meas_krea_race_2026_11]
+      - set: {optimizer: {value: keel}, automagic_min_lr: {value: 1.0e-8}}
+        why: "Keel's face likeness gain repeated on two seeds (about +7 FaceNet; lr at its 1e-3 ceiling) but its body gain did not. The runs used the old 1e-8 floor, so that is set; unraced on the new floor."
+        confidence: MEAS
+        sources: [meas_krea_race_2026_11, meas_keel_2026_11]
+      - action: "Train on: a 300+ image set first showed similarity at 2,500-2,750 steps."
+        why: "One report."
+        confidence: REP
+        sources: [bano_krea_steps_2026_09]
+  - symptom: peaked_early
+    causes:
+      - "learning rate high for the set: likeness at 500 then burn"
+      - "too many epochs on a small set"
+    fixes:
+      - action: "Keep the best early checkpoint; save every 100 steps and stop at the first good probe."
+        why: "Krea 2 learns fast and burns when pushed."
+        confidence: CONF
+        sources: [bano_krea_steps_2026_09, atk_burn_2026_08]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "A lower rate moves the peak later and flatter; measured on another model (gap halved at 5e-5)."
+        confidence: GUESS
+        sources: [meas_region_2026_11]
+  - symptom: lr_collapsed
+    causes:
+      - "automagic's effective learning rate fell below 1e-5"
+    fixes:
+      - set: {automagic_min_lr: {value: 2.0e-5}}
+        why: "The floor RulZ AI Trainer ships since 3.24.0; the community's fixes range from 2e-5 to 3e-5 (and higher)."
+        confidence: CONF
+        sources: [atk_automagic_floor_2026_10]
+      - set: {optimizer: {value: adamw8bit}, learning_rate: {value: 1.0e-4}}
+        why: "A fixed-rate AdamW 8-bit run is our measured reference and cannot collapse."
+        confidence: MEAS
+        sources: [meas_krea_race_2026_11]
+  - symptom: wrong_body
+    causes:
+      - "too few full-body photos (10 of 40 was not enough)"
+      - "only head shots"
+    fixes:
+      - action: "Add standing full-body shots with varied crops, not more close-ups."
+        why: "One user's 10 full-body photos in 40 did not teach height and shape."
+        confidence: REP
+        sources: [bano_krea_body_2026_06]
+      - set: {resolutions: {value: [0.25, 0.5, 1.0]}, crop_augment: {value: face+bust}}
+        why: "Face and bust crops cover the detail so the whole photos can carry the build."
+        confidence: DOC
+        sources: [doc_trainer_3_28]
+  - symptom: lost_framing
+    causes:
+      - "the run was pushed past the point where body renders are still full-body (all 8 body probes lost it by step 1,600 in a 2,000-step run on another model)"
+    fixes:
+      - action: "Pick the checkpoint before body probes started losing their body (the run log counts them); the best-checkpoint tracker in RulZ AI Trainer already discounts a body score by the framing share."
+        why: "Measured on a Qwen-Image 2.1 fine-tune: the drift began about 1,000 steps before the body score went n/a."
+        confidence: MEAS
+        sources: [meas_region_2026_11]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "Half the learning rate halved the train-to-held-out gap and kept the framing a little longer on that fine-tune (one run)."
+        confidence: MEAS
+        sources: [meas_region_2026_11]
+  - symptom: memorized
+    causes:
+      - "OFT or Isolation at a high copy score"
+      - "too few images, or the same outfit in many"
+    fixes:
+      - action: "Use an earlier checkpoint and test with a prompt unlike every training photo; 5 images gives a stiff LoRA that repeats the background."
+        why: "Common overfit tell."
+        confidence: CONF
+        sources: [atk_overfit_tells_2026_01, atk_dataset_size_2026_07]
+      - set: {network_type: {value: lora}, isolation: {value: false}}
+        why: "OFT pulled training clothing into headshots and Isolation produced one memorised scene; a plain LoRA stays under the copy limit."
+        confidence: MEAS
+        sources: [meas_krea_race_2026_11]
+  - symptom: same_pose_outfit
+    causes:
+      - "the same outfit or background in a big share of the set"
+      - "OFT"
+    fixes:
+      - action: "Vary outfits and backgrounds, caption what must stay controllable, and use an earlier checkpoint."
+        why: "Uncaptioned repeats bind to the trigger."
+        confidence: CONF
+        sources: [atk_captions_2026_06, atk_overfit_tells_2026_01]
+      - set: {network_type: {value: lora}}
+        why: "OFT's strongest traits came with training clothing in headshots."
+        confidence: MEAS
+        sources: [meas_krea_race_2026_11]
+  - symptom: identity_bleed
+    causes:
+      - "one LoRA with similar-looking people in the images"
+      - "a single-identity LoRA touches the weights every person shares"
+    fixes:
+      - action: "Prompt the second person's traits explicitly, train separate LoRAs, or train all characters in ONE LoRA with distinct long names and about 20% group images captioned with positions; two similar people in one photo LoKr still bled."
+        why: "Several users; LoKr alone did not fix it."
+        confidence: CONF
+        sources: [atk_multichar_2026_08, bano_krea_multi_2026_06]
+      - set: {isolation: {value: true}}
+        why: "DOP keeps the face off other people (about 1.5-2x the time); it worked on another model, was bad on Krea 2 twice and our Isolation scored 54.5 then 32.0 with memorised scenes."
+        confidence: DISP
+        sources: [atk_dop_reg_2026_08, meas_krea_race_2026_11]
+  - symptom: everyone_same_face
+    causes:
+      - "identity absorbed the class word"
+    fixes:
+      - action: "Caption the rest of the image, give the person a longer unique name in prompts, and lower the LoRA strength or use an earlier checkpoint; fixing a face afterwards by inpainting with the same LoRA works on Krea 2."
+        why: "Reported by several users; no setting fixes it."
+        confidence: REP
+        sources: [atk_multichar_2026_08, atk_dop_reg_2026_08]
+  - symptom: wrong_at_angles
+    causes:
+      - "only frontal photos"
+      - "all captions short"
+    fixes:
+      - action: "Include high-resolution close-ups at odd angles next to clear shots, and keep the other captions long and varied."
+        why: "The teacher's method, restated in October."
+        confidence: CONF
+        sources: [bano_krea_captions_2026_10, atk_dataset_mix_2026_06]
+  - symptom: needs_high_strength
+    causes:
+      - "trained on Raw but sampled on Turbo"
+      - "too few steps"
+    fixes:
+      - action: "Raise the strength toward 1.0-1.5 before adding steps; lowering it loses likeness, so reduce steps rather than strength if it burns."
+        why: "Several users; a Raw-trained LoRA wants strength on Turbo."
+        confidence: REP
+        sources: [atk_strength_2026_07, web_earngenix_2026_08]
+  - symptom: washed_colors
+    causes:
+      - "Krea 2 itself clips highlights"
+      - "a flat or oversaturated source tone"
+    fixes:
+      - action: "Do a tone pass on the dataset (remove excess saturation and clipped highlights, keep a few blown highlights and crushed blacks so the look is not flat)."
+        why: "Reported by several users for Krea 2; no setting fixes it."
+        confidence: REP
+        sources: [atk_krea_color_2026_08]
+  - symptom: noisy_grainy
+    causes:
+      - "a dataset denoised with Topaz leaves artifacts"
+      - "too much turbo or a high guidance"
+    fixes:
+      - action: "Check the source images and lower the turbo LoRA strength."
+        why: "Two users."
+        confidence: REP
+        sources: [atk_dataset_quality_2026_06, atk_plastic_turbo_2026_10]
+  - symptom: out_of_memory
+    causes:
+      - "bf16 weights plus the 1 MP bucket on a card under 24 GB"
+    fixes:
+      - set: {transformer_quant: {value: int8_convrot}, resolutions: {value: [0.25, 0.5]}}
+        why: "int8 (13.5 GB) shows no quality gap to bf16 (25 GB); the measured 0.25 MP step peaked at 20.7 GB."
+        confidence: MEAS
+        sources: [meas_krea_race_2026_11, doc_trainer_3_28]
+      - set: {transformer_quant: {value: nvfp4}}
+        why: "NVFP4 is 8 GB, slower; one user ran it where ConvRot int8 did not fit."
+        confidence: REP
+        sources: [doc_trainer_3_28]
+open_questions:
+  - "OFT (+12 on two seeds) has never been run together with long, clothes-varied captions or the other measured settings; whether its clothing pull is a caption problem is unknown."
+  - "Automagic v3 at 1e-4 (the community's choice) has not been raced against AdamW 8-bit in RulZ AI Trainer; the reference here is AdamW."
+  - "Whether to use differential guidance on a LoKr (one user liked the combination) is not a RulZ AI Trainer setting, and no A/B separates it from the optimizer and network."
+  - "Burn onset (about 4,000 steps for one user, 8,000 fine for another) and the best checkpoint fraction are not settled; the first run on a new set should save often."
+  - "Our races used a small fictional set and 0.25 MP; whether the OFT and Keel gains hold on real photos at 1 MP is untested. region_weights (the trainer's character default) is not in the measured runs."
+  - "Training on Turbo with a training adapter (reported as good for body consistency) is not possible in RulZ AI Trainer; no controlled comparison with Raw exists."
+sources:
+  bano_krea_raw_2026_09:
+    kind: community
+    where: "banodoco Discord #krea-2-image and AI Toolkit Discord #training"
+    date: "2026-09"
+    people: 4
+    url: null
+    note: "Train on Raw, infer on Raw plus the turbo LoRA at 0.5-0.8 (CFG 1-3, 8-20 steps); one user trains and generates on Turbo."
+  bano_krea_captions_2026_10:
+    kind: community
+    where: "banodoco Discord #krea-2-image"
+    date: "2026-10"
+    people: 2
+    url: null
+    note: "Omission captions (60% long / 20% medium / 10% short), trigger early, never name moles or tattoos; stated by the teacher and written back by another user; one teacher, restated."
+  bano_krea_rank_2026_10:
+    kind: community
+    where: "banodoco Discord #krea-2-image and AI Toolkit Discord #general"
+    date: "2026-10"
+    people: 4
+    url: null
+    note: "Low rank or LoKr factor 4-8; a first character LoKr at factor 4 matched the face; the teacher says start small."
+  bano_krea_steps_2026_09:
+    kind: community
+    where: "banodoco Discord #krea-2-image and AI Toolkit Discord #general"
+    date: "2026-09"
+    people: 5
+    url: null
+    note: "Likeness in 200-500 steps on tiny sets, 1,100-1,500 on 18-37 images, 30-50 epochs on 30-40 images; 2,500 steps for any size for one user."
+  bano_krea_tiny_2026_11:
+    kind: community
+    where: "AI Toolkit Discord #training"
+    date: "2026-11"
+    people: 1
+    url: null
+    note: "A hard set with zero resemblance at 500 steps that another model matched; 'done at 500' is not universal."
+  bano_krea_burn_2026_07:
+    kind: community
+    where: "banodoco Discord #krea-2-image"
+    date: "2026-07"
+    people: 1
+    url: null
+    note: "Peach-fuzz or over-detailed skin at 7-10 MP from slight overtraining; use an earlier checkpoint."
+  bano_krea_body_2026_06:
+    kind: community
+    where: "banodoco Discord #krea-2-image"
+    date: "2026-06"
+    people: 1
+    url: null
+    note: "Ten full-body shots in 40 did not teach body height and shape."
+  bano_krea_multi_2026_06:
+    kind: community
+    where: "banodoco Discord #krea-2-image"
+    date: "2026-06"
+    people: 2
+    url: null
+    note: "Two similar people in one LoKr bled; a 460-image cast of ten anime characters in one LoRA did not."
+  bano_krea_diffguide_2026_10:
+    kind: community
+    where: "banodoco Discord #krea-2-image"
+    date: "2026-10"
+    people: 1
+    url: null
+    note: "LoKr plus automagic v3 plus differential guidance looked strong without obvious overfit (three thumbs-up); which of the three did it is unknown. Two-step Raw-then-turbo looked underbaked."
+  atk_krea_optimizer_2026_09:
+    kind: community
+    where: "AI Toolkit Discord #general, #training and #training-images"
+    date: "2026-09"
+    people: 6
+    url: null
+    note: "Automagic v3 at 1e-4, weight decay 1e-5, 1,000-1,500 steps; AdamW 8-bit also worked (2,000 steps; 2e-4 cosine, 800 steps)."
+  atk_krea_nolikeness_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #general"
+    date: "2026-06"
+    people: 3
+    url: null
+    note: "Name in every caption, automagic v3 at 1e-4, LoKr 4, cull to 20-30 images: from nothing at 2,500 steps to right at 250."
+  atk_krea_color_2026_08:
+    kind: community
+    where: "AI Toolkit Discord #training-images"
+    date: "2026-08"
+    people: 3
+    url: null
+    note: "Krea 2 clips highlights and oversaturates; a tone pass on the dataset and some blown highlights helped. Reported by users, not A/B tested."
+  web_earngenix_2026_08:
+    kind: web
+    where: "earngenix.com tutorial: train a Krea 2 LoRA with AI Toolkit"
+    date: "2026-08"
+    people: null
+    url: https://www.earngenix.com/tutorials/train-krea-2-lora-ai-toolkit
+    note: "Always Raw; a dozen images; rank 32; 3,000 steps; Linear Balanced timesteps; avoid 768; strength 1.0-1.5. Optimizer not stated."
+  web_hf_krea_turbo_2026_07:
+    kind: web
+    where: "Hugging Face discussion on krea/Krea-2-Turbo"
+    date: "2026-07"
+    people: 2
+    url: https://huggingface.co/krea/Krea-2-Turbo/discussions/10
+    note: "A Raw-trained LoRA works on Turbo; one Raw run reached about 90% likeness by step 1,750; a Turbo-plus-adapter run gave good body consistency."
+  web_imagelora_2026_10:
+    kind: web
+    where: "imagelora.dev Krea 2 page (an aggregator; one author's own run)"
+    date: "2026-10"
+    people: 1
+    url: null
+    note: "LoKr factor 8, automagic v3 1e-4, sigmoid, differential guidance 3, caption dropout 0.05, 34 images, about 160 epochs."

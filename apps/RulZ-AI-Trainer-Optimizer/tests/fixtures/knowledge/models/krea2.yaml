@@ -1,0 +1,26 @@
+id: krea2
+name: Krea 2
+kind: image
+updated: 2026-11-16
+summary: A test recipe.
+model_path: krea/Krea-2-Raw
+base:
+  network_type: {value: lora, why: Test network (the wizard picks OFT for Krea 2), confidence: REP, sources: [test]}
+  crop_augment: {value: none, why: Test steps without crop extras, confidence: REP, sources: [test]}
+  lora_rank: {value: 16, why: Test rank, confidence: REP, sources: [test]}
+  learning_rate: {value: 0.0001, why: Test rate, confidence: REP, sources: [test]}
+steps: {epochs: 100, min: 1000, max: 4000, round_to: 50, why: Test steps, confidence: REP, sources: [test]}
+adjust:
+  - id: tiny
+    when: {images_max: 15}
+    set:
+      lora_rank: {value: 8, why: Small dataset, confidence: REP, sources: [test]}
+flaws:
+  - symptom: plastic_skin
+    fixes:
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: Reduce rate
+        confidence: REP
+        sources: [test]
+sources:
+  test: {kind: community, where: Test, date: '2026-10', people: 1}

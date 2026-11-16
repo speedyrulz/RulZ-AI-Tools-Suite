@@ -69,6 +69,51 @@ export const CATALOG: CatalogApp[] = [
     ]
   },
   {
+    id: 'trainer-optimizer',
+    name: 'RulZ AI Trainer Optimizer',
+    tagline: 'Character LoRA starting settings, run analysis and an AI opinion',
+    description:
+      'Recommends starting settings for a character LoRA in RulZ AI Trainer, one model at a time, drawn from ' +
+      'community reports and measured runs. Every setting shows the value, the reason, a confidence and the ' +
+      'sources. Export the config or queue it on this PC or on vast.ai, read finished runs to see what went ' +
+      'wrong and get a corrected next config, and ask Claude Code, Codex, Grok Build or Antigravity for a ' +
+      'second opinion. It does not train anything and needs no GPU.',
+    category: 'AI Training',
+    repo: SUITE_REPO,
+    path: 'apps/RulZ-AI-Trainer-Optimizer',
+    tagPrefix: 'trainer-optimizer-v',
+    branch: 'app/trainer-optimizer',
+    install: {
+      kind: 'source',
+      setup: [
+        { label: 'Creating the Python environment', run: ['python', '-m', 'venv', '.venv'] },
+        {
+          label: 'Installing NiceGUI, PyYAML and Pillow',
+          run: ['.venv\\Scripts\\python.exe', '-m', 'pip', 'install', '-r', 'requirements.txt']
+        }
+      ]
+    },
+    launch: { target: 'start-windows.bat', icon: 'assets\\icon.ico' },
+    requirements: [
+      { id: 'python', note: 'Python 3.10 or newer. RulZ AI Trainer is optional, and only for Validate and Queue.' },
+      { id: 'git', optional: true, note: 'Lets the launcher update it with git pull' }
+    ],
+    folderName: 'RulZ AI Trainer Optimizer',
+    notes: [
+      'Setup installs NiceGUI, PyYAML and Pillow. The app does not train anything and needs no GPU.',
+      'Launch opens a console window and the app in your browser at http://localhost:8775. Closing the console stops it.',
+      'RulZ AI Trainer is optional. Validate and Queue need an install on this PC, and vast.ai also needs the fleet set up there. A trainer folder next to this app is found by itself.',
+      'The recommendations are a starting point. Version 0.1.0 has not been checked against a finished training run.',
+      'Settings are kept in %APPDATA%\\RulZ-AI-Trainer-Optimizer, separate from the program.'
+    ],
+    highlights: [
+      'Starting settings per model',
+      'Queue locally or on vast.ai',
+      'Analyse runs and propose fixes',
+      'Ask Claude, Codex, Grok or Antigravity'
+    ]
+  },
+  {
     id: 'image-organizer',
     name: 'RulZ Image Organizer',
     tagline: 'Finds and groups the faces in your photo library, fully offline',

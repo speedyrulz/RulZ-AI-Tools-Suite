@@ -1,0 +1,456 @@
+# Ideogram 4: character LoRA starting recipe (thin evidence: the training talk is from June 2026).
+# Public file: no handles, no personal details, no dataset names. Shared sources are in general.yaml.
+id: ideogram4
+name: Ideogram 4
+kind: image
+updated: 2026-11-16
+summary: >-
+  Ideogram 4 was trained on structured JSON captions, and the caption format is the biggest lever reported: plain Z-Image
+  style captions at 8,000 steps still gave a weak person, while bbox JSON captions gave zero-bleed multi-character LoRAs.
+  RulZ AI Trainer takes a name.json next to each image and wraps plain captions into the smallest JSON the schema
+  allows, so write JSON where you can. It is slower to converge than Krea 2 (about 125-200 steps per image, 3,500-7,500
+  steps) and overshoots and unlearns rather than collapsing. There is no character recipe newer than June; the starting
+  numbers come from two web recipes and one early community config and are not a verified character recipe. Judge with
+  the LoRA applied on both the conditional and unconditional passes.
+model_preset: Ideogram-4
+model_path: ideogram-ai/ideogram-4-fp8
+facts:
+  - text: "Captions are JSON: a high-level description, an optional style description and a compositional deconstruction (a background plus a list of object and text elements, each with an optional bbox). Plain captions gave artifact-heavy results; the schema was the biggest quality lever in a six-model comparison and Ideogram's own docs say plain prompts will not work. RulZ AI Trainer uses a name.json caption next to an image as it is, re-serialised compactly, and wraps a plain caption into {high_level_description, background '', elements []}; the trigger word is put in front of the first object element's description. Natural-language captions beat JSON for one single-character dataset, so format is disputed for one person."
+    confidence: CONF
+    sources: [id_json_2026_06, web_estylon_2026_06, web_ideogram_prompting_2026_06, id_firstcfg_2026_06]
+  - text: "Multi-character: the AI Toolkit author's dual-character LoRA (identity spot on, zero bleed, relayed with five fire reacts), a user's eight-character cast with full bbox prompts, and another user's boxes isolating the character all used the auto bbox captioner (one box per person, boxes at the training resolution). Without boxes a multi-character LoRA failed past two people."
+    confidence: CONF
+    sources: [id_json_2026_06]
+  - text: "Put the trigger in both the high-level description and the element description of JSON captions (LLM rewriters delete triggers); a caption that already holds it is left alone by RulZ AI Trainer. Vision captioners that include watermarks keep the marks out of the LoRA."
+    confidence: REP
+    sources: [id_trigger_json_2026_06]
+  - text: "Convergence is slow: 12 images with the simple captions that worked on two other models were not converged at 8,000 steps and 15 images at 4,500 steps gave a weak version; a 26-image set needed 5,000-6,500 steps ('very hard to overtrain if captioned well'), 28 images 3,500 and 50 images' best epoch was step 7,750 by a face-symmetry check (about 125-200 steps per image). A car LoRA took about 500 steps for 90% of its details; one test was 'a bit burned at 1,750 steps'."
+    confidence: REP
+    sources: [id_slow_2026_06, id_steps_2026_06]
+  - text: "It overshoots and unlearns rather than collapsing: backgrounds went sharp and then blurry again even at 5e-5. Start at 5e-5 to 1e-4 and keep early checkpoints."
+    confidence: REP
+    sources: [id_overshoot_2026_06]
+  - text: "Early recipes: a first community config used LoRA rank 32 / alpha 32, JSON captions, dropout 0.05, 1024 only, 4,000 steps, automagic v2 at 1e-4, 'weighted' timesteps, fp8 with the text encoder quantised, no DOP; two web recipes use rank 16, adamw8bit at 1e-4, EMA 0.99, 1,000 steps for 20 + 20 full-body and face images or 2,500 steps for 30-60 style images with 'linear' timesteps; a later account mentions LoKr factor 4, lr 1e-5 and about 200 steps per image (not found again). Quantising everything and training at 512 only ruined one run."
+    confidence: DISP
+    sources: [id_firstcfg_2026_06, web_estylon_2026_06, web_note_ideogram_2026_06, id_buckets_2026_06]
+  - text: "Timestep: 'weighted' (first community config), 'linear' (a style recipe) and, much later, 'shift was the only timestep that worked' (one user, October). RulZ AI Trainer's 'reference' is Ideogram's documented time distribution, a logit-normal with a resolution-aware mean (median sigma about 0.77 at 1 MP), which is high-noise like shift; it was never compared with the others."
+    confidence: DISP
+    sources: [id_firstcfg_2026_06, web_estylon_2026_06, id_shift_2026_10, doc_trainer_3_28]
+  - text: "Resolution: native is near 1024-2k. 512+768+1024 mixes gave grainy or soft results for one user while a mixed run for another worked; 512-only plus full quantisation ruined a run; 1024-only is what the first community config used."
+    confidence: DISP
+    sources: [id_buckets_2026_06, web_note_ideogram_2026_06]
+  - text: "DOP: it slowed identity and the LoRA still overrode the class for two users (DOP at automagic v3 from 1e-6 showed almost nothing from 250 to 1,000 steps and automagic's LR fell toward 1e-8 by step 750); it 'worked amazingly' for a third. LoKr with differential guidance was 'horrible' for one."
+    confidence: DISP
+    sources: [id_dop_2026_06, atk_dop_reg_2026_08]
+  - text: "Sampling: the CFG override is a LOWER guidance on the last steps so the image does not burn; outputs looked overcooked until CFG was lowered; 48 steps looked less CG than a 12-step turbo for one user. The LoRA must be applied on the conditional and the unconditional passes in ComfyUI (a three-way comparison showed the difference); a training sample can look worse, even grotesque, while the exported file is fine. RulZ AI Trainer's samples use Ideogram's own 20-step schedule at guidance 7 (the last 2 steps at 3)."
+    confidence: CONF
+    sources: [id_cfg_2026_06, id_lora_both_2026_06, doc_trainer_3_28]
+  - text: "The unconditional model is a perturbed, worse copy; training the concept into it cancels the guidance gap. The empty caption stays empty in RulZ AI Trainer (the reference pipeline's unconditional branch), so caption dropout trains that branch."
+    confidence: REP
+    sources: [id_uncond_2026_06, doc_trainer_3_28]
+  - text: "Memory: the model ships in fp8; the trainer picks bf16 (about 18.6 GB) on 32 GB cards, int8 (9.6 GB) on 16 GB ones, else NVFP4 (5.5 GB); the Qwen3-VL-8B text encoder is 17.5 GB in bf16. An AI Toolkit run with fp8 and a quantised text encoder used about 17-18 GB at 1024 at 5.4 s per step."
+    confidence: DOC
+    sources: [doc_trainer_3_28, id_firstcfg_2026_06]
+base:
+  network_type:
+    value: lora
+    why: "Both early community and web recipes use a plain LoRA; LoKr factor 4 was mentioned later and 'harder to train than Krea' is the shared view, with no A/B."
+    confidence: REP
+    sources: [id_firstcfg_2026_06, web_note_ideogram_2026_06]
+  lora_rank:
+    value: 16
+    why: "Both sides: two web recipes use 16 (32 for complex styles), the first community config used 32. No comparison exists."
+    confidence: DISP
+    sources: [web_estylon_2026_06, web_note_ideogram_2026_06, id_firstcfg_2026_06]
+  lora_alpha:
+    value: 16.0
+    why: "Alpha equals rank."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  optimizer:
+    value: adamw8bit
+    why: "Both web recipes use adamw8bit at 1e-4; the early community config used automagic v2 and a later account says automagic v3 was slightly better than AdamW. Automagic with DOP drove the LR toward 1e-8 by step 750."
+    confidence: DISP
+    sources: [web_estylon_2026_06, web_note_ideogram_2026_06, id_firstcfg_2026_06, id_dop_2026_06]
+  learning_rate:
+    value: 1.0e-4
+    why: "Both web recipes and the first community config use 1e-4; one user saw overshoot-and-unlearn even at 5e-5 and a later account says 1e-5. Start at 1e-4 and drop toward 5e-5 if backgrounds go sharp then blurry."
+    confidence: DISP
+    sources: [web_estylon_2026_06, id_firstcfg_2026_06, id_overshoot_2026_06]
+  lr_scheduler:
+    value: constant
+    why: "Constant is the trainer's default and the web recipes' schedule."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  timestep_sampling:
+    value: reference
+    why: "Ideogram's documented time distribution (logit-normal, resolution-aware mean), which is high-noise like the one user's 'shift only'; the earlier community config used 'weighted' and a style recipe 'linear'. Not compared."
+    confidence: DISP
+    sources: [id_firstcfg_2026_06, id_shift_2026_10, web_estylon_2026_06, doc_trainer_3_28]
+  batch_size:
+    value: 1
+    why: "Batch 1 in every recipe."
+    confidence: CONF
+    sources: [web_estylon_2026_06, id_firstcfg_2026_06]
+  caption_dropout:
+    value: 0.05
+    why: "0.05 in the first community config and a web recipe. Dropped captions train the unconditional branch, which is a perturbed copy (open question)."
+    confidence: REP
+    sources: [id_firstcfg_2026_06, web_estylon_2026_06]
+  resolutions:
+    value: [1.0]
+    why: "1024 only, as the first community config: mixed 512+768+1024 gave grainy or soft results for one user and 512-only ruined a run. The model's native range is near 1024-2k. A mixed run worked for another, so this is disputed."
+    confidence: DISP
+    sources: [id_buckets_2026_06, id_firstcfg_2026_06, web_note_ideogram_2026_06]
+  isolation:
+    value: false
+    why: "DOP slowed identity for two users and collapsed automagic's LR; a third found it amazing. It costs 1.5-2x the time and is unmeasured here."
+    confidence: DISP
+    sources: [id_dop_2026_06]
+  turbo_lora:
+    value: ""
+    why: "Judge on the full model: a 48-step render looked less CG than a 12-step turbo one. The trainer's TurboTime LoRA (8 steps, CFG 1) is the quick alternative."
+    confidence: REP
+    sources: [id_cfg_2026_06, doc_trainer_3_28]
+  sample_steps:
+    value: 20
+    why: "Ideogram's own 20-step preset (48 steps is its quality preset)."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  sample_cfg:
+    value: 7.0
+    why: "Ideogram's guidance 7; the last steps drop to 3 by themselves, as the CFG override does. Lower it if outputs look overcooked."
+    confidence: DOC
+    sources: [doc_trainer_3_28, id_cfg_2026_06]
+  probe_steps:
+    value: 20
+    why: "Probes sample as the previews do so the face score sees the look you judge."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_cfg:
+    value: 7.0
+    why: "As the samples."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_seeds:
+    value: 4
+    why: "A single probe swings about 10 points between seeds; four seeds give a curve you can read."
+    confidence: MEAS
+    sources: [meas_region_2026_11, meas_krea_race_2026_11]
+  likeness_framing:
+    value: true
+    why: "Counts a body render with no body as zero so best-checkpoint tracking is not fooled by lost framing."
+    confidence: MEAS
+    sources: [meas_region_2026_11]
+  copy_check:
+    value: "on"
+    why: "Logs the copy score with the probes so a memorised checkpoint shows."
+    confidence: MEAS
+    sources: [meas_krea_race_2026_11]
+steps:
+  epochs: 100
+  min: 2000
+  max: 5000
+  round_to: 50
+  why: "Both sides: 125-200 steps per image (26 images 5,000-6,500 steps, 28 images 3,500, a best epoch at 7,750 for 50) and 'very hard to overtrain', against 'a bit burned at 1,750 steps' and overshoot-and-unlearn. About 100 epochs capped at 5,000 steps, with probes every ~10%, lets the likeness peak decide; lower the rate before adding steps."
+  confidence: DISP
+  sources: [id_steps_2026_06, id_slow_2026_06, id_overshoot_2026_06]
+adjust:
+  - id: tiny_dataset
+    when: {images_max: 14}
+    set:
+      lora_rank: {value: 8, why: "A small set overfits a big adapter; 12-15 images were not converged at 4,500-8,000 steps with plain captions, so the cause is captions and data, not a rank that is too small.", confidence: GUESS, sources: [id_slow_2026_06]}
+      lora_alpha: {value: 8.0, why: "Alpha equals rank.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "12-15 images with plain captions did not converge at 4,500-8,000 steps. Add photos and write JSON captions before tuning; the step minimum is 2,000."
+  - id: small_dataset
+    when: {images_min: 15, images_max: 40}
+    set:
+      holdout_images: {value: 3, why: "Three held-out photos let the sweeps show where the subject stops being learned (measured on a Qwen-Image 2.1 fine-tune; never run on Ideogram).", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "A sweep every 4 epochs costs little on a small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "20-30 images with JSON captions at 3,500-6,500 steps is where the reports sit."
+  - id: large_dataset
+    when: {images_min: 80}
+    set:
+      lora_rank: {value: 32, why: "More data supports a bigger adapter; the first community config used 32.", confidence: GUESS, sources: [id_firstcfg_2026_06]}
+      lora_alpha: {value: 32.0, why: "Alpha equals rank.", confidence: DOC, sources: [doc_trainer_3_28]}
+      holdout_images: {value: 8, why: "Up to a fifth of the set may be held out; eight photos give a steadier held-out curve.", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "As for the small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "80+ images: the cap (5,000 steps) gives under 63 epochs, about 62 steps per image at 80 images, below the 125-200 reported; the best epoch for 50 images was step 7,750, so a large set may want more steps if probes are still rising."
+  - id: goal_quick
+    when: {goal: quick}
+    set:
+      learning_rate: {value: 2.0e-4, why: "Twice the base rate speeds a slow model; overshoot was seen even at 5e-5, so stop at the first good probe.", confidence: GUESS, sources: [id_overshoot_2026_06]}
+      probe_seeds: {value: 2, why: "A first test needs a rough read only.", confidence: GUESS, sources: []}
+    note: "Ideogram is slow to converge: a quick test may show nothing at 1,000 steps. Use JSON captions and expect 2,000+ steps."
+  - id: goal_likeness
+    when: {goal: likeness}
+    set:
+      learning_rate: {value: 7.0e-5, why: "A lower rate peaks later; overshoot and unlearning were seen even at 5e-5, so stay within 5e-5 to 1e-4. An interpolation, not a finding.", confidence: GUESS, sources: [id_overshoot_2026_06, web_estylon_2026_06]}
+      probe_seeds: {value: 6, why: "More probe seeds make the best checkpoint reliable.", confidence: MEAS, sources: [meas_krea_race_2026_11]}
+  - id: focus_face
+    when: {focus: face}
+    set:
+      crop_augment: {value: face, why: "Close-ups teach the face's detail; bust crops would mostly teach the build.", confidence: DOC, sources: [doc_trainer_3_28]}
+      face_weight: {value: 1.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+      body_weight: {value: 0.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: focus_face_body
+    when: {focus: face_body}
+    set:
+      crop_augment: {value: face+bust, why: "Close-ups for the face and head-and-shoulders crops between them and the whole photos.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "One web run used 20 full-body and 20 face close-ups; JSON captions with a bbox isolating the person helped for one user."
+  - id: low_median_mp
+    when: {median_mp_max: 0.4}
+    set:
+      resolutions: {value: [0.25], why: "The photos are under 0.4 MP: training above their size only upscales them; 512-only is risky on this model, so upscale the photos first if you can.", confidence: DOC, sources: [doc_trainer_3_28, id_buckets_2026_06]}
+  - id: no_captions
+    when: {has_captions: false}
+    set:
+      caption_dropout: {value: 0.0, why: "Most images have no caption file, so there is nothing to drop.", confidence: GUESS, sources: []}
+    note: "Plain captions are wrapped into minimal JSON, which is the format the model was not trained on beyond its smallest schema. Generate JSON captions with a captioner (Qwen3-VL), include the trigger in the high-level and the element descriptions, and let the captioner write watermarks into the captions."
+  - id: vram_24
+    when: {vram_max_gb: 24}
+    set:
+      transformer_quant: {value: int8_convrot, why: "bf16 needs about 18.6 GB; int8 is 9.6 GB (the trainer picks it from 16 GB).", confidence: DOC, sources: [doc_trainer_3_28]}
+      text_encoder_quant: {value: int8, why: "Halves the 17.5 GB Qwen3-VL-8B so it fits the GPU for caching.", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: vram_16
+    when: {vram_max_gb: 16}
+    set:
+      transformer_quant: {value: int8_convrot, why: "int8 (9.6 GB) is the trainer's pick for 16 GB cards.", confidence: DOC, sources: [doc_trainer_3_28]}
+      text_encoder_quant: {value: int8, why: "Halves the 17.5 GB text encoder.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "A 12 GB run needed patches in another trainer. Not run on a 16 GB card here; do not drop to 512-only to save memory (it ruined a run), use NVFP4 first if short."
+evaluate:
+  strength: "1.0; compare LoRA off, LoRA on the conditional pass only, and on both passes before judging."
+  sampler: "ComfyUI with the LoRA applied to BOTH the conditional and the unconditional passes; Ideogram's own schedule (the node's shift is 5; a wrong shift of 7 left a large artifact gap)."
+  steps: "About 20 (the preset) or 48 (the quality preset looked less CG than 12 steps); the TurboTime LoRA gives 8 steps."
+  cfg: "Guidance about 7 with a LOWER value on the last steps (the CFG override); lower it if outputs look overcooked."
+  notes:
+    - "Trainer samples can look worse than the exported file; judge in ComfyUI."
+    - "Save every 100-250 steps. The model overshoots and unlearns: backgrounds go sharp then blurry; keep earlier checkpoints."
+    - "Use JSON prompts like the captions (trigger in the description) for tests."
+    - "Test a second person in the frame; a single-identity LoRA may bleed."
+flaws:
+  - symptom: no_likeness
+    causes:
+      - "plain captions instead of the JSON the model expects (8,000 steps of simple captions still weak)"
+      - "too few images (12-15) for this model's slow convergence"
+      - "the LoRA applied on the conditional pass only when testing"
+    fixes:
+      - action: "Switch to JSON captions (the auto bbox captioner), with the trigger in both the high-level and the element descriptions, and add images toward 20-30."
+        why: "Several users; plain Z-Image style captions at 8,000 steps still gave a weak person."
+        confidence: CONF
+        sources: [id_json_2026_06, id_slow_2026_06, id_trigger_json_2026_06]
+      - set: {timestep_sampling: {value: shift}, timestep_shift: {value: 5.0}}
+        why: "One user later said shift was the only timestep that worked for him; the 5.0 value is Ideogram's sampler shift and a guess for training. Contradicts the weighted-style default."
+        confidence: REP
+        sources: [id_shift_2026_10, id_cfg_2026_06]
+      - action: "Test with the LoRA applied on both the conditional and the unconditional pass before concluding it does nothing."
+        why: "A three-way comparison showed the difference."
+        confidence: REP
+        sources: [id_lora_both_2026_06]
+  - symptom: slow_likeness
+    causes:
+      - "Ideogram needs about 125-200 steps per image"
+      - "DOP or an automagic LR that fell toward 1e-8"
+    fixes:
+      - action: "Keep going to 3,500-7,500 steps on 26-50 images if the probes are still rising; do not call it failed at 1,000."
+        why: "Reports of 5,000-6,500 steps for 26 images and a best epoch at step 7,750 for 50."
+        confidence: REP
+        sources: [id_steps_2026_06]
+      - set: {isolation: {value: false}}
+        why: "DOP made identity arrive very late for two users."
+        confidence: REP
+        sources: [id_dop_2026_06]
+  - symptom: peaked_early
+    causes:
+      - "overshoot and unlearning: the look goes sharp then blurry again, even at 5e-5"
+    fixes:
+      - set: {learning_rate: {op: min, value: 5.0e-5}}
+        why: "Lower the rate toward 5e-5 and keep earlier checkpoints."
+        confidence: REP
+        sources: [id_overshoot_2026_06]
+      - action: "Pick the checkpoint before the blur returns; save every 100-250 steps."
+        why: "The model unlearns rather than collapsing."
+        confidence: REP
+        sources: [id_overshoot_2026_06]
+  - symptom: identity_bleed
+    causes:
+      - "plain captions and no boxes in a multi-character set"
+    fixes:
+      - action: "Use JSON bbox captions: one box per person, boxes written at the training resolution, a short background line. Train all characters in one LoRA."
+        why: "The method of the zero-bleed dual-character and eight-character LoRAs."
+        confidence: CONF
+        sources: [id_json_2026_06]
+      - set: {isolation: {value: true}}
+        why: "DOP worked 'amazingly' for one user and slowed identity for two."
+        confidence: DISP
+        sources: [id_dop_2026_06]
+  - symptom: burned
+    causes:
+      - "the CFG override used backwards or too many high-guidance steps"
+      - "overtraining (one test was a bit burned at 1,750 steps)"
+    fixes:
+      - action: "The override is a LOWER guidance on the last steps (not higher); lower the CFG if outputs look overcooked."
+        why: "Two users and the sampler maintainer."
+        confidence: CONF
+        sources: [id_cfg_2026_06]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "A lower rate delays burn; overshoot appeared even at 5e-5."
+        confidence: GUESS
+        sources: [id_overshoot_2026_06]
+  - symptom: noisy_grainy
+    causes:
+      - "mixed 512+768+1024 buckets gave grainy or soft results for one user"
+    fixes:
+      - set: {resolutions: {value: [1.0]}}
+        why: "Train at 1024 only, as the first community config did; the model's native range is near 1024-2k."
+        confidence: DISP
+        sources: [id_buckets_2026_06]
+  - symptom: lr_collapsed
+    causes:
+      - "automagic v3 with DOP drove the LR to about 1e-8 by step 750"
+    fixes:
+      - set: {optimizer: {value: adamw8bit}, learning_rate: {value: 1.0e-4}, isolation: {value: false}}
+        why: "A fixed-rate optimizer without DOP; automagic's floor (2e-5 in RulZ AI Trainer) also prevents it."
+        confidence: REP
+        sources: [id_dop_2026_06, atk_automagic_floor_2026_10]
+  - symptom: trigger_as_text
+    causes:
+      - "a trigger with digits or symbols, or an LLM rewriter that deleted the trigger"
+    fixes:
+      - action: "Use a real-name-style trigger with no digits, and keep it in the caption descriptions (LLM rewriters delete triggers)."
+        why: "Cross-model finding plus the Ideogram note."
+        confidence: CONF
+        sources: [atk_trigger_text_2026_07, id_trigger_json_2026_06]
+  - symptom: same_pose_outfit
+    causes:
+      - "a small set, overshoot, or backgrounds learned from the photos"
+    fixes:
+      - action: "Vary outfits and backgrounds in the set, describe the background in the JSON caption, and use an earlier checkpoint."
+        why: "Uncaptioned repeats bind to the trigger."
+        confidence: REP
+        sources: [atk_captions_2026_06, id_overshoot_2026_06]
+  - symptom: out_of_memory
+    causes:
+      - "bf16 (18.6 GB) or the 17.5 GB text encoder on a card under 32 GB"
+    fixes:
+      - set: {transformer_quant: {value: int8_convrot}, text_encoder_quant: {value: int8}}
+        why: "int8 is 9.6 GB for the transformer and halves the text encoder."
+        confidence: DOC
+        sources: [doc_trainer_3_28]
+      - set: {transformer_quant: {value: nvfp4}}
+        why: "NVFP4 is 5.5 GB; do not shrink by training at 512 only."
+        confidence: DOC
+        sources: [doc_trainer_3_28, id_buckets_2026_06]
+open_questions:
+  - "No character recipe newer than June exists in the evidence; the later account of LoKr factor 4, 1e-5 and about 200 steps per image was not found again."
+  - "Natural-language captions beat JSON for one single-character dataset, JSON won for multi-character: which is better for one person is open."
+  - "Timestep: weighted, linear, shift or Ideogram's documented distribution ('reference'): no comparison."
+  - "Does caption dropout hurt because the unconditional branch is a perturbed copy of the model?"
+  - "Does the 1024-only advice survive against mixed buckets? Reports split on grain."
+  - "RulZ AI Trainer's Ideogram support has not been run on a real model here; nothing in this file is measured."
+sources:
+  id_json_2026_06:
+    kind: community
+    where: "banodoco Discord #ideogram and AI Toolkit Discord #training"
+    date: "2026-06"
+    people: 4
+    url: null
+    note: "Bbox JSON captions are the native format; dual-character zero bleed (relayed), eight-character cast, a user with bboxes isolating the character; plain captions failed past two people."
+  id_firstcfg_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #general"
+    date: "2026-06"
+    people: 1
+    url: null
+    note: "A first config, not a final one: rank 32, JSON captions, dropout 0.05, 1024 only, 4,000 steps, automagic v2 1e-4, weighted timesteps, fp8. Later (not found again): LoKr 4, 1e-5, 200 steps per image. Natural-language captions beat JSON for one dataset."
+  id_overshoot_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #training"
+    date: "2026-06"
+    people: 1
+    url: null
+    note: "Ideogram overshoots and unlearns (backgrounds sharp then blurry) even at 5e-5; start there and check early checkpoints."
+  id_slow_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #training"
+    date: "2026-06"
+    people: 2
+    url: null
+    note: "12 images not converged at 8,000 steps and 15 images a weak version at 4,500, with simple captions that worked on two other models."
+  id_steps_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #general and #training-images"
+    date: "2026-06"
+    people: 3
+    url: null
+    note: "26 images 5,000-6,500 steps, 28 images 3,500, a best epoch at 7,750 for 50 images; hard to overtrain if captioned well; one test a bit burned at 1,750."
+  id_dop_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #training"
+    date: "2026-06"
+    people: 3
+    url: null
+    note: "DOP slowed identity and the LoRA still overrode the class for two users; automagic v3 plus DOP drove LR to 1e-8; a third found DOP amazing. LoKr plus differential guidance horrible for one."
+  id_cfg_2026_06:
+    kind: community
+    where: "banodoco Discord #ideogram"
+    date: "2026-06"
+    people: 3
+    url: null
+    note: "CFG override is a lower guidance on the last steps; outputs overcooked until CFG lowered; 48 steps looked less CG than 12; a wrong shift of 7 in a ComfyUI node left an artifact gap."
+  id_lora_both_2026_06:
+    kind: community
+    where: "banodoco Discord #ideogram"
+    date: "2026-06"
+    people: 2
+    url: null
+    note: "The LoRA must be applied on both the conditional and the unconditional passes; a three-way comparison image."
+  id_buckets_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #training and #development"
+    date: "2026-06"
+    people: 2
+    url: null
+    note: "512+768+1024 gave grainy or soft results for one; quantising everything and training at 512 only ruined a run for another."
+  id_trigger_json_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #development"
+    date: "2026-06"
+    people: 1
+    url: null
+    note: "Trigger in both the high-level description and the element desc; LLM rewriters delete triggers; captioners that write watermarks keep the marks out of the LoRA."
+  id_uncond_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #development"
+    date: "2026-06"
+    people: 1
+    url: null
+    note: "The unconditional model is a perturbed worse copy; training the concept into it cancels the guidance gap."
+  id_shift_2026_10:
+    kind: community
+    where: "AI Toolkit Discord #moss_image"
+    date: "2026-10"
+    people: 1
+    url: null
+    note: "Much later, about Ideogram: shift was the only timestep that worked for him. Contradicts the earlier weighted-style defaults."
+  web_estylon_2026_06:
+    kind: web
+    where: "estylon.substack.com Ideogram 4 LoRA training write-up"
+    date: "2026-06"
+    people: null
+    url: https://estylon.substack.com
+    note: "A style recipe: .json captions, rank 16/16, adamw8bit wd 1e-4, EMA 0.99, 1e-4, 2,500 steps, 'linear' timesteps, 30-60 images, dropout 0.05; overtraining means revert to 1,000-1,750 steps. No quality results."
+  web_note_ideogram_2026_06:
+    kind: web
+    where: "note.com Ideogram 4 character-ish LoRA write-up"
+    date: "2026-06"
+    people: null
+    url: null
+    note: "20 full-body plus 20 face close-ups, buckets 512/768/1024, rank 16/16, adamw8bit 1e-4, EMA 0.99, 1,000 steps; the trigger was recommended but untested."
+  web_ideogram_prompting_2026_06:
+    kind: official
+    where: "Ideogram 4 repository prompting guide"
+    date: "2026-06"
+    people: null
+    url: https://github.com/ideogram-oss/ideogram4
+    note: "The caption schema: high-level and style descriptions plus a compositional deconstruction of elements with optional bboxes; plain-text prompts will not work."

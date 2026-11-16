@@ -1,0 +1,17 @@
+id: minimax_h3
+name: MiniMax H3
+kind: video
+updated: 2026-11-16
+summary: A test video recipe.
+model_path: MiniMaxAI/MiniMax-H3
+variants:
+  - id: ref2va
+    label: Ref2VA
+    model_path: MiniMaxAI/MiniMax-H3#ref2va
+    base:
+      lora_rank: {value: 8, why: Variant, confidence: REP, sources: [test]}
+base:
+  lora_rank: {value: 16, why: Base, confidence: REP, sources: [test]}
+steps: {epochs: 100, min: 1000, max: 4000, round_to: 50, why: Test, confidence: REP, sources: [test]}
+sources:
+  test: {kind: community, where: Test, date: '2026-10', people: 1}

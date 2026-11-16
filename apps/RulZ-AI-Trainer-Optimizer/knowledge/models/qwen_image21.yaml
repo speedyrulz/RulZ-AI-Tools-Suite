@@ -1,0 +1,490 @@
+# Qwen-Image 2.1: character LoRA starting recipe.
+# Public file: no handles, no personal details, no dataset names. Shared sources are in general.yaml.
+id: qwen_image21
+name: Qwen-Image 2.1
+kind: image
+updated: 2026-11-16
+summary: >-
+  Qwen-Image 2.1 is heavily RL-distilled and breaks without a training adapter (garbage from the first step on the
+  turbo weights), so the adapter stays on and is removed at inference. For a person, sigmoid timesteps (RulZ AI Trainer's
+  logit_normal) beat shift in matched runs, mixed 512/768/1024 buckets matter (2048-only broke it, 512-only is weak),
+  and faces look done at 700-2,000 steps while wide shots and new poses need 4,000+ and overtrain around 30-35 epochs.
+  Small rank at a high learning rate (rank 8, 2e-4) is the best-supported fast start; the optimizer is disputed. Body
+  framing drifts to portraits in every run we measured, so save often and pick an early checkpoint.
+model_preset: Qwen-Image-2.1
+model_path: Qwen/Qwen-Image-2.1
+facts:
+  - text: "A training adapter is required: the model is RL-distilled and 'will only produce garbage' trained bare on the turbo weights (the AI Toolkit author, October 2026, matching September collapse reports). A LoRA trained on the base transfers to turbo worse than one trained on turbo with the adapter in place and removed at inference. RulZ AI Trainer trains with Fizgig's frozen adapter by default (on while training, off while sampling, never saved in the LoRA); another trainer measured likeness 77 with it against 56 without."
+    confidence: CONF
+    sources: [qa_adapter_2026_10, doc_trainer_3_28, web_fizgig_qwen_2026_09]
+  - text: "Timestep: sigmoid from start to finish for characters. Two matched A/Bs (same dataset and checkpoint, only the sampler changed) gave a closer face with sigmoid than with shift, and one run on shift was slow and regressing at 2,600 steps before it was switched. In RulZ AI Trainer sigmoid is logit_normal at its default scale; the 'reference' sampler is the shifted one. Linear is for art styles."
+    confidence: CONF
+    sources: [qa_timestep_2026_09, atk_timestep_2026_07]
+  - text: "Buckets: 512 + 768 + 1024 mixed is what most users prefer; 2048-only broke the model before likeness arrived (2048 as an extra bucket next to 1024 worked for one); 512-only is weaker on likeness. The VAE is 16x, so 512 px behaves like 256 px on an 8x model. Upscale old low-resolution sources to about 2 MP before training or quality drops from the first save."
+    confidence: CONF
+    sources: [qa_resolution_2026_10, atk_distance_multires_2026_01]
+  - text: "Optimizer is disputed. Automagic v3 fell to 1e-5 or below on three datasets and samples turned weird; a fixed AdamW at 1e-5 for 50 epochs (2,000 steps, 40 images) gave very good likeness. Others run automagic at 1e-4 with batch 2 and stop at 400-600 steps, or LoKr 4 with automagic and sigmoid with detail by step 250 and 'phenomenal' likeness by 1,000. If automagic's logged LR collapses and samples are already weird, switch to AdamW 1e-5 rather than waiting."
+    confidence: DISP
+    sources: [qa_optimizer_2026_09, atk_automagic_floor_2026_10]
+  - text: "Network: LoKr factor 4 (full rank) with sigmoid gave one user near-perfect likeness and body proportion; factor 8 full rank was 30-40% faster and more accurate on one set. LoRA rank 8 at 2e-4 is another trainer's fastest-to-likeness recipe (rank 16 at the same rate overcooked), and one user prefers LoRA over LoKr at equal settings, down to rank 4. Rank 64 and 32 LoRA and LoKr 4/8 all deformed before likeness for one user until the resolution mix changed."
+    confidence: CONF
+    sources: [qa_network_2026_09, web_fizgig_qwen_2026_09]
+  - text: "Steps: faces look done at 700-2,000 steps; wide shots and 'problem prompts' need 4,000+ (easy prompts hide it); 30 epochs good and 35 weird on three datasets for one user (automagic); 5,000 steps did not hurt another user's LoKrs; for 30-50 images 2,000 steps, for 100-200 images 4,000. 120 Gemini-captioned images with defaults deformed progressively for one user while another says the same model is extremely trainable with his config (not shared)."
+    confidence: CONF
+    sources: [qa_steps_2026_09, qa_nov_2026_11]
+  - text: "Captions: describe shot, pose, clothes and background, not the character's identity; give a unique trigger. A captioner (Qwen VL 4B) plus a hand pass works. An accidentally wrong trigger beat the right one for one user (unexplained, do not copy). A caption-dropout cache error was reported when reference slots differ; no dropout rate is agreed."
+    confidence: REP
+    sources: [qa_captions_2026_09, atk_captions_2026_06]
+  - text: "Close portraits learn first; medium and full-body views lag, especially with a new pose, and a pose change sheds likeness even when the head angle matches. Seventeen synthetic images were not enough for body identity."
+    confidence: CONF
+    sources: [qa_body_2026_09]
+  - text: "Our own runs (a fine-tuned Qwen-Image 2.1, small fictional set, rank 32, 0.25 MP, 2,000 steps, a rented 32 GB card): AdamW LoRA reached a combined likeness of 28; Muon tied it at twice the step time; Keel reached 44.7 (lr at its 1e-3 ceiling by step 500, one run); OFT at lr 1e-4 overtrained (copy score 0.61-0.64 by step 200, face likeness below the untrained model's late), while OFT with AdamW 8-bit at 5e-5 held the face and was the only run that kept full-body framing (second to Keel on likeness, one run each). Every row lost body framing, drifting from waist-up to portraits between steps 1,000 and 1,600."
+    confidence: MEAS
+    sources: [meas_qwen_optim_2026_11, meas_region_2026_11]
+  - text: "Measured on that fine-tune over nine runs: held-out photos peaked at 35-50% of the run (steps 700-950 of 2,000) while training pictures kept improving; the sweeps repeat across seeds (sd 0.2-0.7 points) but the probes do not (a combined probe read 48.5, 47.6, 49.5 and 63.9 on four seeds); a fixed face-3 / background-0.3 weighting memorised more and lost framing sooner; steering by region did nothing; half the learning rate (5e-5) halved the train-to-held-out gap (+8 against +14-16) and lost no likeness."
+    confidence: MEAS
+    sources: [meas_region_2026_11]
+  - text: "Softness is disputed: one user says the trained LoRA itself stays soft until it collapses, another says the base looks blurry with no character LoRA unless a turbo LoRA is on at low strength. Judge at CFG above 1 with a turbo LoRA at 0.5-0.7 before retraining; slamming turbo at high strength and raising CFG is a fake fix."
+    confidence: DISP
+    sources: [qa_soft_2026_10]
+  - text: "A single-identity LoRA or LoKr makes a second person look like the subject at any rank (LoKr 4 bleed onto a second man was expected; rank 4 did not prevent it). Whether that is LoKr or any single-identity LoRA is disputed."
+    confidence: DISP
+    sources: [qa_bleed_2026_09, atk_multichar_2026_08]
+  - text: "Memory: the trainer picks bf16 (14.2 GB) from 24 GB, int8 (7.3 GB) from 11 GB, else NVFP4; the Qwen3-VL-8B text encoder is 17 GB in bf16. A 0.25 MP rank-32 step peaked at 14.1 GB and a trigger-attention capture cost about 9% of step time. Sage-attention builds that drop attn_mask ignore the causal mask on the text prefix and change composition and faces (measured on a 5090): keep the mask in any attention swap."
+    confidence: MEAS
+    sources: [meas_region_2026_11, qa_sage_2026_10, doc_trainer_3_28]
+base:
+  network_type:
+    value: lora
+    why: "Reached likeness much sooner than LoKr in RulZ AI Trainer's tests and loads everywhere. LoKr factor 4-8 with sigmoid is the community's other winner; OFT needs half the rate (5e-5) and only has one run here."
+    confidence: DISP
+    sources: [qa_network_2026_09, meas_qwen_optim_2026_11, doc_trainer_3_28]
+  lora_rank:
+    value: 8
+    why: "Rank 8 held skin detail best in another trainer's presets and agrees with a second default (rank 8, short run, high rate); rank 16 at the same rate overcooked. Against it, a web recipe used rank 16 at 1e-4 and the reference code rank 32."
+    confidence: CONF
+    sources: [web_fizgig_qwen_2026_09, web_note_sepiablue_2026_09, qa_network_2026_09]
+  lora_alpha:
+    value: 8.0
+    why: "Alpha equals rank so the adapter's scale stays 1."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  optimizer:
+    value: adamw8bit
+    why: "Both sides: automagic v3 collapsed to 1e-5 and below for one user and AdamW fixed at 1e-5 (and the trainer's rank-8 recipe at 2e-4) worked, while others got likeness with automagic at 1e-4. AdamW 8-bit is the one that cannot collapse and is the wizard's choice."
+    confidence: DISP
+    sources: [qa_optimizer_2026_09, web_fizgig_qwen_2026_09, doc_trainer_3_28]
+  learning_rate:
+    value: 2.0e-4
+    why: "The fastest-to-likeness rate for rank 8 in another trainer's presets (adaptive 2e-4 to 4e-4 there; flat 1.5e-4 for styles) and the wizard's value. Against it: a rank-32 run at 3e-4 degraded all validation prompts by update 500, our fine-tune runs at 1e-4 overfit by step 1,000, and a fixed 1e-5 worked for one user with 50 epochs."
+    confidence: DISP
+    sources: [web_fizgig_qwen_2026_09, web_orcarouter_2026_10, qa_optimizer_2026_09, meas_region_2026_11]
+  lr_scheduler:
+    value: constant
+    why: "Constant, as the recipes that state a schedule."
+    confidence: REP
+    sources: [web_note_sepiablue_2026_09]
+  timestep_sampling:
+    value: logit_normal
+    why: "RulZ AI Trainer's name for the sigmoid that beat shift in two matched A/Bs; 'reference' is the shifted curve and should not be used for a person here."
+    confidence: CONF
+    sources: [qa_timestep_2026_09]
+  batch_size:
+    value: 1
+    why: "Batch 1 is the wizard's value and our reference; one user needed batch 2 with automagic to train 'the way he wanted' and AI Toolkit does not scale the LR with batch."
+    confidence: REP
+    sources: [doc_trainer_3_28, atk_lr_scaling_2026_11]
+  training_adapter:
+    value: auto
+    why: "The adapter is the guard that keeps the RL-distilled model from collapsing into texture or wobble; it is on while training, off while sampling and not saved in the LoRA."
+    confidence: CONF
+    sources: [qa_adapter_2026_10, doc_trainer_3_28]
+  resolutions:
+    value: [0.5, 1.0]
+    why: "About 724 and 1024 px. Another trainer's sweet spot for Qwen is 0.5 MP (quicker, and a LoRA pulls less of the model's sharpness toward the photos'); the community prefers a 512/768/1024 mix and 512-only is weak on a 16x-VAE model, so 0.25 MP is left out. Our runs used 0.25 MP and still learned."
+    confidence: DISP
+    sources: [qa_resolution_2026_10, web_fizgig_qwen_2026_09, meas_region_2026_11]
+  isolation:
+    value: false
+    why: "DOP is disputed (worked on one model, bad on another) and has not been run on Qwen here; it costs 1.5-2x the time. Turn it on only for bleed onto other people."
+    confidence: DISP
+    sources: [atk_dop_reg_2026_08]
+  region_weights:
+    value: false
+    why: "Fixed face-3 / hair-1.5 / background-0.3 class weights (the same numbers as this setting) memorised more training faces, gave no likeness gain and lost framing sooner on a Qwen-Image 2.1 fine-tune; a background-only weight was worse still."
+    confidence: MEAS
+    sources: [meas_region_2026_11]
+  probe_seeds:
+    value: 4
+    why: "A single probe swings about 10 points between seeds; four seeds give a curve you can read (our runs used eight)."
+    confidence: MEAS
+    sources: [meas_region_2026_11, meas_qwen_optim_2026_11]
+  likeness_framing:
+    value: true
+    why: "Counts a body render with no body as zero so best-checkpoint tracking is not fooled by lost framing (it was in 8 of 9 runs)."
+    confidence: MEAS
+    sources: [meas_region_2026_11]
+  copy_check:
+    value: "on"
+    why: "Logs the copy score with the probes: step-0 copy is already about 0.54 with descriptive probe prompts, and 0.6-0.7 marked the memorised OFT rows."
+    confidence: MEAS
+    sources: [meas_qwen_optim_2026_11]
+steps:
+  epochs: 40
+  min: 1000
+  max: 4000
+  round_to: 50
+  why: "Both sides: faces look done at 700-2,000 steps and 30-35 epochs were the overtrain zone on automagic, while wide shots and new poses need 4,000+ and 30-50 images reached likeness around 2,000. Forty epochs of a 30-40 image set (1,200-1,600 steps) with probes about every 10% lets the likeness peak decide; a 100+ image set hits the 4,000 cap."
+  confidence: DISP
+  sources: [qa_steps_2026_09, web_fizgig_qwen_2026_09, meas_region_2026_11]
+adjust:
+  - id: tiny_dataset
+    when: {images_max: 14}
+    set:
+      lora_rank: {value: 4, why: "A small set overfits a big adapter; rank 4 gave one user likeness (including a two-person LoRA) at the same settings as rank 8.", confidence: REP, sources: [qa_network_2026_09]}
+      lora_alpha: {value: 4.0, why: "Alpha equals rank.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "Under 15 images the LoRA is stiff and copies the background and pose, and 17 synthetic images were not enough for body identity. Add photos before tuning. The step minimum is 1,000, so a 10-image set trains 100 epochs: stop at the first good probe."
+  - id: small_dataset
+    when: {images_min: 15, images_max: 40}
+    set:
+      holdout_images: {value: 3, why: "Three held-out photos let the sweeps show where the subject stops being learned; on a Qwen-Image 2.1 fine-tune that peak came at 35-50% of the run, before the probes agreed.", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "A sweep every 4 epochs costs little on a small set (24 s for 62 pictures).", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "The base recipe is made for this size (20-40 images: 30 epochs good, 35 weird on automagic; about 2,000 steps for 30-50 images)."
+  - id: large_dataset
+    when: {images_min: 80}
+    set:
+      lora_rank: {value: 16, why: "More data supports a bigger adapter, and the 'Standard' preset of another trainer is rank 16.", confidence: REP, sources: [web_fizgig_qwen_2026_09, atk_rank_lokr_2026]}
+      lora_alpha: {value: 16.0, why: "Alpha equals rank.", confidence: DOC, sources: [doc_trainer_3_28]}
+      learning_rate: {value: 1.0e-4, why: "Rank 16 at the fast rate overtrained; the Standard preset runs 1e-4 to 2e-4.", confidence: REP, sources: [web_fizgig_qwen_2026_09]}
+      holdout_images: {value: 8, why: "Up to a fifth of the set may be held out; eight photos give a steadier held-out curve.", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "As for the small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "100-200 images need about 4,000 steps (the cap). A 120-image set that deformed under defaults for one user and a 40-image set that trained well for another make 'cull to the best 40-60 and keep them varied' the safer move."
+  - id: goal_quick
+    when: {goal: quick}
+    set:
+      learning_rate: {value: 3.0e-4, why: "Rank 8 at 2e-4 to 4e-4 reached likeness fastest in another trainer's presets and was 500 steps in its defaults; 3e-4 on a rank-32 run degraded validation by update 500, so stay near the middle.", confidence: DISP, sources: [web_fizgig_qwen_2026_09, web_orcarouter_2026_10]}
+      resolutions: {value: [0.5], why: "Half a megapixel keeps the first test short (another trainer's sweet spot).", confidence: REP, sources: [web_fizgig_qwen_2026_09]}
+      probe_seeds: {value: 2, why: "A first test needs a rough read only.", confidence: GUESS, sources: []}
+    note: "A quick test: faces can look done at 250-700 steps (about 90% on a weak rate), but they lie: test a wide shot before trusting it."
+  - id: goal_likeness
+    when: {goal: likeness}
+    set:
+      learning_rate: {value: 1.0e-4, why: "A lower rate peaks later and flatter and halved the train-to-held-out gap in our runs (5e-5 on a fine-tune); 1e-4 is the web recipe and the 'Standard' preset's low end.", confidence: DISP, sources: [meas_region_2026_11, web_note_sepiablue_2026_09, web_fizgig_qwen_2026_09]}
+      probe_seeds: {value: 6, why: "More probe seeds make the best checkpoint reliable.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "For the closest likeness also test sigmoid LoKr factor 4-8 and Keel (see the flaw lists): both gave strong results in single runs."
+  - id: focus_face
+    when: {focus: face}
+    set:
+      crop_augment: {value: face, why: "Close-ups teach the face's detail; bust crops would mostly teach the build.", confidence: DOC, sources: [doc_trainer_3_28]}
+      face_weight: {value: 1.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+      body_weight: {value: 0.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: focus_face_body
+    when: {focus: face_body}
+    set:
+      crop_augment: {value: face+bust, why: "Close-ups for the face, head-and-shoulders crops between them and the whole photos; the build comes from the whole photos.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "Body identity needs wide shots with real poses in the set: close portraits learn first, wide and new-pose views lag, and all our runs lost body framing between steps 1,000 and 1,600. Mask or drop photos where the head does not match the body."
+  - id: low_median_mp
+    when: {median_mp_max: 0.4}
+    set:
+      resolutions: {value: [0.25], why: "The photos are under 0.4 MP: training above their size only upscales them, and soft sources tank quality from the first save.", confidence: DOC, sources: [doc_trainer_3_28, atk_dataset_quality_2026_06]}
+  - id: no_captions
+    when: {has_captions: false}
+    set:
+      caption_dropout: {value: 0.0, why: "Most images have no caption file, so there is nothing to drop.", confidence: REP, sources: [qa_captions_2026_09]}
+    note: "Write captions first: shot, pose, clothes and background, without the person's own traits. A Qwen VL captioner plus a hand pass works."
+  - id: vram_24
+    when: {vram_max_gb: 24}
+    set:
+      text_encoder_quant: {value: int8, why: "Halves the 17 GB Qwen3-VL-8B so it fits on the GPU for caching instead of spilling into system RAM.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "The transformer picks bf16 (14.2 GB) from 24 GB; a 0.25 MP rank-32 step peaked at 14.1 GB."
+  - id: vram_16
+    when: {vram_max_gb: 16}
+    set:
+      transformer_quant: {value: int8_convrot, why: "int8 is 7.3 GB against bf16's 14.2 GB (the trainer's auto picks it from 11 GB).", confidence: DOC, sources: [doc_trainer_3_28]}
+      resolutions: {value: [0.5], why: "One half-megapixel bucket keeps the step small; another trainer's sweet spot.", confidence: GUESS, sources: [web_fizgig_qwen_2026_09]}
+    note: "Untested here on a 16 GB card; one user asked whether rank 32 and qfloat8 defaults suit a 16 GB card and got no settings reply."
+evaluate:
+  strength: "1.0. Judge the trained LoRA with the training adapter OFF (it is never saved in the file)."
+  sampler: "Euler Bong Tangent or res_multistep beta; trainer samples are less misleading than on Ideogram but Comfy settings change the verdict."
+  steps: "About 16 steps with a turbo LoRA at 0.5-0.7 (the regular's samples), or 25 steps at turbo 0.2; 32-50 steps without turbo (still slightly soft). Official turbo is 8 steps."
+  cfg: "3-3.5 with turbo at 0.5-0.7, or 5 at turbo 0.2. Do not judge at CFG 1: one user's point is that LoRAs were being judged there."
+  notes:
+    - "Save every 100-250 steps. Test a close portrait, a full-body shot in a pose that is not in the set, and the character next to a different person."
+    - "Watch the 30-35 epoch zone; keep an earlier checkpoint. Easy prompts lie: wide shots show the real state."
+    - "Judge text-to-image and edit use separately; a t2i LoRA used on the edit path can give a horror face."
+    - "Do not use a Sage-attention build that drops attn_mask: it changes composition and faces."
+flaws:
+  - symptom: no_likeness
+    causes:
+      - "shift timesteps, 2048-only buckets, or an automagic LR still high or collapsed"
+      - "no training adapter on the turbo weights (garbage from the first step)"
+      - "photos too few, old or low-resolution"
+    fixes:
+      - set: {timestep_sampling: {value: logit_normal}, training_adapter: {value: auto}, resolutions: {value: [0.5, 1.0]}}
+        why: "Sigmoid from step 0, the adapter on, and 512/768/1024-class buckets fixed deformed or broken runs in matched A/Bs and several reports."
+        confidence: CONF
+        sources: [qa_timestep_2026_09, qa_adapter_2026_10, qa_resolution_2026_10]
+      - set: {optimizer: {value: adamw8bit}, learning_rate: {value: 1.0e-5}}
+        why: "If automagic's logged LR sank to 1e-5 or below and samples are already weird, a fixed AdamW at 1e-5 for about 50 epochs gave very good likeness for one user. (Lower than the base rate on purpose; raise it again if nothing learns.)"
+        confidence: REP
+        sources: [qa_optimizer_2026_09]
+      - set: {network_type: {value: oft}, optimizer: {value: adamw8bit}, learning_rate: {value: 5.0e-5}}
+        why: "OFT with AdamW 8-bit at 5e-5 held the face (ArcFace about 71 against about 60 at 1e-4) and kept body framing; second to Keel on likeness, one run, on a fine-tune. At 1e-4 OFT overtrained."
+        confidence: MEAS
+        sources: [meas_qwen_optim_2026_11]
+      - action: "Upscale or restore old sources to about 2 MP first; poor or old datasets tank quality from the first checkpoint."
+        why: "Two users."
+        confidence: CONF
+        sources: [qa_resolution_2026_10, atk_dataset_quality_2026_06]
+  - symptom: slow_likeness
+    causes:
+      - "rate too low or automagic collapsed"
+      - "a large or hard set"
+    fixes:
+      - set: {optimizer: {value: keel}, automagic_min_lr: {value: 1.0e-8}}
+        why: "Keel was the best Qwen-Image 2.1 row (combined 44.7 against 28.0 for AdamW LoRA; lr at its 1e-3 ceiling by step 500; loss on watched pictures -44% against -15-17%) in one run; its Krea 2 body gain did not repeat. The runs used the old 1e-8 floor, so that is set; no second seed yet."
+        confidence: MEAS
+        sources: [meas_qwen_optim_2026_11, meas_keel_2026_11]
+      - set: {network_type: {value: lokr}, lokr_factor: {value: 4}, timestep_sampling: {value: logit_normal}}
+        why: "LoKr factor 4 full rank with sigmoid gave near-perfect likeness for one user, and factor 8 was 30-40% faster than his previous setup on the same set (the community's other winning stack; RulZ AI Trainer's own tests found a LoRA faster)."
+        confidence: CONF
+        sources: [qa_network_2026_09]
+  - symptom: peaked_early
+    causes:
+      - "30-35 epochs is the overtrain zone for automagic on small sets"
+      - "rate too high for rank 8 on a small set"
+    fixes:
+      - action: "Keep the epoch-30 checkpoint (fine at 30, odd at 35 on three datasets) and save every 100-250 steps."
+        why: "Three of one user's own datasets."
+        confidence: REP
+        sources: [qa_steps_2026_09]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "Half the rate halved the train-to-held-out gap on a Qwen-Image 2.1 fine-tune and lost no likeness on the probes."
+        confidence: MEAS
+        sources: [meas_region_2026_11]
+  - symptom: lost_framing
+    causes:
+      - "pushed past the point where body renders stay full-body (all 8 body probes lost it by 1,600 steps at 1e-4)"
+      - "the set is mostly close portraits"
+    fixes:
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "At 5e-5 body framing held until step 1,200, with 0 of 8 renders lost, and two lost at 1,400 (one seed kept it all run); one run, so a second seed is the open check."
+        confidence: MEAS
+        sources: [meas_region_2026_11]
+      - action: "Pick the checkpoint before the framing share fell (about step 800-1,200 at 0.25 MP) and add full-body, new-pose photos; the best-checkpoint tracker already discounts a body score by the framing share."
+        why: "All rows lost body framing; seed 43 alone kept the body probe on its prompt."
+        confidence: MEAS
+        sources: [meas_region_2026_11, meas_qwen_optim_2026_11]
+  - symptom: wrong_body
+    causes:
+      - "undertrained wide views, or heads inconsistent in the body shots"
+      - "shift timesteps"
+    fixes:
+      - action: "Train longer on sigmoid (4,000-class for a large set), put real poses in the set and mask photos whose head does not match the body; easy prompts hide this. One user's body proportions still wandered at 3,500 steps."
+        why: "A matched A/B plus several reports; the fix is more data and steps, not a magic rate."
+        confidence: CONF
+        sources: [qa_body_2026_09, qa_timestep_2026_09]
+      - set: {timestep_sampling: {value: logit_normal}}
+        why: "Sigmoid got the face closer than shift from the same checkpoint."
+        confidence: CONF
+        sources: [qa_timestep_2026_09]
+  - symptom: soft_blurry
+    causes:
+      - "the LoRA itself (one view), or the base look (another)"
+      - "CFG 1 with full-strength turbo"
+    fixes:
+      - set: {turbo_lora_strength: {value: 0.6}, sample_steps: {value: 16}, sample_cfg: {value: 3.0}}
+        why: "A regular's samples all use a turbo LoRA at 0.5-0.7, 16 steps, CFG 3-3.5; try this before retraining. The other view is that raising CFG and slamming turbo is a fake fix, so treat it as the cheaper test."
+        confidence: DISP
+        sources: [qa_soft_2026_10]
+      - action: "If it stays soft, the trained LoRA may be the cause: keep the earlier checkpoint (longer training overfits before the softness leaves)."
+        why: "One user's view."
+        confidence: REP
+        sources: [qa_soft_2026_10]
+  - symptom: deformed_bodies
+    causes:
+      - "shift timesteps, 2048-only buckets, rank 32-64, or no adapter"
+      - "an automagic LR that is still high"
+    fixes:
+      - set: {timestep_sampling: {value: logit_normal}, resolutions: {value: [0.5, 1.0]}, lora_rank: {op: min, value: 16}, training_adapter: {value: auto}}
+        why: "Rank 64 and 32 LoRAs and LoKr 4/8 all deformed before likeness until the buckets were mixed; sigmoid and the adapter fixed the rest."
+        confidence: CONF
+        sources: [qa_network_2026_09, qa_timestep_2026_09, qa_adapter_2026_10]
+  - symptom: plastic_skin
+    causes:
+      - "an overbaked edit-style LoRA (about 1,200 steps in one report)"
+      - "the base's own GPT texture, which goes away once a LoRA is trained"
+    fixes:
+      - action: "Stop earlier, and judge t2i and edit LoRAs separately; plastic skin, dirt and raindrop artifacts appeared on an edit LoRA after about 1,200 steps."
+        why: "One report each."
+        confidence: REP
+        sources: [qa_edit_2026_09]
+  - symptom: identity_bleed
+    causes:
+      - "a single-identity LoRA or LoKr (any rank)"
+    fixes:
+      - action: "Use separate LoRAs for separate people, or train all characters in one LoRA with distinct long names and about 20% group photos captioned with positions."
+        why: "Rank 4 did not prevent it; the multi-character fix is the most repeated one."
+        confidence: CONF
+        sources: [qa_bleed_2026_09, atk_multichar_2026_08]
+      - set: {isolation: {value: true}}
+        why: "DOP keeps the face off other people at 1.5-2x the time; disputed across models and unmeasured on Qwen here."
+        confidence: DISP
+        sources: [atk_dop_reg_2026_08]
+  - symptom: memorized
+    causes:
+      - "OFT at 1e-4 (copy 0.61-0.64 by step 200, training backgrounds in headshots)"
+      - "a high rate on a tiny set"
+    fixes:
+      - set: {learning_rate: {op: mul, value: 0.5}, network_type: {value: lora}}
+        why: "OFT wanted about half Krea 2's rate (5e-5); a plain LoRA stayed under the copy limit."
+        confidence: MEAS
+        sources: [meas_qwen_optim_2026_11]
+  - symptom: likeness_unstable
+    causes:
+      - "probe noise: seeds swing up to 20 points and one seed alone kept the body prompt"
+    fixes:
+      - set: {probe_seeds: {op: max, value: 6}}
+        why: "A single probe swings about 10 points; sweeps repeat across seeds, probes do not."
+        confidence: MEAS
+        sources: [meas_region_2026_11]
+  - symptom: lr_collapsed
+    causes:
+      - "automagic v3's effective LR fell to 1e-5 or below on three datasets"
+    fixes:
+      - set: {automagic_min_lr: {value: 2.0e-5}}
+        why: "The floor RulZ AI Trainer ships since 3.24.0; the community's floors run from 2e-5 up."
+        confidence: CONF
+        sources: [atk_automagic_floor_2026_10, qa_optimizer_2026_09]
+      - set: {optimizer: {value: adamw8bit}, learning_rate: {value: 1.0e-5}}
+        why: "A fixed AdamW at 1e-5 for 50 epochs gave very good likeness for the user who saw the collapse."
+        confidence: REP
+        sources: [qa_optimizer_2026_09]
+  - symptom: out_of_memory
+    causes:
+      - "bf16 text encoder (17 GB) or transformer (14.2 GB) with a 1 MP bucket on a card under 24 GB"
+    fixes:
+      - set: {transformer_quant: {value: int8_convrot}, text_encoder_quant: {value: int8}, resolutions: {value: [0.5]}}
+        why: "int8 is 7.3 GB for the transformer and halves the text encoder; a half-megapixel bucket keeps the step small."
+        confidence: DOC
+        sources: [doc_trainer_3_28]
+open_questions:
+  - "Optimizer: AdamW 1e-5, automagic 1e-4 with a floor, AdamW 2e-4 at rank 8 and Keel all reported likeness; nobody has raced them on one set. Our only Keel number is one run on a fine-tune."
+  - "Whether OFT at 5e-5 and Keel hold on a second seed, and whether they hold on plain Qwen-Image 2.1 rather than the fine-tune we ran."
+  - "The winning config of one user who calls 2.1 extremely trainable on a 120-image set was offered privately and is not in the evidence."
+  - "Softness: whether the LoRA or the base causes it is unresolved; the turbo-at-low-strength test is the cheap check."
+  - "A tiny mole or wrinkle was never learned by one user; other models learned the same mark, and no setting is known."
+  - "No agreed caption-dropout rate, and nobody has compared the default 0.05 with 0; our own reference runs used no drop."
+sources:
+  qa_adapter_2026_10:
+    kind: community
+    where: "AI Toolkit Discord #qwen_image_2 (the AI Toolkit author among them)"
+    date: "2026-10"
+    people: 3
+    url: null
+    note: "Training adapter required, removed at inference; a LoRA trained on base transfers worse to turbo; the September collapse reports match the mechanism."
+  qa_timestep_2026_09:
+    kind: community
+    where: "AI Toolkit Discord #qwen_image_2"
+    date: "2026-09"
+    people: 4
+    url: null
+    note: "Two matched A/Bs, same dataset and checkpoint: sigmoid got the face closer than shift; two more trainers agree. Linear for an art style was one user."
+  qa_resolution_2026_10:
+    kind: community
+    where: "AI Toolkit Discord #qwen_image_2"
+    date: "2026-10"
+    people: 5
+    url: null
+    note: "512+768+1024 mixed preferred; 2048-only broke the model, 2048 as an extra bucket worked; 512-only weak; upscale old sources."
+  qa_optimizer_2026_09:
+    kind: community
+    where: "AI Toolkit Discord #qwen_image_2"
+    date: "2026-09"
+    people: 4
+    url: null
+    note: "Automagic v3 LR fell to 1e-5 or below (3 datasets); AdamW fixed 1e-5, 50 epochs, very good; others automagic 1e-4 with batch 2 stopping at 400-600 steps; LoKr 4 automagic sigmoid detail by 250."
+  qa_network_2026_09:
+    kind: community
+    where: "AI Toolkit Discord #qwen_image_2"
+    date: "2026-09"
+    people: 4
+    url: null
+    note: "LoKr 4 / 8 full rank with sigmoid; LoRA over LoKr and rank 4 for another user; rank 64/32 and LoKr 4/8 deformed until the resolution mix changed."
+  qa_steps_2026_09:
+    kind: community
+    where: "AI Toolkit Discord #qwen_image_2"
+    date: "2026-09"
+    people: 4
+    url: null
+    note: "Faces done at 700-2,000 steps, wide shots 4,000+; 30 epochs good and 35 weird on three datasets; 5,000 steps did not hurt LoKrs."
+  qa_captions_2026_09:
+    kind: community
+    where: "AI Toolkit Discord #qwen_image_2"
+    date: "2026-09"
+    people: 3
+    url: null
+    note: "Describe shot, pose, clothes and background, not identity; a Qwen VL captioner plus a hand pass; a caption-dropout cache error when reference slots differ."
+  qa_body_2026_09:
+    kind: community
+    where: "AI Toolkit Discord #qwen_image_2"
+    date: "2026-09"
+    people: 3
+    url: null
+    note: "Close portraits learn first; medium and full body lag with new poses; a pose change sheds likeness; 17 synthetic images were not enough for body identity."
+  qa_soft_2026_10:
+    kind: community
+    where: "AI Toolkit Discord #qwen_image_2"
+    date: "2026-10"
+    people: 2
+    url: null
+    note: "Disputed: the LoRA stays soft until collapse vs the base is blurry unless a turbo LoRA is on at low strength; CFG 1 judging called unfair."
+  qa_bleed_2026_09:
+    kind: community
+    where: "AI Toolkit Discord #qwen_image_2"
+    date: "2026-09"
+    people: 2
+    url: null
+    note: "A second person turns into the subject with a single-identity LoKr or LoRA; rank 4 did not prevent it; disputed whether it is LoKr."
+  qa_edit_2026_09:
+    kind: community
+    where: "AI Toolkit Discord #qwen_image_2"
+    date: "2026-09"
+    people: 2
+    url: null
+    note: "Plastic skin, dirt and raindrop artifacts on an overbaked edit LoRA after about 1,200 steps; edit mode changed identity in text-to-image-quality sets."
+  qa_nov_2026_11:
+    kind: community
+    where: "AI Toolkit Discord #training"
+    date: "2026-11"
+    people: 2
+    url: null
+    note: "One user could not stabilise 2.1 on 120 Gemini-captioned images while another says it is extremely trainable with his config (not shared). Disputed."
+  qa_sage_2026_10:
+    kind: community
+    where: "banodoco Discord #qwen-image"
+    date: "2026-10"
+    people: 1
+    url: null
+    note: "Sage attention builds that drop attn_mask ignore the causal mask on the text prefix and change composition and faces (measured on a 5090)."
+  web_fizgig_qwen_2026_09:
+    kind: web
+    where: "ComfyUI Wiki news: Fizgig v6.5.0 Qwen-Image 2.1 support"
+    date: "2026-09"
+    people: null
+    url: https://comfyui-wiki.com/en/news/2026-09-27-fizgig-v6-5-qwen-image-2-1
+    note: "Frozen training adapter on by default, 0.5 MP, adamw8bit, EMA 0.98, 30 epochs; Fast preset rank 8 at 2e-4 to 4e-4 reached likeness fastest and kept skin detail; rank 16 at those rates overtrained. One author's own app."
+  web_note_sepiablue_2026_09:
+    kind: web
+    where: "note.com article on Qwen-Image 2.1 LoRA training"
+    date: "2026-09"
+    people: null
+    url: https://note.com/sepiablue/n/n9372886b9e5d
+    note: "31 images, rank 16, 1e-4, adamw8bit, batch 1, 2,000 steps, shift timesteps; the result was weak and flat on a 2D character and the author was still tuning."
+  web_orcarouter_2026_10:
+    kind: web
+    where: "orcarouter.ai blog: Qwen-Image 2.1 LoRA"
+    date: "2026-10"
+    people: null
+    url: https://www.orcarouter.ai/blog/qwen-image-2-1-lora
+    note: "Reference recipe rank 32, 1e-4; an edit-adapter run at 3e-4 degraded all validation prompts by update 500; quality was non-monotonic across thousands of updates."

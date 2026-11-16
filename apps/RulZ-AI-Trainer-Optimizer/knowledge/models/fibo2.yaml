@@ -1,0 +1,363 @@
+# FIBO 2 (Bria): character LoRA starting recipe. THERE IS NO PERSON-LIKENESS RECIPE FOR THIS MODEL: most numbers are GUESS.
+# Public file: no handles, no personal details, no dataset names. Shared sources are in general.yaml.
+id: fibo2
+name: FIBO 2
+kind: image
+updated: 2026-11-16
+summary: >-
+  FIBO 2 has no published person-likeness recipe: the evidence is a vendor object recipe (rank 64, 1e-4, 1,000 steps), one
+  object test, two users who saw likeness at about 300 steps (batch 2) and useful results by 500, and a few warnings.
+  Train the dev model (not the distilled edit-turbo) at about 1 MP, use a fixed-rate AdamW rather than automagic (whose
+  LR fell from 1e-4 to 2e-6 in about 100 steps on FIBO), save often because it trains fast and overtrains, and judge on dev
+  at full steps and CFG without speed LoRAs. Every number below that is not marked otherwise is a reasoned default shown
+  with a warning, not a finding; the first real run should be treated as the experiment.
+model_preset: FIBO-2.0-dev
+model_path: briaai/Fibo-2.0-dev
+facts:
+  - text: "Train on FIBO-2.0-dev, not the Edit Turbo: edit-turbo is a step and CFG distillation of dev. The model was trained at 1 MP and higher resolutions have issues (the model card). RulZ AI Trainer's preset FIBO-2.0-edit-turbo is for editing; use FIBO-2.0-dev for a character."
+    confidence: CONF
+    sources: [fb_card_2026_10, web_bria_diffusers_2026_10]
+  - text: "Speed: likeness at about 300 steps at batch 2, convergence at about 500; it trains fast and overtrains too. An object (plush-dragon) test with plain captions wrapped as JSON, rank 64, 1e-4 constant and 400 steps showed likeness from step 200 and was best at 300. These are not person results."
+    confidence: CONF
+    sources: [fb_speed_2026_10, web_imagelora_fibo_2026_10]
+  - text: "Vendor recipe (an object, not a person): LoRA rank 64 / alpha 64 on all linear layers, LR 1e-4 constant, 1024 px, batch 1 with accumulation 4 (Bria suggests 8), 1,000 steps for text-to-image and 2,000 for edit. Another reference example used rank 32, 1e-4, 5 epochs at 1 MP."
+    confidence: REP
+    sources: [web_bria_diffusers_2026_10]
+  - text: "Automagic v3 drove the LR from 1e-4 to about 2e-6 in about 100 steps on FIBO (and MOSS): three users, with floors of 2.5e-4 to 1e-3 reported to work. Automagic v4 held about 6e-5 steady and behaved better on FIBO for one user. AdamW is the safe route."
+    confidence: CONF
+    sources: [fb_automagic_2026_10, atk_automagic_floor_2026_10, atk_automagic4_2026_11]
+  - text: "Captions: JSON (structured) and plain captions gave no meaningful difference across three LoRAs (one user), and a plain caption wrapped as JSON worked in the object test; the prompt format of the model is structured JSON (a short description, objects, background, lighting and photographic characteristics). RulZ AI Trainer uses a plain sentence as it is or cleans a JSON caption the way Bria's training did; dropped captions train on the model's null caption."
+    confidence: REP
+    sources: [fb_captions_2026_10, doc_trainer_3_28]
+  - text: "A text-to-image LoRA used on the Edit model disfigures people (two users): train an edit LoRA with a reference-image dataset if you need one, and keep a t2i character LoRA on dev."
+    confidence: CONF
+    sources: [fb_edit_2026_10]
+  - text: "Timestep: AI Toolkit's template uses 'weighted' by accident (the author: 'may be ideal'). RulZ AI Trainer's 'reference' is Bria's own trainer recipe: sigma = sigmoid(N(shift, 1)) with probability 0.9 (the shift grows with the image's token count) and uniform otherwise."
+    confidence: DOC
+    sources: [fb_template_2026_10, doc_trainer_3_28]
+  - text: "Inference: dev wants 50 steps and CFG 5 (RulZ AI Trainer's previews use 30 at 5); the turbo LoRA at 0.75 on dev infers well; test likeness on dev at full steps and CFG without speed LoRAs. A slight yellow tint was reported, and ComfyUI 0.42.1 gave key errors with any FIBO LoRA as of 2026-10-24."
+    confidence: REP
+    sources: [fb_infer_2026_10, web_imagelora_fibo_2026_10]
+  - text: "Memory: about 22 GB at 1024, batch 1 with AdamW 8-bit (one user; another report of 15 GB at batch 2 is probably a different quantisation); the trainer switches the transformer to int8 on GPUs under 22 GB and the text encoder is about 9 GB. AI Toolkit's qfloat8 gave black samples; the ConvRot int8 route works."
+    confidence: REP
+    sources: [fb_memory_2026_10, doc_trainer_3_28]
+  - text: "No person-likeness evidence: the only community question 'has anyone found a way to train fibo2 yet?' (2026-10-22) went unanswered, and no run of RulZ AI Trainer on FIBO 2 characters has been measured. Treat every base setting here as a starting guess."
+    confidence: GUESS
+    sources: []
+base:
+  network_type:
+    value: lora
+    why: "The vendor and reference recipes train a plain LoRA; no LoKr or OFT report exists for FIBO."
+    confidence: REP
+    sources: [web_bria_diffusers_2026_10]
+  lora_rank:
+    value: 32
+    why: "GUESS between the vendor's rank 64 (an object) and a reference example's 32; the wizard uses 32 for a person. Low rank is the trend elsewhere but nobody tried it on FIBO."
+    confidence: GUESS
+    sources: [web_bria_diffusers_2026_10, doc_trainer_3_28]
+  lora_alpha:
+    value: 32.0
+    why: "Alpha equals rank (the vendor uses alpha equal to rank)."
+    confidence: REP
+    sources: [web_bria_diffusers_2026_10]
+  optimizer:
+    value: adamw8bit
+    why: "Automagic v3 collapses on FIBO (LR 1e-4 to 2e-6 in about 100 steps, three users); the vendor uses AdamW; the 22 GB report is for AdamW 8-bit."
+    confidence: CONF
+    sources: [fb_automagic_2026_10, web_bria_diffusers_2026_10, fb_memory_2026_10]
+  learning_rate:
+    value: 1.0e-4
+    why: "The vendor's and the object test's rate (constant); also the wizard's."
+    confidence: REP
+    sources: [web_bria_diffusers_2026_10, web_imagelora_fibo_2026_10, doc_trainer_3_28]
+  lr_scheduler:
+    value: constant
+    why: "Constant, as the vendor and the object test."
+    confidence: REP
+    sources: [web_bria_diffusers_2026_10, web_imagelora_fibo_2026_10]
+  timestep_sampling:
+    value: reference
+    why: "Bria's own trainer distribution; the community template's 'weighted' was an accident the author thinks 'may be ideal'."
+    confidence: DOC
+    sources: [doc_trainer_3_28, fb_template_2026_10]
+  batch_size:
+    value: 1
+    why: "The wizard's value; the vendor uses batch 1 with accumulation 4 and likeness showed at 300 steps at batch 2 for others. Whether steps count accumulation is a question for the first run."
+    confidence: GUESS
+    sources: [web_bria_diffusers_2026_10, fb_speed_2026_10]
+  resolutions:
+    value: [1.0]
+    why: "The model was trained at 1 MP and higher resolutions have issues; nothing was said about lower sizes."
+    confidence: CONF
+    sources: [fb_card_2026_10]
+  isolation:
+    value: false
+    why: "DOP has no FIBO evidence and costs 1.5-2x the time."
+    confidence: GUESS
+    sources: []
+  turbo_lora:
+    value: ""
+    why: "Test likeness on dev at full steps and CFG without speed LoRAs; the trainer's own 4-step turbo LoRA is the quick alternative (0.75 on dev infers well for one user)."
+    confidence: REP
+    sources: [web_imagelora_fibo_2026_10, fb_infer_2026_10]
+  sample_steps:
+    value: 30
+    why: "Bria samples dev at 50 steps; 20-30 is plenty for previews."
+    confidence: DOC
+    sources: [doc_trainer_3_28, fb_infer_2026_10]
+  sample_cfg:
+    value: 5.0
+    why: "Bria's guidance scale for FIBO 2.0 dev."
+    confidence: DOC
+    sources: [doc_trainer_3_28, fb_infer_2026_10]
+  probe_steps:
+    value: 30
+    why: "Probes sample as the previews do; without a turbo LoRA a probe needs the full steps."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_cfg:
+    value: 5.0
+    why: "As the samples."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_seeds:
+    value: 4
+    why: "A single probe swings about 10 points between seeds; four seeds give a curve you can read."
+    confidence: MEAS
+    sources: [meas_region_2026_11, meas_krea_race_2026_11]
+  likeness_framing:
+    value: true
+    why: "Counts a body render with no body as zero so best-checkpoint tracking is not fooled by lost framing."
+    confidence: MEAS
+    sources: [meas_region_2026_11]
+  copy_check:
+    value: "on"
+    why: "Logs the copy score with the probes so a memorised checkpoint shows."
+    confidence: MEAS
+    sources: [meas_krea_race_2026_11]
+steps:
+  epochs: 30
+  min: 600
+  max: 1500
+  round_to: 50
+  why: "GUESS shaped by two reports: likeness at about 300 steps at batch 2 and useful by 500 (a different set and batch), the vendor's 1,000 steps for an object, and the warning that it overtrains fast. Thirty epochs of 20-40 images is 600-1,200 steps; probes every ~10% decide, and the first real run is the experiment."
+  confidence: GUESS
+  sources: [fb_speed_2026_10, web_bria_diffusers_2026_10]
+adjust:
+  - id: tiny_dataset
+    when: {images_max: 14}
+    set:
+      lora_rank: {value: 16, why: "A small set overfits a big adapter; the trend elsewhere is low rank for one person (no FIBO test).", confidence: GUESS, sources: [atk_rank_lokr_2026]}
+      lora_alpha: {value: 16.0, why: "Alpha equals rank.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "Under 15 images the LoRA is stiff and copies the background; add photos first. The step minimum is 600, so a 10-image set runs 60 epochs: stop at the first good probe (an object test was best at 300 steps)."
+  - id: small_dataset
+    when: {images_min: 15, images_max: 40}
+    set:
+      holdout_images: {value: 3, why: "Three held-out photos let the sweeps show where the subject stops being learned (measured on a Qwen-Image 2.1 fine-tune; never run on FIBO).", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "A sweep every 4 epochs costs little on a small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "The base recipe is a guess for this size; probes decide."
+  - id: large_dataset
+    when: {images_min: 80}
+    set:
+      lora_rank: {value: 64, why: "The vendor recipe's rank, for a bigger set; an object recipe, not a person.", confidence: REP, sources: [web_bria_diffusers_2026_10]}
+      lora_alpha: {value: 64.0, why: "Alpha equals rank.", confidence: DOC, sources: [doc_trainer_3_28]}
+      holdout_images: {value: 8, why: "Up to a fifth of the set may be held out; eight photos give a steadier held-out curve.", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "As for the small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "80+ images: the cap (1,500 steps) gives under 19 epochs; a complex dataset still mixed at 2,000 steps in AI Toolkit, so raise the cap by editing steps if the probes are still rising."
+  - id: goal_quick
+    when: {goal: quick}
+    set:
+      probe_seeds: {value: 2, why: "A first test needs a rough read only.", confidence: GUESS, sources: []}
+    note: "A quick test: likeness was reported at about 300 steps and useful at 500 on others' sets; stop there and judge on dev at full steps."
+  - id: goal_likeness
+    when: {goal: likeness}
+    set:
+      probe_seeds: {value: 6, why: "More probe seeds make the best checkpoint reliable.", confidence: MEAS, sources: [meas_krea_race_2026_11]}
+    note: "No FIBO setting is known to raise likeness beyond the base; use probes and early checkpoints."
+  - id: focus_face
+    when: {focus: face}
+    set:
+      crop_augment: {value: face, why: "Close-ups teach the face's detail; bust crops would mostly teach the build.", confidence: DOC, sources: [doc_trainer_3_28]}
+      face_weight: {value: 1.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+      body_weight: {value: 0.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: focus_face_body
+    when: {focus: face_body}
+    set:
+      crop_augment: {value: face+bust, why: "Close-ups for the face and head-and-shoulders crops between them and the whole photos.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "No FIBO evidence on body identity; include full-body shots at 1 MP."
+  - id: low_median_mp
+    when: {median_mp_max: 0.4}
+    set:
+      resolutions: {value: [0.5], why: "The photos are under 0.4 MP: training above their size only upscales them; the model prefers 1 MP, so upscale if you can.", confidence: GUESS, sources: [fb_card_2026_10]}
+  - id: no_captions
+    when: {has_captions: false}
+    set:
+      caption_dropout: {value: 0.0, why: "Most images have no caption file, so there is nothing to drop.", confidence: GUESS, sources: []}
+    note: "Plain captions and JSON captions gave no meaningful difference for one user; write a plain sentence of the scene and what changes."
+  - id: vram_24
+    when: {vram_max_gb: 24}
+    set:
+      transformer_quant: {value: int8_convrot, why: "About 22 GB at 1024 with AdamW 8-bit leaves no room on 24 GB; the trainer switches itself to int8 under 22 GB.", confidence: GUESS, sources: [fb_memory_2026_10, doc_trainer_3_28]}
+  - id: vram_16
+    when: {vram_max_gb: 16}
+    set:
+      transformer_quant: {value: int8_convrot, why: "The trainer switches FIBO to int8 on GPUs under 22 GB.", confidence: DOC, sources: [doc_trainer_3_28]}
+      text_encoder_quant: {value: int8, why: "Halves the 9 GB text encoder so it fits the card for caching.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "Not run here on a 16 GB card. Do not use AI Toolkit's qfloat8 route (black samples); if the step does not fit, use the trainer's block swap plan."
+evaluate:
+  strength: "1.0; the trained LoRA only, with no speed LoRA on top for the first judgement."
+  sampler: "FIBO dev at its default sampler; a turbo LoRA at 0.75 on dev works as a fast second look."
+  steps: "50 on dev for the final judgement (previews use 30)."
+  cfg: "5 on dev."
+  notes:
+    - "Test likeness on dev at full steps and CFG without speed LoRAs; a distilled look hides a weak LoRA."
+    - "Save every 50-100 steps: it learns by about 300 and overtrains too."
+    - "Do not use the LoRA on the Edit model: a t2i LoRA disfigures people there."
+    - "ComfyUI 0.42.1 gave key errors with any FIBO LoRA in late October; update before concluding the file is bad."
+flaws:
+  - symptom: lr_collapsed
+    causes:
+      - "automagic v3: LR 1e-4 to 2e-6 in about 100 steps on FIBO"
+    fixes:
+      - set: {optimizer: {value: adamw8bit}, learning_rate: {value: 1.0e-4}}
+        why: "A fixed-rate AdamW cannot collapse; the vendor uses it."
+        confidence: CONF
+        sources: [fb_automagic_2026_10, web_bria_diffusers_2026_10]
+      - set: {automagic_min_lr: {value: 2.0e-4}}
+        why: "If you keep automagic, floors of 2.5e-4 to 1e-3 were reported to look good after 100 steps (the trainer's default is 2e-5, too low for FIBO)."
+        confidence: REP
+        sources: [fb_automagic_2026_10]
+  - symptom: no_likeness
+    causes:
+      - "the Edit or turbo model was trained instead of dev"
+      - "the LoRA is judged under a speed LoRA, or in ComfyUI with a key error"
+    fixes:
+      - action: "Train on FIBO-2.0-dev (preset FIBO-2.0-dev) and judge on dev at 50 steps and CFG 5; update ComfyUI if every FIBO LoRA errors."
+        why: "Edit-turbo is a distillation; the card and two reports agree."
+        confidence: CONF
+        sources: [fb_card_2026_10, fb_infer_2026_10]
+      - action: "No setting is known to fix a weak FIBO likeness beyond more photos and a checkpoint near step 300-500; the vendor's rank 64 at 1e-4 is the other documented start."
+        why: "No person-likeness evidence exists."
+        confidence: GUESS
+        sources: []
+  - symptom: peaked_early
+    causes:
+      - "FIBO trains fast and overtrains: likeness at about 300 steps"
+    fixes:
+      - action: "Keep the checkpoint near step 300-600 (save every 50-100) and compare it to later ones on dev."
+        why: "Two users reported likeness at about 300 and useful results by 500, and that it overtrains too."
+        confidence: CONF
+        sources: [fb_speed_2026_10]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "A lower rate peaks later and flatter; measured on another model (the train-to-held-out gap halved at 5e-5)."
+        confidence: GUESS
+        sources: [meas_region_2026_11]
+  - symptom: burned
+    causes:
+      - "too many steps for a fast learner"
+    fixes:
+      - action: "Use an earlier checkpoint; judge on dev at full steps rather than under the turbo LoRA."
+        why: "FIBO overtrains quickly; no burn-specific report exists."
+        confidence: GUESS
+        sources: [fb_speed_2026_10]
+  - symptom: deformed_bodies
+    causes:
+      - "a t2i LoRA used on the Edit model"
+    fixes:
+      - action: "Use the LoRA on dev. For editing, train an edit LoRA with a reference-image dataset."
+        why: "Two users saw people disfigured by a t2i LoRA on the edit model."
+        confidence: CONF
+        sources: [fb_edit_2026_10]
+  - symptom: color_shift
+    causes:
+      - "a slight yellow tint was reported with FIBO LoRAs"
+    fixes:
+      - action: "Compare against the same prompt without the LoRA; if the tint is new, use an earlier checkpoint. No setting is known."
+        why: "One report."
+        confidence: REP
+        sources: [web_imagelora_fibo_2026_10]
+  - symptom: out_of_memory
+    causes:
+      - "about 22 GB at 1024 with AdamW 8-bit, batch 1"
+    fixes:
+      - set: {transformer_quant: {value: int8_convrot}, text_encoder_quant: {value: int8}}
+        why: "The trainer's int8 route for cards under 22 GB; AI Toolkit's qfloat8 gave black samples."
+        confidence: DOC
+        sources: [doc_trainer_3_28, fb_memory_2026_10]
+open_questions:
+  - "Everything about a person on FIBO 2 is open: rank, rate, steps, timestep and caption style are guesses or object recipes."
+  - "Does the vendor's rank 64 at 1e-4, 1,000 steps apply to a person, and is low rank better as elsewhere?"
+  - "Likeness at about 300 steps (batch 2) against the steps counted here at batch 1: are steps counted per accumulation?"
+  - "JSON versus plain captions gave no difference for one user; a person set has not been compared."
+  - "Whether FIBO's weak spots (body, distance) need a different resolution than 1 MP."
+sources:
+  fb_card_2026_10:
+    kind: official
+    where: "FIBO 2.0 dev model card (briaai) and the pinned note in banodoco Discord #fibo"
+    date: "2026-10"
+    people: null
+    url: https://huggingface.co/briaai/Fibo-2.0-dev
+    note: "Edit-turbo is a step and CFG distillation of dev; trained at 1 MP, higher resolutions have issues."
+  fb_speed_2026_10:
+    kind: community
+    where: "AI Toolkit Discord #new_models"
+    date: "2026-10"
+    people: 2
+    url: null
+    note: "Likeness at about 300 steps at batch 2, convergence about 500; trains fast and overtrains too."
+  fb_captions_2026_10:
+    kind: community
+    where: "AI Toolkit Discord #new_models"
+    date: "2026-10"
+    people: 1
+    url: null
+    note: "JSON versus plain captions made no meaningful difference across three LoRAs."
+  fb_automagic_2026_10:
+    kind: community
+    where: "AI Toolkit Discord #development and #new_models"
+    date: "2026-10"
+    people: 3
+    url: null
+    note: "Automagic v3 drove the LR 1e-4 to 2e-6 in about 100 steps on FIBO and MOSS; floors of 2.5e-4 to 1e-3 looked good after 100 steps."
+  fb_edit_2026_10:
+    kind: community
+    where: "AI Toolkit Discord #new_models and #general"
+    date: "2026-10"
+    people: 2
+    url: null
+    note: "A t2i LoRA used on the edit model disfigures people; train edit LoRAs with a reference dataset."
+  fb_infer_2026_10:
+    kind: community
+    where: "banodoco Discord #fibo"
+    date: "2026-10"
+    people: 2
+    url: null
+    note: "Dev needs 50 steps and CFG 5; dev plus the turbo LoRA at 0.75 infers well."
+  fb_memory_2026_10:
+    kind: community
+    where: "AI Toolkit Discord #new_models"
+    date: "2026-10"
+    people: 1
+    url: null
+    note: "About 22 GB at 1024 with AdamW 8-bit, batch 1; a 15 GB figure at batch 2 with other settings; qfloat8 gave black samples."
+  fb_template_2026_10:
+    kind: community
+    where: "AI Toolkit Discord #development"
+    date: "2026-10"
+    people: 1
+    url: null
+    note: "The template's weighted timesteps were an accident but may be ideal (the AI Toolkit author)."
+  web_bria_diffusers_2026_10:
+    kind: official
+    where: "diffusers DreamBooth example for Bria FIBO 2"
+    date: "2026-10"
+    people: null
+    url: https://github.com/huggingface/diffusers/blob/main/examples/dreambooth/README_bria_fibo2.md
+    note: "Rank 64 / alpha 64 on all linear layers, LR 1e-4 constant, 1024 px, batch 1 with accumulation 4, 1,000 steps (text-to-image), 2,000 (edit); an object, not a person."
+  web_imagelora_fibo_2026_10:
+    kind: web
+    where: "imagelora.dev FIBO 2 page (an aggregator; one author's object test)"
+    date: "2026-10"
+    people: 1
+    url: null
+    note: "15 plush-dragon images, plain captions wrapped as JSON, rank 64/64, 1e-4 constant, 400 steps, likeness from step 200 and best at 300; test on dev without speed LoRAs; 23 GiB peak. An object, not a person."

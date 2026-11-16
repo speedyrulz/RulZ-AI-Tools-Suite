@@ -1,0 +1,302 @@
+# PAN 2 (IFM, 29B video model) trained on stills as one-frame videos: character LoRA starting recipe.
+# THERE IS NO COMMUNITY EVIDENCE FOR PAN 2: the only measured data are our own runs on one small fictional set.
+# Public file: no handles, no personal details, no dataset names. Shared sources are in general.yaml.
+id: pan2
+name: PAN 2
+kind: video
+updated: 2026-11-16
+summary: >-
+  PAN 2 has no community character recipe at all (released 2026-11-10; nobody has posted steps, rank, captions or a
+  likeness result). The base settings are RulZ AI Trainer's own first real run: stills as one-frame videos, rank 16, 1e-4
+  with AdamW 8-bit, the model's own uniform-through-shift-9 timesteps, about 0.56 MP, NVFP4, 600 steps on a small set: the
+  character appeared by about step 400 and grain showed by 600. Two findings matter most: captions must match their
+  photos (shuffled captions lost the prompt within 200 steps), and plain prompts give an unreadable picture, so the
+  trainer wraps every plain caption into PAN 2's structured skeleton (ComfyUI does not). Everything else (other rates,
+  ranks, resolutions, longer runs, other sets) is untested; treat the values as one data point, not a recommendation.
+model_preset: PAN-2
+model_path: IFM/PAN2
+facts:
+  - text: "No external evidence: no community training thread, no model-card hyperparameters and no independent likeness result exist as of 2026-11-16 (the video model was released 2026-11-10; the training code and a separate safety checker came with it). Analogues (LTX frame count 1 for image sets, Wan 2.2 sigmoid timesteps for people) do not transfer with confidence."
+    confidence: GUESS
+    sources: [pan2_nm_2026_11]
+  - text: "IFM's own fine-tune recipe (config sft_29B_720p.yaml and docs/data.md): images are trained as one-frame videos, timesteps a uniform draw through a fixed shift of 9 (pretraining used a logit-normal under the same shift). RulZ AI Trainer's 'reference' sampler is exactly this recipe."
+    confidence: DOC
+    sources: [pan2_official_2026_11, doc_trainer_3_28]
+  - text: "Measured: a first real run (one rented 32 GB card, NVFP4 quantised on load, rank 16, 1e-4, AdamW 8-bit, reference timesteps, 768 px = a 640x928 bucket, 600 steps, a small fictional set with matching captions): the character appeared by about step 400, scenes held, a no-trigger prompt of a dog stayed a dog, fine grain showed at 600; loss about 0.17. The steps are few: the likeness peak is early."
+    confidence: MEAS
+    sources: [meas_pan2_2026_11]
+  - text: "Measured: the same run on SHUFFLED captions (captions not matching their photos) lost the prompt by step 200 (hazy, scenes gone; loss about 0.20). Check that every caption describes its own photo before anything else."
+    confidence: MEAS
+    sources: [meas_pan2_2026_11]
+  - text: "Measured: a plain prompt gives an unreadable picture (default negative, empty negative and CFG 1 alike; a bare {init_frame_visual_description} too), so RulZ AI Trainer wraps every plain caption and prompt into the full skeleton (style, one subject, one static-camera event that repeats the caption, a quality block) and passes JSON through verbatim. ComfyUI does not wrap: prompts there must be structured."
+    confidence: MEAS
+    sources: [meas_pan2_2026_11]
+  - text: "Measured in ComfyUI (the fork, converted files, 524 LoRA patches attached, no unmatched keys): the LoRA changes single frames and a 49-frame 480x704 clip, scene and motion hold, and the likeness is clearer in single frames than in a small clip. Judge character likeness on single frames."
+    confidence: MEAS
+    sources: [meas_pan2_2026_11]
+  - text: "Measured memory (NVFP4, rank 16): whole model 17.7 GB loaded, 20.5 GB training, 27.0 GB with a 768x1152 sample (a 1,477-token negative prompt), 0.62 s per step compiled; with block_swap 24, 9.0 GB after load and 13.6 GB peak with samples at 1.5 s per step. int8 on real weights, model split, likeness probes, other rates, ranks and resolutions, longer runs and local 16 GB cards were not run."
+    confidence: MEAS
+    sources: [meas_pan2_2026_11]
+  - text: "The model is not distilled: there is no turbo LoRA and no training adapter, and it samples at the released 50 steps with CFG 2.5 on shift 9 with a structured negative prompt. The last block's add_q_proj, to_add_out and ff_context layers get no gradient and are not LoRA targets. Samples in the trainer took about 32 s with torch.compile on against 19 s without."
+    confidence: DOC
+    sources: [pan2_official_2026_11, meas_pan2_2026_11, doc_trainer_3_28]
+  - text: "Video: the model is a 29B image-text-to-video model; RulZ AI Trainer can also train clips and render sample and probe clips (train_frames, sample_frames, probe_frames). Only one-frame image training has been run for a character; clip training of PAN 2 and clip probes were run for samples only."
+    confidence: MEAS
+    sources: [meas_pan2_2026_11, doc_trainer_3_28]
+base:
+  network_type:
+    value: lora
+    why: "The measured run used a plain LoRA; no other adapter has been tried on PAN 2."
+    confidence: MEAS
+    sources: [meas_pan2_2026_11]
+  lora_rank:
+    value: 16
+    why: "The measured run's rank. No other rank was tried."
+    confidence: MEAS
+    sources: [meas_pan2_2026_11]
+  lora_alpha:
+    value: 16.0
+    why: "Alpha equals rank, as in the measured run."
+    confidence: MEAS
+    sources: [meas_pan2_2026_11]
+  optimizer:
+    value: adamw8bit
+    why: "The measured run's optimizer; automagic and others were not tried on PAN 2."
+    confidence: MEAS
+    sources: [meas_pan2_2026_11]
+  learning_rate:
+    value: 1.0e-4
+    why: "The measured run's rate: the character appeared by about step 400 and grain showed by 600. No other rate was tried."
+    confidence: MEAS
+    sources: [meas_pan2_2026_11]
+  lr_scheduler:
+    value: constant
+    why: "The trainer's default, as in the measured run."
+    confidence: MEAS
+    sources: [meas_pan2_2026_11]
+  timestep_sampling:
+    value: reference
+    why: "IFM's own fine-tune recipe (a uniform draw through shift 9), used in the measured run."
+    confidence: DOC
+    sources: [pan2_official_2026_11, meas_pan2_2026_11]
+  batch_size:
+    value: 1
+    why: "Batch 1 in the measured run."
+    confidence: MEAS
+    sources: [meas_pan2_2026_11]
+  resolutions:
+    value: [0.5625]
+    why: "768 px (a 640x928 bucket), the measured size; at 1.0 MP the memory and step time grow. No other size was tried."
+    confidence: MEAS
+    sources: [meas_pan2_2026_11]
+  transformer_quant:
+    value: nvfp4
+    why: "The measured run quantised to NVFP4 on load (17.7 GB loaded, 20.5 GB training). int8 on real weights was not run."
+    confidence: MEAS
+    sources: [meas_pan2_2026_11]
+  caption_dropout:
+    value: 0.0
+    why: "A plain or empty prompt gives an unreadable picture on PAN 2, so a dropped (empty) caption may be harmful; no run tested dropout, so none is used."
+    confidence: GUESS
+    sources: [meas_pan2_2026_11]
+  isolation:
+    value: false
+    why: "DOP builds side-by-side pictures and has not been run on PAN 2; it costs 1.5-2x the time."
+    confidence: GUESS
+    sources: []
+  sample_steps:
+    value: 50
+    why: "The released sampling: 50 steps."
+    confidence: DOC
+    sources: [pan2_official_2026_11, doc_trainer_3_28]
+  sample_cfg:
+    value: 2.5
+    why: "The released CFG 2.5 (with its structured negative prompt)."
+    confidence: DOC
+    sources: [pan2_official_2026_11, doc_trainer_3_28]
+  probe_steps:
+    value: 50
+    why: "The model is not distilled and has no turbo LoRA, so a probe needs the full steps."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_cfg:
+    value: 2.5
+    why: "As the samples."
+    confidence: DOC
+    sources: [doc_trainer_3_28]
+  probe_seeds:
+    value: 2
+    why: "A single probe swings about 10 points between seeds on other models; a 50-step probe on a 29B model is slow, so two seeds is a compromise (not tested here)."
+    confidence: GUESS
+    sources: [meas_region_2026_11]
+  likeness_framing:
+    value: true
+    why: "Counts a body render with no body as zero so best-checkpoint tracking is not fooled by lost framing."
+    confidence: MEAS
+    sources: [meas_region_2026_11]
+  copy_check:
+    value: "on"
+    why: "Logs the copy score with the probes so a memorised checkpoint shows."
+    confidence: MEAS
+    sources: [meas_krea_race_2026_11]
+steps:
+  epochs: 12
+  min: 400
+  max: 800
+  round_to: 50
+  why: "One measured run: 600 steps on about 60 pictures (about 10 epochs): the character appeared by about step 400 and grain showed at 600. Twelve epochs, floored at 400 and capped at 800, with probes every ~10%, is a guess about how that scales to other set sizes."
+  confidence: GUESS
+  sources: [meas_pan2_2026_11]
+adjust:
+  - id: tiny_dataset
+    when: {images_max: 14}
+    set:
+      lora_rank: {value: 8, why: "A small set overfits a big adapter on every other model; never tried on PAN 2.", confidence: GUESS, sources: []}
+      lora_alpha: {value: 8.0, why: "Alpha equals rank.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "The step minimum is 400, so a 10-image set runs 40 epochs: expect it to be past its peak; stop at the first good probe. Nothing was run on a set this small."
+  - id: small_dataset
+    when: {images_min: 15, images_max: 40}
+    set:
+      holdout_images: {value: 3, why: "Three held-out photos let the sweeps show where the subject stops being learned (measured on a Qwen-Image 2.1 fine-tune; never run on PAN 2).", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "A sweep every 4 epochs costs little on a small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "Our only run was on about 60 pictures; small sets are untested."
+  - id: large_dataset
+    when: {images_min: 80}
+    set:
+      holdout_images: {value: 8, why: "Up to a fifth of the set may be held out; eight photos give a steadier held-out curve.", confidence: MEAS, sources: [meas_region_2026_11]}
+      region_sweep_every: {value: 4, why: "As for the small set.", confidence: MEAS, sources: [meas_region_2026_11]}
+    note: "80+ images: the cap (800 steps) gives under 10 epochs, about the epochs of the one measured run; nothing larger was run."
+  - id: goal_quick
+    when: {goal: quick}
+    set:
+      probe_seeds: {value: 1, why: "A first test needs a rough read only; 50-step probes on a 29B model are slow.", confidence: GUESS, sources: []}
+    note: "A quick test: the character appeared by about step 400; judge on single frames at 50 steps."
+  - id: goal_likeness
+    when: {goal: likeness}
+    set:
+      probe_seeds: {value: 4, why: "More probe seeds make the best checkpoint reliable on other models (a single probe swings about 10 points).", confidence: GUESS, sources: [meas_region_2026_11]}
+    note: "No PAN 2 setting is known to raise likeness above the measured run; choose the checkpoint by probes and by eye on single frames."
+  - id: focus_face
+    when: {focus: face}
+    set:
+      crop_augment: {value: face, why: "Close-ups teach the face's detail; bust crops would mostly teach the build.", confidence: DOC, sources: [doc_trainer_3_28]}
+      face_weight: {value: 1.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+      body_weight: {value: 0.0, why: "A face-only run scores the face alone.", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: focus_face_body
+    when: {focus: face_body}
+    set:
+      crop_augment: {value: face+bust, why: "Close-ups for the face and head-and-shoulders crops between them and the whole photos.", confidence: DOC, sources: [doc_trainer_3_28]}
+    note: "Body probes, prompt checks and clip probes were not run on PAN 2."
+  - id: low_median_mp
+    when: {median_mp_max: 0.4}
+    set:
+      resolutions: {value: [0.25], why: "The photos are under 0.4 MP: training above their size only upscales them.", confidence: DOC, sources: [doc_trainer_3_28]}
+  - id: no_captions
+    when: {has_captions: false}
+    set:
+      caption_dropout: {value: 0.0, why: "Most images have no caption file; an empty prompt is unreadable on PAN 2.", confidence: MEAS, sources: [meas_pan2_2026_11]}
+    note: "Write captions that match each photo, one plain sentence about the scene and subject; the trainer wraps it into the structured skeleton. Shuffled captions lost the prompt within 200 steps."
+  - id: vram_24
+    when: {vram_max_gb: 24}
+    set:
+      block_swap: {value: 12, why: "Measured: 20.5 GB for training and 27.0 GB with a large sample, against 13.6 GB peak with block_swap 24; 12 blocks is an interpolation, not a run.", confidence: GUESS, sources: [meas_pan2_2026_11]}
+      sample_width: {value: 640, why: "A 768x1152 sample peaked at 27.0 GB; a sample the size of the training bucket (640x928) stays near the training peak (not measured).", confidence: GUESS, sources: [meas_pan2_2026_11]}
+      sample_height: {value: 928, why: "As for the width.", confidence: GUESS, sources: [meas_pan2_2026_11]}
+    note: "Untested on a 24 GB card. block_swap runs on one GPU."
+  - id: vram_16
+    when: {vram_max_gb: 16}
+    set:
+      block_swap: {value: 24, why: "Measured with NVFP4: 9.0 GB after load and 13.6 GB peak with samples at 1.5 s per step (against 0.62 s per step with the whole model).", confidence: MEAS, sources: [meas_pan2_2026_11]}
+    note: "The measured run was on a 32 GB card with block swap 24; a real 16 GB card has not been run."
+evaluate:
+  strength: "1.0; judge likeness on single frames rather than a small clip (it was clearer in single frames)."
+  sampler: "The released sampler: 50 steps, CFG 2.5, shift 9, with the structured negative prompt."
+  steps: "50."
+  cfg: "2.5."
+  notes:
+    - "Prompts must be structured in ComfyUI (a plain prompt is unreadable): use the same skeleton the trainer wraps captions in."
+    - "Check at about step 400 and at the last step: the character appeared by about 400 and grain showed by 600 in the one run."
+    - "The step-0 sample should be clean; if a plain prompt is unreadable, that is the model, not a broken LoRA."
+    - "Verify that every caption matches its photo; shuffled captions lost the prompt by step 200."
+    - "Convert the checkpoint with the trainer's script before ComfyUI; 'files' mode needs all three files set."
+flaws:
+  - symptom: ignores_prompt
+    causes:
+      - "captions that do not match their photos (shuffled captions lost the prompt by step 200)"
+      - "a plain prompt in ComfyUI: PAN 2 needs the structured skeleton"
+    fixes:
+      - action: "Check that every caption describes its own photo, regenerate them if needed, and use structured prompts in ComfyUI."
+        why: "Measured: a run on shuffled captions went hazy by step 200 with the scenes gone, the matched run held its scenes."
+        confidence: MEAS
+        sources: [meas_pan2_2026_11]
+  - symptom: noisy_grainy
+    causes:
+      - "grain showed at step 600 in the one run"
+    fixes:
+      - action: "Use an earlier checkpoint, about step 400-500 of a 1e-4 run."
+        why: "The character appeared by about 400 and fine grain showed at 600."
+        confidence: MEAS
+        sources: [meas_pan2_2026_11]
+      - set: {learning_rate: {op: mul, value: 0.5}}
+        why: "A lower rate delays grain on other models (measured as a halved train-to-held-out gap elsewhere); not tried on PAN 2."
+        confidence: GUESS
+        sources: [meas_region_2026_11]
+  - symptom: no_likeness
+    causes:
+      - "mismatched captions"
+      - "too few steps: the character appeared by about 400"
+      - "an untested rate or rank"
+    fixes:
+      - action: "Fix the captions first, then train to at least 400 steps and compare single-frame probes at 50 steps."
+        why: "The measured run's timing."
+        confidence: MEAS
+        sources: [meas_pan2_2026_11]
+      - set: {learning_rate: {op: max, value: 1.0e-4}}
+        why: "1e-4 is the only rate that was run."
+        confidence: MEAS
+        sources: [meas_pan2_2026_11]
+  - symptom: lost_motion
+    causes:
+      - "likeness was clearer in single frames than in a small clip; nothing was trained on clips for a character"
+    fixes:
+      - action: "Judge the likeness on single frames; for motion use a longer clip render and the trainer's clip training (train_frames above 1), which has not been run for a PAN 2 character."
+        why: "One measurement."
+        confidence: MEAS
+        sources: [meas_pan2_2026_11]
+  - symptom: out_of_memory
+    causes:
+      - "20.5 GB for training and 27.0 GB with a large sample at NVFP4"
+    fixes:
+      - set: {block_swap: {value: 24}, sample_width: {value: 640}, sample_height: {value: 928}}
+        why: "Measured: block_swap 24 gave 9.0 GB after load and 13.6 GB peak with samples at 1.5 s per step."
+        confidence: MEAS
+        sources: [meas_pan2_2026_11]
+open_questions:
+  - "Everything beyond the one run is untested: other learning rates, ranks (8, 32), resolutions (1 MP), longer runs and other sets."
+  - "How steps scale with set size (600 steps on about 60 pictures is the only point)."
+  - "Whether int8 on real weights, model split and block swap on a real 16 GB card behave."
+  - "Whether LoKr, OFT or Keel help as they did on other models."
+  - "Clip training for a character, clip probes and body probes were never run."
+  - "The sample speed with torch.compile (32 s against 19 s without) was not looked into."
+sources:
+  meas_pan2_2026_11:
+    kind: measured
+    where: "RulZ AI Trainer own runs on a rented RTX 5090 (PAN 2, small fictional test set, plus ComfyUI loading tests)"
+    date: "2026-11"
+    people: null
+    url: null
+    note: "Rank 16, 1e-4, AdamW 8-bit, reference timesteps, 768 px, 600 steps, NVFP4: character by about step 400, grain at 600; shuffled captions lost the prompt by 200; plain prompts unreadable; memory and speed figures. One run each; nothing else was tried."
+  pan2_official_2026_11:
+    kind: official
+    where: "IFM PAN 2 repository (config/sft_29B_720p.yaml, docs/data.md) and model card"
+    date: "2026-11"
+    people: null
+    url: https://github.com/ifm-ai/PAN2
+    note: "Images are trained as one-frame videos; the fine-tune draws timesteps uniformly through a fixed shift of 9; released sampling 50 steps at CFG 2.5 with a structured negative prompt; 29B model, Wan 2.2 VAE."
+  pan2_nm_2026_11:
+    kind: community
+    where: "AI Toolkit Discord #new_models"
+    date: "2026-11"
+    people: 1
+    url: null
+    note: "Release notice (2026-11-10): training code released, a safety checker is a separate module. No training settings or results were posted."

@@ -31,6 +31,7 @@ APPS = {
     "image-preparer": ("RulZ-Image-Preparer", "assets/icon.png", "assets/icon.ico"),
     "image-grid": ("RulZ-Image-Grid", "assets/app.png", "assets/app.ico"),
     "hf-manager": ("RulZ-Huggingface-Manager", "assets/icon.png", "assets/icon.ico"),
+    "trainer-optimizer": ("RulZ-AI-Trainer-Optimizer", "assets/icon.png", "assets/icon.ico"),
 }
 
 IMAGE_REFS = [

@@ -1,0 +1,4 @@
+job_name: example
+model_arch: krea2
+optimizer: automagic4
+learning_rate: 0.0001
