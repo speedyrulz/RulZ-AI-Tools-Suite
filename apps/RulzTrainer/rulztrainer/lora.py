@@ -66,7 +66,7 @@ log = logging.getLogger("rulztrainer")
 
 COMFY_PREFIX = "diffusion_model."
 PEFT_PREFIX = "transformer."
-LORA_FORMATS = ("comfy", "peft", "folded", "comfy_ab")
+LORA_FORMATS = ("comfy", "peft", "folded", "comfy_ab", "kohya")
 FOLDED_ALPHA_KEY = "rulztrainer_lora_alpha"  # folded files: {module: alpha} the lora_B weights were multiplied by
 # the metadata save_lora writes from the tensors it saves (kind, alpha, layout): a caller's copy of another file's
 # description (post-hoc EMA keeps the newest checkpoint's) never carries these over
@@ -916,6 +916,23 @@ def export_state_dict(injected: dict[str, LoRALinear], dtype=torch.bfloat16, fmt
     for name, m in injected.items():
         if not getattr(m, "trainable", True):
             continue  # a race's switched-off layer (empty tensors)
+        if fmt == "kohya":
+            if not name.startswith("unet."):
+                raise ValueError(f"Kohya SDXL export requires a unet. module name: {name}")
+            if (m.kind != "lora" or set(m.adapter_params()) != {"lora_down", "lora_up"}
+                    or getattr(m, "dora", False)):
+                raise ValueError(f"Kohya SDXL export supports only plain LoRA tensors: {name}")
+            if (getattr(m, "scale", m.alpha / m.rank) != m.alpha / m.rank
+                    or getattr(m, "multiplier", 1.0) != 1.0):
+                raise ValueError(f"Kohya SDXL export requires alpha/rank scaling and multiplier 1: {name}")
+            key = "lora_unet_" + name.removeprefix("unet.").replace(".", "_")
+            if f"{key}.alpha" in out:
+                raise ValueError(f"Ambiguous kohya module name: {name}")
+            parts = m.adapter_params()
+            out[f"{key}.lora_down.weight"] = parts["lora_down"].detach().to("cpu", dtype).contiguous()
+            out[f"{key}.lora_up.weight"] = parts["lora_up"].detach().to("cpu", dtype).contiguous()
+            out[f"{key}.alpha"] = torch.tensor(float(m.alpha), dtype=torch.float32)
+            continue
         parts = {k: v.detach().to("cpu", dtype).contiguous() for k, v in m.adapter_params().items()}
         key = (PEFT_PREFIX if fmt == "peft" else COMFY_PREFIX) + name  # ComfyUI maps "transformer." for Krea 2
         if "dora_scale" in parts:  # DoRA on the input axis: [1, in] (see the module docstring); always fp32: it holds
@@ -975,7 +992,7 @@ def peft_adapter_metadata(injected: dict[str, LoRALinear]) -> dict:
 
 
 def save_lora(injected: dict[str, LoRALinear], path, metadata: dict | None = None, dtype=torch.bfloat16,
-              fmt: str = "comfy") -> None:
+              fmt: str = "comfy", ss_base_model_version: str | None = None) -> None:
     if isinstance(dtype, str):
         dtype = SAVE_DTYPES[dtype]
     meta = {"format": "pt", "rulztrainer_version": "0.1.0"}
@@ -985,6 +1002,12 @@ def save_lora(injected: dict[str, LoRALinear], path, metadata: dict | None = Non
         meta.pop(k, None)
     kinds = network_kinds(injected)
     live = [m for m in injected.values() if getattr(m, "trainable", True)]
+    if fmt == "kohya" and live:
+        meta["ss_network_module"] = "networks.lora"
+        meta["ss_network_dim"] = str(max(m.rank for m in live))
+        meta["ss_network_alpha"] = str(float(max(m.alpha for m in live)))
+        if ss_base_model_version is not None:
+            meta["ss_base_model_version"] = str(ss_base_model_version)
     dora = any(getattr(m, "dora", False) for m in live)
     if "lokr" in kinds:
         meta["rulztrainer_network"] = "lokr"
@@ -1022,8 +1045,12 @@ def file_format(path) -> str:
     (transformer.<module>.lora_A/B), folded or comfy_ab (diffusion_model.<module>.lora_A/B, alpha folded into lora_B;
     folded keeps the alphas in its metadata), else comfy (lora_down/up, or LoKr)."""
     with safe_open(str(path), "pt") as f:
-        keys = [k for k in f.keys() if k.endswith(".lora_A.weight")]
+        all_keys = list(f.keys())
+        keys = [k for k in all_keys if k.endswith(".lora_A.weight")]
         meta = f.metadata() or {}
+    if any(k.startswith("lora_unet_") and k.endswith((".lora_down.weight", ".lora_up.weight", ".alpha"))
+           for k in all_keys):
+        return "kohya"
     if not keys:
         return "comfy"
     if any(k.startswith(PEFT_PREFIX) for k in keys):
@@ -1060,6 +1087,16 @@ def read_folded_alpha(path) -> dict | None:
 def load_lora_weights(injected: dict[str, LoRALinear], path) -> int:
     """Load a previously exported LoRA (either format) into injected modules. Returns number of modules loaded."""
     state = load_file(str(path))
+    kohya = any(k.startswith("lora_unet_") and k.endswith((".lora_down.weight", ".lora_up.weight", ".alpha"))
+                for k in state)
+    kohya_names = {}
+    if kohya:
+        for name in injected:
+            if name.startswith("unet."):
+                key = "lora_unet_" + name.removeprefix("unet.").replace(".", "_")
+                if key in kohya_names:
+                    raise ValueError(f"Ambiguous kohya module names: {kohya_names[key]} and {name}")
+                kohya_names[key] = name
     peft = any(k.endswith(".lora_A.weight") for k in state)
     peft_meta = read_peft_metadata(path) if peft else {}
     folded = read_folded_alpha(path) if peft else None  # a folded file: lora_B carries alpha / rank
@@ -1110,7 +1147,8 @@ def load_lora_weights(injected: dict[str, LoRALinear], path) -> int:
                 (p + name for p in (PEFT_PREFIX, COMFY_PREFIX) if f"{p}{name}.lora_A.weight" in state), PEFT_PREFIX + name)
             down, up = state.get(f"{key}.lora_A.weight"), state.get(f"{key}.lora_B.weight")
         else:
-            key = COMFY_PREFIX + name
+            key = ("lora_unet_" + name.removeprefix("unet.").replace(".", "_")
+                   if kohya and name.startswith("unet.") else COMFY_PREFIX + name)
             down, up = state.get(f"{key}.lora_down.weight"), state.get(f"{key}.lora_up.weight")
         if down is None or up is None:
             continue
