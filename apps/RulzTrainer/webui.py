@@ -2580,6 +2580,21 @@ h1, h2, h3, .rz-pane-title { font-family: "Segoe UI Variable Display", "Segoe UI
 .rz-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; width: 100%; }
 .rz-tiles .rz-tile { min-width: 0; }
 .rz-gpu { flex: 1 1 18rem; min-width: 0; }
+/* Monitor on a wide screen: the status tiles in a column at the right edge, GPUs, disks and memory in one at the
+   left, both held between the header and the action bar while the page scrolls; the middle narrows to make room */
+@media (min-width: 1640px) {
+  .rz-monitor { --mon-side: 220px; max-width: min(1440px, calc(100vw - 2 * (var(--mon-side) + 32px) - 20px)); }
+  .rz-monitor > .rz-tiles, .rz-monitor > .rz-machine {
+    position: fixed; z-index: 1; width: var(--mon-side); top: calc(var(--rz-head-h, 104px) + 20px);
+    max-height: calc(100vh - var(--rz-head-h, 104px) - var(--rz-foot-h, 66px) - 36px);
+    overflow-y: auto; scrollbar-width: thin; display: flex; flex-direction: column; gap: 10px;
+  }
+  .rz-monitor > .rz-tiles { right: 16px; }
+  .rz-monitor > .rz-machine { left: 16px; }
+  .rz-monitor > .rz-tiles .rz-tile, .rz-monitor > .rz-machine .rz-tile { flex: none; min-width: 0; padding: 10px 14px; }
+  .rz-monitor > .rz-machine .rz-gpu .w-12 { width: 2.6rem; }
+  .rz-monitor > .rz-machine .rz-gpu .w-28 { width: auto; white-space: nowrap; }
+}
 /* the Monitor's image galleries: square thumbnails in a grid, a title and the scores under each */
 .rz-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; width: 100%; }
 .rz-shot { background: var(--rz-surface-2); border: 1px solid var(--rz-border); border-radius: 10px; overflow: hidden;
@@ -2788,6 +2803,16 @@ THEME_HEAD = """<script>
     window.rzDark = theme !== 'light';
     if (typeof setDark === 'function') setDark(window.rzDark);
   };
+  // the header (with its run strip) and the action bar change height: the Monitor's side columns sit between them
+  function track(sel, name) {
+    var el = document.querySelector(sel);
+    if (!el) { setTimeout(function () { track(sel, name); }, 300); return; }
+    var set = function () { document.documentElement.style.setProperty(name, el.offsetHeight + 'px'); };
+    set();
+    if (window.ResizeObserver) new ResizeObserver(set).observe(el);
+  }
+  track('.nicegui-header.rz-header', '--rz-head-h');
+  track('.nicegui-footer.rz-footer', '--rz-foot-h');
 })();
 </script>
 <style>html[data-theme="light"], html[data-theme="light"] body { background: #FFFFFF; }</style>""" % {"key": THEME_KEY}
@@ -12142,7 +12167,8 @@ def build_page(local: bool = True):
                 disk_box.visible = False
                 bucket_box = ui.label("").classes("rz-banner info")
                 bucket_box.visible = False
-                # GPU, disk and memory above the view switch: in view on every view, not just the Overview
+                # GPU, disk and memory above the view switch: in view on every view, not just the Overview (on a
+                # wide screen these and the status tiles stand in columns at the sides instead: .rz-monitor CSS)
                 with ui.element("div").classes("rz-machine"):
                     gpu_box = ui.element("div").classes("rz-machine-gpus")
                     sys_box = ui.element("div").classes("rz-machine-sys")
