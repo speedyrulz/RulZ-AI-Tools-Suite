@@ -30,7 +30,8 @@ from rulztrainer.archs import get_arch
 from rulztrainer.config import (AUTOMAGIC, KEEL, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
                                 MODEL_PRESETS, ARCH_SAMPLE_LORA, VIDEO_ARCHS, VIDEO_EXTS,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
-from rulztrainer import __version__, bodysim, facesim, history, lookfilter, machine, oom_recovery, promptcheck
+from rulztrainer import (__version__, bodysim, capabilities, facesim, history, lookfilter, machine, oom_recovery,
+                         promptcheck)
 from rulztrainer.train_queue import TrainQueue
 from rulztrainer.dataset import skipped as dataset_skipped
 from rulztrainer.pictures import to_rgb
@@ -89,6 +90,15 @@ def preset_arch(preset: str, model_path: str = "") -> str:
     """The model family behind a preset name (or a custom path / repo id)."""
     path = (model_path or "") if preset == CUSTOM else MODEL_PRESETS.get(preset, preset or "")
     return TrainConfig(model_path=path).arch_name()
+
+
+# capabilities.py names TrainConfig fields; where the form's control has another name or holds a mode instead of the
+# value (the three LoRA files: a mode select plus a path field), these map one to the other
+FAMILY_FORM_KEYS = {"turbo_lora": "turbo_mode", "sample_lora": "sample_lora_mode", "training_adapter": "adapter_mode"}
+_LORA_MODE_VALUES = {"auto": "auto", "none": "", "file": "a_file.safetensors"}  # the mode's value in the config
+FAMILY_MODE_VALUES = {"turbo_mode": _LORA_MODE_VALUES, "sample_lora_mode": _LORA_MODE_VALUES,
+                      "adapter_mode": _LORA_MODE_VALUES}
+FORM_FAMILY_KEYS = {v: k for k, v in FAMILY_FORM_KEYS.items()}
 
 
 def is_fibo_preset(preset: str, model_path: str = "") -> bool:
@@ -1785,6 +1795,10 @@ class Form:
         self.w: dict[str, object] = {}
         self.extras: dict[str, object] = {}  # the page's other inputs that outlive a reload but are not config options
         self.quant_copies: dict[str, object] = {}  # the wizard's download format selects, bound to the form's
+        self.family_notes: dict[str, list] = {}  # form key -> labels that show why the model does not take the setting
+        self.family_mirrors: dict[str, list] = {}  # form key -> the wizard's own controls for the setting
+        self.family_options: dict[int, tuple] = {}  # control id -> (control, its full options), kept while filtered
+        self.family_limited: set[str] = set()  # the form keys the picked model restricts right now
         self.preset_sync = False  # True while from_config moves the preset switch (its on_change must not re-apply)
         self.loading = False  # True while from_config fills the widgets
         self.target_family = TrainConfig().arch_name()  # the family whose default LoRA targets the boxes started from
@@ -1811,6 +1825,7 @@ class Form:
             self.clear_foreign_sampling_files(family)
             self.follow_sample_defaults(self.target_family, family, self.turbo_on(), self.turbo_on())
             self.set_quant_options(family)
+            self.apply_family_support(family, notify=True)
         self.target_family = family
 
     def clear_foreign_sampling_files(self, family: str) -> None:
@@ -1874,6 +1889,107 @@ class Form:
                 if family == "minimax_h3" and kind == "model" and value == "int8_convrot":
                     value = "pruned_int8_convrot"  # H3: the pruned file (21 GB) instead of the full one (34 GB)
                 sel.set_options(opts, value=value)
+
+    def family_note(self, key: str):
+        """The label under a Train tab setting that says why the picked model does not take it (made on first use,
+        beside the control; hidden with it)."""
+        for lbl in self.family_notes.get(key, []):
+            if getattr(lbl, "rz_train_note", False) and not lbl.is_deleted:
+                return lbl
+        widget = self.w[key]
+        slot = getattr(widget, "parent_slot", None)
+        if slot is None:  # not a page element (a test's stand-in)
+            return None
+        with slot:
+            lbl = ui.label("").classes("rz-unavail")
+        in_item = "rz-item" in slot.parent.classes  # a setting with its description: the note goes under both
+        lbl.move(slot.parent, -1 if in_item else slot.children.index(widget) + 1,
+                 target_slot=slot.name)
+        lbl.rz_train_note = True
+        lbl.visible = False
+        lbl.bind_visibility_from(widget, "visible", backward=lambda v: bool(v) and bool(lbl.text))
+        self.family_notes.setdefault(key, []).append(lbl)
+        return lbl
+
+    def add_family_note(self, key: str, label) -> None:
+        """Register a label (the wizard's, under a setting's explanation) that shows the model's reason for `key`."""
+        label.visible = False
+        self.family_notes.setdefault(key, []).append(label)
+
+    def add_family_mirror(self, key: str, controls) -> None:
+        """Register the wizard's controls for form key `key` (bound to the form's widget): they are disabled and
+        filtered with it."""
+        self.family_mirrors.setdefault(key, []).extend(controls)
+
+    def current_family(self) -> str:
+        return preset_arch(self.w["model_preset"].value, self.w["model_path"].value)
+
+    def apply_family_support(self, family: str | None = None, notify: bool = False, release: bool = False) -> list[str]:
+        """Grey out what the picked model cannot do (capabilities.py, the table the run-start check reads too): a
+        setting it does not take is put back to its default, disabled and explained ("Not available for SDXL: ...");
+        a choice list loses the values the model refuses; a setting the model takes again is switched back on.
+        Returns the settings that were reset (notify: said in one message). release: lift every restriction (before
+        values are loaded: a choice list that lacks a value refuses it)."""
+        family = family or self.current_family()
+        limited = {}
+
+        def form_value(field):
+            ctl = self.w.get(FAMILY_FORM_KEYS.get(field, field))
+            return None if ctl is None else ctl.value
+
+        for field, rule in ({} if release else capabilities.rules_for(family)).items():
+            key = FAMILY_FORM_KEYS.get(field, field)
+            # a rule that holds only while another setting has some value (SDXL's Keel face gain, with a Keel
+            # optimizer) follows that setting: the optimizer's own change runs this again
+            if self.w.get(key) is not None and rule.applies(form_value):
+                limited[key] = (field, rule)
+        reset = []
+        for key in self.family_limited | set(limited):
+            widget = self.w.get(key)
+            if widget is None:
+                continue
+            field, rule = limited.get(key, (None, None))
+            controls = [widget] + [c for c in self.family_mirrors.get(key, []) if not getattr(c, "is_deleted", False)]
+            modes = FAMILY_MODE_VALUES.get(key, {})
+            # an ignored setting (the model never reads it) is greyed out with its value kept, so switching to another
+            # model and back does not lose it; only a refused setting is put back and its choices filtered
+            ignored = rule is not None and rule.ignored
+            disabled = ignored or (rule is not None and getattr(widget, "options", None) is None)
+            if disabled and not ignored and not rule.allows(widget.value):
+                widget.value = rule.default
+                if not rule.ignored:
+                    reset.append(field)
+            for ctl in controls:
+                if getattr(ctl, "options", None) is None:
+                    continue
+                full = self.family_options.setdefault(id(ctl), (ctl, ctl.options))[1]
+                ok = (lambda o: True) if rule is None or ignored else (lambda o: rule.allows(modes.get(o, o)))
+                kept = [o for o in full if ok(o)]
+                shown = {o: full[o] for o in kept} if isinstance(full, dict) else kept
+                value = ctl.value
+                if not ok(value):
+                    value = "auto" if "auto" in kept and modes else (rule.default if rule.default in kept else kept[0])
+                    if ctl is widget and not rule.ignored:
+                        reset.append(field)
+                if (shown != ctl.options or value != ctl.value) and hasattr(ctl, "set_options"):
+                    ctl.set_options(shown, value=value)
+                if ctl is widget and rule is not None and len(kept) <= 1:
+                    disabled = True
+            for ctl in controls:  # the wizard's copies too, its one-choice selects included
+                if hasattr(ctl, "enable"):
+                    (ctl.disable if disabled else ctl.enable)()
+            text = capabilities.reason(family, field) if rule is not None else ""
+            if rule is not None:
+                self.family_note(key)
+            for lbl in self.family_notes.get(key, []):
+                lbl.text = text
+                lbl.visible = bool(text) and (getattr(widget, "visible", True) if getattr(lbl, "rz_train_note", False) else True)
+        self.family_limited = set(limited)
+        self.family_released = release  # values are being loaded: the optimizer's change must not filter yet
+        if reset and notify:
+            ui.notify(f"{', '.join(dict.fromkeys(reset))} reset: not available for {capabilities.display_name(family)}",
+                      type="info")
+        return reset
 
     def to_config(self) -> TrainConfig:
         v = self.value
@@ -2141,6 +2257,7 @@ class Form:
             values["resolutions"] = [min(MEGAPIXEL_CHOICES, key=lambda m: abs(m - side_to_mp(cfg.resolution)))]
         self.loading = True
         try:
+            self.apply_family_support(release=True)
             self.set_quant_options(cfg.arch_name())  # the loaded family's download formats, before its values
             for key, widget in self.w.items():
                 if key in values:
@@ -2148,6 +2265,7 @@ class Form:
         finally:
             self.loading = False
         self.target_family = cfg.arch_name()
+        self.apply_family_support(self.target_family, notify=True)  # a loaded setting the model refuses is reset
         toggle = self.w.get("preset_toggle")
         if toggle is not None and toggle.value != (cfg.preset == "identity"):
             # the switch mirrors the loaded config's preset in both directions; setting .value fires on_change,
@@ -2180,6 +2298,7 @@ class Form:
         family = preset_arch(model["model_preset"], model["model_path"])
         self.loading = self.preset_sync = True
         try:
+            self.apply_family_support(release=True)
             self.set_quant_options(family)  # the saved family's download formats, before its values
             for key, widget in widgets.items():
                 if key in values and fits_options(widget, values[key]):
@@ -2190,6 +2309,7 @@ class Form:
         finally:
             self.loading = self.preset_sync = False
         self.target_family = family
+        self.apply_family_support(family)
 
 
 def fits_options(widget, value) -> bool:
@@ -2390,6 +2510,9 @@ html[data-theme="light"] .q-btn.rz-danger, html[data-theme="light"] .q-btn.rz-da
 .rz-item { display: grid; grid-template-columns: minmax(0, 300px) minmax(0, 1fr); gap: 4px 28px; width: 100%; align-items: start; }
 .rz-pane .rz-item > .q-field, .rz-pane .rz-item > .rz-path { width: 100%; max-width: 100%; }
 .rz-desc { font-size: 14px; color: var(--rz-muted); line-height: 1.5; padding-top: 9px; max-width: 760px; }
+/* why a setting is greyed out for the picked model (capabilities.py) */
+.rz-unavail { font-size: 13px; color: var(--rz-warn-text); line-height: 1.4; max-width: 760px; }
+.rz-item > .rz-unavail { grid-column: 1 / -1; }
 .rz-desc.rz-clamp { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; cursor: pointer; }
 .rz-desc.rz-clamp:hover { color: var(--rz-text-2); }
 .rz-desc.rz-clamp.rz-open { display: block; }
@@ -5185,9 +5308,11 @@ MODEL_GB = {"moss_image": {"bf16": 10.0, "int8": 5.5, "nvfp4": 3.0}, "krea2": {"
             "flux3_klein": {"bf16": 9.7, "int8": 5.1, "nvfp4": 3.0}}  # Klein without its reference-image mode
 # FLUX.2 Klein 9B: 9.08 B weights, bf16 16.9 GB; Fizgig holds it in about 9.6 GB fp8 and 5.6 GB 4-bit, the estimate here
 MODEL_GB["flux2_klein"] = {"bf16": 16.9, "int8": 9.6, "nvfp4": 5.6}
-# SDXL: the UNet is 2.6 B weights, bf16 5.1 GB (about 5 here); there is no quantized form, so one row. The two text
-# encoders (CLIP-L + OpenCLIP bigG, about 1.6 GB in bf16) and the fp32 VAE (0.3 GB) are not counted in this table
-MODEL_GB["sdxl"] = {"bf16": 5.0, "int8": 5.0, "nvfp4": 5.0}
+# SDXL: the UNet is 2.6 B weights, bf16 5.1 GB (about 5 here). int8 / int8_convrot quantize the linears of its
+# transformer blocks only (about 2 B of the weights; the convolutions and the rest stay bf16), so about 3.2 GB: an
+# estimate, not measured. nvfp4 is not available (capabilities.py; its 5.0 is a placeholder). The two text encoders
+# (CLIP-L + OpenCLIP bigG, about 1.6 GB in bf16) and the fp32 VAE (0.3 GB) are not counted in this table
+MODEL_GB["sdxl"] = {"bf16": 5.0, "int8": 3.2, "nvfp4": 5.0}
 # Ideogram 4: 9.29 B weights (the release's fp8 file, 9.29 GB): bf16 about 18.6 GB; Comfy-Org's int8_convrot file
 # 9.58 GB, nvfp4_mixed 5.49 GB
 MODEL_GB["ideogram4"] = {"bf16": 18.6, "int8": 9.6, "nvfp4": 5.5}
@@ -5247,9 +5372,9 @@ def adapter_words(cfg: TrainConfig, overrides: dict | None = None) -> str:
 def plan_quant_of(fam: str, model_source: str, model_file_quant: str, vram: float | None, quant: str) -> str | None:
     """The quantization the memory plan counts (a key of MODEL_GB's rows) for a transformer_quant setting: auto is the
     file's own format, or for a model that is quantized as it loads the one its family picks for a card of `vram` GB.
-    None when that card is not known (a run in the measured record that did not keep it). SDXL has one form: bf16."""
+    None when that card is not known (a run in the measured record that did not keep it). SDXL: bf16, or int8 when its transformer blocks are quantized."""
     if fam == "sdxl":
-        return "bf16"
+        return "int8" if quant in ("int8", "int8_convrot") else "bf16"
     if quant == "auto":
         if model_source == "files" and fam != "flux2_klein":  # its float files are quantized for the memory
             quant = "bf16" if model_file_quant == "bf16" else "int8"
@@ -5522,7 +5647,8 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     elif gpus:
         r["multi_gpu"] = ("off", "one GPU found")
     if sdxl:
-        r["transformer_quant"] = ("auto", "SDXL's 2.6B UNet (about 5 GB) trains in bf16; it has no quantized form")
+        r["transformer_quant"] = ("auto", "SDXL's 2.6B UNet (about 5 GB) trains in bf16 as it is; int8 or int8_convrot "
+                                          "would cut it to about 3 GB if a card is short (nvfp4 is not available)")
         r["text_encoder_quant"] = ("auto", "the two CLIP text encoders are about 1.6 GB together: no need to shrink them")
     elif cfg.model_source == "files":
         r["transformer_quant"] = ("auto", "keeps the format of your file (a ComfyUI int8 or nvfp4 file stays quantized)")
@@ -6563,11 +6689,14 @@ class Wizard:
             element.visible = bool(when())
 
     @contextmanager
-    def setting(self, key: str | None, title: str, text: str, show_if=None, when=None, adv: bool = False):
+    def setting(self, key: str | None, title: str, text: str, show_if=None, when=None, adv: bool = False,
+                form_key: str | None = None):
         """One setting: title, explanation and recommendation on the left, the control (built in the block) on the
         right. show_if=(form key, predicate) shows it only while the predicate holds for that widget's value; when
         is a no-argument predicate re-read on every refresh (for conditions on more than one setting); adv shows it
-        only with the Advanced switch on. Yields the setting's box."""
+        only with the Advanced switch on. The form key it edits (key, or form_key where the setting has no
+        recommendation) also gets the reason a model does not take it, and its controls follow the form's (greyed
+        out, choices filtered). Yields the setting's box."""
         box = ui.element("div").classes("rz-setting")
         self.show_when(box, when, adv, show_if)
         with box:
@@ -6577,10 +6706,17 @@ class Wizard:
                     if adv:
                         ui.label("Advanced").classes("rz-badge muted")
                 ui.label(text).classes("rz-hint")
+                if form_key or key:
+                    self.f.add_family_note(form_key or key, ui.label("").classes("rz-unavail"))
                 if key:
                     self.rec_row(key)
-            with ui.column().classes("gap-2 w-full min-w-0 justify-center"):
+            with ui.column().classes("gap-2 w-full min-w-0 justify-center") as controls:
                 yield box
+        if form_key or key:
+            from nicegui.elements.mixins.value_element import ValueElement
+
+            self.f.add_family_mirror(form_key or key, [e for e in controls.descendants()
+                                                        if isinstance(e, ValueElement)])
 
     def rec_row(self, key: str):
         with ui.row().classes("rz-rec items-start gap-2 no-wrap") as row:
@@ -7241,7 +7377,7 @@ class Wizard:
                           "A step-distilled LoRA used only while rendering samples and probes, never in training: "
                           "previews take seconds. The model's own is downloaded (MOSS-Image: 12 steps at CFG 1; Krea 2, "
                           "Qwen-Image 2.1, Ideogram 4 and MiniMax H3: 8; FIBO 2.0: 4; the Kleins have none) and the "
-                          "steps and guidance below follow it.", adv=True):
+                          "steps and guidance below follow it.", adv=True, form_key="turbo_mode"):
             self.bind(ui.select(TURBO_MODES, label="Turbo LoRA"), "turbo_mode").classes("w-full")
             self.bind(path_field("Turbo LoRA file", "file", width="w-full"), "turbo_lora") \
                 .parent_slot.parent.bind_visibility_from(self.w["turbo_mode"], "value", lambda x: x == "file")
@@ -9596,9 +9732,10 @@ def build_page(local: bool = True):
                         hint("SDXL: a LoRA on the UNet only. Give it a Hugging Face folder (or the "
                              "stabilityai preset), or one all-in-one .safetensors checkpoint under Single files: the "
                              "VAE and both text encoders then come from that file unless you set them. Captions are "
-                             "cut at 77 tokens (CLIP's limit). No quantization, block swap, model split, "
-                             "fine-tune, LoKr / OFT / DoRA or likeness boosters (attention, Keel face gain, hull); "
-                             "a run that sets one is refused with a message naming it.").bind_visibility_from(
+                             "cut at 77 tokens (CLIP's limit). int8 / int8_convrot quantize the UNet's transformer blocks "
+                             "(not nvfp4). Block swap, model split, fine-tune, LoKr / OFT / DoRA, likeness boosters "
+                             "(attention, Keel face gain, hull) and the like are greyed out with the reason, and "
+                             "a loaded config that sets one has it reset.").bind_visibility_from(
                             w["model_preset"], "value", lambda p: preset_arch(p, w["model_path"].value) == "sdxl")
                         subhead("GPUs and memory")
                         with fields():
@@ -10169,6 +10306,9 @@ def build_page(local: bool = True):
                                                            step=1e-5).classes("w-36")
                             w["optimizer"] = ui.select(list(OPTIMIZERS), value="adamw8bit", label="Optimizer") \
                                 .classes("w-40")
+                            # a family rule can hang on the optimizer (SDXL's Keel face gain): check them again
+                            w["optimizer"].on_value_change(
+                                lambda _: None if getattr(f, "family_released", False) else f.apply_family_support())
                             w["lr_scheduler"] = ui.select(["constant", "cosine", "linear"], value=d.lr_scheduler,
                                                           label="LR schedule").classes("w-36")
                             w["warmup_steps"] = ui.number("Warmup steps", value=d.warmup_steps, precision=0) \
