@@ -1477,6 +1477,16 @@ learning rate you set is only the start: every weight keeps the signs of its las
 `automagic_max_lr`. The LR schedule, warm-up, LoRA+ and the per-image learning rate do not apply. `automagic_groups:
 by_type` gives the text-side, attention, feed-forward and other layers their own rate (see the identity levers below).
 
+**The floor** (`automagic_min_lr`, also Keel's) is 2e-5 since 3.24.0; it was 1e-8. Trainers using ai-toolkit
+reported the adapted rate sinking to 1e-5 and below until learning stopped (its author confirmed it on MiniMax H3;
+users on Qwen-Image 2.1, FLUX.3 Klein, MOSS-Image, FIBO 2 and Ideogram 4), and fixed it with a floor of 2e-5 to 3e-5.
+A floor at or above `learning_rate` drops to a fifth of it, so a low start rate can still go down. When the rate sits
+on its floor for 100 steps the log says so once: check the samples, and raise the floor or switch to `adamw` if
+learning has stalled. Set `automagic_min_lr: 1e-8` for the old behaviour (the Keel results in
+[docs/keel-test-results.md](docs/keel-test-results.md) were measured with it). **Automagic 4** logs a warning when
+picked: ai-toolkit's author advised staying on Automagic 3 until a rework (8 November 2026), and a P-H3-Image run it
+ruined trained fine on Automagic 3. Both were ai-toolkit's v4; this port's changes below are untested against them.
+
 **Automagic 4** adds two things. *Sensitivity-balanced steps*: a weight's gradient power (the second moment the
 optimizer keeps anyway) measures how far one step moves the model's output; weights above the
 `automagic_sensitivity_quantile` (0.9) of the LoRA's elements take a smaller, Newton-like step, so a timestep embedder,
@@ -3416,6 +3426,12 @@ reference-to-video checkpoint) is listed as not for training: this trainer makes
 that a LoRA for one H3 checkpoint degrades the other. **Video clips** train too (`train_frames`, 17n + 5 frames), and
 samples and probes can be clips (`sample_frames`, `probe_frames`): see
 [Video clip training](#video-clip-training-pan-2-minimax-h3).
+
+**Stills-only runs train blocks 20-49** (since 3.24.0): with no video clips and `lora_blocks` empty, the LoRA leaves
+blocks 0-19 out. Several trainers found that a LoRA trained on photos over all 50 blocks cut H3's motion by about half,
+and that leaving out the first 20 kept it (Fizgig does the same for photos). Set `lora_blocks: all` to train every
+block. A resumed run (`resume_from`, `resume_state`) and a race keep the layout they have. Runs with clips train every
+block as before.
 
 **Licence.** The MiniMax H3 Community License Agreement. It excludes the USA, the EU, the UK and South Korea: users
 there must apply to MiniMax for a licence first ([application form](https://platform.minimax.io/h3-license); see the
