@@ -33,6 +33,9 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
 - **PAN 2** (29B video model, IFM): experimental LoRAs trained on still images as one-frame videos and on video
   clips, for use in PAN 2 video generation; the LoRA loads in a ComfyUI build with PAN 2 support ([details](#pan-2),
   [video clips](#video-clip-training-pan-2-minimax-h3)).
+- **SDXL** (2.6B UNet, Stability AI; also Illustrious, Pony, NoobAI and other SDXL fine-tunes): LoRAs on the UNet from
+  a Hugging Face folder or one all-in-one checkpoint, saved in kohya's format for ComfyUI; not yet run on the real
+  model ([details](#sdxl)).
 
 | Dark | Light |
 | --- | --- |
@@ -648,6 +651,7 @@ the file was there):
 | P-H3-Image | [PrunaAI/P-H3-Image-Comfy](https://huggingface.co/PrunaAI/P-H3-Image-Comfy) | int8_convrot 21.2 GB, bf16 40.5 GB (both pruned; the w4a8 file reads when you set it yourself) | Qwen3-VL-4B + text connector int8_convrot 5.1 GB, bf16 9.1 GB | `p-h3-image_vae_bf16` (5.6 GB) |
 | MiniMax-H3-Image | [Comfy-Org/MiniMax-H3-Image](https://huggingface.co/Comfy-Org/MiniMax-H3-Image) | int8_convrot 21.0 GB, bf16 40.2 GB, w4a8 12.5 GB (all pruned; w4a8 holds int8 weights once read) | MiniMax H3's Qwen3-VL-32B files, from Comfy-Org/MiniMax-H3 (the same bytes) | `minimax_h3_image_vae_fp16` (1.2 GB) |
 | PAN 2 | none published: make them once from [IFM/PAN2](https://huggingface.co/IFM/PAN2) with `scripts/pan2/convert_pan2.py` and set all three file fields | see [PAN 2](#pan-2) | Qwen3.5-9B (30 of its 32 layers), from the same converter | Wan 2.2 VAE, from the same converter |
+| SDXL (and fine-tunes) | none: nothing is downloaded from Comfy-Org. Set `transformer_file` to one all-in-one `.safetensors` checkpoint (for example `sd_xl_base_1.0.safetensors`), or use the Hugging Face source | the checkpoint's UNet (about 5 GB in bf16; no quantized form) | both CLIP text encoders (CLIP-L and OpenCLIP bigG, about 1.6 GB), read from the checkpoint unless `text_encoder_file` is set | the checkpoint's VAE, kept in fp32, unless `vae_file` is set |
 
 To use files you already have, set `transformer_file`, `text_encoder_file` and `vae_file` (the WebUI's optional file
 fields): only the ones left empty are downloaded. Fused-qkv ("repacked") files are split back automatically. The
@@ -3997,11 +4001,59 @@ measure of what real footage teaches.
 Not run: clip training with block swap or two GPUs, `train_video_mode: spread`, real footage, longer clips than
 39 frames, and how a clip-trained LoRA behaves in ComfyUI.
 
+## SDXL
+
+RulzTrainer trains **LoRAs for SDXL** (Stability AI's 2.6B UNet with two CLIP text encoders), and for the SDXL
+fine-tunes most checkpoints are made from (Illustrious, Pony, NoobAI and so on). Pick the **SDXL-Base-1.0** preset
+(`stabilityai/stable-diffusion-xl-base-1.0`, about 7 GB to download), or point `transformer_file` at one all-in-one
+`.safetensors` checkpoint. Added in 3.23.0. Experimental.
+
+**What it trains.** A LoRA on the UNet only, as OneTrainer, ai-toolkit and Fizgig train SDXL; the text encoders (CLIP-L
+and OpenCLIP bigG) and the VAE stay frozen.
+
+- **Targets** (the Target layers boxes): `q`, `k`, `v`, `o` (the self- and cross-attention of every one of the UNet's
+  70 transformer blocks), `ffn_up_gate` and `ffn_down` (the feed-forward's in and out), and `proj` (each transformer's
+  `proj_in` and `proj_out`). All seven are on by default. The block list takes block numbers 0 to 69.
+- **Loss.** The model's own DDPM loss: epsilon prediction by default. `sdxl_prediction` (auto, epsilon or
+  v_prediction) and `sdxl_zero_terminal_snr` set the other kind; `auto` reads the model's `scheduler_config.json`, or a
+  single file's `v_pred` and `ztsnr` keys, and falls back to epsilon.
+- **Timesteps.** `timestep_sampling: reference` draws the model's own uniform DDPM timesteps and is the one to use
+  (the wizard recommends it); `logit_normal` is accepted but warns, because it draws noise levels SDXL was not
+  trained on. `loss_weighting: min_snr` works; `sigma_sqrt` does not.
+- **Captions.** Both text encoders read 77 tokens, so `max_token_length` is held at 77 and longer captions are cut.
+  An empty caption (caption dropout) and an empty negative prompt are the encoded empty text.
+- **Sizes.** Training resolutions are bucketed in steps of 64 px. The VAE runs in fp32; the UNet trains in bf16.
+- **Samples.** A DDIM-equivalent sampler, 30 steps at CFG 6 by default. Shift does not apply.
+
+**Where the model comes from.** *Hugging Face source*: the diffusers folder or repo (`unet/`, `text_encoder/`,
+`text_encoder_2/`, `vae/`). *Single files source*: one all-in-one checkpoint in `transformer_file`; the VAE and both
+text encoders are read from the same file unless you set `vae_file` / `text_encoder_file`. Nothing is downloaded from
+Comfy-Org for SDXL (the quantization and download-format choices do not apply). A checkpoint is recognized as SDXL by
+its header, so a file named `ponyDiffusionV6XL.safetensors` or `illustrious.safetensors` needs no extra setting.
+
+**What is refused.** Each of these stops the run at the start with a message naming the setting: `block_swap`,
+`multi_gpu: model_split`, `activation_offload`, `checkpoint_keep_blocks` above 0, `attn_localize`, `id_align`,
+`body_align`, `training_maps`, the `keel_fb` and `hull` optimizers, a Keel face gain above 0, `transformer_quant`
+other than auto or none, `compile_model: true`, `loss_type` other than mse, `loss_weighting: sigma_sqrt`,
+`finetune`, `network_type` other than lora, `dora`, `train_text_embedder`, a set `turbo_lora`, `sample_lora` or
+`training_adapter`, and video clips. Data parallel on two GPUs works. The other optimizers (adamw, adamw8bit,
+adafactor, automagic3 / 4, keel, muon, normuon) work.
+
+**The LoRA file.** Saved in kohya's format: `lora_unet_<UNet module path with underscores>.lora_down.weight`,
+`.lora_up.weight` and `.alpha`, the layout ComfyUI's *Load LoRA* node, AUTOMATIC1111 and kohya's own scripts read.
+Add the standard node (model and CLIP) after *Load Checkpoint* with the SDXL checkpoint; only the UNet is changed.
+
+**Status: not yet run on the real model.** Nothing has been trained on real SDXL weights yet: no step, sample or saved
+LoRA has been checked in ComfyUI. What was checked is the code, with unit tests and small random UNets that match the
+published layout. The first real run should compare its step-0 sample with the diffusers pipeline's picture of the
+same prompt and seed.
+
 ## Using the LoRA in ComfyUI
 
 Copy the trained `.safetensors` into `ComfyUI/models/loras/` and add a standard **Load LoRA** node after *Load
 Diffusion Model*. Current ComfyUI builds run MOSS-Image, Krea 2, Qwen-Image 2.1, FLUX 3 Klein, FLUX.2 Klein 9B,
-Ideogram 4, MiniMax H3, P-H3-Image and MiniMax-H3-Image natively, so no plugin is needed. Two exceptions:
+Ideogram 4, MiniMax H3, P-H3-Image and MiniMax-H3-Image natively, so no plugin is needed (SDXL LoRAs load in the
+same node: see [SDXL](#sdxl)). Two exceptions:
 
 - **FIBO 2.0**: ComfyUI runs the model, but its LoRA loader does not map the diffusers layout RulzTrainer saves FIBO
   LoRAs in; use them in diffusers (see [FIBO 2.0](#fibo-20-bria-training-on-dev-using-the-lora-on-edit-turbo)).
