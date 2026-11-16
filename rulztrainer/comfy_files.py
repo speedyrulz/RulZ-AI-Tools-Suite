@@ -26,14 +26,21 @@ def _file_quant(fam: str, quant: str) -> str:
 
 def planned_downloads(cfg: TrainConfig) -> list[tuple[str, str, str]]:
     """(config field, repo, file) for every file the config leaves to a download."""
-    fam = cfg.arch_name()
+    from .archs import guess_arch_name
+
+    fam = guess_arch_name(cfg)  # (a single file names its own family: an SDXL checkpoint with no hint in its name)
     out = []
     if cfg.model_source == "files" and fam not in COMFY_REPOS:
-        # a family nobody publishes single files of (PAN 2): every file has to be set
-        missing = [f for f in ("transformer_file", "text_encoder_file", "vae_file") if not getattr(cfg, f)]
+        # a family nobody publishes single files of (PAN 2): every file has to be set. SDXL's all-in-one checkpoint
+        # holds the UNet, both text encoders and the VAE: transformer_file alone (an empty text_encoder_file /
+        # vae_file means the same file; a separate VAE file may be set)
+        files = ("transformer_file",) if fam == "sdxl" else ("transformer_file", "text_encoder_file", "vae_file")
+        missing = [f for f in files if not getattr(cfg, f)]
         if missing:
-            raise ValueError(f"No single-file download exists for {fam}: set {', '.join(missing)} (for PAN 2, the "
-                             "files scripts/pan2/convert_pan2.py makes), or use the Hugging Face source")
+            hint = ("the all-in-one checkpoint (a .safetensors holding the UNet, the text encoders and the VAE)"
+                    if fam == "sdxl" else "for PAN 2, the files scripts/pan2/convert_pan2.py makes")
+            raise ValueError(f"No single-file download exists for {fam}: set {', '.join(missing)} ({hint}), or use "
+                             "the Hugging Face source")
     elif cfg.model_source == "files":
         repo = COMFY_REPOS[fam]
         if not cfg.transformer_file:

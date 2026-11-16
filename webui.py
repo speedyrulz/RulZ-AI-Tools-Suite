@@ -77,6 +77,10 @@ N_BLOCKS["pan2"] = 44  # PAN 2: 44 joint blocks; its 4 text-refiner blocks are a
 EXTRA_TARGETS["token_refiner"] = (EXTRA_TARGETS["token_refiner"][0] + ("pan2",),
                                   "the token-refiner blocks over the text (MiniMax H3: 2, which musubi-tuner leaves "
                                   "out and the training adapters train; PAN 2: 4)")
+# SDXL: 70 transformer blocks across the UNet's three levels; "proj" is each Transformer2DModel's proj_in / proj_out (on by
+# default, with q k v o and the two feed-forward groups)
+N_BLOCKS["sdxl"] = 70
+EXTRA_TARGETS["proj"] = (("sdxl",), "each transformer's proj_in / proj_out (the linear layers in and out of its blocks)")
 COMPILE_CHOICES = {"auto": "auto: runs of 100+ steps", True: "on", False: "off"}
 N_BLOCKS_MAX = max(N_BLOCKS.values())
 
@@ -1860,6 +1864,7 @@ class Form:
             int8_matmul=bool(v("int8_matmul")), int8_backward=v("int8_backward"),
             nvfp4_matmul=bool(v("nvfp4_matmul")), nvfp4_backward=v("nvfp4_backward"),
             attention_backend=v("attention_backend"),
+            sdxl_prediction=v("sdxl_prediction"), sdxl_zero_terminal_snr=bool(v("sdxl_zero_terminal_snr")),
             datasets=self.w["datasets"].value, dataset_dir=(self.w["datasets"].selected or [""])[0],
             resolutions=sorted(float(x) for x in (v("resolutions") or [1.0])),
             resolution_step_up=bool(v("resolution_step_up")), step_up_patience=int(v("step_up_patience")),
@@ -4995,6 +5000,7 @@ RACE_LABELS = {
     "selftrain_share": "Self-training share", "selftrain_weight": "Self-training weight", "seed": "Seed",
     "copy_check": "Copy check (SSCD)", "copy_max": "Copy limit",
     "dop_weight": "DOP weight (LoRA Isolation)", "dop_every": "DOP every N steps (LoRA Isolation)",
+    "sdxl_prediction": "SDXL prediction", "sdxl_zero_terminal_snr": "SDXL zero terminal SNR",
     "int8_backward": "int8 backward", "nvfp4_backward": "nvfp4 backward (fp4 is faster on RTX 50)",
 }
 
@@ -5130,6 +5136,9 @@ MODEL_GB = {"moss_image": {"bf16": 10.0, "int8": 5.5, "nvfp4": 3.0}, "krea2": {"
             "flux3_klein": {"bf16": 9.7, "int8": 5.1, "nvfp4": 3.0}}  # Klein without its reference-image mode
 # FLUX.2 Klein 9B: 9.08 B weights, bf16 16.9 GB; Fizgig holds it in about 9.6 GB fp8 and 5.6 GB 4-bit, the estimate here
 MODEL_GB["flux2_klein"] = {"bf16": 16.9, "int8": 9.6, "nvfp4": 5.6}
+# SDXL: the UNet is 2.6 B weights, bf16 5.1 GB (about 5 here); there is no quantized form, so one row. The two text
+# encoders (CLIP-L + OpenCLIP bigG, about 1.6 GB in bf16) and the fp32 VAE (0.3 GB) are not counted in this table
+MODEL_GB["sdxl"] = {"bf16": 5.0, "int8": 5.0, "nvfp4": 5.0}
 # Ideogram 4: 9.29 B weights (the release's fp8 file, 9.29 GB): bf16 about 18.6 GB; Comfy-Org's int8_convrot file
 # 9.58 GB, nvfp4_mixed 5.49 GB
 MODEL_GB["ideogram4"] = {"bf16": 18.6, "int8": 9.6, "nvfp4": 5.5}
@@ -5189,7 +5198,9 @@ def adapter_words(cfg: TrainConfig, overrides: dict | None = None) -> str:
 def plan_quant_of(fam: str, model_source: str, model_file_quant: str, vram: float | None, quant: str) -> str | None:
     """The quantization the memory plan counts (a key of MODEL_GB's rows) for a transformer_quant setting: auto is the
     file's own format, or for a model that is quantized as it loads the one its family picks for a card of `vram` GB.
-    None when that card is not known (a run in the measured record that did not keep it)."""
+    None when that card is not known (a run in the measured record that did not keep it). SDXL has one form: bf16."""
+    if fam == "sdxl":
+        return "bf16"
     if quant == "auto":
         if model_source == "files" and fam != "flux2_klein":  # its float files are quantized for the memory
             quant = "bf16" if model_file_quant == "bf16" else "int8"
@@ -5217,7 +5228,7 @@ ESTIMATED_NOTE = "; estimated (no comparable finished run of yours yet)"
 
 
 # Families whose `auto` quantization of a model that is quantized as it loads is known by card size (plan_quant_of)
-AUTO_QUANT_BY_CARD = ("krea2", "fibo2", "qwen_image21", "flux3_klein", "flux2_klein", "ideogram4")
+AUTO_QUANT_BY_CARD = ("krea2", "fibo2", "qwen_image21", "flux3_klein", "flux2_klein", "ideogram4", "sdxl")
 # Families whose bf16 file is quantized for the card too (h3_recommendations: "a bf16 source is quantized for the GPUs")
 QUANTIZED_FROM_BF16 = H3_PLAN_FAMILIES + ("pan2",)
 
@@ -5420,6 +5431,12 @@ MODEL_NOTES = {
                                               "trains text-only one-frame LoRAs, and a LoRA made on one H3 checkpoint "
                                               "degrades the other (diffusers' note)."),
 }
+MODEL_NOTES["SDXL-Base-1.0"] = (
+    "Experimental", "Stability AI's SDXL 1.0 base (2.6B UNet, two CLIP text encoders), the model most community "
+                    "checkpoints (Illustrious, Pony, NoobAI) are fine-tuned from. Trains a LoRA on the UNet only, "
+                    "about 7 GB to download; captions read 77 tokens. To train a fine-tune of it, keep this pick and set its "
+                    "all-in-one .safetensors checkpoint under Single files (nothing is downloaded from Comfy-Org for "
+                    "SDXL). LoRAs are saved in kohya's format and load in ComfyUI. Not yet run on the real model.")
 
 
 def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict], data: dict | None,
@@ -5437,6 +5454,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     klein2 = cfg.arch_name() == "flux2_klein"
     klein2_distilled = klein2 and get_arch(cfg).distilled_sample_model(cfg.sample_model_path or "")
     ideo = cfg.arch_name() == "ideogram4"
+    sdxl = cfg.arch_name() == "sdxl"
     character = goal == "character"
     vram = min(g["total"] for g in gpus) / 1024 if gpus else None
     gpu_name = "your smallest GPU" if len(gpus) > 1 else "your GPU"
@@ -5454,7 +5472,10 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                                    "does not wait; the images per step stay the same")
     elif gpus:
         r["multi_gpu"] = ("off", "one GPU found")
-    if cfg.model_source == "files":
+    if sdxl:
+        r["transformer_quant"] = ("auto", "SDXL's 2.6B UNet (about 5 GB) trains in bf16; it has no quantized form")
+        r["text_encoder_quant"] = ("auto", "the two CLIP text encoders are about 1.6 GB together: no need to shrink them")
+    elif cfg.model_source == "files":
         r["transformer_quant"] = ("auto", "keeps the format of your file (a ComfyUI int8 or nvfp4 file stays quantized)")
         r["text_encoder_quant"] = ("auto", "keeps the format of your file")
     elif vram is not None:
@@ -5497,7 +5518,9 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     r["checkpoint_keep_blocks"] = (-1, "measured at the start: as many blocks as fit skip the recompute")
     r["compile_model"] = ("auto", "measured 26% (MOSS-Image) and 12% (Krea 2) faster per step after a warm-up of "
                                   "under a minute; auto skips it for short test runs")
-    plan_swap = vram is not None and cfg.multi_gpu == "off" and not cfg.finetune
+    plan_swap = vram is not None and cfg.multi_gpu == "off" and not cfg.finetune and not sdxl
+    if sdxl:
+        r["block_swap"] = (0, "SDXL's UNet (about 5 GB) fits any card that trains it; block swap is not available")
     if plan_swap:  # its place in the list; filled in below, once the weight average pick is known
         r["block_swap"] = (0, "")
     # dataset
@@ -5614,6 +5637,9 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     if goal == "style":
         r["timestep_sampling"] = ("logsnr", "spends most steps at very high noise, where an art style is learned "
                                             "(the style-friendly sampler)")
+    elif sdxl:
+        r["timestep_sampling"] = ("reference", "the model's own uniform DDPM timesteps, as OneTrainer, ai-toolkit and "
+                                               "Fizgig train SDXL (logit-normal draws noise levels it was not trained on)")
     elif klein2:
         r["timestep_sampling"] = ("reference", "Fizgig's flux2_shift for Klein: logit-normal, shifted by the image size")
     elif not character:  # the identity recipe sets logit_normal itself
@@ -6808,18 +6834,21 @@ class Wizard:
             ui.button("Download now", icon="download", on_click=download_now).props("outline")
         for key, title, text, kind in (
                 ("transformer_file", "Diffusion model file", "A ComfyUI models/diffusion_models file you already "
-                                                             "have.", "file"),
+                                                             "have (SDXL: its all-in-one checkpoint).", "file"),
                 ("text_encoder_file", "Text encoder file", "Qwen3.5-9B for MOSS-Image, Qwen3-VL-4B for Krea 2, FIBO 2.0 "
                                                            "and FLUX 3 Klein, Qwen3-8B for FLUX.2 Klein 9B, "
                                                            "Qwen3-VL-8B for Qwen-Image 2.1 and "
                                                            "Ideogram 4, Qwen3-VL-32B (cut to 50 layers) for MiniMax "
                                                            "H3 and MiniMax-H3-Image (the same file), P-H3-Image's "
-                                                           "Qwen3-VL-4B with its text connector for P-H3-Image.",
+                                                           "Qwen3-VL-4B with its text connector for P-H3-Image. "
+                                                           "SDXL: leave it empty and both CLIP text encoders are "
+                                                           "read from the checkpoint above.",
                  "file"),
                 ("vae_file", "VAE file", "The Flux2 VAE for MOSS-Image, FIBO 2.0, both Kleins and Ideogram 4, the "
                                          "Qwen-Image VAE for Krea 2, its own for Qwen-Image 2.1, the video VAE for "
                                          "MiniMax H3 (its audio VAE is found next to it or downloaded), its own "
-                                         "single-frame VAE for P-H3-Image, its own image VAE for MiniMax-H3-Image.",
+                                         "single-frame VAE for P-H3-Image, its own image VAE for MiniMax-H3-Image. "
+                                         "SDXL: leave it empty and the VAE in the checkpoint is used.",
                  "file"),
                 ("tokenizer_path", "Tokenizer folder", "Left empty, the tokenizer is downloaded once (a few MB).",
                  "dir")):
@@ -9483,19 +9512,45 @@ def build_page(local: bool = True):
                                  "run. To use files you already have, set them below: anything left empty is "
                                  "downloaded.")
                             path_input(f, "transformer_file", "Diffusion model file (optional)", "file", "",
-                                       "w-[40rem]").tooltip("Empty: downloaded in the format picked above.")
+                                       "w-[40rem]").tooltip("Empty: downloaded in the format picked above. SDXL: "
+                                                            "its one all-in-one .safetensors checkpoint "
+                                                            "(Comfy-Org has no SDXL files to download).")
                             path_input(f, "text_encoder_file", "Text encoder file (optional)", "file", "",
                                        "w-[40rem]").tooltip("Empty: downloaded. Qwen3.5-9B for MOSS-Image; Qwen3-VL-4B "
                                                             "for Krea 2, FIBO 2.0 and FLUX 3 Klein; Qwen3-8B for "
                                                             "FLUX.2 Klein; Qwen3-VL-8B for "
                                                             "Qwen-Image 2.1 and Ideogram 4; Qwen3-VL-32B for MiniMax "
-                                                            "H3 and MiniMax-H3-Image.")
+                                                            "H3 and MiniMax-H3-Image. SDXL: empty = the checkpoint's own.")
                             path_input(f, "vae_file", "VAE file (optional)", "file", "", "w-[40rem]") \
                                 .tooltip("Empty: downloaded. Flux2's for MOSS-Image, FIBO 2.0, both Kleins and "
                                          "Ideogram 4; Qwen-Image's for Krea 2; its own for Qwen-Image 2.1; the video "
-                                         "VAE for MiniMax H3; its own image VAE for MiniMax-H3-Image.")
+                                         "VAE for MiniMax H3; its own image VAE for MiniMax-H3-Image. SDXL: empty = the checkpoint's "
+                                         "own (nothing is downloaded for SDXL).")
                             path_input(f, "tokenizer_path", "Tokenizer folder (optional)", "dir", "", "w-[40rem]") \
                                 .tooltip("Empty: downloaded with the model.")
+                        with fields().bind_visibility_from(
+                                w["model_preset"], "value", lambda p: preset_arch(p, w["model_path"].value) == "sdxl"):
+                            w["sdxl_prediction"] = ui.select({"auto": "auto (from the model's own files)",
+                                                              "epsilon": "epsilon (noise)",
+                                                              "v_prediction": "v-prediction"},
+                                                             value=d.sdxl_prediction, label="SDXL prediction") \
+                                .classes("w-72") \
+                                .tooltip("What the UNet predicts. auto reads the model's scheduler_config.json (a "
+                                         "folder) or the v_pred key of an all-in-one checkpoint, else epsilon: SDXL "
+                                         "base and most fine-tunes are epsilon models; some (NoobAI v-pred) are "
+                                         "v-prediction. Set it by hand when a checkpoint does not say.")
+                            w["sdxl_zero_terminal_snr"] = ui.checkbox("Zero terminal SNR",
+                                                                      value=d.sdxl_zero_terminal_snr) \
+                                .tooltip("The model's noise schedule ends at pure noise (zero terminal SNR), as "
+                                         "v-prediction fine-tunes are made. A checkpoint's own ztsnr key turns it on "
+                                         "by itself; leave it off for SDXL base.")
+                        hint("SDXL: a LoRA on the UNet only. Give it a Hugging Face folder (or the "
+                             "stabilityai preset), or one all-in-one .safetensors checkpoint under Single files: the "
+                             "VAE and both text encoders then come from that file unless you set them. Captions are "
+                             "cut at 77 tokens (CLIP's limit). No quantization, block swap, model split, "
+                             "fine-tune, LoKr / OFT / DoRA or likeness boosters (attention, Keel face gain, hull); "
+                             "a run that sets one is refused with a message naming it.").bind_visibility_from(
+                            w["model_preset"], "value", lambda p: preset_arch(p, w["model_path"].value) == "sdxl")
                         subhead("GPUs and memory")
                         with fields():
                             w["multi_gpu"] = ui.select({"off": "single GPU",
@@ -10484,6 +10539,11 @@ def build_page(local: bool = True):
                              "published: make them with scripts/pan2/convert_pan2.py and set all three."
                              ).bind_visibility_from(w["model_preset"], "value",
                                                     lambda p: preset_arch(p, w["model_path"].value) == "pan2")
+                        hint("SDXL: samples use a DDIM-equivalent sampler, 30 steps at CFG 6, and no sampling LoRA "
+                             "or turbo LoRA applies. An empty negative prompt is the encoded empty text, which is "
+                             "what the model was trained against. Prompts are cut at 77 tokens; Shift is ignored."
+                             ).bind_visibility_from(w["model_preset"], "value",
+                                                    lambda p: preset_arch(p, w["model_path"].value) == "sdxl")
                         hint("P-H3-Image: samples render on the plain model (the training adapter off) at its own "
                              "8-step grid, CFG 1; Shift is ignored. It is tuned for 4-8 MP images: 1 MP previews show "
                              "more artifacts in faces, hands and small details than the finished LoRA will at full "
