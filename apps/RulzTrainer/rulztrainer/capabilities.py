@@ -109,8 +109,10 @@ _SDXL = [
                             "that form", 0.0, when=("optimizer", ("keel", "keel_fb"))),
     _only("training_maps", "its attention heat maps are read inside the transformer blocks, which SDXL's UNet does "
                            "not expose that way", False),
-    _forbid("transformer_quant", "nvfp4 is not available for SDXL's UNet; use auto, none, int8 or int8_convrot (the "
-                                 "UNet's attention and feed-forward linears)", "nvfp4", default="auto"),
+    _only("transformer_quant", "nvfp4 is not available for SDXL's UNet; use auto, none, int8 or int8_convrot (the "
+                               "UNet's attention and feed-forward linears)", "auto", "none", "int8", "int8_convrot"),
+    _only("sample_model_quant", "nvfp4 is not available for SDXL's UNet; use auto, none, int8 or int8_convrot",
+          "auto", "none", "int8", "int8_convrot"),
     _forbid("compile_model", "true is not available (the UNet is not compiled; auto and false run it eagerly)", True,
             default="auto"),
     _only("loss_type", "its loss is the model's own epsilon / v-prediction MSE; use mse", "mse"),
@@ -128,7 +130,8 @@ _SDXL = [
           default="auto"),
     _only("checkpoint_keep_blocks", "SDXL's checkpointing is all or nothing (diffusers'); use -1 or 0", -1, 0),
 ]
-# SDXL's transformer_quant: the rule above refuses only nvfp4 (auto / none / int8 / int8_convrot pass)
+# SDXL's transformer_quant and sample_model_quant: auto / none / int8 / int8_convrot pass (any case), nvfp4 and
+# anything else is refused at the start, as the loader (sdxl/loading.py _validate_quant) would refuse it later
 
 _FRAME_REASONS = {
     "sample_frames": "frames above 1 need a video model ({video}): this model renders stills",

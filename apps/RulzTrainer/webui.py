@@ -1932,9 +1932,16 @@ class Form:
         values are loaded: a choice list that lacks a value refuses it)."""
         family = family or self.current_family()
         limited = {}
+
+        def form_value(field):
+            ctl = self.w.get(FAMILY_FORM_KEYS.get(field, field))
+            return None if ctl is None else ctl.value
+
         for field, rule in ({} if release else capabilities.rules_for(family)).items():
             key = FAMILY_FORM_KEYS.get(field, field)
-            if self.w.get(key) is not None:
+            # a rule that holds only while another setting has some value (SDXL's Keel face gain, with a Keel
+            # optimizer) follows that setting: the optimizer's own change runs this again
+            if self.w.get(key) is not None and rule.applies(form_value):
                 limited[key] = (field, rule)
         reset = []
         for key in self.family_limited | set(limited):
@@ -1968,8 +1975,8 @@ class Form:
                     ctl.set_options(shown, value=value)
                 if ctl is widget and rule is not None and len(kept) <= 1:
                     disabled = True
-            for ctl in controls:
-                if hasattr(ctl, "enable") and (ctl is widget or getattr(ctl, "options", None) is None):
+            for ctl in controls:  # the wizard's copies too, its one-choice selects included
+                if hasattr(ctl, "enable"):
                     (ctl.disable if disabled else ctl.enable)()
             text = capabilities.reason(family, field) if rule is not None else ""
             if rule is not None:
@@ -1978,6 +1985,7 @@ class Form:
                 lbl.text = text
                 lbl.visible = bool(text) and (getattr(widget, "visible", True) if getattr(lbl, "rz_train_note", False) else True)
         self.family_limited = set(limited)
+        self.family_released = release  # values are being loaded: the optimizer's change must not filter yet
         if reset and notify:
             ui.notify(f"{', '.join(dict.fromkeys(reset))} reset: not available for {capabilities.display_name(family)}",
                       type="info")
@@ -10298,6 +10306,9 @@ def build_page(local: bool = True):
                                                            step=1e-5).classes("w-36")
                             w["optimizer"] = ui.select(list(OPTIMIZERS), value="adamw8bit", label="Optimizer") \
                                 .classes("w-40")
+                            # a family rule can hang on the optimizer (SDXL's Keel face gain): check them again
+                            w["optimizer"].on_value_change(
+                                lambda _: None if getattr(f, "family_released", False) else f.apply_family_support())
                             w["lr_scheduler"] = ui.select(["constant", "cosine", "linear"], value=d.lr_scheduler,
                                                           label="LR schedule").classes("w-36")
                             w["warmup_steps"] = ui.number("Warmup steps", value=d.warmup_steps, precision=0) \

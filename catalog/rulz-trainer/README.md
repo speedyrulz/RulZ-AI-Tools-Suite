@@ -4080,13 +4080,16 @@ its header, so a file named `ponyDiffusionV6XL.safetensors` or `illustrious.safe
 file that sets one stops the run at the start with a message naming the setting (since 3.26.0 both read one table,
 see [Settings a model cannot use](#settings-a-model-cannot-use)): `block_swap`, `multi_gpu: model_split`,
 `activation_offload`, `checkpoint_keep_blocks` above 0, `attn_localize`, `id_align`, `body_align`, `training_maps`,
-the `keel_fb` and `hull` optimizers, a Keel face gain above 0, `transformer_quant: nvfp4`, `compile_model: true`,
+the `keel_fb` and `hull` optimizers, a Keel face gain above 0, `transformer_quant` or `sample_model_quant` other than
+auto, none, int8 or int8_convrot (so `nvfp4`), `compile_model: true`,
 `loss_type` other than mse, `loss_weighting: sigma_sqrt`, `finetune`, `network_type` other than lora, `dora`,
 `train_text_embedder`, a set `turbo_lora`, `sample_lora` or `training_adapter`, and video clips. Data parallel on two
 GPUs works. The other optimizers (adamw, adamw8bit, adafactor, automagic3 / 4, keel, muon, normuon) work.
 
 **int8 UNet** (since 3.26.0). `transformer_quant: int8` or `int8_convrot` trains the LoRA on a UNet whose transformer
-blocks hold int8 weights: the plain linear layers of their attention and feed-forward (640 wide and up). The
+blocks hold int8 weights: the plain linear layers of their attention and feed-forward (640 wide and up; under
+`int8_convrot` the 640-wide ones of the outer stages stay plain int8, because the rotation needs widths in steps of
+256). The
 convolutions, norms, embeddings and each transformer's `proj_in` / `proj_out` stay bf16, so the saving is about 2 GB
 of the UNet's 5 GB. The sample model follows `sample_model_quant` the same way. The LoRA file is unchanged (same keys
 as on the bf16 UNet). `nvfp4` is refused, and the CLIP text encoders are not quantized (`text_encoder_quant` is

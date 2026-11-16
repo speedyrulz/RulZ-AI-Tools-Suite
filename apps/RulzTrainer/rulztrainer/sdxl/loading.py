@@ -320,12 +320,18 @@ def grad_vae(vae):
 
 
 def _validate_quant(quant):
-    if quant not in (None, "none", "auto", "int8", "int8_convrot"):
+    if _norm_quant(quant) not in (None, "none", "auto", "int8", "int8_convrot"):
         raise ValueError(f"SDXL UNet quantization {quant!r} is unsupported; use none, auto, int8 or int8_convrot")
+
+
+def _norm_quant(quant):
+    """The quant name in lower case (the run-start check takes INT8 as int8 too)."""
+    return quant.lower() if isinstance(quant, str) else quant
 
 
 def _quantize_unet(unet, quant, device):
     _validate_quant(quant)
+    quant = _norm_quant(quant)
     if quant in (None, "none", "auto"):
         return unet
     from .. import quant as Q
