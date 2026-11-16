@@ -2583,9 +2583,9 @@ h1, h2, h3, .rz-pane-title { font-family: "Segoe UI Variable Display", "Segoe UI
 /* Monitor on a wide screen: the status tiles in a column at the right edge, GPUs, disks and memory in one at the
    left, both held between the header and the action bar while the page scrolls; the middle narrows to make room */
 @media (min-width: 1640px) {
-  .rz-monitor { --rz-side: 220px; max-width: min(1440px, calc(100vw - 2 * (var(--rz-side) + 32px) - 20px)); }
+  .rz-monitor { --mon-side: 220px; max-width: min(1440px, calc(100vw - 2 * (var(--mon-side) + 32px) - 20px)); }
   .rz-monitor > .rz-tiles, .rz-monitor > .rz-machine {
-    position: fixed; z-index: 1; width: var(--rz-side); top: calc(var(--rz-head-h, 104px) + 20px);
+    position: fixed; z-index: 1; width: var(--mon-side); top: calc(var(--rz-head-h, 104px) + 20px);
     max-height: calc(100vh - var(--rz-head-h, 104px) - var(--rz-foot-h, 66px) - 36px);
     overflow-y: auto; scrollbar-width: thin; display: flex; flex-direction: column; gap: 10px;
   }
