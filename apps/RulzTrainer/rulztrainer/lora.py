@@ -1263,6 +1263,68 @@ def parse_bias_diffs(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return {_module_name(k[: -len(".diff_b")]): v.float() for k, v in state.items() if k.endswith(".diff_b")}
 
 
+def _kohya_name_map(model: nn.Module) -> dict[str, str]:
+    """{kohya stem without lora_unet_: module name} for the model's `unet.` layers that a LoRA can target (convs,
+    linears, already wrapped linears), the same mapping load_lora_weights and the exporter use. A name two layers
+    share is an error."""
+    wrapped = {n for n, m in model.named_modules() if isinstance(m, LoRALinear)}
+    out: dict[str, str] = {}
+    for name, m in model.named_modules():
+        if not name.startswith("unet.") or not (isinstance(m, (nn.Conv2d, LoRALinear)) or _is_linear_like(m)):
+            continue
+        parts = name.split(".")
+        if any(".".join(parts[:i]) in wrapped for i in range(1, len(parts))):  # a wrapper's own inner layers
+            continue
+        key = name.removeprefix("unet.").replace(".", "_")
+        if key in out:
+            raise ValueError(f"Ambiguous kohya module names: {out[key]} and {name}")
+        out[key] = name
+    return out
+
+
+def _add_conv_extra(model: nn.Module, conv: nn.Conv2d, entry: tuple, strength: float) -> bool:
+    """Record a sampling-only LoRA entry for a Conv2d (applied by set_extras_enabled as a forward hook); False when
+    its shapes do not fit the layer. down [r, in, kh, kw], up [out, r] or [out, r, 1, 1]."""
+    kind, down, up, scale = entry
+    if kind != "lora":
+        return False
+    if up.dim() == 2:
+        up = up[:, :, None, None]
+    if (down.dim() != 4 or up.dim() != 4 or conv.groups != 1 or conv.padding_mode != "zeros"
+            or down.shape[1] != conv.in_channels or tuple(down.shape[2:]) != tuple(conv.kernel_size)
+            or up.shape[0] != conv.out_channels or up.shape[1] != down.shape[0] or tuple(up.shape[2:]) != (1, 1)):
+        return False
+    model.__dict__.setdefault("_rz_conv_extras", []).append((conv, down.float(), up.float(), scale * strength))
+    return True
+
+
+def _set_conv_extras(model: nn.Module, enabled: bool) -> None:
+    """Switch the Conv2d LoRA entries on (one forward hook each, adding up(down(x)) x scale to the conv's output, the
+    weights staged once on the conv's device) or off (hooks and staged copies gone). Idempotent."""
+    for handle in model.__dict__.pop("_rz_conv_hooks", []):
+        handle.remove()
+    if not enabled:
+        return
+    import torch.nn.functional as F
+
+    handles = []
+    for conv, down, up, scale in model.__dict__.get("_rz_conv_extras", []):
+        w = conv.weight
+        dtype = w.dtype if w.dtype.is_floating_point else torch.float32
+        staged = [down.to(w.device, dtype), up.to(w.device, dtype)]
+
+        def hook(m, args, out, staged=staged, scale=scale):
+            x = args[0]
+            d, u = staged
+            if d.dtype != x.dtype:
+                d, u = d.to(x.dtype), u.to(x.dtype)
+            h = F.conv2d(x, d, stride=m.stride, padding=m.padding, dilation=m.dilation)
+            return out + F.conv2d(h, u) * scale
+
+        handles.append(conv.register_forward_hook(hook))
+    model.__dict__["_rz_conv_hooks"] = handles
+
+
 def attach_extra_lora(model: nn.Module, path: str, strength: float = 1.0,
                       rename: Callable[[str], str] | None = None,
                       convert: Callable[[dict], dict] | None = None) -> int:
@@ -1278,6 +1340,7 @@ def attach_extra_lora(model: nn.Module, path: str, strength: float = 1.0,
                                alpha_pattern=peft_meta.get("alpha_pattern"))
     biases = parse_bias_diffs(state)
     names = {n for n, _ in model.named_modules()}
+    kmap = _kohya_name_map(model) if any(k.startswith("lora_unet_") for k in state) else {}
 
     def resolve(name: str) -> str | None:
         if name not in names and rename is not None:
@@ -1304,11 +1367,24 @@ def attach_extra_lora(model: nn.Module, path: str, strength: float = 1.0,
         matched.add(name)
     for kind, table in (("lora", entries), ("bias", biases)):
         for name, value in table.items():
+            name = kmap.get(name, name)  # kohya's lora_unet_<path with _> -> the model's own module name
+            conv = model.get_submodule(name) if name in names else None
+            if kind == "lora" and isinstance(conv, nn.Conv2d):  # a Conv2d target: applied by a forward hook
+                if _add_conv_extra(model, conv, value, strength):
+                    matched.add(name)
+                else:
+                    missed.append(name)
+                continue
             target = resolve(name)
             if target is None:
                 missed.append(name)
                 continue
             module = model.get_submodule(target)
+            if kind == "lora" and value[0] == "lora" and value[1].dim() == 4:  # a 1x1 conv file entry on a Linear
+                if value[1].shape[2:] != (1, 1) or value[2].shape[2:] != (1, 1):
+                    missed.append(name)
+                    continue
+                value = ("lora", value[1].flatten(1), value[2].flatten(1), value[3])
             if not isinstance(module, LoRALinear):
                 module = _wrap(model, target, rank=1, alpha=1.0, trainable=False)
             if kind == "lora":
@@ -1380,8 +1456,8 @@ def attach_training_adapter(model: nn.Module, path: str, strength: float = 1.0,
 
 def extras_active(model: nn.Module) -> bool:
     """Whether a sampling-only LoRA is attached and switched on."""
-    return any(isinstance(m, LoRALinear) and m.extras_enabled and (m.extras or m.extra_biases)
-               for m in model.modules())
+    return bool(model.__dict__.get("_rz_conv_hooks")) or any(
+        isinstance(m, LoRALinear) and m.extras_enabled and (m.extras or m.extra_biases) for m in model.modules())
 
 
 def set_extras_enabled(model: nn.Module, enabled: bool) -> None:
@@ -1395,6 +1471,7 @@ def set_extras_enabled(model: nn.Module, enabled: bool) -> None:
                 m.stage_extras()  # on the layer's device once, not uploaded on every forward of the round
             else:
                 m.unstage_extras()  # the GPU copies go; the originals stay in RAM
+    _set_conv_extras(model, enabled)  # Conv2d entries (SDXL's DMD2 LoRA): hooks on while sampling, off for training
     with torch.no_grad():  # norm weight offsets: swapped in for sampling, the original weight back for training
         per_weight: dict[int, list] = {}  # several files' offsets on one weight add up (each was set alone, so the
         for weight, original, delta in model.__dict__.get("_rz_param_diffs", []):  # last file's won)

@@ -378,13 +378,23 @@ VIDEO_ARCHS = VIDEO_FAMILIES  # (defined in capabilities.py, with the rest of wh
 # SDXL (Stability AI's UNet, rulztrainer.sdxl): LoRA on the UNet only, as OneTrainer, ai-toolkit and Fizgig train it. Its
 # text encoders (CLIP-L and OpenCLIP bigG) read 77 tokens, so max_token_length is held at SDXL_TOKENS. The default
 # targets are Fizgig's: q/k/v/o of both attentions, the feed-forward in/out, and each Transformer2DModel's proj_in /
-# proj_out. Sampling is the usual 30 steps at CFG 6 (Euler on the model's own schedule). model_source "files" takes one
-# all-in-one checkpoint (transformer_file; the VAE and text encoders default to the same file), and nobody's ComfyUI
-# repackage is fetched (COMFY_REPOS has no entry). No turbo LoRA, sampling LoRA or training adapter exists for it.
+# proj_out. Samples and probes render with Tianwei Yin's DMD2 LoRA (turbo_lora "auto" downloads it): 8 steps, CFG 1, an
+# LCM sampler (rulztrainer.sdxl.sampler picks it while a turbo LoRA is attached). turbo_lora "" falls back to the usual
+# 30 steps at CFG 6 (Euler on the model's own schedule). model_source "files" takes one all-in-one checkpoint
+# (transformer_file; the VAE and text encoders default to the same file); left empty it downloads
+# SDXL_SINGLE_FILE, and nobody's ComfyUI repackage is fetched (COMFY_REPOS has no entry). No sampling LoRA or training
+# adapter exists for it.
 MODEL_PRESETS["SDXL-Base-1.0"] = "stabilityai/stable-diffusion-xl-base-1.0"
 ARCH_NAMES += ("sdxl",)
 ARCH_DEFAULT_TARGETS["sdxl"] = _CORE_TARGETS + ("proj",)
 ARCH_FULL_SAMPLE["sdxl"] = (30, 6.0)
+# DMD2 SDXL 4-step LoRA (kohya names, 788 modules incl. Conv2d); tianweiy's card samples it at 4 steps with LCM, 8 steps
+# is the same schedule at finer spacing. Not gated.
+ARCH_TURBO["sdxl"] = {"repo": "tianweiy/DMD2", "file": "dmd2_sdxl_4step_lora.safetensors", "strength": 1.0,
+                      "steps": 8, "cfg": 1.0, "shift": 1.0, "sampler": "lcm"}
+ARCH_SAMPLE_DEFAULTS["sdxl"] = (ARCH_TURBO["sdxl"]["steps"], ARCH_TURBO["sdxl"]["cfg"])
+# SDXL 1.0 base with the 0.9 VAE baked in (not gated): the single file downloaded when transformer_file is empty
+SDXL_SINGLE_FILE = ("stabilityai/stable-diffusion-xl-base-1.0", "sd_xl_base_1.0_0.9vae.safetensors")
 SDXL_TOKENS = 77
 SDXL_PREDICTIONS = ("auto", "epsilon", "v_prediction")
 VIDEO_EXTS = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v")  # video files a dataset trains as clips
