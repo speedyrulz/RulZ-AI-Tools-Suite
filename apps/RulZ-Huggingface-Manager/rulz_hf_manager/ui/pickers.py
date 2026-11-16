@@ -48,7 +48,7 @@ def _scan(path: Path, folders_only: bool, show_hidden: bool) -> list[dict]:
                     'size': None if is_dir else st.st_size,
                     'modified': fmt_date(datetime.fromtimestamp(st.st_mtime)),
                     'created': fmt_date(datetime.fromtimestamp(c)) if (c := created_time(st)) else '',
-                    'icon': 'folder' if is_dir else 'draft',
+                    'icon': 'folder' if is_dir else 'insert_drive_file',
                 })
             except OSError:
                 continue
@@ -77,14 +77,16 @@ async def pick_local(mode: str = 'any', title: str | None = None, start: str | P
             ui.space()
             ui.button(icon='close', on_click=lambda: dialog.submit(None)).props('flat round dense')
         ui.separator()
-        with ui.row().classes('w-full flex-1 no-wrap gap-0 overflow-hidden'):
+        # items-stretch: NiceGUI rows align children to the top, which let the file list grow to its
+        # full content height (clipped, so nothing could scroll). Stretched, it stays the dialog's height.
+        with ui.row().classes('w-full flex-1 no-wrap gap-0 overflow-hidden items-stretch min-h-0'):
             with ui.column().classes('w-48 p-2 gap-0 overflow-auto gt-xs'):
                 ui.label('Places').classes('text-xs uppercase rulz-muted px-2 pt-1')
                 for label, icon, p in places:
                     ui.button(label, icon=icon, on_click=lambda p=p: go(p)) \
                         .props('flat no-caps align=left dense').classes('w-full')
             ui.separator().props('vertical')
-            with ui.column().classes('flex-1 p-3 gap-2 overflow-hidden column no-wrap'):
+            with ui.column().classes('flex-1 p-3 gap-2 overflow-hidden column no-wrap min-h-0'):
                 with ui.row().classes('w-full items-center no-wrap gap-1'):
                     ui.button(icon='arrow_upward', on_click=lambda: go(state['cwd'].parent)) \
                         .props('flat round dense').tooltip('Parent folder')
@@ -110,12 +112,16 @@ async def pick_local(mode: str = 'any', title: str | None = None, start: str | P
                                  selection=None if folders_only else 'multiple',
                                  pagination={'rowsPerPage': 0}) \
                     .props('flat dense virtual-scroll binary-state-sort') \
-                    .classes('w-full flex-1 rulz-table').style('min-height: 0')
+                    .classes('w-full flex-1 rulz-table rz-fill-table')
                 table.bind_filter_from(search, 'value')
+                # virtual-scroll puts a QVirtualScroll between this cell and the table, so $parent is not the
+                # component that listens for 'enter'; walk up to the first one that does. Keep it a plain arrow
+                # function: Vue evaluates "(() => ...)()" at every render as if it were the handler itself.
                 table.add_slot('body-cell-name', r'''
                     <q-td :props="props">
                       <div class="row items-center no-wrap q-gutter-x-sm cursor-pointer rulz-name"
-                           @click="$parent.$emit('enter', props.row)">
+                           @click="() => { let p = $parent; while (p && !(p.$attrs && p.$attrs.onEnter)) p = p.$parent;
+                                           if (p) p.$emit('enter', props.row); }">
                         <q-icon :name="props.row.icon" size="20px" :class="props.row.is_dir ? 'rz-ic-dir' : 'rz-ic-file'"/>
                         <span>{{ props.row.name }}</span>
                       </div>
