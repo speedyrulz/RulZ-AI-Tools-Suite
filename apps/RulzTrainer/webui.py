@@ -55,17 +55,18 @@ EXTRA_TARGETS = {
                               "default)"),
     "text_fusion": (("krea2",), "the text fusion blocks that mix the 12 text encoder layers (on by default: the usual "
                                 "recipe leaves them under-trained)"),
-    "text_in": (("qwen_image21", "flux3_klein", "flux2_klein"),
+    "text_in": (("qwen_image21", "flux3_klein", "flux2_klein", "flux2_klein4b"),
                 "the text projection that brings the text encoder's features into the model"),
-    "embed": (("fibo2", "krea2", "qwen_image21", "flux3_klein", "flux2_klein"),
+    "embed": (("fibo2", "krea2", "qwen_image21", "flux3_klein", "flux2_klein", "flux2_klein4b"),
               "image / text / timestep embedders and the final layer"),
     "mode_blocks": (("flux3_klein",), "the 5 text and 5 image per-mode blocks that run before the 28 joint ones (on by "
                                       "default: the attention / feed-forward groups apply there too)"),
-    "modulation": (("flux3_klein", "flux2_klein"), "the shift / scale / gate projections of the timestep"),
+    "modulation": (("flux3_klein", "flux2_klein", "flux2_klein4b"), "the shift / scale / gate projections of the timestep"),
     "token_refiner": (("minimax_h3",), "the 2 token-refiner blocks over the text (musubi-tuner leaves them out; the "
                                        "training adapters train them)"),
 }
-N_BLOCKS = {"moss_image": 42, "fibo2": 44, "krea2": 28, "qwen_image21": 32, "flux3_klein": 28, "flux2_klein": 32}
+N_BLOCKS = {"moss_image": 42, "fibo2": 44, "krea2": 28, "qwen_image21": 32, "flux3_klein": 28, "flux2_klein": 32,
+            "flux2_klein4b": 25}  # Klein 4B: 5 double + 20 single
 # Ideogram 4: 34 blocks; its per-block modulation, text projection and embedders are LoRA targets too
 N_BLOCKS["ideogram4"] = 34
 for _t in ("adaln", "text_in", "embed"):
@@ -5401,6 +5402,9 @@ MODEL_GB = {"moss_image": {"bf16": 10.0, "int8": 5.5, "nvfp4": 3.0}, "krea2": {"
             "flux3_klein": {"bf16": 9.7, "int8": 5.1, "nvfp4": 3.0}}  # Klein without its reference-image mode
 # FLUX.2 Klein 9B: 9.08 B weights, bf16 16.9 GB; Fizgig holds it in about 9.6 GB fp8 and 5.6 GB 4-bit, the estimate here
 MODEL_GB["flux2_klein"] = {"bf16": 16.9, "int8": 9.6, "nvfp4": 5.6}
+# FLUX.2 Klein 4B: 3.9 B weights, bf16 7.75 GB (the file); int8 and nvfp4 are the 9B's ratios (0.57 and 0.33), an
+# estimate, not measured
+MODEL_GB["flux2_klein4b"] = {"bf16": 7.75, "int8": 4.4, "nvfp4": 2.6}
 # SDXL: the UNet is 2.6 B weights, bf16 5.1 GB (about 5 here). int8 / int8_convrot quantize the linears of its
 # transformer blocks only (about 2 B of the weights; the convolutions and the rest stay bf16), so about 3.2 GB: an
 # estimate, not measured. nvfp4 is not available (capabilities.py; its 5.0 is a placeholder). The two text encoders
@@ -5469,7 +5473,7 @@ def plan_quant_of(fam: str, model_source: str, model_file_quant: str, vram: floa
     if fam == "sdxl":
         return "int8" if quant in ("int8", "int8_convrot") else "bf16"
     if quant == "auto":
-        if model_source == "files" and fam != "flux2_klein":  # its float files are quantized for the memory
+        if model_source == "files" and fam not in ("flux2_klein", "flux2_klein4b"):  # their float files are quantized for the memory
             quant = "bf16" if model_file_quant == "bf16" else "int8"
             quant = "nvfp4" if model_file_quant == "nvfp4_mixed" else quant  # Ideogram 4's 5.5 GB file
         elif vram is None:
@@ -5479,6 +5483,7 @@ def plan_quant_of(fam: str, model_source: str, model_file_quant: str, vram: floa
                      "qwen_image21": "bf16" if vram >= 24 else "int8" if vram >= 11 else "nvfp4",
                      "flux3_klein": "bf16" if vram >= 15 else "int8" if vram >= 9.5 else "nvfp4",
                      "flux2_klein": "bf16" if vram >= 30 else "int8" if vram >= 18 else "nvfp4",
+                     "flux2_klein4b": "bf16" if vram >= 20 else "int8" if vram >= 10 else "nvfp4",  # flux2/loading.py
                      "ideogram4": "bf16" if vram >= 30 else "int8" if vram >= 15 else "nvfp4"}.get(fam, "bf16")
     return {"int8_convrot": "int8", "none": "bf16"}.get(quant, quant)
 
@@ -5495,7 +5500,8 @@ ESTIMATED_NOTE = "; estimated (no comparable finished run of yours yet)"
 
 
 # Families whose `auto` quantization of a model that is quantized as it loads is known by card size (plan_quant_of)
-AUTO_QUANT_BY_CARD = ("krea2", "fibo2", "qwen_image21", "flux3_klein", "flux2_klein", "ideogram4", "sdxl")
+AUTO_QUANT_BY_CARD = ("krea2", "fibo2", "qwen_image21", "flux3_klein", "flux2_klein", "flux2_klein4b", "ideogram4",
+                      "sdxl")
 # Families whose bf16 file is quantized for the card too (h3_recommendations: "a bf16 source is quantized for the GPUs")
 QUANTIZED_FROM_BF16 = H3_PLAN_FAMILIES + ("pan2",)
 
@@ -5506,7 +5512,7 @@ def measured_quant(fam: str, model_source: str, model_file_quant: str, vram: flo
     it must not be taken for the same model. Unknown: auto on a repo of a family with no rule by card size, and
     auto on a bf16 file of a family that quantizes it for the card."""
     if quant == "auto":
-        from_file = model_source == "files" and fam != "flux2_klein"
+        from_file = model_source == "files" and fam not in ("flux2_klein", "flux2_klein4b")
         if from_file and model_file_quant == "bf16" and fam in QUANTIZED_FROM_BF16:
             return None
         if not from_file and fam not in AUTO_QUANT_BY_CARD:
@@ -5660,6 +5666,14 @@ MODEL_NOTES = {
                                  "sharing a LoRA). LoRAs load in ComfyUI and diffusers, on the distilled Klein too."),
     "FLUX-2-Klein-9B": ("Not for training", "The 4-step distilled FLUX.2 Klein 9B. Train on FLUX-2-Klein-9B-Base and set "
                                             "this as the sampling model: a Base LoRA runs on it at 4 steps, CFG 1."),
+    "FLUX-2-Klein-4B-Base": ("", "Black Forest Labs' FLUX.2 Klein 4B, the base model to train on: a 7.75 GB bf16 file "
+                                 "and the Qwen3-4B text encoder (8 GB). Text-to-image LoRAs only here. Auto quantizes "
+                                 "it for your GPU: nvfp4 below 10 GB, int8 up to 20. Apache 2.0 and not gated (unlike "
+                                 "the 9B, which is non-commercial and gated). LoRAs load in ComfyUI and diffusers, on "
+                                 "the distilled Klein 4B too."),
+    "FLUX-2-Klein-4B": ("Not for training", "The 4-step distilled FLUX.2 Klein 4B. Train on FLUX-2-Klein-4B-Base and "
+                                            "set this as the sampling model: a Base LoRA runs on it at 4 steps, "
+                                            "CFG 1."),
     "Ideogram-4": ("", "Ideogram 4 (9.3B), strong at typography and layout, trained on structured JSON captions. "
                        "Comfy-Org's single files (int8, 9.6 GB, with the 9.4 GB Qwen3-VL-8B text encoder) train on "
                        "one 16 GB card; its LoRAs load in ComfyUI and diffusers. Ideogram Non-Commercial Model "
@@ -5718,7 +5732,9 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     qwen = cfg.arch_name() == "qwen_image21"
     klein = cfg.arch_name() == "flux3_klein"
     klein_distilled = klein and get_arch(cfg).distilled_sample_model(cfg.sample_model_path or "")
-    klein2 = cfg.arch_name() == "flux2_klein"
+    klein2_4b = cfg.arch_name() == "flux2_klein4b"
+    klein2 = cfg.arch_name() == "flux2_klein" or klein2_4b
+    k2_note = " (measured on the 9B, reused for 4B)" if klein2_4b else ""
     klein2_distilled = klein2 and get_arch(cfg).distilled_sample_model(cfg.sample_model_path or "")
     ideo = cfg.arch_name() == "ideogram4"
     sdxl = cfg.arch_name() == "sdxl"
@@ -5778,7 +5794,11 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         else:
             r["text_encoder_quant"] = ("int8", f"halves the {te_gb} GB text encoder so it fits on the GPU for caching "
                                                "instead of spilling into system RAM")
-    if klein2:
+    if klein2_4b:
+        r["transformer_quant"] = ("auto", "FLUX.2 Klein 4B (bf16 7.75 GB) picks for the memory it runs in: bf16 from "
+                                          "20 GB, int8 (4.4 GB) from 10 GB, else nvfp4 (2.6 GB); estimated, not measured")
+        r["text_encoder_quant"] = ("auto", "Qwen3-4B (bf16 8 GB) runs as it is from 12 GB, else int8 ConvRot (half)")
+    elif klein2:
         r["transformer_quant"] = ("auto", "FLUX.2 Klein (bf16 17 GB) picks for the memory it runs in: bf16 from 30 GB, "
                                           "int8 (9.6 GB) from 18 GB, else nvfp4 (5.6 GB)")
         r["text_encoder_quant"] = ("auto", "Qwen3-8B (bf16 15 GB) runs as it is from 19.5 GB, else int8 ConvRot (half)")
@@ -5877,7 +5897,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                 r["lr_scheduler"] = ("constant", "BFL's FLUX 3 Klein recipe")
                 r["warmup_steps"] = (200, "BFL's FLUX 3 Klein recipe")
             if klein2 and cfg.network_type == "lora":
-                r["learning_rate"] = (1e-4, "Fizgig's Klein 9B full-model recipe (\"Old Reliable\")")
+                r["learning_rate"] = (1e-4, "Fizgig's Klein 9B full-model recipe (\"Old Reliable\")" + k2_note)
         r["network_type"] = ("oft", "14 to 15 points over a plain LoRA on two seeds of one small set, face and body; "
                                     "loads in ComfyUI, not diffusers; not tested with the identity recipe's extras"
                              ) if character and krea else (
@@ -5900,7 +5920,8 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                 r["lora_rank"] = (rank, "BFL's FLUX 3 Klein recipe: rank 32, alpha 32")
             if klein2:
                 rank = 16
-                r["lora_rank"] = (rank, "Fizgig's Klein 9B full-model recipe (\"Old Reliable\"): rank 16, alpha 16")
+                r["lora_rank"] = (rank, "Fizgig's Klein 9B full-model recipe (\"Old Reliable\"): rank 16, alpha 16"
+                                  + k2_note)
             r["lora_alpha"] = (float(rank), "alpha equal to rank keeps the adapter's scale at 1")
     if goal == "style":
         r["timestep_sampling"] = ("logsnr", "spends most steps at very high noise, where an art style is learned "
@@ -5945,6 +5966,11 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     elif klein2_distilled:
         r["sample_steps"] = (4, "the distilled FLUX.2 Klein (your sampling model) is a 4-step model")
         r["sample_cfg"] = (1.0, "the distilled Klein samples without guidance")
+    elif klein2_4b and cfg.turbo_lora in ("auto", ""):  # no turbo LoRA exists for Klein 4B
+        r["sample_steps"] = (50, "the diffusers Klein pipeline's 50 steps for Klein 4B Base (the distilled Klein 4B as "
+                                 "the sampling model takes 4)")
+        r["sample_cfg"] = (4.0, "the Klein pipeline's guidance 4.0 for Base; it has no guidance embedding, CFG is all "
+                                "that steers it")
     elif klein2 and not cfg.turbo_lora:  # the turbo LoRA switched off
         r["sample_steps"] = (20, "BFL's default for Klein Base (the distilled Klein as the sampling model takes 4)")
         r["sample_cfg"] = (3.5, "BFL's guidance for Klein Base; it has no guidance embedding, CFG is all that steers it")
@@ -6343,6 +6369,13 @@ def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus:
                             "huggingface.co/black-forest-labs/FLUX.2-klein-base-9b-fp8 (or -base-9B for bf16) and log "
                             "in with hf auth login before the first download. This trains text-to-image LoRAs, not "
                             "edit LoRAs."))
+    elif cfg.arch_name() == "flux2_klein4b" and get_arch(cfg).distilled_sample_model(cfg.model_path):
+        out.append(("warning", "FLUX-2-Klein-4B is the distilled model (4 steps, for samples). Train on "
+                               "FLUX-2-Klein-4B-Base and set the distilled one as the sampling model."))
+    elif cfg.arch_name() == "flux2_klein4b":
+        out.append(("info", "FLUX.2 Klein 4B is Apache 2.0 and not gated (the 9B is non-commercial and gated): no "
+                            "Hugging Face login is needed for its repos or for Comfy-Org/Flux-2-Klein-4B. This trains "
+                            "text-to-image LoRAs, not edit LoRAs."))
     if cfg.multi_gpu != "off" and n_gpus < 2:
         out.append(("error", "Multi-GPU is on, but only one GPU was found."))
     if goal == "character" or cfg.preset == "identity":
@@ -7117,7 +7150,7 @@ class Wizard:
                 ("transformer_file", "Diffusion model file", "A ComfyUI models/diffusion_models file you already "
                                                              "have (SDXL: its all-in-one checkpoint).", "file"),
                 ("text_encoder_file", "Text encoder file", "Qwen3.5-9B for MOSS-Image, Qwen3-VL-4B for Krea 2, FIBO 2.0 "
-                                                           "and FLUX 3 Klein, Qwen3-8B for FLUX.2 Klein 9B, "
+                                                           "and FLUX 3 Klein, Qwen3-8B for FLUX.2 Klein 9B, Qwen3-4B for FLUX.2 Klein 4B, "
                                                            "Qwen3-VL-8B for Qwen-Image 2.1 and "
                                                            "Ideogram 4, Qwen3-VL-32B (cut to 50 layers) for MiniMax "
                                                            "H3 and MiniMax-H3-Image (the same file), P-H3-Image's "
@@ -10906,6 +10939,12 @@ def build_page(local: bool = True):
                              "needs no turbo LoRA.").bind_visibility_from(
                             w["model_preset"], "value",
                             lambda p: preset_arch(p, w["model_path"].value) == "flux2_klein")
+                        hint("FLUX.2 Klein 4B: no turbo LoRA exists. Base samples 50 steps at CFG 4.0 (the diffusers "
+                             "Klein pipeline's defaults); the distilled "
+                             "black-forest-labs/FLUX.2-klein-4B as the sampling model below takes 4 steps at CFG 1."
+                             ).bind_visibility_from(
+                            w["model_preset"], "value",
+                            lambda p: preset_arch(p, w["model_path"].value) == "flux2_klein4b")
                         with advanced("Seeds, negative prompt and sampling models"):
                             with fields():
                                 w["sample_seed"] = ui.number("Sample seed", value=d.sample_seed, precision=0) \

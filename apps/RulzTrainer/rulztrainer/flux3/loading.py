@@ -109,6 +109,10 @@ def gated_error(repo: str, err: Exception) -> Exception:
     """A PermissionError that says which license to accept where (the download's own error is only a 401 / 403)."""
     bfl = repo.lower().startswith("black-forest-labs/")
     flux2 = bfl and "flux.2" in repo.lower()
+    if flux2 and "4b" in repo.lower():  # Klein 4B is Apache 2.0 and not gated: a 401 / 403 is a token or network problem
+        return PermissionError(f"Hugging Face refused {repo} ({type(err).__name__}). FLUX.2 Klein 4B is Apache 2.0 and "
+                               "not gated, so check the account token the trainer uses (hf auth login, or the HF_TOKEN "
+                               "environment variable) and the connection")
     what = "Black Forest Labs' FLUX.2 Klein" if flux2 else "Black Forest Labs' FLUX 3 Klein" if bfl else repo
     terms = "FLUX Non-Commercial License" if flux2 else "FLUX Kommunity License"
     text = GATE_HELP.format(what=what, repo=repo, license=f" ({terms}, approved automatically)" if bfl else "")
