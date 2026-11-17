@@ -487,14 +487,15 @@ class LoRALinear(nn.Module):
         """The LoRA / LoKr output for input x (scaled, before the multiplier)."""
         if self.kind == "lora":
             h = self.dropout(x)
-            tokens = self.hull_arm.tokens(h) if self.hull_arm is not None else None
+            tokens = (self.hull_arm.tokens(h) if self.hull_arm is not None and self.lora_down.weight.requires_grad
+                      else None)  # (gradless: no gains for weights that learn nothing from this batch)
             if tokens is not None:
                 arm = (self.hull_arm.sink, self.lora_down.weight, self.lora_up.weight, *tokens)
                 u = HullBackward.apply(h, self.lora_down.weight.to(h.dtype), self.lora_up.weight.to(h.dtype), arm)
                 return u * self.scale if self.scale != 1.0 else u
             h = nn.functional.linear(h, self.lora_down.weight.to(h.dtype))
             u = nn.functional.linear(h, self.lora_up.weight.to(h.dtype))
-            if self.face_sink is not None and u.requires_grad:
+            if self.face_sink is not None and u.requires_grad and self.lora_up.weight.requires_grad:
                 self._tap_face(h, u)
             return u * self.scale if self.scale != 1.0 else u
         u = lokr_update(x, self.lokr_w1.to(x.dtype), self.lokr_w2.to(x.dtype))
@@ -907,6 +908,26 @@ def lora_param_groups_by(injected: dict[str, LoRALinear], lr: float, group_of) -
     for name, m in injected.items():
         groups.setdefault(group_of(name), []).extend(m.adapter_params().values())
     return [{"params": ps, "lr": lr, "name": g} for g, ps in sorted(groups.items())]
+
+
+@contextmanager
+def gradless(modules: Iterable[LoRALinear]):
+    """The adapters of `modules` take no gradient inside the block (a mixed dataset's batch of stills: still_lora_*).
+    Their weights still act in the forward and the gradient still flows through them to the layers before, so the
+    trained layers see the whole LoRA; only these weights get nothing from the batch. Their .grad is left as it is: a
+    clip's gradient of the same step stays, and a step of stills alone leaves it None, which every optimizer here
+    skips (a zero would move momentum optimizers on). Wrap the forward and the backward both: a checkpointed block's
+    recompute runs in the backward. Restores each weight's own requires_grad on the way out."""
+    saved = []
+    for m in modules:
+        for p in m.adapter_params().values():
+            saved.append((p, p.requires_grad))
+            p.requires_grad_(False)
+    try:
+        yield
+    finally:
+        for p, flag in saved:
+            p.requires_grad_(flag)
 
 
 def set_multiplier(injected: dict[str, LoRALinear], value: float) -> None:

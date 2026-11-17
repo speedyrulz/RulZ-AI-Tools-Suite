@@ -28,7 +28,8 @@ from nicegui import app, background_tasks, run, ui
 
 from rulztrainer.archs import get_arch
 from rulztrainer.config import (AUTOMAGIC, KEEL, KEEL_FB, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
-                                MODEL_PRESETS, ARCH_SAMPLE_LORA, VIDEO_ARCHS, VIDEO_EXTS,
+                                MODEL_PRESETS, ARCH_SAMPLE_LORA, VIDEO_ARCHS, VIDEO_EXTS, VIDEO_DATA_PRESETS,
+                                STILL_FFN_TARGETS, detect_video_data_preset, video_data_preset,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
 from rulztrainer import (__version__, bodysim, capabilities, facesim, history, lookfilter, machine, oom_recovery,
                          promptcheck)
@@ -1924,6 +1925,53 @@ class Form:
     def current_family(self) -> str:
         return preset_arch(self.w["model_preset"].value, self.w["model_path"].value)
 
+    def apply_video_data_preset(self, name: str) -> None:
+        """The "Training data" menu (a video model): its preset's clip frames, LoRA layers and blocks and the
+        photos' layers in a mixed dataset (config.video_data_preset). Not while the page fills itself in."""
+        if self.loading or self.preset_sync or not name:
+            return
+        family = self.current_family()
+        if family not in VIDEO_ARCHS:
+            return
+        try:
+            frames = int(self.w["train_frames"].value or 1)
+        except (TypeError, ValueError):
+            frames = 1
+        vals = video_data_preset(name, family, frames)
+        self.w["train_frames"].value = vals["train_frames"]
+        for t in TARGETS + list(EXTRA_TARGETS):
+            box = self.w.get(f"target_{t}")
+            if box is not None:
+                box.value = t in vals["lora_targets"]
+        for _ in range(2):  # the block boxes write their own text as they tick: the preset's text goes in last
+            self.w["lora_blocks"].value = vals["lora_blocks"]
+        for key in ("still_lora_targets", "still_lora_blocks"):
+            if key in self.w:
+                self.w[key].value = list(vals[key]) if isinstance(vals[key], list) else vals[key]
+        what = {"video": f"clips of {vals['train_frames']} frames train every LoRA layer on every block",
+                "photos": "pictures only; the feed-forward layers of every block train, the attention (motion) "
+                          "is left alone",
+                "mixed": f"clips of {vals['train_frames']} frames train every layer; photos train the "
+                         "feed-forward layers only"}[name]
+        ui.notify(f"{VIDEO_DATA_PRESETS[name]}: {what}", type="info")
+
+    def sync_video_data_preset(self) -> None:
+        """The "Training data" menu shows the preset the form matches (blank for a mix of one's own)."""
+        menu = self.extras.get("video_data_preset")
+        if menu is None:
+            return
+        try:
+            cfg = self.to_config()
+        except Exception:  # noqa: BLE001 - a half-filled form: leave the menu as it is
+            return
+        name = detect_video_data_preset(cfg.arch_name(), cfg)
+        if menu.value != name:
+            self.preset_sync = True
+            try:
+                menu.value = name
+            finally:
+                self.preset_sync = False
+
     def apply_family_support(self, family: str | None = None, notify: bool = False, release: bool = False) -> list[str]:
         """Grey out what the picked model cannot do (capabilities.py, the table the run-start check reads too): a
         setting it does not take is put back to its default, disabled and explained ("Not available for SDXL: ...");
@@ -2043,6 +2091,9 @@ class Form:
                           and self.w[f"target_{t}"].value],
             train_text_embedder=bool(v("train_text_embedder")), resume_from=s("resume_from"),
             lora_blocks=s("lora_blocks"),
+            still_lora_targets=[t for t in ((v("still_lora_targets") if "still_lora_targets" in self.w else None)
+                                            or []) if t],
+            still_lora_blocks=s("still_lora_blocks") if "still_lora_blocks" in self.w else "",
             lora_save_dtype=v("lora_save_dtype"), lora_ema=num("lora_ema", float),
             save_state=bool(v("save_state")), resume_state=s("resume_state"),
             save_state_every=int(v("save_state_every")), keep_states=int(v("keep_states")),
@@ -2266,6 +2317,7 @@ class Form:
             self.loading = False
         self.target_family = cfg.arch_name()
         self.apply_family_support(self.target_family, notify=True)  # a loaded setting the model refuses is reset
+        self.sync_video_data_preset()
         toggle = self.w.get("preset_toggle")
         if toggle is not None and toggle.value != (cfg.preset == "identity"):
             # the switch mirrors the loaded config's preset in both directions; setting .value fires on_change,
@@ -9700,6 +9752,18 @@ def build_page(local: bool = True):
                                 .bind_visibility_from(w["model_preset"], "value", lambda p: p == CUSTOM)
                             for key in ("model_preset", "model_path"):  # each family has its own default targets
                                 w[key].on_value_change(lambda _: f.follow_family_targets())
+                            data_menu = ui.select({"": "Choose...", **VIDEO_DATA_PRESETS}, value="",
+                                                  label="Training data").classes("w-60") \
+                                .bind_visibility_from(w["model_preset"], "value",
+                                                      lambda p: preset_arch(p, w["model_path"].value) in VIDEO_ARCHS) \
+                                .tooltip("What the dataset holds, for a video model. Video only: clips train every "
+                                         "LoRA layer. Photos only: pictures train the feed-forward layers of every "
+                                         "block and leave the attention, which carries motion, alone (adamanthy's "
+                                         "image-only recipe for MiniMax H3). Photos + video: clips train every "
+                                         "layer, batches of photos the feed-forward layers only (his mixed recipe, "
+                                         "experimental). Sets the clip frames, LoRA layers and blocks below.")
+                            f.extras["video_data_preset"] = data_menu
+                            data_menu.on_value_change(lambda e: f.apply_video_data_preset(e.value))
                             with ui.row().bind_visibility_from(w["model_source"], "value", lambda x: x == HF_SOURCE):
                                 async def on_download():
                                     dl_status.text = "Downloading / verifying... (about 30 GB on first download)"
@@ -10292,6 +10356,8 @@ def build_page(local: bool = True):
                                 for i, cb in enumerate(block_boxes):
                                     cb.value = i in sel
                                 text_from_blocks()
+                                if sel >= set(range(n_blocks())):  # every block, said: on MiniMax H3 an empty
+                                    w["lora_blocks"].value = "all"  # field trains blocks 20-49 on photos alone
 
                             block_presets = (("All", lambda n: set(range(n))), ("None", lambda n: set()),
                                              ("First half", lambda n: set(range(0, n // 2))),
@@ -10317,6 +10383,33 @@ def build_page(local: bool = True):
                                             lambda p, i=i: i < N_BLOCKS[preset_arch(p, w["model_path"].value)])
                                     block_boxes.append(cb)
                             w["lora_blocks"].on_value_change(lambda e: blocks_from_text())
+                        with ui.column().classes("w-full gap-0").bind_visibility_from(
+                                w["model_preset"], "value",
+                                lambda p: preset_arch(p, w["model_path"].value) in VIDEO_ARCHS):
+                            with advanced("Photos in a video dataset"):
+                                hint("When the dataset holds clips and photos: what a batch of photos trains. The "
+                                     "rest of the LoRA still acts on the photos but learns from the clips alone, so "
+                                     "the photos stay off the layers that make motion (adamanthy's mixed recipe "
+                                     "for MiniMax H3: feed-forward only on photos, everything on clips; he calls it "
+                                     "very experimental). Empty: photos train what clips train. With no clips in "
+                                     "the dataset these are simply the LoRA's layers and blocks.")
+                                with fields():
+                                    w["still_lora_targets"] = ui.select(TARGETS, multiple=True, value=[],
+                                                                        label="Layers photos train") \
+                                        .props("use-chips").classes("w-96 max-w-full") \
+                                        .tooltip(f"Feed-forward only: {', '.join(STILL_FFN_TARGETS)}. Each must be "
+                                                 "one of the target layers ticked above.")
+                                    w["still_lora_blocks"] = ui.input("Blocks photos train", value="",
+                                                                      placeholder="empty = the LoRA's blocks") \
+                                        .classes("w-80 max-w-full") \
+                                        .tooltip("e.g. 20-49 keeps photos out of MiniMax H3's first 20 blocks, "
+                                                 "where motion is made (Fizgig's split), while clips train every "
+                                                 "block.")
+                                    ui.button("Feed-forward only", on_click=lambda: w["still_lora_targets"].set_value(
+                                        list(STILL_FFN_TARGETS))).props("dense flat size=sm")
+                                    ui.button("Clear", on_click=lambda: (w["still_lora_targets"].set_value([]),
+                                                                         w["still_lora_blocks"].set_value(""))) \
+                                        .props("dense flat size=sm")
                         with advanced("Resume and training states"):
                             path_input(f, "resume_from", "Resume from LoRA weights (.safetensors, optional)", "file",
                                        "", "w-[40rem]")

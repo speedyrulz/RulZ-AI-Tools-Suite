@@ -3473,6 +3473,12 @@ and that leaving out the first 20 kept it (Fizgig does the same for photos). Set
 block. A resumed run (`resume_from`, `resume_state`) and a race keep the layout they have. Runs with clips train every
 block as before.
 
+**Feed-forward-only photos** (since 3.32.0). adamanthy's recipe from musubi-tuner trains photos on the feed-forward
+layers only (`include_patterns blocks.N.mlp.(fc1|fc2)`): the attention, which carries motion, is left alone, on every
+block. Here that is `lora_targets: [ffn_up_gate, ffn_down]` with `lora_blocks: all`, which the *Photos only* training
+data preset sets. With a mixed dataset, `still_lora_targets` does his mixed recipe: see
+[Mixed datasets](#mixed-datasets-photos-and-clips).
+
 **Licence.** The MiniMax H3 Community License Agreement. It excludes the USA, the EU, the UK and South Korea: users
 there must apply to MiniMax for a licence first ([application form](https://platform.minimax.io/h3-license); see the
 model card's license Q&A). Elsewhere a LoRA (a model derivative) may be shared with a copy of the agreement and the
@@ -3999,6 +4005,36 @@ video files are left out, and the log says how many. The Dataset tab's upload an
 | `train_frames` | Frames per clip at 24 frames per second. PAN 2 rounds down to 4k + 1 (49 is 2 s), MiniMax H3 up to 17n + 5 (22, 39, 56, ...: the H3 VAE encodes 17 frames into 5 latent frames). 1 = pictures only |
 | `train_video_mode` | `fps` (default): the clip is the start of the video in real time at 24 fps, so motion keeps its speed and the rest of a longer video is left out; a video too short for that is spread instead. `spread`: the whole video squeezed onto the clip's frames, evenly spaced, which speeds motion up. These are ai-toolkit's two modes (`auto_frame_count` + `trim_auto_frame_count_tail`, which it recommends for MiniMax H3, and `shrink_video_to_frames`). Trim your videos to the part you want |
 | `video_resolution` | A clip's size as a square-equivalent side in px, the video's aspect ratio kept (default 512; 0 = the run's first training resolution). A clip costs about one picture per latent frame (PAN 2: one per 4 frames, H3: 5 per 17), so a 39-frame H3 clip at 512 holds 12 latent frames |
+
+**Training data presets.** For a video model the Train tab has a *Training data* menu beside the model:
+
+| Preset | Clip frames | LoRA layers | Photos train |
+|---|---|---|---|
+| Video only | about 2 s (H3 39, PAN 2 49; a count above 1 already set stays) | every layer, every block | (no photos) |
+| Photos only | 1 (video files left out) | feed-forward only (`ffn_up_gate`, `ffn_down`), `lora_blocks: all` | the same |
+| Photos + video (mixed) | as Video only | every layer, every block | feed-forward only (`still_lora_targets`) |
+
+The menu only fills in the settings below it; change any of them afterwards and the run takes yours. Loading a config
+shows the preset it matches, or none.
+
+#### Mixed datasets (photos and clips)
+
+| Setting | What it does |
+|---|---|
+| `still_lora_targets` | The LoRA layer groups a batch of photos trains (e.g. `[ffn_up_gate, ffn_down]`). `[]` (default) = what clips train. Each must be one of `lora_targets` |
+| `still_lora_blocks` | The blocks a batch of photos trains (e.g. `20-49`, Fizgig's split for H3). `""` (default) = `lora_blocks` |
+
+adamanthy's mixed recipe for MiniMax H3: photos train the feed-forward layers, clips train attention and feed-forward
+("very experimental", in his words, but "working wonders"; his fork also keeps photos off the blocks that carry
+motion, which `still_lora_blocks` does). A batch is all photos or all clips (buckets hold one frame count). On a batch
+of photos the rest of the LoRA still acts in the forward, so the photo is rendered by the whole LoRA, and the gradient
+still flows through it to the layers before; only those weights learn nothing from the batch. Their gradient is left
+empty (not zero), so an optimizer step of photos alone does not move them through momentum or weight decay, and a clip
+earlier in the same step keeps its gradient (gradient accumulation). Masked blocks at the start of the model also let
+the backward of a photo batch stop early. With no clips in the dataset the two settings simply become the LoRA's
+layout (`lora_targets` / `lora_blocks`), so no layer is made that never trains. Not in a configuration race or a full
+fine-tune (refused at the start). With `compile_model` on, the first photo batch compiles one more graph per block
+shape.
 
 What happens to a clip:
 

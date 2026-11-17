@@ -375,6 +375,53 @@ ARCH_FULL_SAMPLE["pan2"] = (50, 2.5)
 # probe_frames). MiniMax H3 is the video + audio model, not MiniMax-H3-Image or P-H3-Image (stills only).
 VIDEO_ARCHS = VIDEO_FAMILIES  # (defined in capabilities.py, with the rest of what each family cannot do)
 
+# The Train tab's "Training data" menu for a video model: what the dataset holds sets the clip frames and which layers
+# train. Photos only: the feed-forward layers of every block (adamanthy's image-only recipe in musubi-tuner for H3,
+# include_patterns blocks.N.mlp.(fc1|fc2): the attention, which carries motion, is left alone). Mixed: clips train
+# the whole LoRA, batches of photos its feed-forward layers only (still_lora_targets; his "very experimental" mixed
+# recipe). Video only: the whole LoRA on every block.
+STILL_FFN_TARGETS = ("ffn_up_gate", "ffn_down")
+VIDEO_PRESET_FRAMES = {"minimax_h3": 39, "pan2": 49}  # about 2 s at 24 fps, on each VAE's frame grid (17n + 5, 4k + 1)
+VIDEO_DATA_PRESETS = {"video": "Video only", "photos": "Photos only", "mixed": "Photos + video (mixed)"}
+
+
+def video_data_preset(name: str, family: str, train_frames: int = 1) -> dict:
+    """The settings a "Training data" preset puts on the form for a video family. A clip preset keeps a frame count
+    already above 1 (the user's own); else about 2 seconds."""
+    if name not in VIDEO_DATA_PRESETS:
+        raise ValueError(f"unknown training data preset {name!r} (one of {', '.join(VIDEO_DATA_PRESETS)})")
+    frames = int(train_frames) if int(train_frames or 1) > 1 else VIDEO_PRESET_FRAMES.get(family, 49)
+    every = list(ARCH_DEFAULT_TARGETS.get(family, _CORE_TARGETS))
+    if name == "photos":
+        return {"train_frames": 1, "lora_targets": list(STILL_FFN_TARGETS), "lora_blocks": "all",
+                "still_lora_targets": [], "still_lora_blocks": ""}
+    if name == "mixed":
+        return {"train_frames": frames, "lora_targets": every, "lora_blocks": "",
+                "still_lora_targets": list(STILL_FFN_TARGETS), "still_lora_blocks": ""}
+    return {"train_frames": frames, "lora_targets": every, "lora_blocks": "", "still_lora_targets": [],
+            "still_lora_blocks": ""}
+
+
+def detect_video_data_preset(family: str, values) -> str:
+    """The preset the settings match ("" for none: the user's own mix). `values`: a TrainConfig or a dict."""
+    get = values.get if isinstance(values, dict) else (lambda k, d=None: getattr(values, k, d))
+    if family not in VIDEO_ARCHS:
+        return ""
+    frames = int(get("train_frames", 1) or 1)
+    targets = set(get("lora_targets") or ARCH_DEFAULT_TARGETS.get(family, _CORE_TARGETS))
+    blocks = (get("lora_blocks", "") or "").strip().lower()
+    still = set(get("still_lora_targets") or [])
+    still_blocks = (get("still_lora_blocks", "") or "").strip()
+    for name in VIDEO_DATA_PRESETS:
+        want = video_data_preset(name, family, frames)
+        if ((frames > 1) == (want["train_frames"] > 1) and targets == set(want["lora_targets"])
+                and blocks in ({"all", ""} if want["lora_blocks"] in ("all", "") else {want["lora_blocks"]})
+                and still == set(want["still_lora_targets"]) and still_blocks == want["still_lora_blocks"]):
+            if name == "photos" and blocks != "all":
+                continue  # photos without "all": H3 trains blocks 20-49 on its own, not this recipe
+            return name
+    return ""
+
 # SDXL (Stability AI's UNet, rulztrainer.sdxl): LoRA on the UNet only, as OneTrainer, ai-toolkit and Fizgig train it. Its
 # text encoders (CLIP-L and OpenCLIP bigG) read 77 tokens, so max_token_length is held at SDXL_TOKENS. The default
 # targets are Fizgig's: q/k/v/o of both attentions, the feed-forward in/out, and each Transformer2DModel's proj_in /
@@ -583,6 +630,13 @@ class TrainConfig:
     lora_dropout: float = 0.0
     lora_targets: list[str] = field(default_factory=list)  # target groups; [] = the family's (ARCH_DEFAULT_TARGETS)
     lora_blocks: str = ""  # DiT blocks to train, e.g. "0-41" (all), "21-41", "10-31,40", "even"; empty = all
+    # a video model's mixed dataset (clips and stills): the LoRA layer groups and blocks a batch of stills trains. The
+    # rest of the LoRA still runs in that batch's forward but gets no gradient from it: those layers learn from the
+    # clips alone (adamanthy's recipe in musubi-tuner: stills train the feed-forward layers, clips everything, so the
+    # photos stay off the layers that make motion). [] / "" = stills train what clips train (still_lora_blocks ""
+    # = lora_blocks). A run with no clips trains these alone, as its lora_targets / lora_blocks.
+    still_lora_targets: list[str] = field(default_factory=list)
+    still_lora_blocks: str = ""
     train_text_embedder: bool = False  # also LoRA the 2-block text projection inside the DiT
     resume_from: str = ""  # path to a previously exported LoRA .safetensors (weights only)
     # --- LoRA Isolation (isolation.py): keep the subject(s) off everyone else in a picture ---
@@ -1237,6 +1291,30 @@ class TrainConfig:
                              f"needs likeness probes (probe_every, face_refs and/or body_refs) and a probe prompt "
                              f"whose frame is known (set probe_face_expect / probe_body_expect, or add probe_checks)")
 
+    def still_masking(self) -> bool:
+        """still_lora_targets or still_lora_blocks is set (a batch of stills trains part of the LoRA)."""
+        return bool(self.still_lora_targets) or bool((self.still_lora_blocks or "").strip())
+
+    def validate_still_masking(self) -> None:
+        if not isinstance(self.still_lora_targets, (list, tuple)) or not all(
+                isinstance(t, str) for t in self.still_lora_targets):
+            raise ValueError(f"still_lora_targets must be a list of LoRA target groups, got {self.still_lora_targets!r}")
+        if not isinstance(self.still_lora_blocks, str):
+            raise ValueError(f"still_lora_blocks must be a block list such as \"20-49\", got {self.still_lora_blocks!r}")
+        if not self.still_masking():
+            return
+        if self.finetune:
+            raise ValueError("still_lora_targets / still_lora_blocks pick the LoRA layers a batch of stills trains: "
+                             "they do not apply to a full fine-tune (turn finetune off, or clear them)")
+        if self.race:
+            raise ValueError("still_lora_targets / still_lora_blocks are not available in a configuration race yet "
+                             "(clear them, or train the configuration on its own)")
+        own = set(self.resolved_lora_targets())
+        stray = [t for t in self.still_lora_targets if t not in own]
+        if stray:
+            raise ValueError(f"still_lora_targets {stray} are not among the LoRA's layers ({', '.join(sorted(own))}): "
+                             f"a batch of stills can only train layers the LoRA has (add them to lora_targets)")
+
     def validate(self) -> None:
         if min(self.sample_frames, self.probe_frames, self.train_frames) < 1:
             raise ValueError("sample_frames, probe_frames and train_frames must be 1 (a still) or more")
@@ -1248,6 +1326,7 @@ class TrainConfig:
             if self.isolation:
                 raise ValueError("LoRA Isolation builds side-by-side pictures from the dataset's photos: it does not "
                                  "take video clips (set train_frames to 1, or turn isolation off)")
+        self.validate_still_masking()
         if self.sdxl_prediction not in SDXL_PREDICTIONS:
             raise ValueError(f"sdxl_prediction must be one of {', '.join(SDXL_PREDICTIONS)}, got "
                              f"{self.sdxl_prediction!r}")
