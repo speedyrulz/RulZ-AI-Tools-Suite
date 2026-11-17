@@ -2402,7 +2402,10 @@ h1, h2, h3, .rz-pane-title { font-family: "Segoe UI Variable Display", "Segoe UI
 .rz-chip.warning { border-color: rgba(245, 158, 11, .6); color: var(--rz-warn-text); }
 .rz-chip.critical { border-color: rgba(255, 59, 48, .7); color: var(--rz-err-text); }
 .rz-chip.warning .q-icon, .rz-chip.critical .q-icon { color: inherit; }
-.rz-run { border-top: 1px solid var(--rz-border); background: var(--rz-surface); cursor: pointer; }
+/* width capped: the log line's min-content would otherwise widen the header (a column flexbox) past a phone's screen,
+   and the logo row, centred in it, slid off to the right */
+.rz-run { border-top: 1px solid var(--rz-border); background: var(--rz-surface); cursor: pointer;
+  width: 100%; max-width: 100%; min-width: 0; }
 .rz-run:hover { background: var(--rz-surface-2); }
 .rz-run-row { max-width: 1440px; margin: 0 auto; padding: 6px 20px; gap: 12px; min-height: 36px; color: var(--rz-text); }
 .rz-run-state { font-weight: 600; font-size: 14px; color: var(--rz-heading); white-space: nowrap; }
