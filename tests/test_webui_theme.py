@@ -37,3 +37,10 @@ def test_css_variables_defined_for_both_looks():
     # every themed color except the brand red is redefined for the light look (its hover and wash differ, as in
     # the launcher)
     assert set(re.findall(r"(--rz-[\w-]+):", dark_block)) - light_names == {"--rz-red"}
+
+
+def test_run_strip_cannot_widen_the_header():
+    # the header is a column flexbox: without a width cap, the run strip's long log line widened it past a phone's
+    # screen and the logo row, centred in it, slid off to the right (seen at 412 px)
+    rule = re.search(r"^\.rz-run \{([^}]*)\}", webui.THEME_CSS, re.M).group(1)
+    assert "max-width: 100%" in rule and "min-width: 0" in rule
