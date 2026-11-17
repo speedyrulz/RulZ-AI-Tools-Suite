@@ -1,0 +1,116 @@
+# FLUX.2 Klein 4B Base: unmeasured character LoRA starting recipe.
+id: flux2_klein4b
+name: FLUX.2 Klein (4B)
+kind: image
+updated: 2026-11-17
+summary: >-
+  Train on FLUX.2 Klein Base 4B and compare checkpoints on Base; the distilled 4B model is for fast sampling.
+  This recipe adapts family guidance and 9B starting settings and has not been measured on 4B. One 4B report
+  found editing degraded after about 20 epochs, so check editing and save early checkpoints.
+model_preset: FLUX-2-Klein-4B-Base
+model_path: black-forest-labs/FLUX.2-klein-base-4B
+facts:
+  - text: "The Base 4B training model and distilled black-forest-labs/FLUX.2-klein-4B sampling model are Apache 2.0 and not gated. The distilled model uses four steps."
+    confidence: DOC
+    sources: [hf_klein4b_2026_11]
+  - text: "The transformer has approximately 3.9 billion parameters, width 3072 (24 heads of 128), five double and 20 single blocks. It shares block naming, LoRA format, noise schedule and the Flux2 VAE with 9B."
+    confidence: DOC
+    sources: [hf_klein4b_2026_11]
+  - text: "The vendor says the 4B base needs about 12 GB (bf16), against about 22 GB for the 9B base."
+    confidence: DOC
+    sources: [web_bfl_f2_training_2026_01]
+  - text: "Qwen3-4B has 2560 hidden dimensions and three stacked layers (7680 text features); its bf16 weights are estimated at about 8 GB, versus about 16 GB for Qwen3-8B. These are weight estimates, not training VRAM measurements."
+    confidence: GUESS
+    sources: []
+  - text: "ComfyUI files are in Comfy-Org/Flux-2-Klein-4B: split_files/diffusion_models/flux-2-klein-base-4b.safetensors, split_files/text_encoders/qwen_3_4b.safetensors and split_files/vae/flux2-vae.safetensors."
+    confidence: DOC
+    sources: [hf_klein4b_2026_11]
+  - text: "Use descriptive captions for the scene and changing features, and vary pose, angle and lighting. The vendor recommends Base for training and distilled for fast inference."
+    confidence: DOC
+    sources: [web_bfl_f2_training_2026_01]
+  - text: "One 4B finetune report found editing degraded after about 20 epochs; this is a single report, not a measured limit for this recipe."
+    confidence: REP
+    sources: [f2_4b_2026_06]
+base:
+  network_type: {value: lora, why: "Plain LoRA is a family starting point, unmeasured on 4B here.", confidence: GUESS, sources: []}
+  lora_rank: {value: 16, why: "Start with the 9B rank; its suitability for 4B is unmeasured.", confidence: GUESS, sources: []}
+  lora_alpha: {value: 16.0, why: "Keep alpha equal to rank; unmeasured on 4B.", confidence: GUESS, sources: []}
+  optimizer: {value: adamw8bit, why: "An 8-bit AdamW starting point carried over from 9B; unmeasured on 4B.", confidence: GUESS, sources: []}
+  learning_rate: {value: 5.0e-5, why: "Conservative 9B starting point; the vendor suggests lowering to this rate if training collapses. Unmeasured on 4B.", confidence: GUESS, sources: [web_bfl_f2_training_2026_01]}
+  lr_scheduler: {value: constant, why: "Family starting point; unmeasured on 4B.", confidence: GUESS, sources: []}
+  timestep_sampling: {value: reference, why: "The same family noise schedule as 9B; this setting is unmeasured on 4B.", confidence: GUESS, sources: []}
+  batch_size: {value: 1, why: "Conservative memory starting point; unmeasured on 4B.", confidence: GUESS, sources: []}
+  resolutions: {value: [0.25, 0.5, 1.0], why: "The vendor suggests starting at 512 for iteration and using 1024+ images; these mixed buckets are unmeasured on 4B.", confidence: GUESS, sources: [web_bfl_f2_training_2026_01]}
+  isolation: {value: false, why: "Start without isolation; its benefit on 4B is unmeasured.", confidence: GUESS, sources: []}
+  turbo_lora: {value: "", why: "Compare on Base without a turbo LoRA; no 4B distillation LoRA is assumed.", confidence: GUESS, sources: []}
+  sample_steps: {value: 50, why: "RulZ AI Trainer's Klein 4B Base default (the diffusers Klein pipeline's 50 steps); unmeasured on 4B.", confidence: GUESS, sources: []}
+  sample_cfg: {value: 4.0, why: "RulZ AI Trainer's Klein 4B Base default (the diffusers Klein pipeline's guidance 4.0); unmeasured on 4B.", confidence: GUESS, sources: []}
+  probe_steps: {value: 50, why: "Match Base previews; unmeasured on 4B.", confidence: GUESS, sources: []}
+  probe_cfg: {value: 4.0, why: "Match Base previews; unmeasured on 4B.", confidence: GUESS, sources: []}
+  probe_seeds: {value: 4, why: "Multiple seeds help compare checkpoints; unmeasured on 4B.", confidence: GUESS, sources: []}
+steps:
+  epochs: 20
+  min: 500
+  max: 3000
+  round_to: 50
+  why: "An unmeasured starting budget, chosen to inspect early checkpoints because one 4B report described degraded editing after about 20 epochs. The minimum and crop augmentation can cause more than 20 dataset passes; check editing throughout."
+  confidence: GUESS
+  sources: [f2_4b_2026_06, web_bfl_f2_training_2026_01]
+adjust:
+  - id: tiny_dataset
+    when: {images_max: 14}
+    set:
+      lora_rank: {value: 8, why: "A smaller adapter may reduce overfitting; unmeasured on 4B.", confidence: GUESS, sources: []}
+      lora_alpha: {value: 8.0, why: "Keep alpha equal to rank; unmeasured on 4B.", confidence: GUESS, sources: []}
+    note: "A small dataset and the minimum step count can require many passes; inspect early checkpoints and editing."
+  - id: goal_quick
+    when: {goal: quick}
+    set:
+      resolutions: {value: [0.5], why: "The vendor suggests 512 for iteration; unmeasured here on 4B.", confidence: GUESS, sources: [web_bfl_f2_training_2026_01]}
+  - id: no_captions
+    when: {has_captions: false}
+    set:
+      caption_dropout: {value: 0.0, why: "There are few caption files to drop.", confidence: GUESS, sources: []}
+    note: "Write descriptive captions of the scene and what changes."
+evaluate:
+  strength: "Start at 1.0; compare the same strength across checkpoints."
+  sampler: "Compare on Base and separately test the distilled 4B model; no 4B distillation LoRA is assumed."
+  steps: "Base preview: 50 (the diffusers Klein pipeline default) as an unmeasured starting point; distilled 4B: 4."
+  cfg: "Base: 4.0 (the diffusers Klein pipeline default) as an unmeasured starting point; distilled: 1 as a family starting point."
+  notes:
+    - "Save and compare early checkpoints for likeness, prompt following and editing; 4B results have not been measured here."
+    - "Test a new prompt, a full-body shot and another person."
+flaws:
+  - symptom: out_of_memory
+    causes: ["Model weights and training activations exceed available memory; exact 4B requirements are unmeasured here."]
+    fixes:
+      - set: {resolutions: {value: [0.25, 0.5]}}
+        why: "Smaller buckets can reduce activation memory; the effect on 4B has not been measured here."
+        confidence: GUESS
+        sources: []
+open_questions:
+  - "What rank, learning rate, step budget and sampling settings work best for 4B character LoRAs? None has been measured here."
+  - "Does the reported loss of editing generalize to LoRA training and this dataset? Compare early checkpoints."
+  - "Actual training VRAM, quantization needs and quality on 4B remain unmeasured."
+sources:
+  hf_klein4b_2026_11:
+    kind: official
+    where: "Hugging Face: black-forest-labs/FLUX.2-klein-base-4B and FLUX.2-klein-4B (model cards, transformer and text_encoder config.json), Comfy-Org/Flux-2-Klein-4B (file list)"
+    date: "2026-11"
+    people: null
+    url: https://huggingface.co/black-forest-labs/FLUX.2-klein-base-4B
+    note: "Apache 2.0, not gated; transformer 24 heads x 128, 5 double + 20 single blocks, joint_attention_dim 7680; Qwen3-4B text encoder (hidden 2560); Comfy-Org split_files layout."
+  f2_4b_2026_06:
+    kind: community
+    where: "AI Toolkit Discord #training"
+    date: "2026-06"
+    people: 1
+    url: null
+    note: "Klein 4B: a four-week finetune got worse and editing dies after about 20 epochs."
+  web_bfl_f2_training_2026_01:
+    kind: official
+    where: "Black Forest Labs documentation: FLUX.2 Klein training"
+    date: "2026-01"
+    people: null
+    url: https://docs.bfl.ml/flux_2/flux2_klein_training
+    note: "Undated page. LoRA LR 8e-5 to 1e-4; characters 1,500-3,000 steps; vary pose, angle and lighting; start at 512."
