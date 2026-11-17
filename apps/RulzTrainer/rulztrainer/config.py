@@ -1488,7 +1488,7 @@ class TrainConfig:
 
     def validate_sdxl(self) -> None:
         """What an SDXL run cannot do (v1 is a LoRA on the UNet): each refusal names the setting, none is a silent
-        no-op. "auto" settings that name nothing for SDXL (transformer_quant, compile_model, the downloads, the
+        no-op. "auto" settings that name nothing for SDXL (transformer_quant, the downloads, the
         checkpointing's kept blocks) resolve to off; a fresh SDXL config trips none of these. The refusals are the
         table in capabilities.py (transformer_quant: auto, none, int8 or int8_convrot); the rest here is rewritten, not refused."""
         no = ValueError

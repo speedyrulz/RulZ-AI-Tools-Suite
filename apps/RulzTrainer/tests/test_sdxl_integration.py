@@ -48,12 +48,13 @@ def test_registry_and_attributes():
     assert arch.default_targets == ("q", "k", "v", "o", "ffn_up_gate", "ffn_down", "proj")
     assert set(arch.target_groups) == set(arch.default_targets)
     assert arch.supports_single_files and arch.weighted_dop and arch.reference_exact_curriculum
-    assert arch.reference_sigmas_exact and not arch.supports_kept_blocks and not arch.supports_compile
+    assert arch.reference_sigmas_exact and not arch.supports_kept_blocks and arch.supports_compile
     assert arch.max_text_tokens == 77 and not arch.linear_blocks
     assert get_arch(sdxl_cfg()) is arch
     assert arch.lora_metadata() == {"modelspec.architecture": "stable-diffusion-xl-v1-base/lora",
                                     "ss_base_model_version": "sdxl_base_v1-0"}
-    assert arch.compile_blocks(object()) == []
+    facade = types.SimpleNamespace(layers=[object(), object()])
+    assert arch.compile_blocks(facade) == facade.layers
 
 
 def test_saved_lora_metadata_comes_from_the_arch():
@@ -169,7 +170,6 @@ REFUSALS = [
     ({"optimizer": "hull", "hull_rho": 0.01}, "hull"),
     ({"training_maps": True}, "training_maps"),
     ({"transformer_quant": "nvfp4"}, "transformer_quant"),
-    ({"compile_model": True}, "compile_model"),
     ({"train_frames": 4}, "train_frames"),
     ({"loss_type": "band"}, "loss_type"),
     ({"loss_weighting": "sigma_sqrt"}, "sigma_sqrt"),

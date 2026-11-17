@@ -445,6 +445,8 @@ def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None
         model = load_unet_dir(d, dev, pred, ztsnr, quant=quant)
     log.info("Loaded SDXL UNet: %d transformer blocks, %s prediction%s", len(model.layers), pred,
              ", zero terminal SNR" if ztsnr else "")
+    if _norm_quant(quant) in ("int8", "int8_convrot"):
+        log.info("SDXL's 2.6B UNet fits in bf16 on 8 GB+ cards (about 5 GB); int8 makes steps slower on most PCs because each quantized Linear runs extra kernels (2.4 s vs 1.44 s per 512 px LoRA step on an RTX 5060 Ti). Use transformer_quant none for speed unless VRAM is short.")
     return model
 
 

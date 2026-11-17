@@ -90,7 +90,7 @@ def _forbid(key, reason, *values, default) -> Rule:
 
 
 # SDXL (a LoRA on the UNet): each rule is one refusal. "auto" settings that name nothing for SDXL (transformer_quant,
-# compile_model, the downloads, the checkpointing's kept blocks) resolve to off; a fresh SDXL config trips none of them.
+# the downloads, the checkpointing's kept blocks) resolve to off; a fresh SDXL config trips none of them.
 _SDXL = [
     _only("block_swap", "the UNet is not swapped block by block (its 2.6B weights fit a 12 GB card)", 0),
     _forbid("multi_gpu", "the UNet cannot be split across GPUs here (use off or data_parallel)", "model_split",
@@ -113,8 +113,6 @@ _SDXL = [
                                "UNet's attention and feed-forward linears)", "auto", "none", "int8", "int8_convrot"),
     _only("sample_model_quant", "nvfp4 is not available for SDXL's UNet; use auto, none, int8 or int8_convrot",
           "auto", "none", "int8", "int8_convrot"),
-    _forbid("compile_model", "true is not available (the UNet is not compiled; auto and false run it eagerly)", True,
-            default="auto"),
     _only("loss_type", "its loss is the model's own epsilon / v-prediction MSE; use mse", "mse"),
     _forbid("loss_weighting", "sigma_sqrt is a flow-matching weight with no meaning for SDXL's epsilon / "
                               "v-prediction loss; use none or min_snr", "sigma_sqrt", default="none"),
