@@ -11,6 +11,18 @@ def test_recommend(knowledge, dataset):
     assert rec.config()['datasets'][0]['trigger'] == dataset.name  # the folder name, not the captions' first word
 
 
+def test_flux2_klein4b():
+    from rulz_optimizer.knowledge import load
+    knowledge = load()
+    model = knowledge.models['flux2_klein4b']
+    rec = recommend(knowledge, model.id, None, Goals())
+    assert rec.config()['model_arch'] == 'flux2_klein4b'
+    assert rec.config()['model_path'] == 'black-forest-labs/FLUX.2-klein-base-4B'
+    assert rec.config()['lora_rank'] == 16
+    assert rec.config()['timestep_sampling'] == 'reference'
+    assert rec.config()['turbo_lora'] == ''
+
+
 def test_variant(knowledge):
     rec = recommend(knowledge, 'minimax_h3', None, Goals(variant='ref2va'))
     assert rec.config()['model_path'].endswith('#ref2va')

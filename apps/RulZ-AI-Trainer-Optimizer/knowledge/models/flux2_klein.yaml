@@ -9,8 +9,8 @@ summary: >-
   October 2026 (a checkpoint at 200 steps beat FLUX.3 at 7,500). Train on Base and judge on Base: the distilled model looks
   too polished and the likeness slips. The best-supported start is a LOW learning rate (1e-5 to 2e-5 gave likeness at
   1,000-1,500 steps on about 30 images) against the vendor and the trainer's 1e-4, so the file starts between them at
-  5e-5 and notes both sides. High rates, Prodigy and 3e-4 collapse or deform bodies. Do not train characters on the 4B
-  model, whose editing dies after about 20 epochs.
+  5e-5 and notes both sides. High rates, Prodigy and 3e-4 collapse or deform bodies. Prefer 9B for characters: one report
+  says a 4B finetune's editing died after about 20 epochs (4B has its own, unmeasured file, flux2_klein4b).
 model_preset: FLUX-2-Klein-9B-Base
 model_path: black-forest-labs/FLUX.2-klein-base-9B
 facts:
@@ -314,7 +314,7 @@ open_questions:
   - "Rank and timestep for a person were never settled; no Klein 9B character report states a timestep."
   - "Differential guidance, DOP and regularisation are all disputed on Klein; differential guidance is not a RulZ AI Trainer setting."
   - "The trainer's own turbo LoRA (rank 256, 4 steps) has never been tried on real weights; the Base-only sampling used here is slow."
-  - "Does Klein's body deformation come from the rate or from Klein 9B itself? A 4B model is not an alternative (editing dies)."
+  - "Does Klein's body deformation come from the rate or from Klein 9B itself? Is the 4B model (flux2_klein4b) an alternative? One report says its editing dies after about 20 epochs; unmeasured here."
 sources:
   f2_lowlr_2026_01:
     kind: community

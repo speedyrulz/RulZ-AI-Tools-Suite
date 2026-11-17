@@ -54,7 +54,7 @@ apps/RulZ-AI-Trainer-Optimizer/
 
 ## Arch ids
 
-Exactly RulZ AI Trainer's `ARCH_NAMES`: `moss_image fibo2 krea2 qwen_image21 flux3_klein flux2_klein ideogram4
+Exactly RulZ AI Trainer's `ARCH_NAMES`: `moss_image fibo2 krea2 qwen_image21 flux3_klein flux2_klein flux2_klein4b ideogram4
 minimax_h3 p_h3_image minimax_h3_image pan2 sdxl`. `minimax_h3` covers both FL2VA and Ref2VA (`model_path`
 `MiniMaxAI/MiniMax-H3` or `MiniMaxAI/MiniMax-H3#ref2va`); a model file may define `variants` for that.
 

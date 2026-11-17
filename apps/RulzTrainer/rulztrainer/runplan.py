@@ -31,11 +31,14 @@ import os
 import re
 from pathlib import Path
 
-# The transformer class of each family: (module under rulztrainer, class). The H3 image variants train the same
+# Klein 4B is the 9B's class at its own size (3072 wide, 24 heads, 5 double + 20 single blocks, 7680 text features)
+KLEIN_4B_CONFIG = dict(context_in_dim=7680, hidden_size=3072, num_heads=24, depth=5, depth_single_blocks=20)
+# The transformer class of each family: (module under rulztrainer, class[, constructor arguments]). The H3 image variants train the same
 # transformer blocks as MiniMax H3 (their differences are the audio stream and the AdaLN tables, which hold no LoRA).
 FAMILY_MODEL = {"moss_image": ("moss", "MOSSImageTransformer"), "fibo2": ("fibo", "FiboTransformer"),
                 "krea2": ("krea2", "Krea2Transformer"), "qwen_image21": ("qwen21", "QwenImage21Transformer"),
                 "flux3_klein": ("flux3", "Flux3KleinTransformer"), "flux2_klein": ("flux2", "Flux2KleinTransformer"),
+                "flux2_klein4b": ("flux2", "Flux2KleinTransformer", KLEIN_4B_CONFIG),
                 "ideogram4": ("ideogram4", "Ideogram4Transformer"), "minimax_h3": ("h3", "MiniMaxH3Transformer"),
                 "p_h3_image": ("h3", "MiniMaxH3Transformer"), "minimax_h3_image": ("h3", "MiniMaxH3Transformer"),
                 "pan2": ("pan2", "PAN2Transformer"), "sdxl": ("sdxl", "SdxlUNet")}
@@ -108,10 +111,10 @@ def target_shapes(family: str, targets: tuple[str, ...], blocks_spec: str = "",
         from .archs import _ARCHS
         from .lora import parse_blocks
 
-        module, cls = FAMILY_MODEL[family]
+        module, cls, *kwargs = FAMILY_MODEL[family]
         model_cls = getattr(importlib.import_module(f".{module}.model", __package__), cls)
         with torch.device("meta"):
-            model = model_cls()
+            model = model_cls(**(kwargs[0] if kwargs else {}))
         arch = _ARCHS[family]()
         blocks = parse_blocks(blocks_spec, len(model.layers))
         names = arch.lora_module_names(model, list(targets), blocks, text_embedder)

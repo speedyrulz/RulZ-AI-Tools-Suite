@@ -31,6 +31,10 @@ DIT_PREFIXES = ("model.diffusion_model.", "diffusion_model.")
 MARKER = "double_stream_modulation_img.lin.weight"  # Flux 1 has no such key; FLUX.2 dev has it too (see check_klein9b)
 DIFFUSERS_MARKER = "double_stream_modulation_img.linear.weight"
 TEXT_DIM_9B = 12288  # Qwen3-8B's three stacked layers; FLUX.2 dev reads Mistral (15360), Klein 4B Qwen3-4B (7680)
+TEXT_DIM_4B = 7680  # Qwen3-4B's three stacked layers (3 x 2560)
+SIZES = ("9b", "4b")
+# the model entry (arch name) and label of each size: what an error names when a file is the other size
+SIZE_ENTRY = {"9b": ("flux2_klein", "FLUX.2 Klein 9B"), "4b": ("flux2_klein4b", "FLUX.2 Klein 4B")}
 
 # Qwen/Qwen3-8B's config.json (the text model's part)
 TEXT_CONFIG = dict(vocab_size=151936, hidden_size=4096, intermediate_size=12288, num_hidden_layers=36,
@@ -39,10 +43,13 @@ TEXT_CONFIG = dict(vocab_size=151936, hidden_size=4096, intermediate_size=12288,
                    attention_dropout=0.0, use_sliding_window=False, sliding_window=None, tie_word_embeddings=False,
                    bos_token_id=151643, eos_token_id=151645, rope_parameters={"rope_type": "default",
                                                                               "rope_theta": 1000000.0})
-# loading.SELECT_LAYERS reads layers 9, 18 and 27: the last 9 of the 36 never reach a feature, so they are not built
-# (about 3.5 GB of bf16 weights)
+# Qwen/Qwen3-4B's config.json (Klein 4B's text encoder): 2560 wide, 36 layers, tied embeddings (the LM head is not read)
+TEXT_CONFIG_4B = dict(TEXT_CONFIG, hidden_size=2560, intermediate_size=9728, tie_word_embeddings=True)
+# loading.SELECT_LAYERS reads layers 9, 18 and 27 (diffusers' Flux2KleinPipeline default for both sizes): the last 9 of
+# the 36 never reach a feature, so they are not built (about 3.5 GB of bf16 weights for 8B)
 TE_LAYERS = 27
 TOKENIZER_REPO = "Qwen/Qwen3-8B"
+TOKENIZER_REPO_4B = "Qwen/Qwen3-4B"  # the same tokenizer family: the fallback for a 4B single-file run
 TOKENIZER_FILES = ["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"]
 
 _EXACT = {"x_embedder": "img_in", "context_embedder": "txt_in",
@@ -91,14 +98,15 @@ def diffusers_to_bfl(state: dict) -> dict:
     return out
 
 
-def to_model_layout(state: dict) -> dict:
-    """A DiT state dict (BFL's or diffusers' layout, prefixes stripped) in the port's names."""
+def to_model_layout(state: dict, size: str | None = "9b") -> dict:
+    """A DiT state dict (BFL's or diffusers' layout, prefixes stripped) in the port's names. size: the Klein size the
+    caller trains ("9b" or "4b"; None accepts either): a file of the other size is refused, naming its model entry."""
     if DIFFUSERS_MARKER in state:
         state = diffusers_to_bfl(state)
     elif MARKER not in state:
         raise ValueError("not a FLUX.2 Klein diffusion model (no double_stream_modulation_img)")
     state = {k: v for k, v in state.items() if not k.endswith(".input_scale")}  # the fp8 repos' activation scales
-    return norm_scales_fp32(check_klein9b(state))
+    return norm_scales_fp32(check_klein_size(state, size))
 
 
 def norm_scales_fp32(state: dict) -> dict:
@@ -110,13 +118,34 @@ def _shape(v) -> tuple:
     return tuple(v.orig_shape) if isinstance(v, Q.QuantWeight) else tuple(v.shape)
 
 
-def check_klein9b(state: dict) -> dict:
-    """Only Klein 9B trains here: FLUX.2 dev and Klein 4B need another text encoder than this family's."""
+def klein_size(state: dict) -> str:
+    """"9b" or "4b" by the width of the text features the DiT reads (txt_in): 12288 is Qwen3-8B's three stacked
+    layers, 7680 Qwen3-4B's. FLUX.2 dev (Mistral, 15360, and a guidance embedding) and anything else raise."""
     text_dim = _shape(state["txt_in.weight"])[1]
-    if text_dim != TEXT_DIM_9B or "guidance_in.in_layer.weight" in state:
-        raise ValueError(f"this is not FLUX.2 Klein 9B (text features of {text_dim}, 9B has {TEXT_DIM_9B}): FLUX.2 dev "
-                         "and Klein 4B are not supported")
+    if "guidance_in.in_layer.weight" in state or text_dim not in (TEXT_DIM_9B, TEXT_DIM_4B):
+        raise ValueError(f"text features of {text_dim} (Klein 9B has {TEXT_DIM_9B} and Klein 4B {TEXT_DIM_4B}), or a "
+                         "guidance embedding: FLUX.2 dev is not supported")
+    return "9b" if text_dim == TEXT_DIM_9B else "4b"
+
+
+def check_klein_size(state: dict, size: str | None = "9b") -> dict:
+    """The state dict when it is FLUX.2 Klein of `size`; else a ValueError naming the model entry it belongs to."""
+    try:
+        found = klein_size(state)
+    except ValueError as e:
+        if size is None:
+            raise
+        raise ValueError(f"this is not {SIZE_ENTRY[size][1]}: {e}") from e
+    if size is not None and found != size:
+        entry, label = SIZE_ENTRY[found]
+        raise ValueError(f"this is not {SIZE_ENTRY[size][1]} but {label} (text features of "
+                         f"{_shape(state['txt_in.weight'])[1]}): pick the {label} model ({entry})")
     return state
+
+
+def check_klein9b(state: dict) -> dict:
+    """The state dict when it is Klein 9B (kept for callers that name the size)."""
+    return check_klein_size(state, "9b")
 
 
 def _count(state: dict, pattern: str) -> int:
@@ -149,14 +178,15 @@ def is_flux2_state(keys) -> bool:
 
 
 def load_transformer_file(path: str | Path, device, quant: str = "auto", dtype=torch.bfloat16,
-                          quant_devices=None) -> Flux2KleinTransformer:
+                          quant_devices=None, size: str | None = "9b") -> Flux2KleinTransformer:
     """quant "auto" keeps a quantized file's format; a float file (bf16, or fp8 read up to bf16) is quantized for the
-    memory it will run in (quant_devices: the GPUs of a model split)."""
+    memory it will run in (quant_devices: the GPUs of a model split). size: "9b" or "4b" (None: either); a file of the
+    other size is refused."""
     from .loading import QUANT_FILTER, resolve_quant
 
     state = sf.strip_prefix(sf.read_state(path, dtype), DIT_PREFIXES)
     try:
-        state = to_model_layout(state)
+        state = to_model_layout(state, size)
     except ValueError as e:
         raise ValueError(f"{Path(path).name}: {e}") from e
     config = transformer_config_from_state(state)
@@ -177,8 +207,13 @@ def load_transformer_file(path: str | Path, device, quant: str = "auto", dtype=t
 # ---------------------------------------------------------------- text encoder (Qwen3-8B) and tokenizer
 
 
-def build_text_model(state: dict, quant: str = "none", work_device=None):
-    """Text-only Qwen3-8B, its first TE_LAYERS layers without the final norm, from an HF-style state dict, which is
+def text_config(size: str | None) -> dict:
+    """The Qwen3 config of a Klein size's text encoder (None: the 9B's, TEXT_CONFIG)."""
+    return TEXT_CONFIG_4B if size == "4b" else TEXT_CONFIG
+
+
+def build_text_model(state: dict, quant: str = "none", work_device=None, config: dict | None = None):
+    """Text-only Qwen3-8B (or the 4B with config=TEXT_CONFIG_4B), its first TE_LAYERS layers without the final norm, from an HF-style state dict, which is
     consumed (the layers past the cut and the norm are dropped unread). work_device: where to quantize. Its quantized
     layers run weight-only (moss.single_file.weight_only).
 
@@ -187,8 +222,9 @@ def build_text_model(state: dict, quant: str = "none", work_device=None):
     full model (ComfyUI, diffusers and ai-toolkit read it unnormed)."""
     from transformers import Qwen3Config, Qwen3Model
 
-    keep = min(TE_LAYERS, int(TEXT_CONFIG["num_hidden_layers"]))
-    cfg = Qwen3Config(**{**TEXT_CONFIG, "num_hidden_layers": keep})
+    config = TEXT_CONFIG if config is None else config
+    keep = min(TE_LAYERS, int(config["num_hidden_layers"]))
+    cfg = Qwen3Config(**{**config, "num_hidden_layers": keep})
     state = sf.strip_prefix(sf.take_state(state, ("lm_head.",)), ("model.",))
     for k in list(state):
         if k.startswith("norm.") or (k.startswith("layers.") and int(k.split(".")[1]) >= keep):
@@ -206,8 +242,9 @@ def build_text_model(state: dict, quant: str = "none", work_device=None):
     return sf.weight_only(model).eval().requires_grad_(False)
 
 
-def load_text_encoder_file(path: str | Path, device: str = "auto", quant: str = "auto"):
-    """Comfy-Org's qwen_3_8b*.safetensors (bf16, fp8mixed read up to bf16)."""
+def load_text_encoder_file(path: str | Path, device: str = "auto", quant: str = "auto", size: str | None = "9b"):
+    """Comfy-Org's qwen_3_8b*.safetensors (Klein 9B) or qwen_3_4b.safetensors (Klein 4B; bf16, fp8mixed read up to
+    bf16). size: which one the model expects; the other is refused by name."""
     from ..fibo.loading import place_text_encoder
     from .loading import resolve_text_quant
 
@@ -215,26 +252,38 @@ def load_text_encoder_file(path: str | Path, device: str = "auto", quant: str = 
     state = sf.read_state(path, torch.bfloat16)
     if not any(k.endswith("layers.0.self_attn.q_proj.weight") for k in state):
         raise ValueError(f"{Path(path).name} is not a Qwen3 text encoder")
-    model = build_text_model(state, fmt, sf.quant_target(device).get("work_device"))
+    config = text_config(size)
+    embed = state.get("model.embed_tokens.weight", state.get("embed_tokens.weight"))
+    if embed is not None and size is not None and int(embed.shape[-1]) != int(config["hidden_size"]):
+        have = "9b" if int(embed.shape[-1]) == int(TEXT_CONFIG["hidden_size"]) else "4b" if int(
+            embed.shape[-1]) == int(TEXT_CONFIG_4B["hidden_size"]) else None
+        raise ValueError(f"{Path(path).name} is not the text encoder of {SIZE_ENTRY[size][1]} (Qwen3 of width "
+                         f"{int(embed.shape[-1])}, Klein {size.upper()} reads {int(config['hidden_size'])})" + (
+                             f": it is {SIZE_ENTRY[have][1]}'s" if have else ""))
+    model = build_text_model(state, fmt, sf.quant_target(device).get("work_device"), config)
     del state
     return place_text_encoder(model, device)
 
 
-def resolve_tokenizer(tokenizer_path: str, models_dir: str = "models") -> Path:
-    """The Qwen3-8B tokenizer folder: the given one, a downloaded Klein repo's tokenizer/, else Qwen/Qwen3-8B's files
-    (downloaded once, a few MB; not gated)."""
+def resolve_tokenizer(tokenizer_path: str, models_dir: str = "models", size: str | None = "9b") -> Path:
+    """The Qwen3 tokenizer folder: the given one, a downloaded Klein repo's tokenizer/ (the size's own first), else
+    Qwen/Qwen3-8B's files (Qwen/Qwen3-4B's for Klein 4B), downloaded once, a few MB; not gated."""
     if tokenizer_path:
         p = Path(tokenizer_path).expanduser()
         for cand in (p, p / "tokenizer"):
             if (cand / "tokenizer_config.json").is_file():
                 return cand
         raise FileNotFoundError(f"No tokenizer_config.json under {p}")
-    for cand in sorted(Path(models_dir).glob("black-forest-labs__FLUX.2-klein*/tokenizer/tokenizer_config.json")):
-        return cand.parent
-    local = Path(models_dir) / "tokenizer__Qwen3-8B"
+    own = "4B" if size == "4b" else "9B"
+    for pattern in (f"black-forest-labs__FLUX.2-klein*{own}*/tokenizer/tokenizer_config.json",
+                    "black-forest-labs__FLUX.2-klein*/tokenizer/tokenizer_config.json"):
+        for cand in sorted(Path(models_dir).glob(pattern)):
+            return cand.parent
+    repo = TOKENIZER_REPO_4B if size == "4b" else TOKENIZER_REPO
+    local = Path(models_dir) / f"tokenizer__{repo.split('/')[-1]}"
     if not (local / "tokenizer_config.json").is_file():
         from huggingface_hub import snapshot_download
 
-        log.info("Downloading the Qwen3-8B tokenizer to %s", local)
-        snapshot_download(TOKENIZER_REPO, local_dir=str(local), allow_patterns=TOKENIZER_FILES)
+        log.info("Downloading the %s tokenizer to %s", repo.split("/")[-1], local)
+        snapshot_download(repo, local_dir=str(local), allow_patterns=TOKENIZER_FILES)
     return local

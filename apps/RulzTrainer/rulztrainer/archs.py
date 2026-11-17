@@ -30,6 +30,7 @@ log = logging.getLogger("rulztrainer")
 
 ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "flux3_klein")
 ARCH_NAMES += ("flux2_klein",)
+ARCH_NAMES += ("flux2_klein4b",)
 ARCH_NAMES += ("ideogram4",)
 ARCH_NAMES += ("minimax_h3",)
 ARCH_NAMES += ("p_h3_image",)
@@ -950,6 +951,34 @@ class Flux2KleinArch(Arch):
 _ARCHS["flux2_klein"] = Flux2KleinArch
 
 
+class Flux2Klein4bArch(Flux2KleinArch):
+    """FLUX.2 Klein 4B: the 9B's port, LoRA format and sampler with a 3072-wide DiT (5 double + 20 single blocks) and
+    the Qwen3-4B text encoder (the same layers 9, 18, 27: 3 x 2560 = 7680 features). Only the size-dependent loading
+    differs (flux2.loading.sized); the Flux2 VAE and its latents are shared with the 9B."""
+
+    name = "flux2_klein4b"
+    label = "FLUX.2 Klein 4B"
+    modelspec = "Flux.2-klein-4b"
+    n_blocks = 25  # 5 double + 20 single, double_blocks.N = N, single_blocks.N = 5 + N
+    default_targets = ARCH_DEFAULT_TARGETS["flux2_klein4b"]
+    supports_single_files = True  # BFL's bf16 files; Comfy-Org's Qwen3-4B and Flux2 VAE
+    default_sample_steps, default_sample_cfg = ARCH_FULL_SAMPLE["flux2_klein4b"]
+
+    def __init__(self):
+        from .flux2 import loading
+
+        self._loading = loading.sized("4b")
+
+    def distilled_sample_model(self, path: str) -> bool:
+        """The 4-step distilled Klein 4B (FLUX.2-klein-4B, flux-2-klein-4b*.safetensors): no "base"."""
+        from .flux2.single_file import is_distilled_name
+
+        return is_distilled_name(path)
+
+
+_ARCHS["flux2_klein4b"] = Flux2Klein4bArch
+
+
 class Ideogram4Arch(Arch):
     name = "ideogram4"
     label = "Ideogram 4"
@@ -1766,6 +1795,16 @@ def arch_by_name(name: str) -> Arch:
 _FILE_ARCH_CACHE: dict[tuple, str | None] = {}
 
 
+def _klein2_family_of_file(f) -> str:
+    """A FLUX.2 diffusion file's family by the width of the text features it reads (txt_in, or diffusers'
+    context_embedder): 7680 is Klein 4B's, anything else the 9B's (flux2.single_file refuses FLUX.2 dev by name)."""
+    for k in f.keys():
+        if k.split("diffusion_model.", 1)[-1] in ("txt_in.weight", "context_embedder.weight"):
+            shape = tuple(f.get_slice(k).get_shape())
+            return "flux2_klein4b" if len(shape) == 2 and shape[1] == 7680 else "flux2_klein"
+    return "flux2_klein"
+
+
 def arch_from_transformer_file(path: str) -> str | None:
     """The family a single diffusion-model file holds, read from its safetensors header (None: unknown, or the file
     cannot be read). Cached per path, size and modification time."""
@@ -1782,6 +1821,7 @@ def arch_from_transformer_file(path: str) -> str | None:
 
             with safe_open(str(p), "pt") as f:
                 names = {k.split("diffusion_model.", 1)[-1] for k in f.keys()}
+                klein2 = _klein2_family_of_file(f)  # (9B or 4B, used if the keys say FLUX.2 Klein)
             if "txtfusion.projector.weight" in names or "text_fusion.projector.weight" in names:
                 found = "krea2"
             elif "txt_in.text_norm.weight" in names and "modulation.1.weight" in names:
@@ -1795,7 +1835,7 @@ def arch_from_transformer_file(path: str) -> str | None:
                 found = "flux3_klein"
             elif "double_stream_modulation_img.lin.weight" in names or \
                     "double_stream_modulation_img.linear.weight" in names:
-                found = "flux2_klein"
+                found = klein2
             elif "embed_image_indicator.weight" in names and "llm_cond_proj.weight" in names:
                 found = "ideogram4"
             elif "video_patch_proj.weight" in names and "audio_patch_proj.weight" in names:
@@ -1850,8 +1890,10 @@ def detect_arch(cfg: TrainConfig, model_dir: Path | None) -> Arch:
     """The Arch for a resolved model directory (its transformer/config.json), falling back to the config's."""
     guessed = guess_arch_name(cfg)
     if model_dir is not None:
+        tconf = {}
         try:
-            cls = json.loads((Path(model_dir) / "transformer" / "config.json").read_text(encoding="utf-8")).get("_class_name")
+            tconf = json.loads((Path(model_dir) / "transformer" / "config.json").read_text(encoding="utf-8"))
+            cls = tconf.get("_class_name")
         except (OSError, ValueError):
             cls = None
         if cls is None:  # SDXL's diffusers folder has unet/ where the others have transformer/
@@ -1870,6 +1912,8 @@ def detect_arch(cfg: TrainConfig, model_dir: Path | None) -> Arch:
                  "MiniMaxH3Transformer3DModel": "minimax_h3", "MiniMaxH3DiTModel": "minimax_h3",
                  "MiniMaxH3ImageTransformer2DModel": "minimax_h3_image",
                  "PAN2Transformer3DModel": "pan2", "UNet2DConditionModel": "sdxl"}.get(cls)
+        if found == "flux2_klein" and tconf.get("joint_attention_dim") == 7680:
+            found = "flux2_klein4b"  # Klein 4B reads Qwen3-4B's 3 x 2560 features; the 9B's are 12288
         if found in (None, "minimax_h3"):
             from .h3image.loading import is_h3_image_dir
 
