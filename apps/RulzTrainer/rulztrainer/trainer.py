@@ -1141,13 +1141,76 @@ class Trainer(RaceParallelMixin):
 
     def _h3_still_blocks(self, cfg: TrainConfig, clips: list) -> None:
         """A MiniMax H3 run with no clips and no lora_blocks trains blocks 20-49 (lora_blocks "all" keeps every
-        block). Not on a resume or a race, whose LoRA layout is already set."""
+        block). Not on a resume or a race, whose LoRA layout is already set, nor with still_lora_targets / blocks
+        (the stills' layers are already chosen)."""
         if (self.arch.name != "minimax_h3" or clips or (cfg.lora_blocks or "").strip() or cfg.resume_from
-                or cfg.resume_state or cfg.race or self.race_rows):
+                or cfg.resume_state or cfg.race or self.race_rows or cfg.still_masking()):
             return
         cfg.lora_blocks = self.H3_STILL_BLOCKS
         log.info("MiniMax H3 on stills only: training blocks %s to keep the video model's motion (set lora_blocks "
                  "to all to train every block)", self.H3_STILL_BLOCKS)
+
+    def _still_layout(self, cfg: TrainConfig, clips: list) -> None:
+        """still_lora_targets / still_lora_blocks before the LoRA is made. Without clips every batch is stills, so
+        they are the LoRA (lora_targets / lora_blocks): no layer is made that would never train. With clips the LoRA
+        keeps its own layout and _still_gradless picks the part a batch of stills leaves alone."""
+        self.still_gradless_names: list[str] = []
+        if not cfg.still_masking():
+            return
+        unknown = [t for t in cfg.still_lora_targets if t not in self.arch.target_groups]
+        if unknown:
+            raise ValueError(f"still_lora_targets {unknown} do not exist for {self.arch.label} (its groups: "
+                             f"{', '.join(self.arch.target_groups)})")
+        if not getattr(self.arch, "supports_video", False):
+            log.info("still_lora_targets / still_lora_blocks: %s trains stills only, so they are the LoRA's layout",
+                     self.arch.label)
+        if clips:
+            return
+        if cfg.resume_from or cfg.resume_state:
+            log.warning("still_lora_targets / still_lora_blocks on a resumed run with no clips: the resumed LoRA's "
+                        "layout stays (lora_targets / lora_blocks)")
+            return
+        if cfg.still_lora_targets:
+            cfg.lora_targets = list(cfg.still_lora_targets)
+        if (cfg.still_lora_blocks or "").strip():
+            cfg.lora_blocks = cfg.still_lora_blocks
+        log.info("No video clips: every batch is stills, so the LoRA trains the stills' layers alone: %s, blocks %s",
+                 ", ".join(cfg.lora_targets), (cfg.lora_blocks or "").strip() or "all")
+
+    def _still_keep(self, model, cfg: TrainConfig, clips: list) -> set[str] | None:
+        """With clips and still_lora_targets / still_lora_blocks: the modules a batch of stills trains (their groups
+        and blocks), read before the LoRA is made (the family's lookup skips modules already wrapped). None: off."""
+        if not clips or not cfg.still_masking():
+            return None
+        targets = list(cfg.still_lora_targets) or list(cfg.lora_targets)
+        spec = (cfg.still_lora_blocks or "").strip() or cfg.lora_blocks
+        return set(self.arch.lora_module_names(model, targets, lora_mod.parse_blocks(spec, len(model.layers)),
+                                               cfg.train_text_embedder))
+
+    def _still_gradless(self, injected: dict, keep: set[str] | None, cfg: TrainConfig, clips: list) -> None:
+        """The LoRA modules a batch of stills gives no gradient: every one outside `keep` (_still_keep). They still
+        act in its forward."""
+        if keep is None or not injected:
+            return
+        targets = list(cfg.still_lora_targets) or list(cfg.lora_targets)
+        spec = (cfg.still_lora_blocks or "").strip() or cfg.lora_blocks
+        self.still_gradless_names = [nm for nm in injected if nm not in keep]
+        trained = len(injected) - len(self.still_gradless_names)
+        if not trained:
+            raise ValueError("still_lora_targets / still_lora_blocks leave a batch of stills nothing to train: none of "
+                             "the LoRA's modules is in their groups and blocks")
+        log.info("Mixed dataset (%d clips): batches of stills train %d of the LoRA's %d modules (%s, blocks %s); the "
+                 "other %d learn from the clips alone. Clips train all of them", len(clips), trained, len(injected),
+                 ", ".join(targets), spec or "all", len(self.still_gradless_names))
+
+    def _still_mask(self, rinj: dict, batch):
+        """The gradless block for one batch: a mixed run's batch of stills leaves still_gradless_names alone
+        (lora.gradless); anything else trains the whole LoRA. A bucket holds one frame count, so a batch is all
+        stills or all clips."""
+        names = getattr(self, "still_gradless_names", None)
+        if not names or any(getattr(it, "frames", 1) > 1 for it in batch):
+            return contextlib.nullcontext()
+        return lora_mod.gradless([rinj[nm] for nm in names if nm in rinj])
 
     def run(self):
         try:
@@ -1212,6 +1275,7 @@ class Trainer(RaceParallelMixin):
         # held-out photos, the look filter; their batches train on the plain loss (load_batch gives them no regions)
         clips = [it for it in items if it.frames > 1]
         items = [it for it in items if it.frames <= 1]
+        self._still_layout(cfg, clips)
         self._h3_still_blocks(cfg, clips)
         log.info("Dataset: %d images%s in %s", len({it.image for it in items}),
                  f" and {len(clips)} video clips of {clips[0].frames} frames" if clips else "",
@@ -1254,6 +1318,7 @@ class Trainer(RaceParallelMixin):
             self.ft = FineTuner(model, names, self.devices[0], log)
             backprop = None  # a window spans every block: the backward runs through all of them
         else:
+            still_keep = self._still_keep(model, cfg, clips)
             injected = lora_mod.inject_lora(model, cfg.lora_rank, cfg.lora_alpha, cfg.lora_targets,
                                             include_text_embedder=cfg.train_text_embedder, dropout=cfg.lora_dropout,
                                             blocks=blocks, names=self._lora_names(model, blocks),
@@ -1262,6 +1327,7 @@ class Trainer(RaceParallelMixin):
             # blocks the backward runs from (None = all); a UNet's blocks are no chain (skip connections), so the
             # backward always runs through all of them
             backprop = (lora_mod.backprop_blocks(model, injected, blocks) if self.arch.linear_blocks else None)
+            self._still_gradless(injected, still_keep, cfg, clips)
         if blocks is not None:
             log.info("LoRA blocks: %s (%d of %d); %s", lora_mod.format_blocks(blocks), len(blocks), len(model.layers),
                      f"backward skips blocks before {min(blocks) if blocks else 'n/a'}" if backprop is not None else
@@ -1528,8 +1594,12 @@ class Trainer(RaceParallelMixin):
         peak_ram = profiling.PeakRam().start()
 
         def work(job):
-            """Forward + backward for one model copy on its device. Returns (loss value, per-image multipliers,
-            (identity loss value, samples, seconds) or None)."""
+            """Forward + backward for one model copy on its device (a mixed run's batch of stills inside _still_mask).
+            Returns (loss value, per-image multipliers, (identity loss value, samples, seconds) or None)."""
+            with self._still_mask(job[0][1], job[1]):
+                return work_batch(job)
+
+        def work_batch(job):
             (rmodel, rinj, rdev), batch, latents, embeds, mask, sigma, noise, regions, cur_step, n_total, dop = job
             observe = getattr(optimizer, "observe", None)
             if observe is not None:  # Keel: this micro-batch's noise level (the CPU tensor: no sync); a replica's
