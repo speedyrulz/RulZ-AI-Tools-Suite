@@ -20,6 +20,8 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
   in int8 or bf16 ([details](#flux-3-klein)).
 - **FLUX.2 Klein 9B** (9B, Black Forest Labs): text-to-image LoRAs; train on Base, use on Base or the 4-step distilled
   Klein ([details](#flux2-klein-9b)).
+- **FLUX.2 Klein 4B** (4B, Black Forest Labs, Apache 2.0, not gated): the 9B's loaders and LoRA format at 7.75 GB in
+  bf16, with the Qwen3-4B text encoder; its own model entry ([details](#flux2-klein-4b)).
 - **Ideogram 4** (9.3B): LoRAs on one 16 GB card from the fp8 release, structured JSON captions or wrapped plain
   ones; non-commercial license ([details](#ideogram-4)).
 - **MiniMax H3** (33B video + audio): experimental LoRAs for H3 video generation from pictures (one-frame, as
@@ -243,7 +245,7 @@ or in the web editor (Templates -> Create) with these settings:
 | Environment variables | `PROVISIONING_SCRIPT=https://raw.githubusercontent.com/speedyrulz/RulZ-AI-Tools-Suite/app/rulz-trainer/scripts/vast/provision.sh`<br>`PORTAL_CONFIG=localhost:1111:11111:/:Instance Portal\|localhost:7870:17870:/:RulzTrainer\|localhost:8080:18080:/:Jupyter\|localhost:8080:8080:/terminals/1:Jupyter Terminal`<br>`OPEN_BUTTON_PORT=1111` |
 | Disk space | 120 GB (a base model download is about 10 to 20 GB, over 50 GB for MiniMax H3; datasets, caches and outputs come on top) |
 
-Put `HF_TOKEN` (needed for gated repos, such as BFL's FLUX 3 Klein and FLUX.2 Klein 9B files) into your **account** environment variables
+Put `HF_TOKEN` (needed for gated repos, such as BFL's FLUX 3 Klein and FLUX.2 Klein 9B files; FLUX.2 Klein 4B is not gated) into your **account** environment variables
 (cloud.vast.ai -> Account -> Environment Variables), never into the template: account variables are injected into
 every instance and land in `/etc/environment`, where the WebUI and the training subprocess read them.
 
@@ -645,6 +647,7 @@ the file was there):
 | FIBO 2.0 dev / Edit Turbo | [Comfy-Org/Fibo-2.0](https://huggingface.co/Comfy-Org/Fibo-2.0) | int8_convrot 8.4 GB, bf16 16.5 GB | Qwen3-VL-4B, the same files as Krea 2's | `flux2-vae` |
 | Qwen-Image 2.1 / Turbo | [Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1) | int8_convrot 7.3 GB, bf16 14.2 GB | Qwen3-VL-8B int8_convrot 9.4 GB, bf16 17.5 GB | `qwen_image_2.1_vae_bf16` |
 | FLUX.2 Klein 9B Base / distilled | BFL's [FLUX.2-klein-base-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9b-fp8) and [-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8) (gated); bf16 in FLUX.2-klein-base-9B and -9B | fp8 8.9 GB, bf16 16.9 GB (read up to bf16, then quantized for your GPU) | [Comfy-Org/Flux-2-Klein-9B](https://huggingface.co/Comfy-Org/Flux-2-Klein-9B) Qwen3-8B fp8 mixed 8.1 GB, bf16 15.3 GB | `flux2-vae` |
+| FLUX.2 Klein 4B Base / distilled | [Comfy-Org/Flux-2-Klein-4B](https://huggingface.co/Comfy-Org/Flux-2-Klein-4B) (Apache 2.0, not gated) | bf16 7.75 GB (the only format; quantized for your GPU on load) | Qwen3-4B bf16 8.0 GB (its fp4 file is not read) | `flux2-vae` (the 9B's) |
 | FLUX 3 Klein Base / distilled | [black-forest-labs/flux-3-image-klein-comfy](https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy) (BFL's own, gated) | int8_convrot 5.8 GB, nvfp4 5.3 GB, bf16 11.1 GB (files; 5.1 / 4.8 / 9.7 GB loaded) | Qwen3-VL-4B int8_convrot 4.9 GB, bf16 8.9 GB | `flux2-vae` |
 | Ideogram 4 | [Comfy-Org/Ideogram-4](https://huggingface.co/Comfy-Org/Ideogram-4) | int8_convrot 9.6 GB, fp8_scaled 9.3 GB, nvfp4_mixed 5.5 GB (no bf16 release) | Qwen3-VL-8B: int8_convrot 9.4 GB and bf16 17.5 GB from Comfy-Org/Qwen-Image-2.1 (the same model), fp8_scaled 10.6 GB and nvfp4 6.3 GB from Comfy-Org/Ideogram-4 | `flux2-vae` |
 | MiniMax H3 FL2VA / Ref2VA | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) | pruned_int8_convrot 21.0 GB, pruned_bf16 40.2 GB, int8_convrot 34.0 GB, bf16 66.3 GB | Qwen3-VL-32B (50 layers) int8_convrot 27.1 GB, nvfp4_awq 15.7 GB, bf16 51.5 GB | `minimax_h3_video_vae_fp16` (5.2 GB) + `minimax_h3_audio_vae_fp32` (0.6 GB) |
@@ -3256,7 +3259,8 @@ RulZ AI Trainer trains text-to-image LoRAs for Black Forest Labs' FLUX.2 Klein 9
 **FLUX-2-Klein-9B-Base** as the model; **FLUX-2-Klein-9B** is the 4-step distilled model, for samples. Its keys are the
 same as Base's, so it is told apart by its name: the trainer warns on a file named as distilled, and a renamed Base
 file should keep "base" in its name. Training image editing is out of scope: a LoRA trained here still loads for editing.
-FLUX.2 dev and Klein 4B are not supported (another text encoder) and are refused on load.
+FLUX.2 dev is not supported and is refused on load; Klein 4B is its own model entry ([below](#flux2-klein-4b)), and each
+entry refuses the other size's files by name.
 
 - **Gated repos.** BFL's repos are gated with automatic approval: accept the FLUX Non-Commercial License on
   [FLUX.2-klein-base-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9b-fp8) (and on
@@ -3292,6 +3296,40 @@ random weights, the key layouts both ways, the sampler against diffusers' schedu
 converter. A one-off check on CPU also read BFL's real `flux-2-klein-9b-fp8.safetensors`: every key matches the port, the
 file loads and a forward pass gives finite output. **Not run yet: a training run on real Klein weights, the real
 Qwen3-8B encoder, and a trained LoRA in ComfyUI.**
+
+## FLUX.2 Klein 4B
+
+FLUX.2 Klein 4B (since 3.33.0) is a model entry of its own (`flux2_klein4b`, shown as FLUX.2 Klein 4B) that reuses the 9B's code in
+`rulztrainer/flux2/`, parameterized by size: a 3072-wide DiT (24 heads of 128, 5 double and 20 single blocks, 3.9B
+weights) that reads the Qwen3-4B text encoder (36 layers, 2560 wide) through the same layers 9, 18 and 27, so 7680
+features per token. The Flux2 VAE and its cached latents are the 9B's. Pick **FLUX-2-Klein-4B-Base**
+([black-forest-labs/FLUX.2-klein-base-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-4B)) as the model;
+**FLUX-2-Klein-4B** is the 4-step distilled model, for samples. Unlike the 9B (non-commercial, gated), the 4B repos are
+Apache 2.0 and not gated: no login or license click is needed.
+
+- **Files.** The default `files` source takes Comfy-Org/Flux-2-Klein-4B's `flux-2-klein-base-4b.safetensors` (7.75 GB
+  bf16), `qwen_3_4b.safetensors` (8.0 GB bf16) and `flux2-vae.safetensors`, all ungated. Only bf16 is offered for the
+  diffusion model and the text encoder (its `qwen_3_4b_fp4_flux2` file is not read here); `transformer_quant: auto`
+  quantizes for your GPU. The `hf` source reads BFL's root file, `text_encoder/`, `tokenizer/` and `vae/`; with single
+  files the tokenizer comes from the downloaded Klein repo or Qwen/Qwen3-4B (a few MB).
+- **Told apart from the 9B** by the text-feature width of the file's `txt_in` (7680 against 12288), for single files and
+  diffusers folders (`joint_attention_dim`), so a file of either size sets the right entry on its own. A model entry that
+  is handed the other size's file refuses it and names the entry to pick. Names count too: `4b` in a repo id or file name
+  means this entry. FLUX.2 dev (15360 features, a guidance embedding) is refused by both.
+- **Memory.** Auto thresholds are scaled from the 9B's, not measured on 4B: transformer bf16 from 20 GB, int8 from 10 GB,
+  else nvfp4 (weights 7.75, about 4.4 and 2.6 GB); text encoder bf16 from 12 GB, else int8 ConvRot.
+- **Samples.** No distill LoRA exists for 4B, so `turbo_lora: auto` downloads nothing. Base samples 50 steps at CFG 4.0
+  (the defaults of diffusers' `Flux2KleinPipeline`); the distilled FLUX-2-Klein-4B as `sample_model_path` takes 4 steps
+  at CFG 1 on the same schedule as the 9B's distilled model. Training noise, the default targets, the block naming
+  (`model.layers` is 25 blocks: 0-4 double, 5-24 single) and the saved LoRA keys (`diffusion_model.<module>.lora_A /
+  lora_B`, alpha folded in, modelspec `Flux.2-klein-4b`) follow the 9B.
+- **Wizard.** The learning rate, rank and noise recipe are Fizgig's 9B values reused (marked as such); nothing is measured
+  on 4B yet.
+
+Tested without weights (`tests/test_flux2_klein4b.py`): size detection from tiny state dicts and from the 4B config on
+the meta device, both entries refusing each other's files, the distilled-name rule, the Qwen3-4B config, arch detection
+from files and folders, downloads, caches, thresholds and the wizard text. **Not run yet: a training run on real 4B
+weights, the real Qwen3-4B encoder, and a trained LoRA in ComfyUI.**
 
 ## FLUX 3 Klein
 

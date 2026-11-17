@@ -1,5 +1,11 @@
-"""Load FLUX.2 Klein 9B components from a Hugging Face repo or folder and encode prompts; single files (the default)
-go through flux2.single_file.
+"""Load FLUX.2 Klein (9B and 4B) components from a Hugging Face repo or folder and encode prompts; single files (the
+default) go through flux2.single_file. Every size-dependent function takes `size` ("9b" by default, or "4b"); `sized`
+binds one for an Arch.
+
+Klein 4B (black-forest-labs/FLUX.2-klein-base-4B, Apache 2.0, not gated): the same layout and loaders with a 3072-wide
+DiT (5 double + 20 single blocks) and the Qwen3-4B text encoder (text_encoder/, 7680 features: layers 9, 18, 27 of
+2560). Comfy-Org/Flux-2-Klein-4B holds its text encoder and VAE; the distilled black-forest-labs/FLUX.2-klein-4B is the
+sampling model.
 
     black-forest-labs/FLUX.2-klein-base-9B   the model to train on: flux-2-klein-base-9b.safetensors (BFL's layout, which
                                              the port keeps), text_encoder/ (Qwen3-8B), tokenizer/, vae/ (Flux2 VAE),
@@ -45,6 +51,11 @@ QUANT_FILTER = lambda name: name.startswith(("double_blocks.", "single_blocks.")
 # 7.9 / 9.9 GB. Its bf16 is 17 GB of weights alone. This trainer's nvfp4 is not the same code as Fizgig's NF4.
 AUTO_BF16_FROM_GB, AUTO_INT8_FROM_GB = 30, 18
 AUTO_TEXT_FULL_FROM_GB = 19.5  # Qwen3-8B in bf16 is 15 GB: Fizgig halves it below this much VRAM
+# Klein 4B: the transformer is 7.75 GB in bf16 (3.9 B weights), under half of the 9B's 17 GB: bf16 from 20 GB, int8 from
+# 10 GB, else nvfp4 (scaled from the 9B's 30 / 18 GB thresholds, which leave the same room for activations); Qwen3-4B in
+# bf16 is 8 GB: kept as it is from 12 GB. Estimates scaled from the 9B's measurements, not measured on 4B
+AUTO_BF16_FROM_GB_4B, AUTO_INT8_FROM_GB_4B = 20, 10
+AUTO_TEXT_FULL_FROM_GB_4B = 12
 
 PROMPT_PREFIX = "<|im_start|>user\n"
 PROMPT_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -55,9 +66,10 @@ HF_PATTERNS = ["*.json", ROOT_FILES, "text_encoder/*", "tokenizer/*", "vae/*", "
 SAMPLE_PATTERNS = ["*.json", ROOT_FILES, "LICENSE.md"]
 
 
-def resolve_quant(quant: str, devices) -> str:
-    """`auto`: bf16 with 30 GB+, int8 from 18 GB, else nvfp4, counting the memory of every GPU the model is split over.
-    A model loaded on the CPU (a sampling model) is sized for the smallest GPU, where it will run."""
+def resolve_quant(quant: str, devices, size: str = "9b") -> str:
+    """`auto`: bf16 with 30 GB+, int8 from 18 GB, else nvfp4, counting the memory of every GPU the model is split over
+    (Klein 4B: 20 / 10 GB). A model loaded on the CPU (a sampling model) is sized for the smallest GPU, where it will
+    run."""
     if quant != "auto" or not torch.cuda.is_available():
         return "none" if quant == "auto" else quant
     devices = [devices] if isinstance(devices, (str, torch.device)) else list(devices)
@@ -67,20 +79,24 @@ def resolve_quant(quant: str, devices) -> str:
     else:
         total = min(_gpu_gb(f"cuda:{i}") for i in range(torch.cuda.device_count()))
         where = "the smallest GPU"
-    fmt = "none" if total >= AUTO_BF16_FROM_GB else "int8_convrot" if total >= AUTO_INT8_FROM_GB else "nvfp4"
+    bf16_from, int8_from = (AUTO_BF16_FROM_GB_4B, AUTO_INT8_FROM_GB_4B) if size == "4b" else (
+        AUTO_BF16_FROM_GB, AUTO_INT8_FROM_GB)
+    fmt = "none" if total >= bf16_from else "int8_convrot" if total >= int8_from else "nvfp4"
     if fmt != "none":
-        log.info("FLUX.2 Klein transformer: auto quantization -> %s for %.0f GB (%s)", fmt, total, where)
+        log.info("FLUX.2 Klein %s transformer: auto quantization -> %s for %.0f GB (%s)", size.upper(), fmt, total,
+                 where)
     return fmt
 
 
-def resolve_text_quant(quant: str) -> str:
+def resolve_text_quant(quant: str, size: str = "9b") -> str:
     """`auto`: bf16 on a GPU with room for it, else int8 ConvRot (about half)."""
     if quant != "auto":
         return quant
     if not torch.cuda.is_available():
         return "none"
     largest = max(_gpu_gb(f"cuda:{i}") for i in range(torch.cuda.device_count()))
-    return "none" if largest >= AUTO_TEXT_FULL_FROM_GB else "int8_convrot"
+    full_from = AUTO_TEXT_FULL_FROM_GB_4B if size == "4b" else AUTO_TEXT_FULL_FROM_GB
+    return "none" if largest >= full_from else "int8_convrot"
 
 
 def is_flux2_dir(model_dir: Path) -> bool:
@@ -117,15 +133,18 @@ def resolve_model_dir(model_path: str, models_dir: str = "models", patterns: lis
 
 
 def load_transformer(model_dir: Path, device, quant: str = "auto", dtype=torch.bfloat16,
-                     quant_devices=None) -> Flux2KleinTransformer:
+                     quant_devices=None, size: str = "9b") -> Flux2KleinTransformer:
     """From the folder's root file, else its diffusers transformer/. quant_devices: the GPUs the model will run on."""
     root = root_file(model_dir)
     if root is not None:
-        return fsf.load_transformer_file(root, device, quant, dtype, quant_devices)
+        return fsf.load_transformer_file(root, device, quant, dtype, quant_devices, size)
     state = moss_loading._read_sharded(model_dir / "transformer", "diffusion_pytorch_model")
-    state = fsf.to_model_layout({k: v.to(dtype) for k, v in state.items()})
+    try:
+        state = fsf.to_model_layout({k: v.to(dtype) for k, v in state.items()}, size)
+    except ValueError as e:
+        raise ValueError(f"{model_dir.name}: {e}") from e
     config = fsf.transformer_config_from_state(state)
-    quant = resolve_quant(quant, quant_devices or device)
+    quant = resolve_quant(quant, quant_devices or device, size)
     with torch.device("meta"):
         model = Flux2KleinTransformer.from_config(config)
     sf.install_state(model, state, quant, dtype, quant_filter=QUANT_FILTER, **sf.quant_target(device, quant_devices))
@@ -137,14 +156,14 @@ def load_transformer(model_dir: Path, device, quant: str = "auto", dtype=torch.b
     return model
 
 
-def load_text_encoder(model_dir: Path, device: str = "auto", quant: str = "auto"):
-    """Qwen3-8B's text model (no LM head) + its tokenizer from text_encoder/ and tokenizer/."""
+def load_text_encoder(model_dir: Path, device: str = "auto", quant: str = "auto", size: str = "9b"):
+    """Qwen3-8B's (Klein 4B: Qwen3-4B's) text model (no LM head) + its tokenizer from text_encoder/ and tokenizer/."""
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir / "tokenizer"))
-    fmt = resolve_text_quant(quant)
+    fmt = resolve_text_quant(quant, size)
     state = moss_loading._read_sharded(model_dir / "text_encoder", "model")
-    model = fsf.build_text_model(state, fmt, sf.quant_target(device).get("work_device"))
+    model = fsf.build_text_model(state, fmt, sf.quant_target(device).get("work_device"), fsf.text_config(size))
     if fmt != "none":
         n = sum(1 for m in model.modules() if isinstance(m, Q.QuantLinear))
         log.info("Text encoder: %d Linear layers quantized to %s", n, fmt)
@@ -188,11 +207,11 @@ def encode_prompt(text_encoder, tokenizer, prompt: str, max_length: int = MAX_TO
     return encode_prompts(text_encoder, tokenizer, [prompt], max_length)[0]
 
 
-def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):
+def get_tokenizer(cfg: TrainConfig, model_dir: Path | None, size: str = "9b"):
     from transformers import AutoTokenizer
 
     if moss_loading._use_file(cfg, "text_encoder_file") or model_dir is None:
-        return AutoTokenizer.from_pretrained(str(fsf.resolve_tokenizer(cfg.tokenizer_path, cfg.models_dir)))
+        return AutoTokenizer.from_pretrained(str(fsf.resolve_tokenizer(cfg.tokenizer_path, cfg.models_dir, size)))
     return AutoTokenizer.from_pretrained(str(model_dir / "tokenizer"))
 
 
@@ -208,10 +227,10 @@ def prompt_tokens(tokenizer, prompt: str, max_length: int = MAX_TOKENS) -> tuple
 # ---------------------------------------------------------------- config-driven entry points
 
 
-def _need_dir(cfg: TrainConfig, model_dir: Path | None, what: str) -> Path:
+def _need_dir(cfg: TrainConfig, model_dir: Path | None, what: str, size: str = "9b") -> Path:
     if model_dir is None:
         raise ValueError(f"No {what} file is set and no Hugging Face model to take it from: set the file (model source "
-                         "'files') or the black-forest-labs/FLUX.2-klein-base-9B repo id / a folder")
+                         f"'files') or the black-forest-labs/FLUX.2-klein-base-{size.upper()} repo id / a folder")
     return model_dir
 
 
@@ -222,22 +241,23 @@ def resolve_for_config(cfg: TrainConfig) -> Path | None:
     return resolve_model_dir(cfg.model_path, cfg.models_dir)
 
 
-def _trainable(model: Flux2KleinTransformer, source: str) -> Flux2KleinTransformer:
+def _trainable(model: Flux2KleinTransformer, source: str, size: str = "9b") -> Flux2KleinTransformer:
     """Base and the distilled file have the same keys, so this goes by the name and only warns."""
     if model.is_distilled:
         log.warning("%s is named as the 4-step distilled FLUX.2 Klein. Train on the Base model "
-                    "(flux-2-klein-base-9b) and set the distilled one as the sampling model; if this file is Base, "
-                    "put \"base\" in its name.", source)
+                    "(flux-2-klein-base-%s) and set the distilled one as the sampling model; if this file is Base, "
+                    "put \"base\" in its name.", source, size)
     return model
 
 
-def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None = None) -> Flux2KleinTransformer:
+def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None = None,
+                    size: str = "9b") -> Flux2KleinTransformer:
     use_file = moss_loading._use_file(cfg, "transformer_file")
     if use_file:
         moss_loading._check_files(cfg, "transformer_file")
         source = Path(cfg.transformer_file).name
     else:
-        model_dir = _need_dir(cfg, model_dir, "diffusion model")
+        model_dir = _need_dir(cfg, model_dir, "diffusion model", size)
         source = model_dir.name
     if cfg.multi_gpu == "model_split" and device is None:
         # the trainer splits it right after loading: stay on the CPU and size "auto" for all the split GPUs
@@ -246,13 +266,15 @@ def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None
         gpus = parse_devices(cfg.devices, cfg.device)
         if use_file:
             return _trainable(fsf.load_transformer_file(cfg.transformer_file, "cpu", cfg.transformer_quant,
-                                                        quant_devices=gpus), source)
-        return _trainable(load_transformer(model_dir, "cpu", cfg.transformer_quant, quant_devices=gpus), source)
+                                                        quant_devices=gpus, size=size), source, size)
+        return _trainable(load_transformer(model_dir, "cpu", cfg.transformer_quant, quant_devices=gpus, size=size),
+                          source, size)
     with sf.quantize_staged_on(sf.staging_gpu(cfg, device)):  # block swap: quantized on the GPU, kept in RAM
         if use_file:
             return _trainable(fsf.load_transformer_file(cfg.transformer_file, device or cfg.device,
-                                                        cfg.transformer_quant), source)
-        return _trainable(load_transformer(model_dir, device or cfg.device, cfg.transformer_quant), source)
+                                                        cfg.transformer_quant, size=size), source, size)
+        return _trainable(load_transformer(model_dir, device or cfg.device, cfg.transformer_quant, size=size),
+                          source, size)
 
 
 def get_vae(cfg: TrainConfig, model_dir: Path | None):
@@ -262,24 +284,57 @@ def get_vae(cfg: TrainConfig, model_dir: Path | None):
     return moss_loading.load_vae(_need_dir(cfg, model_dir, "VAE"), cfg.device)
 
 
-def get_text_encoder(cfg: TrainConfig, model_dir: Path | None):
+def get_text_encoder(cfg: TrainConfig, model_dir: Path | None, size: str = "9b"):
     if moss_loading._use_file(cfg, "text_encoder_file"):
         from transformers import AutoTokenizer
 
         moss_loading._check_files(cfg, "text_encoder_file")
-        tokenizer = AutoTokenizer.from_pretrained(str(fsf.resolve_tokenizer(cfg.tokenizer_path, cfg.models_dir)))
-        model = fsf.load_text_encoder_file(cfg.text_encoder_file, cfg.text_encoder_device, cfg.text_encoder_quant)
+        tokenizer = AutoTokenizer.from_pretrained(str(fsf.resolve_tokenizer(cfg.tokenizer_path, cfg.models_dir, size)))
+        model = fsf.load_text_encoder_file(cfg.text_encoder_file, cfg.text_encoder_device, cfg.text_encoder_quant,
+                                           size)
         return model, tokenizer
-    return load_text_encoder(_need_dir(cfg, model_dir, "text encoder"), cfg.text_encoder_device,
-                             cfg.text_encoder_quant)
+    return load_text_encoder(_need_dir(cfg, model_dir, "text encoder", size), cfg.text_encoder_device,
+                             cfg.text_encoder_quant, size)
 
 
-def load_any_transformer(path: str, device, quant: str = "auto", models_dir: str = "models") -> Flux2KleinTransformer:
+def load_any_transformer(path: str, device, quant: str = "auto", models_dir: str = "models",
+                         size: str = "9b") -> Flux2KleinTransformer:
     """Load a transformer (Base or the distilled sampling model) from a single .safetensors file, a folder, or a HF
     repo id (its root file alone is downloaded)."""
     p = Path(path).expanduser()
     if p.is_file():
-        return fsf.load_transformer_file(p, device, quant)
+        return fsf.load_transformer_file(p, device, quant, size=size)
     if p.is_dir():
-        return load_transformer(p, device, quant)
-    return load_transformer(resolve_model_dir(path, models_dir, SAMPLE_PATTERNS), device, quant)
+        return load_transformer(p, device, quant, size=size)
+    return load_transformer(resolve_model_dir(path, models_dir, SAMPLE_PATTERNS), device, quant, size=size)
+
+
+def sized(size: str):
+    """This module with `size` bound in its size-dependent entry points, for an Arch (an Arch's methods call them
+    without it). Every other name (encode_prompts, prompt_tokens, pad_embeds, ...) falls through to the module, so an
+    entry point the base Arch reaches by name is never missing for one size."""
+    import sys
+
+    module = sys.modules[__name__]
+
+    class _Sized:
+        def __getattr__(self, name):
+            return getattr(module, name)
+
+        @staticmethod
+        def get_transformer(cfg, model_dir, device=None):
+            return get_transformer(cfg, model_dir, device, size)
+
+        @staticmethod
+        def get_text_encoder(cfg, model_dir):
+            return get_text_encoder(cfg, model_dir, size)
+
+        @staticmethod
+        def get_tokenizer(cfg, model_dir):
+            return get_tokenizer(cfg, model_dir, size)
+
+        @staticmethod
+        def load_any_transformer(path, device, quant="auto", models_dir="models"):
+            return load_any_transformer(path, device, quant, models_dir, size)
+
+    return _Sized()
