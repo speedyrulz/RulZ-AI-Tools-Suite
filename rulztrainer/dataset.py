@@ -55,7 +55,8 @@ class Item:
     side: int = 0  # training resolution this item was bucketed for (square-equivalent side, area = side^2)
     repeats: int = 1  # times the item comes up per epoch (its dataset's repeats)
     dataset: str = ""  # the dataset folder it came from
-    loss_scale: float = 1.0  # its loss weight (LoRA Isolation's side-by-side pairs train at isolation_pair_weight)
+    loss_scale: float = 1.0  # its loss weight (its dataset's weight; LoRA Isolation's side-by-side pairs train at
+    #                          isolation_pair_weight)
     dop_caption: str | None = None  # LoRA Isolation: the trigger-free caption of its DOP pass (None: no DOP)
     dop_text_path: Path | None = None  # its cached text features
     pair_side: str = ""  # LoRA Isolation's side-by-side pairs: the subject's panel ("left" / "right"; never mirrored)
@@ -257,6 +258,7 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
         n_images = 0
         n_skipped_videos = 0
         folders: dict[str, list[int]] = {}  # folder_repeats: folder -> [its N, pictures]
+        first_item = len(items)
         for p in sorted(root.rglob("*")):
             mult, folder = folder_repeat_of(p, root) if cfg.folder_repeats else (1, "")
             if p.suffix.lower() in VIDEO_EXTS and not skipped(p, root):
@@ -264,6 +266,7 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
                     clip = _clip_item(p, cfg, spec, root, cache, tag, clip_frames, arch)
                     if clip is not None:
                         clip.repeats, clip.repeat_mult = spec.repeats * mult, mult
+                        clip.loss_scale = float(spec.weight)
                         if folder:
                             folders.setdefault(folder, [mult, 0])[1] += 1
                         items.append(clip)
@@ -300,11 +303,19 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
                     region_path=cache / "regions" / f"{stem}_regions.safetensors",
                     side=side, repeats=spec.repeats * mult, dataset=str(root), repeat_mult=mult,
                     alt_captions=alts, alt_text_paths=[text_cache_path(cfg, c) for c in alts],
+                    loss_scale=float(spec.weight),
                 ))
         for folder, (n, count) in sorted(folders.items()):
             log.info("Dataset %s: folder %s: %d picture%s, %d repeat%s per epoch (from its name%s)", root, folder,
                      count, "" if count == 1 else "s", n * spec.repeats, "" if n * spec.repeats == 1 else "s",
                      f" x the dataset's {spec.repeats}" if spec.repeats != 1 else "")
+        if spec.weight != 1.0:
+            log.info("Dataset %s: loss weight %g (every picture of it trains at that multiple of the loss)", root,
+                     spec.weight)
+        if spec.samples > 0:
+            per_epoch = sum(max(1, int(it.repeats or 1)) for it in items[first_item:])
+            log.info("Dataset %s: at most %d of its %d pictures (repeats counted) per epoch, a fresh draw each epoch",
+                     root, spec.samples, per_epoch)
         if n_skipped_videos:
             log.info("Dataset %s: %d video file(s) left out: %s", root, n_skipped_videos,
                      "set train_frames above 1 to train them as clips" if getattr(arch, "supports_video", False)
@@ -322,6 +333,47 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
         log.info("Training resolutions: %s (%d items = %d images x %d resolutions)", describe_sides(cfg), len(items),
                  summary[0][1], len(summary[0][2]))
     return items
+
+
+ID4_SHORT_WORDS = 20  # Ideogram 4: plain captions with a median under this many words get the warning
+
+
+def ideogram4_caption_warning(items: list[Item], cfg: TrainConfig) -> str | None:
+    """A warning for an Ideogram 4 run whose captions are mostly short plain text, else None. Community reports
+    (OneTrainer Discord): with short plain captions Ideogram 4 starts by predicting its built-in refusal image and the
+    starting loss is very high for a few hundred steps; JSON captions or richer ones lower it, and it still learns.
+    RulZ wraps a plain caption into the smallest JSON caption (ideogram4/prompts.py), which is still short: whether
+    the wrapping avoids the effect is untested. A picture counts as plain unless its caption is a <name>.json file;
+    its words are those of the wrapped caption's high_level_description (the trigger word's element not counted)."""
+    if cfg.arch_name() != "ideogram4":
+        return None
+    from .ideogram4.prompts import parse_caption
+
+    arch = get_arch(cfg)
+    seen: set[Path] = set()
+    structured = 0
+    plain: list[int] = []
+    for it in items:
+        if it.reg or it.category != "image" or it.image in seen:
+            continue
+        seen.add(it.image)
+        if arch.caption_file(it.image, cfg).suffix.lower() == ".json":
+            structured += 1
+            continue
+        cap = parse_caption(it.caption) or {}
+        plain.append(len(str(cap.get("high_level_description") or "").split()))
+    total = structured + len(plain)
+    if not total or len(plain) * 2 <= total:  # mostly structured: nothing to say
+        return None
+    plain.sort()
+    median = (plain[(len(plain) - 1) // 2] + plain[len(plain) // 2]) / 2
+    if median >= ID4_SHORT_WORDS:
+        return None
+    return (f"Ideogram 4: {len(plain)} of {total} captions are short plain text (median {median:g} words). Reports "
+            "from other trainers say Ideogram 4 then starts by predicting its built-in refusal image: a very high "
+            "starting loss for a few hundred steps, and it still learns. RulZ wraps plain captions into the smallest "
+            "JSON caption, which is still short (whether that avoids the effect is untested). Richer captions, or "
+            "structured .json captions next to the pictures, lower it.")
 
 
 REG_NAMED = 5  # file names a message about the regularisation folder lists before "and N more"
@@ -535,7 +587,7 @@ def augment_items(items: list[Item], cfg: TrainConfig, analysis: dict[str, dict]
                 src_box=box, category=category,
                 region_path=cache / "regions" / f"{stem}_regions.safetensors",
                 side=it.side, repeats=it.repeats, dataset=it.dataset, repeat_mult=it.repeat_mult,
-                alt_captions=alts, alt_text_paths=[text_cache_path(cfg, c) for c in alts],
+                loss_scale=it.loss_scale, alt_captions=alts, alt_text_paths=[text_cache_path(cfg, c) for c in alts],
             ))
             added[category] += 1
     log.info("Crop augmentation: +%d face crops, +%d bust crops (%d items total)", added["face_crop"],
@@ -771,9 +823,14 @@ class BucketBatcher:
     Regularisation pictures (Item.reg) are queued apart: an epoch takes reg_per_epoch of them (reg_quotas: each size
     bucket its share), the next ones of a shuffled pass through the bucket, so every picture of the folder comes up
     before any comes up again, and never twice in one epoch. They batch with the subject's pictures of their size,
-    and the sampling weights (the curriculum, the loss watch's exclusions) never touch them."""
+    and the sampling weights (the curriculum, the loss watch's exclusions) never touch them.
 
-    def __init__(self, items: list[Item], batch_size: int, seed: int, reg_per_epoch: int = -1):
+    dataset_samples ({dataset folder: N}, N above 0): a dataset's items (repeats counted) come up at most N times per
+    epoch, a fresh draw each epoch from the batcher's seeded generator. Each size bucket gives a fixed share of the N
+    (reg_quotas), so every epoch has the same number of items and steps."""
+
+    def __init__(self, items: list[Item], batch_size: int, seed: int, reg_per_epoch: int = -1,
+                 dataset_samples: dict[str, int] | None = None):
         # `items` is the subject's alone: what reads the queue's pictures (training maps, region sweeps, the
         # curriculum, the crops' weights) never meets a regularisation picture. Those are in reg_items
         self.reg_items = [it for it in items if getattr(it, "reg", False)]
@@ -787,10 +844,29 @@ class BucketBatcher:
                 self.reg_buckets.setdefault((it.width, it.height, it.frames), []).append(it)
                 continue
             self.buckets.setdefault((it.width, it.height, it.frames), []).extend([it] * max(1, int(it.repeats or 1)))
+        # dataset_samples: per dataset and size bucket, how many of its entries an epoch keeps
+        self.cap_quota: dict[tuple, int] = {}
+        self.capped: set[str] = set()
+        for ds, n in (dataset_samples or {}).items():
+            if int(n or 0) <= 0:
+                continue
+            sizes = {k: sum(1 for it in v if it.dataset == ds) for k, v in self.buckets.items()}
+            sizes = {k: c for k, c in sizes.items() if c}
+            if sum(sizes.values()) <= int(n):
+                continue  # every item fits: nothing to draw
+            self.capped.add(ds)
+            for k, q in reg_quotas(sizes, 0, int(n)).items():
+                self.cap_quota[(k, ds)] = q
+        self.bucket_sizes = {k: len(v) - sum(sum(1 for it in v if it.dataset == ds) - self.cap_quota[(k, ds)]
+                                             for ds in self.capped if (k, ds) in self.cap_quota)
+                             for k, v in self.buckets.items()}
         log.info("Buckets: %s", {f"{k[0]}x{k[1]}" + (f"x{k[2]}f" if k[2] > 1 else ""): len(v)
                                  for k, v in self.buckets.items()})
+        if self.capped:
+            log.info("Per-epoch caps: %s", {ds: f"{sum(q for (k, d), q in self.cap_quota.items() if d == ds)} per epoch"
+                                            for ds in sorted(self.capped)})
         self.reg_quota = reg_quotas({k: len(v) for k, v in self.reg_buckets.items()},
-                                    sum(len(v) for v in self.buckets.values()), int(reg_per_epoch))
+                                    sum(self.bucket_sizes.values()), int(reg_per_epoch))
         self._reg_decks: dict[tuple[int, int], list[Item]] = {}  # the rest of each bucket's current pass
         if self.reg_buckets:
             log.info("Regularisation buckets: %s", {f"{k[0]}x{k[1]}": f"{self.reg_quota[k]} of {len(v)} per epoch"
@@ -816,7 +892,18 @@ class BucketBatcher:
 
     def epoch_images(self) -> int:
         """Pictures in one epoch: the subject's (repeats counted) and the epoch's share of regularisation pictures."""
-        return sum(len(v) for v in self.buckets.values()) + self.reg_images()
+        return sum(self.bucket_sizes.values()) + self.reg_images()
+
+    def _cap_todo(self, key) -> dict[str, int]:
+        """{dataset: entries it gives this bucket per epoch} for the capped datasets with entries in the bucket."""
+        return {ds: q for ds in sorted(self.capped) if (q := self.cap_quota.get((key, ds))) is not None}
+
+    def _pick(self, entries: list[Item], n: int) -> list[Item]:
+        """n entries of a capped dataset for this epoch: with sampling weights, n systematic draws in proportion to
+        them (_resample), else a fresh random subset without repeats. Always exactly n (an all-zero weight set: none)."""
+        if self.weights:
+            return self._resample(entries, [max(0.0, float(self.weights.get(it.key, 1.0))) for it in entries], n)
+        return self.rng.sample(entries, n)
 
     def _reg_draw(self, key) -> list[Item]:
         """A bucket's regularisation pictures for this epoch: the next ones of its shuffled pass. When the pass runs
@@ -836,14 +923,14 @@ class BucketBatcher:
             out.append(deck.pop(0))
         return out
 
-    def _resample(self, group: list[Item], ws: list[float]) -> list[Item]:
-        """len(group) draws in proportion to the weights, systematically: each item comes up the floor or the ceiling
+    def _resample(self, group: list[Item], ws: list[float], n: int | None = None) -> list[Item]:
+        """n draws (default len(group)) in proportion to the weights, systematically: each item comes up the floor or the ceiling
         of its expected count (independent draws with replacement skip some images every epoch and repeat others,
         even where every weight is equal). Zero weights: never; all zero: an empty bucket."""
         total = sum(ws)
         if total <= 0:
             return []
-        n = len(group)
+        n = len(group) if n is None else n
         step = total / n
         pos = self.rng.random() * step
         out, cum = [], 0.0
@@ -862,10 +949,16 @@ class BucketBatcher:
         # shuffles below draw exactly as they did before there was a regularisation dataset)
         for key in list(self.buckets) + [k for k in self.reg_buckets if k not in self.buckets]:
             group = self.buckets.get(key, [])
+            todo = self._cap_todo(key)
+            capped: list[Item] = []
+            if todo:  # each capped dataset's share is drawn (sampling weights inside it), so the cap holds
+                capped = [it for ds, q in todo.items() for it in self._pick([x for x in group if x.dataset == ds], q)]
+                group = [it for it in group if it.dataset not in todo]
             if self.weights and group:
                 group = self._resample(group, [max(0.0, float(self.weights.get(it.key, 1.0))) for it in group])
             else:
                 group = group[:]
+            group += capped
             if self.reg_buckets:
                 group += self._reg_draw(key)
             self.rng.shuffle(group)

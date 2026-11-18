@@ -31,7 +31,7 @@ from . import quant as Q
 from .config import AUTOMAGIC, KEEL, KEEL_FB, KEEL_ON_A3, MUON_EDGE_TARGETS, TrainConfig, effective_optimizer, keel_band_weights, keel_consensus_mode
 from .config import side_to_mp
 from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, dropout_text_path,
-                      items_for_side, load_batch,
+                      ideogram4_caption_warning, items_for_side, load_batch,
                       scan_dataset, scan_reg, text_cache_path, TEXT_BATCH)
 from .archs import detect_arch, get_arch
 from .idloss import effective_weight as idloss_weight
@@ -494,17 +494,26 @@ def loss_weight(cfg: TrainConfig, sigma: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Unknown loss_weighting {cfg.loss_weighting}")
 
 
+def _adam_betas(cfg: TrainConfig) -> tuple[float, float]:
+    """adamw / adamw8bit's betas: adam_beta1 and adam_beta2 (0.9 and 0.99 unless set)."""
+    return (float(cfg.adam_beta1), float(cfg.adam_beta2))
+
+
 def build_optimizer(cfg: TrainConfig, params, pairs=None, ref_norms=None, scales=None):
     """`params` may be a list of tensors or a list of param-group dicts (LoRA+). `pairs`: the (lora_down, lora_up)
     pairs among them (lora.lora_pairs), which Keel preconditions; the other optimizers ignore them. `ref_norms` and
     `scales`: each pair's frozen-weight norm and alpha / rank, for Hull."""
     name, lr, _ = effective_optimizer(cfg)
+    if name not in ("adamw", "adamw8bit") and (cfg.adam_beta1, cfg.adam_beta2, cfg.adam_eps) != (0.9, 0.99, 1e-8):
+        log.info("adam_beta1 / adam_beta2 / adam_eps are ignored with %s (they set adamw and adamw8bit only)", name)
     if name == "adamw":
-        return torch.optim.AdamW(params, lr=lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.99))
+        return torch.optim.AdamW(params, lr=lr, weight_decay=cfg.weight_decay, betas=_adam_betas(cfg),
+                                 eps=float(cfg.adam_eps))
     if name == "adamw8bit":
         import bitsandbytes as bnb
 
-        return bnb.optim.AdamW8bit(params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay, betas=(0.9, 0.99))
+        return bnb.optim.AdamW8bit(params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
+                                   betas=_adam_betas(cfg), eps=float(cfg.adam_eps))
     if name in ("muon", "normuon"):  # LoRA+ groups keep their own lr: lora_up's step is ratio x lora_down's
         from .optimizers.muon import Muon
 
@@ -647,24 +656,52 @@ def brake_detail(stats: dict, names=None) -> str:
     return s + ("; groups: " + "; ".join(parts) if len(parts) > 1 else "")
 
 
+def warmup_length(cfg: TrainConfig) -> int:
+    """Warm-up steps: round(warmup_fraction x steps) when warmup_fraction is above 0, else warmup_steps (never
+    read as a share, whatever its value)."""
+    if cfg.warmup_fraction > 0:
+        return max(0, int(round(cfg.warmup_fraction * cfg.steps)))
+    return max(0, int(cfg.warmup_steps))
+
+
+def lr_factor(cfg: TrainConfig, step: int) -> float:
+    """The learning rate's multiplier at a step: linear warm-up to 1, then the schedule from 1 down to lr_min_factor
+    (cosine, linear, rex: REX, Chen et al. 2021, f(z) = (1 - z) / (0.5 + 0.5 (1 - z)); cosine_restarts: cosine cycles
+    that each start again at 1). constant stays at 1."""
+    warm = warmup_length(cfg)
+    if step < warm:
+        return (step + 1) / (warm + 1)
+    p = min(1.0, (step - warm) / max(1, cfg.steps - warm))
+    kind = cfg.lr_scheduler
+    if kind == "cosine":
+        f = 0.5 * (1 + math.cos(math.pi * p))
+    elif kind == "linear":
+        f = max(0.0, 1 - p)
+    elif kind == "rex":
+        f = (1 - p) / (0.5 + 0.5 * (1 - p))
+    elif kind == "cosine_restarts":
+        q = 0.0 if p >= 1.0 else (p * max(1, int(cfg.lr_cycles))) % 1.0
+        f = 0.5 * (1 + math.cos(math.pi * q)) if p < 1.0 else 0.0
+    else:
+        return 1.0
+    m = min(1.0, max(0.0, float(cfg.lr_min_factor)))
+    return m + (1 - m) * f
+
+
 def build_scheduler(cfg: TrainConfig, optimizer, offset: int = 0):
     """offset: the run's step this optimizer starts at (a fine-tune rebuilds its optimizer every window)."""
-    warm = max(0, cfg.warmup_steps)
     if effective_optimizer(cfg)[0] in AUTOMAGIC:  # self-tuning lr: no warmup/decay from outside
+        if cfg.lr_scheduler != "constant" or cfg.lr_min_factor or cfg.warmup_fraction:
+            log.info("The learning-rate schedule is ignored with %s (it adapts its own rate)",
+                     effective_optimizer(cfg)[0])
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
-
-    def fn(step):
-        step += offset
-        if step < warm:
-            return (step + 1) / (warm + 1)
-        p = (step - warm) / max(1, cfg.steps - warm)
-        if cfg.lr_scheduler == "cosine":
-            return 0.5 * (1 + math.cos(math.pi * min(1.0, p)))
-        if cfg.lr_scheduler == "linear":
-            return max(0.0, 1 - p)
-        return 1.0
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, fn)
+    if not offset:  # (a fine-tune window's rebuild says nothing again)
+        if cfg.warmup_fraction > 0:
+            log.info("Warm-up: %d steps (warmup_fraction %g of %d steps; warmup_steps %d is not used)",
+                     warmup_length(cfg), cfg.warmup_fraction, cfg.steps, cfg.warmup_steps)
+        else:
+            log.info("Warm-up: %d steps (warmup_steps)", warmup_length(cfg))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_factor(cfg, step + offset))
 
 
 class Trainer(RaceParallelMixin):
@@ -1303,6 +1340,9 @@ class Trainer(RaceParallelMixin):
             self.race_base = cfg
             cfg = self.cfg = self._race_prep_config(cfg)
         items = scan_dataset(cfg)
+        id4_note = ideogram4_caption_warning(items, cfg)
+        if id4_note:
+            log.warning(id4_note)
         # the regularisation dataset (reg_dir): read now, so a folder without captions stops the run before the
         # analysis and the caching. Kept out of `items`: nothing below that reads the subject sees its pictures
         self.reg_items = scan_reg(cfg)
@@ -3709,7 +3749,9 @@ class Trainer(RaceParallelMixin):
         if reg and cfg.resolution_step_up:
             reg = items_for_side(reg, self.sides[self.res_stage])
         old = getattr(self, "batcher", None)
-        self.batcher = BucketBatcher(items + reg, cfg.batch_size, cfg.seed + step, reg_per_epoch=cfg.reg_per_epoch)
+        self.batcher = BucketBatcher(items + reg, cfg.batch_size, cfg.seed + step, reg_per_epoch=cfg.reg_per_epoch,
+                                     dataset_samples={str(Path(sp.path)): sp.samples for sp in cfg.dataset_specs()
+                                                      if sp.samples > 0})
         if reg:
             if carry_reg:
                 self.batcher.carry_reg_pass(old)
@@ -3808,7 +3850,8 @@ class Trainer(RaceParallelMixin):
                     items.append(Item(image=png, caption=caption, width=bw, height=bh,
                                       latent_path=cache / "latents" / f"{stem}{tag}.safetensors", latent_flip_path=None,
                                       text_path=text_cache_path(cfg, caption), category="pair", side=side,
-                                      repeats=reps, dataset=d, loss_scale=cfg.isolation_pair_weight,
+                                      repeats=reps, dataset=d,
+                                      loss_scale=cfg.isolation_pair_weight * float(spec.weight),  # x its dataset's
                                       pair_side=iso.pair_side(caption, s.fused)))
                     n_pairs += 1
         n_dop = 0
@@ -4129,8 +4172,10 @@ class Trainer(RaceParallelMixin):
         cfg = self.cfg
         per_step = max(1, cfg.batch_size * cfg.gradient_accumulation * len(self.replicas))
         images = 0
-        if self.batcher is not None:  # (with the epoch's regularisation pictures, which wait outside the buckets)
-            images = sum(len(v) for v in self.batcher.buckets.values()) + sum(
+        if self.batcher is not None:  # (the capped epoch: samples; with its regularisation pictures, which wait
+            sizes = getattr(self.batcher, "bucket_sizes", None)  # outside the buckets)
+            images = (sum(sizes.values()) if sizes is not None else
+                      sum(len(v) for v in self.batcher.buckets.values())) + sum(
                 (getattr(self.batcher, "reg_quota", None) or {}).values())
         return max(1, -(-images // per_step)), per_step
 
