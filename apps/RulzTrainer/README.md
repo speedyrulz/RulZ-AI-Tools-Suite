@@ -476,6 +476,21 @@ section) and samples with its own turbo LoRA by default where it has one ([Turbo
   plain conversion to RGB kept whatever colour the transparent pixels store, often black, so the LoRA learned a
   background nobody sees. A transparent picture's latents are named apart from those cached before, so they are
   encoded again once.
+- **Colour profiles and 16-bit pictures.** A picture with an embedded colour profile other than sRGB (Display P3 from
+  a phone, Adobe RGB, ProPhoto, a CMYK print profile) is converted to sRGB with littleCMS, so it trains as bright as
+  it looks; a 16-bit or 32-bit grey picture is scaled to 8 bits over its range instead of clipped to white (after
+  Fizgig 9.7.4). Only those pictures' latents are encoded again once; every other picture keeps its cache.
+- **Caption files** can be UTF-8 (with or without a byte-order mark), UTF-16 or UTF-32 with one (PowerShell's `>`,
+  Notepad's "Unicode") or Windows-1252: each is read as what it is, and captions are written as UTF-8.
+- **Repeats from folder names** (`folder_repeats`, off by default): a picture in a sub-folder named `<N>_<name>`
+  (kohya's `10_portraits`) trains N times per epoch, times its dataset's own repeats. The nearest such folder below
+  the dataset folder counts (`10_a/3_b` gives 3); the dataset folder's own name never does, and nor does the
+  regularisation set. The log lists each folder's repeats.
+- **One caption per line** (`caption_lines`, off by default): each non-empty line of a `.txt` caption is its own
+  caption, each with the trigger word and its own cached text, and every time the picture trains one line is drawn at
+  random (from the run's seed, so a resumed run draws the same). Face and bust crops get every line too. JSON captions,
+  video clips and the regularisation set keep one caption; where one caption is needed (Isolation's pull-back caption,
+  the loss watch, probes) the first line is used.
 - **Timesteps.** `logit_normal` (mean/std), `sigmoid` (scale) or `uniform`, with an optional `timestep_shift`.
   `logsnr` is the style-friendly sampler ([arXiv 2411.14793](https://arxiv.org/abs/2411.14793), via musubi-tuner):
   the log signal-to-noise ratio is drawn from N(`logsnr_mean`, `logsnr_std`), -6 and 2 as the paper recommends, so
@@ -948,7 +963,9 @@ states and the likeness controller) every `save_state_every` steps (0 = with eac
 `keep_states` of them (default 1; 0 = all), and writes the final state when training ends or is stopped. A state takes
 about 3 times the size of the LoRA in fp32 with Adam. Races and full fine-tunes keep no states.
 
-Set `resume_state` to one of those folders to continue where it stopped. `resume_from` loads only LoRA weights from
+Set `resume_state` to one of those folders to continue where it stopped. Start checks it first: a folder that is not a
+complete state is refused (a folder holding states names the newest one inside), and so is a job folder that is
+itself a state. `resume_from` loads only LoRA weights from
 any exported file. A resumed run carries on with the likeness scale, best scores, patience, smoothing, learning-rate
 factor and face bias it had, and only a probe above the best files already in the job folder replaces them, even when
 those are newer than the state. A state saved by an older version has no controller: its scale and patience start
@@ -1512,6 +1529,15 @@ learning has stalled. Set `automagic_min_lr: 1e-8` for the old behaviour (the Ke
 [docs/keel-test-results.md](docs/keel-test-results.md) were measured with it). **Automagic 4** logs a warning when
 picked: ai-toolkit's author advised staying on Automagic 3 until a rework (8 November 2026), and a P-H3-Image run it
 ruined trained fine on Automagic 3. Both were ai-toolkit's v4; this port's changes below are untested against them.
+
+**With LoRA Isolation** (and its pull-back on, `dop_weight` above 0) an Automagic or Keel pick trains with AdamW instead (at the learning rate when it is between
+1e-6 and 1e-3, else 2e-4; after Fizgig 9.7.6): Isolation's pull-back step every `dop_every` steps flips each weight's
+update, and Automagic reads that as overshooting and lowers its rate to the floor (Fizgig measured 1e-8 from the second
+epoch). Start, the log and each race row say so. A state saved before this resumes its LoRA weights with a fresh AdamW.
+
+**Automagic 4's working rate**: its rate sits at the cap while the sensitivity balance brakes each weight's step, so
+the log and the Monitor's lr tile also show the rate times the mean brake and the share of weights braked
+(`lr 2.50e-04 (working 1.2e-04, 18% braked)`), with each param group's working rate and reference every 100 steps.
 
 **Automagic 4** adds two things. *Sensitivity-balanced steps*: a weight's gradient power (the second moment the
 optimizer keeps anyway) measures how far one step moves the model's output; weights above the

@@ -447,3 +447,89 @@ def test_automagic4_edge_cases_empty_param_dead_first_step_and_group_after_inher
     before = c.detach().clone()
     _run(nxt, [c, d], 1, seed=5)
     assert not torch.equal(before, c)
+
+
+def _brake_params(seed=0):
+    torch.manual_seed(seed)
+    # a 2-D weight whose rows differ in sensitivity (so some are braked), a 1-D bias and a 3-D conv-like weight
+    return [torch.nn.Parameter(torch.randn(16, 32)), torch.nn.Parameter(torch.randn(24)),
+            torch.nn.Parameter(torch.randn(4, 8, 8))]
+
+
+def _brake_grads(params, seed):
+    gen = torch.Generator().manual_seed(seed)
+    for p in params:
+        g = torch.randn(p.shape, generator=gen)
+        if p.dim() >= 2:
+            g = g * torch.logspace(-2, 1, p.shape[-2]).unsqueeze(-1)
+        p.grad = g
+
+
+def test_automagic4_brake_stats_are_read_only_and_consistent():
+    from rulztrainer.optimizers.automagic4 import Automagic4
+
+    def train(call_stats):
+        params = _brake_params()
+        opt = Automagic4(params, lr=1e-3, polarity_history=4, fused=False)
+        seen = []
+        for s in range(8):
+            _brake_grads(params, s)
+            opt.step()
+            if call_stats:
+                seen.append(opt.brake_stats())
+        return params, opt, seen
+
+    pa, oa, seen = train(True)
+    pb, ob, _ = train(False)
+    assert all(torch.equal(a, b) for a, b in zip(pa, pb))  # reading the brake changes no update
+    sa, sb = oa.state_dict(), ob.state_dict()
+    assert sa["state"].keys() == sb["state"].keys()
+    for k in sa["state"]:
+        assert sa["state"][k].keys() == sb["state"][k].keys()
+        for name, v in sa["state"][k].items():
+            if isinstance(v, torch.Tensor):
+                assert torch.equal(v, sb["state"][k][name]), name
+    assert seen[0] is not None  # (the first step only measures, the reference exists after it)
+    st = seen[-1]
+    assert 0.0 < st["mean_balance"] <= 1.0 and 0.0 <= st["braked_share"] <= 1.0
+    assert st["braked_share"] > 0.0 and st["mean_balance"] < 1.0  # the sensitive rows are braked
+    assert abs(st["lr_working"] - st["lr"] * st["mean_balance"]) < 1e-12  # one group
+    assert st["lr"] == pytest.approx(oa.get_avg_learning_rate()) and st["reference"] == pytest.approx(float(oa._ref))
+    assert len(st["groups"]) == 1 and st["groups"][0]["lr_working"] == pytest.approx(st["lr_working"])
+
+
+def test_automagic4_brake_stats_slab_path_matches_and_none_before_a_reference():
+    from rulztrainer.optimizers.automagic4 import Automagic4
+
+    p = torch.nn.Parameter(torch.randn(16, 32))
+    opt = Automagic4([p], lr=1e-3, polarity_history=4, fused=False)
+    assert opt.brake_stats() is None
+    res = []
+    for bucket in (1 << 20, 64):  # whole tensor, then slabs of two rows
+        torch.manual_seed(1)
+        q = torch.nn.Parameter(torch.randn(16, 32))
+        o = Automagic4([q], lr=1e-3, polarity_history=4, fused=False, bucket_elems=bucket)
+        for s in range(4):
+            _brake_grads([q], s)
+            o.step()
+        o.bucket_elems = 1 << 20 if bucket == 64 else 64  # read with the other slab size
+        res.append(o.brake_stats())
+    assert res[0]["mean_balance"] == pytest.approx(res[1]["mean_balance"], rel=1e-5)
+    assert res[0]["braked_share"] == pytest.approx(res[1]["braked_share"], abs=1e-9)
+
+
+def test_brake_stats_in_trainer_helpers_and_not_for_other_optimizers():
+    from rulztrainer.trainer import brake_detail, brake_stats
+
+    params = _brake_params()
+    cfg = TrainConfig(optimizer="automagic4", learning_rate=1e-3, automagic_polarity_history=4)
+    opt = build_optimizer(cfg, params)
+    for s in range(4):
+        _brake_grads(params, s)
+        opt.step()
+    st = brake_stats(opt)
+    assert st is not None and "mean brake" in brake_detail(st) and "% of weights braked" in brake_detail(st)
+    assert current_lr(opt, None) == pytest.approx(opt.get_avg_learning_rate())  # the raw rate stays what lr_floor reads
+    assert brake_stats(torch.optim.AdamW(params, lr=1e-4)) is None
+    a3 = build_optimizer(TrainConfig(optimizer="automagic3", learning_rate=1e-3), _brake_params())
+    assert brake_stats(a3) is None

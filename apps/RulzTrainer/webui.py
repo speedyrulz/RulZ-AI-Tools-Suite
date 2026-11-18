@@ -35,6 +35,7 @@ from rulztrainer import (__version__, bodysim, capabilities, facesim, history, l
                          promptcheck)
 from rulztrainer.train_queue import TrainQueue
 from rulztrainer.dataset import skipped as dataset_skipped
+from rulztrainer.caption_text import read_caption_text
 from rulztrainer.pictures import to_rgb
 from rulztrainer.losswatch import read_verdicts
 from rulztrainer.regionwatch import describe as region_watch_line
@@ -569,6 +570,12 @@ def _start_training(cfg: TrainConfig, recovery_note: str | None = None) -> str:
     """Start a run. recovery_note: the start is out-of-memory recovery's (oom_recovery), and the new train.log opens
     with this note; any other start begins with no recovery tries."""
     global _proc, _adopted, _job_dir
+    from rulztrainer.runplan import check_state_paths
+
+    try:
+        check_state_paths(cfg)
+    except ValueError as e:
+        return str(e)
     reattach_job()
     if _running():
         return "A training job is already running."
@@ -722,6 +729,11 @@ def queue_run(cfg: TrainConfig) -> tuple[bool, str]:
     if _running() and _job_dir is not None:
         taken.add(_job_dir.name)
     from rulztrainer import runplan
+
+    try:
+        runplan.check_state_paths(cfg)
+    except ValueError as e:
+        return False, str(e)
 
     if runplan.name_in(cfg.job_name, taken):  # (on Windows `Portrait` and `portrait` are one folder)
         free = runplan.next_free_name(cfg.job_name, taken, cfg.output_dir)
@@ -1001,6 +1013,19 @@ def last_log_line(path, tail_bytes: int = 16384) -> str:
         if line.strip():
             return re.sub(r"^\d{1,2}:\d{2}:\d{2}\s+", "", line.strip())
     return ""
+
+
+def working_rate_text(st: dict) -> str:
+    """Automagic 4's working rate (the raw rate x its mean brake) for the Monitor's lr tile, e.g. "working 1.2e-04
+    (18% braked)"; "" when the status has none."""
+    try:
+        w = st.get("lr_working")
+        if w is None:
+            return ""
+        share = st.get("braked_share")
+        return f"working {float(w):.1e}" + (f" ({float(share) * 100:.0f}% braked)" if share is not None else "")
+    except (TypeError, ValueError):
+        return ""
 
 
 def run_activity(job_dir, st: dict, now: float, cpu: float | None = None, cores: float | None = None) -> dict:
@@ -2079,6 +2104,7 @@ class Form:
             resolution_step_up=bool(v("resolution_step_up")), step_up_patience=int(v("step_up_patience")),
             step_up_stop_patience=int(v("step_up_stop_patience")),
             enable_buckets=bool(v("enable_buckets")), flip_augment=bool(v("flip_augment")),
+            folder_repeats=bool(v("folder_repeats")), caption_lines=bool(v("caption_lines")),
             trigger_word=s("trigger_word"), caption_dropout=float(v("caption_dropout")),
             caption_dropout_keep_trigger=bool(v("caption_dropout_keep_trigger")),
             max_token_length=int(v("max_token_length")), recache=bool(v("recache")),
@@ -4579,7 +4605,7 @@ def build_dataset_tab(f: Form):
         with grid:
             for img, thumb in zip(page_imgs, thumbs):
                 cap = img.with_suffix(".txt")
-                text = cap.read_text(encoding="utf-8") if cap.is_file() else ""
+                text = read_caption_text(cap) if cap.is_file() else ""
                 with ui.card().tight().classes("w-full rz-thumb"):
                     ui.image(image_url(thumb)).props("fit=cover ratio=1").classes("w-full cursor-pointer") \
                         .on("click", lambda _, p=img: show_full(p)).tooltip("Click to view full size")
@@ -6330,6 +6356,21 @@ def start_warnings(cfg: TrainConfig) -> list[str]:
     from rulztrainer.archs import get_arch
 
     out = []
+    from rulztrainer.config import effective_optimizer
+
+    try:
+        if cfg.race:
+            from rulztrainer import race
+
+            rows = race.variant_configs(cfg)
+        else:
+            rows = [("", cfg, {})]
+    except (ValueError, TypeError, AttributeError, KeyError):  # (a bad race row: validate() says what is wrong)
+        rows = []
+    for row_name, row_cfg, _ in rows:
+        reason = effective_optimizer(row_cfg)[2]
+        if reason:
+            out.append(f"{row_name}: {reason}" if row_name else reason)
     try:
         arch = get_arch(cfg)
     except (ValueError, NotImplementedError):
@@ -6349,7 +6390,7 @@ def start_warnings(cfg: TrainConfig) -> list[str]:
                 continue
             if pattern is not None:
                 try:
-                    text = cap.read_text(encoding="utf-8", errors="replace")
+                    text = read_caption_text(cap)
                 except OSError:
                     continue
                 if pattern.search(text):
@@ -10232,6 +10273,10 @@ def build_page(local: bool = True):
                         with fields():
                             w["enable_buckets"] = ui.switch("Aspect-ratio buckets", value=True)
                             w["flip_augment"] = ui.switch("Horizontal flip augment", value=False)
+                            w["folder_repeats"] = ui.switch("Repeats from folder names", value=d.folder_repeats)                                 .tooltip("kohya style: a picture inside a sub-folder named like 10_portraits trains "
+                                         "10 times per epoch, times its dataset's own repeats. The nearest folder "
+                                         "named that way below the dataset's folder counts (the dataset folder "
+                                         "itself never does). Not applied to the regularisation folder.")
                         with fields() as video_row:
                             w["train_frames"] = ui.number("Frames per training clip", value=d.train_frames, min=1,
                                                           max=361, precision=0).classes("w-48") \
@@ -10266,6 +10311,10 @@ def build_page(local: bool = True):
                                     .tooltip("A dropped caption becomes the trigger word alone instead of the empty "
                                              "prompt, so the trigger by itself summons the subject, the way the LoRA "
                                              "is prompted. Off: the empty prompt (FIBO: its null caption).")
+                                w["caption_lines"] = ui.switch("One caption per line", value=d.caption_lines)                                     .tooltip("Every non-empty line of a .txt caption file is its own caption (the "
+                                             "trigger word added to each); each time the picture trains, one line "
+                                             "is picked at random. Off: the whole file is one caption. A .json "
+                                             "caption is always one.")
                                 w["max_token_length"] = ui.number("Max caption tokens", value=d.max_token_length,
                                                                   min=64, max=4096, step=64, precision=0) \
                                     .classes("w-40")
@@ -12986,7 +13035,7 @@ def build_page(local: bool = True):
                 show("step", f"{step:,}", f"of {total:,} · {step / total * 100:.0f}% done" if total else "")
                 if loss is not None:
                     show("loss", f"{loss:.4f}", f"average {st.get('avg_loss') or 0:.4f}")
-                show("lr", f"{st['lr']:.2e}" if st.get("lr") is not None else "-")
+                show("lr", f"{st['lr']:.2e}" if st.get("lr") is not None else "-", working_rate_text(st))
                 show("eta", eta_text(eta) if running else "-")
                 error_box.text = f"Error: {st['error']}" if st.get("error") else ""
                 error_box.visible = bool(st.get("error"))

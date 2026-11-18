@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .caption_text import read_caption_text
 from .history import probe_racer as _probe_racer
 
 INK, MUTED, FAINT, GRID, SURFACE, CARD = "#1a1a19", "#6b6a63", "#9b9a92", "#e4e3dd", "#f4f3ef", "#ffffff"
@@ -983,7 +984,7 @@ def pdf(run: Run, path: Path) -> Path:
             yy = y
             for pth in picks[::max(1, count // 3)][:3]:
                 try:
-                    cap = pth.with_suffix(".txt").read_text(encoding="utf-8", errors="replace")
+                    cap = read_caption_text(pth.with_suffix(".txt"))
                 except OSError:
                     continue
                 wrapped = _wrap(cap, 118)[:5]

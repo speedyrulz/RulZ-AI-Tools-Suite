@@ -8,6 +8,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import webui  # noqa: E402
 
 
+def test_working_rate_text_for_automagic_4():
+    st = {"lr": 2.5e-4, "lr_working": 1.2e-4, "braked_share": 0.18}
+    assert webui.working_rate_text(st) == "working 1.2e-04 (18% braked)"
+    assert webui.working_rate_text({"lr_working": 1.2e-4}) == "working 1.2e-04"
+    assert webui.working_rate_text({"lr": 2.5e-4}) == "" and webui.working_rate_text({"lr_working": "x"}) == ""
+
+
 def score(img, face, body=None):
     return {"image": img, "face_norm": face, "body_norm": body,
             "combined_norm": face if body is None else 0.7 * face + 0.3 * body}
