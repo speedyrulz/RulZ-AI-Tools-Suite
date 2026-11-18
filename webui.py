@@ -31,7 +31,7 @@ from rulztrainer.config import (AUTOMAGIC, KEEL, KEEL_FB, OPTIMIZERS, ARCH_DEFAU
                                 MODEL_PRESETS, ARCH_SAMPLE_LORA, VIDEO_ARCHS, VIDEO_EXTS, VIDEO_DATA_PRESETS,
                                 STILL_FFN_TARGETS, detect_video_data_preset, video_data_preset,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
-from rulztrainer import (__version__, bodysim, capabilities, facesim, history, lookfilter, machine, oom_recovery,
+from rulztrainer import (__version__, blockaudit, bodysim, capabilities, facesim, history, lookfilter, machine, oom_recovery,
                          promptcheck)
 from rulztrainer.train_queue import TrainQueue
 from rulztrainer.dataset import skipped as dataset_skipped
@@ -2207,6 +2207,8 @@ class Form:
             probe_checks=list(v("probe_checks") or []) + [
                 e for e in getattr(getattr(self, "_base", None), "probe_checks", []) if isinstance(e, dict)],
             probe_check_seeds=int(v("probe_check_seeds") or 4),
+            block_audit_every=int(v("block_audit_every") or 0), block_audit_groups=int(v("block_audit_groups") or 6),
+            block_audit_seeds=int(v("block_audit_seeds") or 0),
             likeness_best_min_kept=float(v("likeness_best_min_kept") or 0),
             probe_seeds=int(v("probe_seeds")), probe_seed=int(v("probe_seed")), probe_size=int(v("probe_size")),
             probe_floor_seeds=int(v("probe_floor_seeds") or 4),
@@ -5316,6 +5318,8 @@ RACE_LABELS = {
     "region_steer_subject_ahead": "Region steering: subject ahead",
     "region_sweep_pictures": "Region sweep: pictures per sweep", "holdout_images": "Held-out photos",
     "holdout_track_best": "Held-out best checkpoint", "holdout_patience": "Held-out stop patience",
+    "block_audit_every": "Block audit every (probes)", "block_audit_groups": "Block audit groups",
+    "block_audit_seeds": "Block audit seeds",
     "per_image_lr": "Per-image learning rate", "lora_rank": "LoRA rank", "lora_alpha": "LoRA alpha",
     "lora_targets": "LoRA layers", "lora_blocks": "LoRA blocks", "lora_dropout": "LoRA dropout",
     "network_type": "Adapter type", "lokr_factor": "LoKr factor", "oft_block_size": "OFT block size",
@@ -9563,7 +9567,8 @@ def build_fleet_tab(form_config=None):
                            f"{', '.join(rec.get('downloaded') or [])})" if folder else "No files downloaded.") + \
             (f" · last download failed: {rec['pull_error']}" if rec.get("pull_error") else "")
         run_images.clear()
-        images = sorted((folder / "probes").glob("*.png"))[-8:] if folder and (folder / "probes").is_dir() else []
+        images = sorted(p for p in (folder / "probes").glob("*.png") if not blockaudit.is_audit_image(p.name))[-8:] \
+            if folder and (folder / "probes").is_dir() else []
         with run_images:
             for img in images:
                 ui.image(image_url(img)).classes("w-40 rounded").tooltip(img.name)
@@ -12127,6 +12132,27 @@ def build_page(local: bool = True):
                                 w["likeness_noise_band"] = ui.number("Noise band (% points)",
                                                                      value=d.likeness_noise_band, step=0.5) \
                                     .classes("w-48")
+                                w["block_audit_every"] = ui.number("Block audit every N probes (0 = off)",
+                                                                   value=d.block_audit_every, min=0, precision=0) \
+                                    .classes("w-72").tooltip(
+                                    "Experimental, report only, untested on a real model. After every Nth probe the "
+                                    "likeness prompts render again once per block group with that group's LoRA "
+                                    "switched off, at the probe's own seeds, and the log, the Monitor and the run "
+                                    "report show how much each group adds to the face and body score. Nothing about "
+                                    "training changes. Costs groups x seeds x (face + body) extra renders per audit. "
+                                    "Not with a race, probe_async, a full fine-tune or compile_model on (auto turns "
+                                    "compile off).")
+                                w["block_audit_groups"] = ui.number("Block audit groups", value=d.block_audit_groups,
+                                                                    min=2, max=16, precision=0).classes("w-48") \
+                                    .tooltip("The trained blocks are cut into this many contiguous groups of near-equal "
+                                             "size; layers that sit in no block (embedders, final layers) form one "
+                                             "more group, 'other'.")
+                                w["block_audit_seeds"] = ui.number("Block audit seeds (0 = as the probe)",
+                                                                   value=d.block_audit_seeds, min=0, max=16,
+                                                                   precision=0).classes("w-64") \
+                                    .tooltip("Seeds per ablated render: the first of the probe's seeds, so every "
+                                             "score is paired with the same seed at full strength. More than Seeds "
+                                             "per probe adds nothing. Each group costs this many renders per kind.")
 
                     # ---- Configuration race
                     with sections.section("Tools", "Configuration race",
@@ -12736,6 +12762,8 @@ def build_page(local: bool = True):
                 with section("Region watch", "How far each part of the pictures has been learned", "grid_view") as rw_exp:
                     rw_label = hint("")
                     rs_label = hint("")
+                    ba_label = hint("")
+                    ba_label.visible = False
                     with ui.column().classes("w-full gap-1") as rs_box:
                         with ui.column().classes("w-full gap-1") as rs_gap_box:
                             hint("Gap between the training pictures and the held-out photos, sweep by sweep: how "
@@ -13186,6 +13214,11 @@ def build_page(local: bool = True):
                         rw_label.text = f"Epoch {rw.get('epoch')} (step {rw.get('step')}): {region_watch_line(rw)}"
                         rw_table.rows = rw.get("rows") or []
                         rw_table.update()
+                ba = st.get("block_audit")
+                ba_label.visible = bool(ba)
+                if ba:  # the block audit's latest line (report only), by the region sweep's
+                    rw_exp.visible = True
+                    ba_label.text = f"Block audit at step {ba.get('step')}: {ba.get('line') or ''}"
                 rs = st.get("region_sweep")
                 if rs:
                     rw_exp.visible = True

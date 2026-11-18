@@ -1088,6 +1088,11 @@ class TrainConfig:
     probe_checks: list = field(default_factory=list)  # extra prompts rendered and checked at every probe, never
     #                 scored: a preset key (promptcheck.PRESETS) or {"name", "prompt", "expect", "kind": face | body}
     probe_check_seeds: int = 4  # seeds per extra prompt (the first of the probe seeds)
+    # the block audit (blockaudit.py): report only. Every Nth probe renders the likeness prompts again once per block
+    # group with that group's adapter off, and logs how much each group adds. Changes nothing about training
+    block_audit_every: int = 0  # audit after every Nth probe; 0 = off (needs probes: probe_every and face_refs / body_refs)
+    block_audit_groups: int = 6  # the trained blocks cut into this many contiguous groups (2 to 16), plus "other"
+    block_audit_seeds: int = 0  # seeds per ablated render (the first of the probe's seeds); 0 = as many as the probe
     likeness_noise_band: float = 1.0  # percent points a change must exceed to count
     likeness_normalize: bool = True  # score face and body on one scale (0 = a stranger, 100 = the references) first
     face_scale_span: float = 1.35  # the face's 100 sits this many times as far above a stranger as the references do
@@ -1412,6 +1417,33 @@ class TrainConfig:
                              f"needs likeness probes (probe_every, face_refs and/or body_refs) and a probe prompt "
                              f"whose frame is known (set probe_face_expect / probe_body_expect, or add probe_checks)")
 
+    def validate_block_audit(self) -> None:
+        """The block audit's settings (blockaudit.py): it reads the likeness probes, needs an adapter to switch off and
+        the same weights for the probe and the audit, so only runs where those hold."""
+        if self.block_audit_every < 0:
+            raise ValueError("block_audit_every must be 0 (off) or a number of probes")
+        if not 2 <= int(self.block_audit_groups) <= 16:
+            raise ValueError("block_audit_groups must be 2 to 16")
+        if not 0 <= int(self.block_audit_seeds) <= 16:
+            raise ValueError("block_audit_seeds must be 0 (as many as the probe) to 16")
+        if self.block_audit_every == 0:
+            return
+        if not (self.probe_every > 0 and (self.face_refs or self.body_refs)):
+            raise ValueError("block_audit_every re-renders the likeness probes with block groups switched off: set "
+                             "probe_every > 0 and face_refs and/or body_refs")
+        for bad, why in ((self.noise_files, "noise_files measures finished LoRAs and trains nothing"),
+                         (self.soup_files, "soup_files averages finished LoRAs and trains nothing"),
+                         (self.finetune, "a full fine-tune has no adapter to switch off"),
+                         (self.race, "a race takes turns between configurations on one model (audit one run at a "
+                                     "time)"),
+                         (self.probe_async, "probe_async scores weights up to probe_every steps old on another GPU, "
+                                            "so the audit's renders would not be paired with its probe"),
+                         (self.compile_model is True, "a compiled block guards on each LoRA layer's multiplier, so "
+                                                      "every group switched off would compile again (compile_model "
+                                                      "auto turns itself off)")):
+            if bad:
+                raise ValueError(f"block_audit_every is not available here: {why}")
+
     def still_masking(self) -> bool:
         """still_lora_targets or still_lora_blocks is set (a batch of stills trains part of the LoRA)."""
         return bool(self.still_lora_targets) or bool((self.still_lora_blocks or "").strip())
@@ -1478,6 +1510,7 @@ class TrainConfig:
         if not 0.0 <= self.likeness_curriculum_framing <= 1.0:
             raise ValueError("likeness_curriculum_framing must be 0 (off) to 1")
         self.validate_prompt_check()
+        self.validate_block_audit()
         foreign = self.foreign_sampling_files()
         if foreign:
             raise ValueError(f"This run trains {self.arch_name()}, but these settings name another model's files: "

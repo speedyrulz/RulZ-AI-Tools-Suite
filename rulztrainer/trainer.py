@@ -36,7 +36,7 @@ from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, d
 from .archs import detect_arch, get_arch
 from .idloss import effective_weight as idloss_weight
 from .losses import elementwise_loss
-from . import regionsweep, regionwatch
+from . import blockaudit, regionsweep, regionwatch
 from .race_parallel import RaceParallelMixin
 from .multigpu import (Balancer, choose_counts, clone_to, compile_count, job_order, no_recompile_stance, norm_device,
                        run_queue, stance_available, step_seconds)
@@ -716,6 +716,7 @@ class Trainer(RaceParallelMixin):
         self.loss_watch = None
         self.region_watch = None  # regionwatch.RegionWatch when region_watch is on
         self.sweep = None  # regionsweep.RegionSweep when sweeps or held-out pictures are on
+        self.block_audit = None  # blockaudit.BlockAudit when block_audit_every is on
         self.holdout_items: list = []  # the photos kept out of training (holdout_images)
         self.holdout_stop = False  # the held-out subject score went holdout_patience sweeps without a new best
         self.region_watch_off = ""  # why it cannot run (no parser), when it cannot
@@ -1530,6 +1531,9 @@ class Trainer(RaceParallelMixin):
         if do_compile and any(c.wants_parts() for c in
                               ([r[1] for r in self.race_rows] if self.race_rows is not None else [cfg])):
             do_compile, why = False, "Hull's region gains run a custom backward in the LoRA layers (hull_regions)"
+        if do_compile and cfg.block_audit_every > 0:
+            do_compile, why = False, ("the block audit switches LoRA layers off by their multiplier, which a compiled "
+                                      "block guards on (block_audit_every)")
         if why:
             log.info("torch.compile %s (%s)", "on" if do_compile else "off", why)
         if do_compile:
@@ -1606,6 +1610,7 @@ class Trainer(RaceParallelMixin):
         if self.maps is not None and self.maps.due(step):  # the baseline (or a resumed run's starting point)
             self._side_job(f"Training maps at step {step}", lambda: self._capture_maps(model, injected, step))
         self._setup_sweep(cfg, step)
+        self._setup_block_audit(cfg, model, injected, step)
         if self.sweep is not None and self.sweep.due(step):  # the first sweep: what every later one is measured from
             self._side_job(f"Region sweep at step {step}", lambda: self._run_sweep(model, injected, step))
         if cfg.sample_prompts and cfg.sample_before_training and step == 0:
@@ -3613,6 +3618,106 @@ class Trainer(RaceParallelMixin):
             log.warning("Region sweeps could not start; training goes on without them (%s: %s)", type(e).__name__,
                         str(e)[:200])
 
+    def _setup_block_audit(self, cfg, model, injected, step: int) -> None:
+        """The block audit (blockaudit.py), or nothing when it is off or cannot run. Its groups are cut from the
+        trained model's blocks and apply to every copy that renders by module name."""
+        from .likeness import probe_seed_count
+
+        self.block_audit = None
+        if cfg.block_audit_every <= 0:
+            return
+        if self.controller is None or (self.face_scorer is None and self.body_scorer is None):
+            log.warning("block_audit_every is on, but there are no working likeness probes to read: no block audit")
+            return
+        try:
+            groups = blockaudit.build_groups(blockaudit.block_map(self.arch.compile_blocks(model), injected),
+                                             cfg.block_audit_groups)
+            if not groups:
+                log.warning("Block audit: the model has no adapter layers to switch off: no block audit")
+                return
+            audit = blockaudit.BlockAudit(self.job_dir, cfg.block_audit_every, cfg.block_audit_groups,
+                                          cfg.block_audit_seeds, resume=bool(cfg.resume_state) and step > 0)
+            kept = audit.set_groups(groups, step)
+            n = probe_seed_count(cfg, 1)
+            seeds = min(n, cfg.block_audit_seeds or n)
+            kinds = sum(1 for k, sc in (("face", self.face_scorer), ("body", self.body_scorer)) if sc is not None
+                        and getattr(cfg, f"probe_{k}_prompt"))
+            log.info("Block audit on: after every %d probe(s) the likeness prompts render again with each of %d "
+                     "groups (%s) switched off, %d seed(s) each: %d extra renders per audit. Report only, training "
+                     "does not change%s%s", audit.every, len(groups),
+                     ", ".join(f"{g['name']} {g['span']}" for g in groups), seeds, len(groups) * seeds * kinds,
+                     f" (the probe's seeds are {n}: the audit uses its first {seeds})" if cfg.block_audit_seeds > n
+                     else "", "" if kept else "; the saved audits were cut differently, so they start again")
+            self.block_audit = audit
+        except Exception as e:  # noqa: BLE001
+            self.block_audit = None
+            log.warning("The block audit could not start; training goes on without it (%s: %s)", type(e).__name__,
+                        str(e)[:200])
+
+    def _block_audit_after_probe(self, model, step: int) -> None:
+        """Right after a normal probe was scored and acted on (in the weight average's context): the audit when it is
+        due. Never raises; a failure turns the audits off."""
+        audit = self.block_audit
+        if audit is None or self.last_probe is None or not audit.tick(step):
+            return
+        try:
+            self._run_block_audit(model, step)
+        except Exception as e:  # noqa: BLE001
+            audit.fail(step, e)
+        finally:
+            free_cuda()
+            self.status.update(stage="training")
+
+    @torch.no_grad()
+    def _run_block_audit(self, model, step: int) -> None:
+        """Render the likeness prompts once per block group with that group off, at the normal probe's seeds, and keep
+        each group's credit (the probe's score less the ablated one, per seed, paired). Changes nothing else: no
+        controller update, no record, no weights."""
+        from . import promptcheck
+        from .likeness import probe_seed_count
+
+        audit, cfg = self.block_audit, self.cfg
+        t0 = time.time()
+        _, _, _, normal_seeds = self.last_probe
+        n = probe_seed_count(cfg, step)
+        n_seeds = min(n, cfg.block_audit_seeds or n)
+        normal = {k: list(normal_seeds.get(k) or [])[:n_seeds] for k in ("face", "body", "gold")}
+        specs = [c for c in promptcheck.checks(cfg) if not c.extra and c.expect]
+        refs = getattr(self.controller, "check_ref", None) or None
+        frames = {k: v[:n_seeds] for k, v in (normal_seeds.get("frames") or {}).items() if k in ("face", "body")}
+        base = promptcheck.tally(specs, frames, refs) if specs and frames else {}
+        norm = self.controller.norm if self.controller.normalize else None
+        out, renders = [], 0
+        self.status.update(stage=f"block audit (step {step})")
+        self._free_for_rendering()
+        with lora_mod.frozen_adapters(), self._sampling_slots(model, step) as slots:
+            # the slots' own models (the training copies, or the sampling model and its copies): same names in each
+            wrappers = [{name: m for name, m in sl.model.named_modules() if isinstance(m, lora_mod.LoRALinear)}
+                        for sl in slots]
+            for g in audit.groups:  # a name missing on a rendering copy would leave its layers on: a credit of ~0
+                lost = sum(1 for w in wrappers for n in g["modules"] if n not in w)
+                if lost:
+                    raise RuntimeError(f"{lost} of group {g['name']}'s adapter layers are not on a model that renders")
+            for i, g in enumerate(audit.groups, 1):
+                with lora_mod.switched_off(wrappers, g["modules"]):
+                    _, _, images, got = self._probe_with(slots, step, tag=blockaudit.image_tag(i, step),
+                                                         n_seeds=n_seeds, check=bool(base))
+                renders += len(images)
+                check = promptcheck.tally(specs, got.get("frames") or {}, refs) if base else {}
+                out.append({"name": g["name"], "span": g["span"], "blocks": g["blocks"], "modules": len(g["modules"]),
+                            "credit": blockaudit.credit(normal, got, norm),
+                            "frame": blockaudit.frame_credit(base.get("drift_share"), check.get("drift_share"))})
+        means = {k: [x for x in vals if x is not None] for k, vals in normal.items()}
+        row = {"step": int(step), "seeds": n_seeds, "renders": renders, "seconds": round(time.time() - t0, 1),
+               "normal": {k: round(sum(v) / len(v), 3) for k, v in means.items() if v},
+               "normalized": norm is not None, "groups": out}
+        row["line"] = blockaudit.describe(row)
+        audit.record(row)
+        log.info("Block audit at step %d: %s", step, row["line"])
+        self.status.update(block_audit={**row, "history": [{"step": r["step"], "groups": [
+            {"name": g["name"], "credit": {k: v.get("mean") for k, v in (g.get("credit") or {}).items()}}
+            for g in r["groups"]]} for r in audit.history[-100:]]})
+
     def _run_sweep(self, model, injected, step: int) -> None:
         """One sweep, then what follows from it: the watch's sweep readings, the held-out best file, the stop."""
         if self.sweep is None:
@@ -4922,10 +5027,12 @@ class Trainer(RaceParallelMixin):
         return out
 
     @torch.no_grad()
-    def _probe_with(self, slots, step, tag: str = "", n_seeds: int | None = None):
+    def _probe_with(self, slots, step, tag: str = "", n_seeds: int | None = None, check: bool | None = None):
         """Render and score one probe: (face, body, images, seeds), face / body the mean raw score over the seeds that
         were scored, seeds each seed's own ({"face": [...], "body": [...]}, seed order, None = no face / body found;
-        "gold" too with the held-out recognizer). n_seeds overrides probe_seeds (the noise check)."""
+        "gold" too with the held-out recognizer). n_seeds overrides probe_seeds (the noise check). check: also read
+        the renders' frames for the prompt check (by default only a plain probe does; the block audit asks for it on
+        its likeness-only renders)."""
         try:  # the sampling extras go off again whatever fails: left on, training would go on against them
             for sl in slots:
                 sl.model.eval()
@@ -4938,7 +5045,9 @@ class Trainer(RaceParallelMixin):
         finally:
             for sl in slots:
                 lora_mod.set_extras_enabled(sl.model, False)
-        face, body, seeds = self._score_probe(jobs, images, step, check=not tag and n_seeds is None)
+        if check is None:
+            check = not tag and n_seeds is None
+        face, body, seeds = self._score_probe(jobs, images, step, check=check)
         return face, body, images, seeds
 
     def _probe_jobs(self, step: int, tag: str = "", n_seeds: int | None = None, n_slots: int = 1) -> list:
@@ -5075,6 +5184,9 @@ class Trainer(RaceParallelMixin):
         self._free_for_rendering()
         with self._averaged(replicas=True):
             stop = self._run_probe(model, step, optimizer, scheduler, injected)
+            # report only: after the probe was scored and acted on, on the same weights (a stopping probe's too: they
+            # are the run's last)
+            self._block_audit_after_probe(model, step)
         self._keel_probe(optimizer, ema, sync_replicas)
         return stop
 

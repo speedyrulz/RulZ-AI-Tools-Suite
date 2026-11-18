@@ -935,6 +935,22 @@ def set_multiplier(injected: dict[str, LoRALinear], value: float) -> None:
         m.multiplier = value
 
 
+@contextmanager
+def switched_off(injecteds: Iterable[dict[str, LoRALinear]], names: Iterable[str]):
+    """The named adapters off (multiplier 0: the frozen layer alone, for every kind) in each of the given
+    {name: LoRALinear} dicts (a data-parallel run's copies), and each one's own previous multiplier back afterwards,
+    whatever fails. The extras (sampling-only LoRAs) and the training adapter stay as they are."""
+    names = list(names)
+    saved = [(m, m.multiplier) for inj in injecteds for n in names for m in [inj.get(n)] if m is not None]
+    try:
+        for m, _ in saved:
+            m.multiplier = 0.0
+        yield
+    finally:
+        for m, value in saved:
+            m.multiplier = value
+
+
 def export_state_dict(injected: dict[str, LoRALinear], dtype=torch.bfloat16, fmt: str = "comfy") -> dict[str, torch.Tensor]:
     if fmt not in LORA_FORMATS:
         raise ValueError(f"LoRA format must be one of {LORA_FORMATS}, got {fmt!r}")
