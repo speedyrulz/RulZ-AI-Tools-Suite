@@ -173,8 +173,10 @@ class FeedForward(nn.Module):
 
 
 def _apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    xc = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    return torch.view_as_real(xc * freqs_cis.unsqueeze(2)).flatten(3).type_as(x)
+    pairs = x.float().reshape(*x.shape[:-1], -1, 2)
+    cos, sin = freqs_cis.unsqueeze(2).unbind(-1)
+    real, imag = pairs.unbind(-1)
+    return torch.stack((real * cos - imag * sin, real * sin + imag * cos), dim=-1).flatten(3).type_as(x)
 
 
 class Attention(nn.Module):
@@ -252,7 +254,7 @@ class FinalLayer(nn.Module):
 
 
 class RopeEmbedder:
-    """Complex rotation tables per axis, looked up by integer position ids; built lazily on the ids' device so a
+    """Real cosine/sine tables per axis, looked up by integer position ids; built lazily on the ids' device so a
     zero-argument construction on the meta device holds no tensors."""
 
     def __init__(self, theta: float, axes_dims, axes_lens):
@@ -265,14 +267,14 @@ class RopeEmbedder:
             freqs = 1.0 / (self.theta ** (torch.arange(0, d, 2, dtype=torch.float64, device="cpu") / d))
             pos = torch.arange(e, dtype=torch.float64, device="cpu")
             freqs = torch.outer(pos, freqs).float()
-            out.append(torch.polar(torch.ones_like(freqs), freqs).to(torch.complex64))
+            out.append(torch.stack((freqs.cos(), freqs.sin()), dim=-1))
         return out
 
     def __call__(self, ids: torch.Tensor) -> torch.Tensor:
-        """ids [..., 3] int -> [..., sum(axes_dims) / 2] complex."""
+        """ids [..., 3] int -> [..., sum(axes_dims) / 2, 2] cosine/sine pairs."""
         if self.freqs_cis is None or self.freqs_cis[0].device != ids.device:
             self.freqs_cis = [f.to(ids.device) for f in (self.freqs_cis or self._precompute())]
-        return torch.cat([self.freqs_cis[i][ids[..., i]] for i in range(len(self.axes_dims))], dim=-1)
+        return torch.cat([self.freqs_cis[i][ids[..., i]] for i in range(len(self.axes_dims))], dim=-2)
 
 
 class ZImageTransformer(nn.Module):

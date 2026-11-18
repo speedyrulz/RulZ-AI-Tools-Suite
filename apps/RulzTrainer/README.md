@@ -491,6 +491,24 @@ section) and samples with its own turbo LoRA by default where it has one ([Turbo
   random (from the run's seed, so a resumed run draws the same). Face and bust crops get every line too. JSON captions,
   video clips and the regularisation set keep one caption; where one caption is needed (Isolation's pull-back caption,
   the loss watch, probes) the first line is used.
+- **Learning-rate schedule** (`lr_scheduler`, `warmup_steps`; Train tab, Optimization). `constant` keeps the rate;
+  `cosine` and `linear` fall from it toward 0, reaching it at the end of the run (the last update comes one step
+  before that point, so it sits a little above); `rex` (Chen et al. 2021, [arXiv
+  2107.04197](https://arxiv.org/abs/2107.04197)) falls as `(1 - z) / (0.5 + 0.5 (1 - z))`, `z` being the share of the
+  steps after the warm-up already done: it stays above linear for most of the run and drops fast at the end;
+  `cosine_restarts` splits the steps after the warm-up into `lr_cycles` (default 1, which is the plain cosine) cosine
+  falls, each starting again at the full rate. `lr_min_factor` (0 to 1, default 0) lifts the end of `cosine`,
+  `linear`, `rex` and `cosine_restarts` to `learning_rate x lr_min_factor` instead of 0 (every factor `f` becomes
+  `lr_min_factor + (1 - lr_min_factor) f`); `constant` ignores it. The warm-up climbs linearly over `warmup_steps`
+  (default 50); `warmup_fraction` (0 to 0.5, default 0 = off) instead sets it to `round(warmup_fraction x steps)` and
+  replaces `warmup_steps`, and the log says which one is used. A `warmup_steps` of 1 is one step, never read as a
+  share. The self-tuning optimizers (Automagic 3 and 4, Keel) ignore all of this and say so in the log. The new
+  schedules are unmeasured here: race them against `cosine` (`lr_scheduler`, `lr_min_factor` and the others are race
+  settings).
+- **AdamW betas** (`adam_beta1` 0.9, `adam_beta2` 0.99, `adam_eps` 1e-8; `adamw` and `adamw8bit` only; other
+  optimizers ignore them and the log notes it when they are changed). 0.99 for the second moment is RulZ's own default
+  and what it always used; PyTorch's and OneTrainer's default is 0.999, which averages the squared gradient over a
+  longer stretch. Which one is better for LoRA training here is untested: race `adam_beta2` 0.99 against 0.999.
 - **Timesteps.** `logit_normal` (mean/std), `sigmoid` (scale) or `uniform`, with an optional `timestep_shift`.
   `logsnr` is the style-friendly sampler ([arXiv 2411.14793](https://arxiv.org/abs/2411.14793), via musubi-tuner):
   the log signal-to-noise ratio is drawn from N(`logsnr_mean`, `logsnr_std`), -6 and 2 as the paper recommends, so
@@ -3087,6 +3105,28 @@ exclusions live in the first dataset's cache (or `cache_dir`, which then holds e
 `dataset_dir` and no `datasets` trains that folder as before; listing a dataset twice, or one inside another (whose
 scan includes its sub-folders), is refused.
 
+A dataset can also carry a **loss weight** (`weight`, above 0, default 1; *Loss weight* on the dataset row) and a
+**per-epoch sample count** (`samples`, 0 or more, default 0; *Per epoch*):
+
+```yaml
+datasets:
+  - {path: datasets/anna_portraits, weight: 1.0}
+  - {path: datasets/street_photos, weight: 0.4, samples: 30}
+```
+
+`weight` multiplies the training loss of every picture of that dataset (its crops too), the way `reg_weight` does for
+the regularisation set: 0.4 makes that dataset pull the LoRA 0.4 times as hard per step as a dataset at 1, without
+changing how often its pictures come up (LoRA Isolation's side-by-side pairs of the dataset scale with it too). It
+works in a `race_parallel` race as in any other. `samples`
+caps how many items of the dataset an epoch trains on, after repeats: 0 trains every image times its repeats as
+before, N trains at most N, a fresh draw each epoch from the run's seed (a resumed run draws a new subset from that point: the draw's state is
+not saved). With the per-image sampling weights (the curriculum, the loss watch) the weights act inside the capped
+share, so the count stays N. Each
+size bucket gives a fixed share of the N, so every epoch has the same number of items and steps, and the epoch the
+loss watch, the curriculum and the regularisation quota count is the capped one. A cap at or above the dataset's size
+changes nothing. The log has one line per dataset whose weight or count is not the default. Configs written before
+these two keys load unchanged.
+
 ## FIBO 2.0 (Bria): training on dev, using the LoRA on Edit Turbo
 
 RulZ AI Trainer also trains LoRAs for [briaai/Fibo-2.0-dev](https://huggingface.co/briaai/Fibo-2.0-dev), Bria's 8B
@@ -3523,6 +3563,11 @@ AdaLN, q/k RMSNorm, 3-axis interleaved MRoPE), conditioned on 13 layers of Qwen3
   (the same JSON, empty). The cache keeps 104 KiB per token (13 layers x 4096 bf16): 4.4 MB for a short wrapped
   caption, 17-110 MB for JSON captions of 165-1077 tokens like the guide's examples; set `max_token_length: 2048`
   (Ideogram's limit) for long ones.
+  Short plain captions have a known cost on this model: users of other trainers report that Ideogram 4 then starts by
+  predicting its built-in refusal image, so the starting loss is very high for a few hundred steps, and that it still
+  learns. When most of a run's pictures have a plain `.txt` caption with a median under 20 words, the log warns once
+  at the start. A structured `.json` caption or a richer description lowers it. The wrapper above is still a short
+  caption, and whether it avoids the effect is untested here.
 - **Text features** follow `Ideogram4Pipeline.encode_prompt`: the caption in Qwen3-VL's user turn, the outputs of
   decoder layers 0, 3, ..., 33 and 35 stacked per token with the layer index fastest. The empty prompt has no tokens
   at all: the pipeline's image-only unconditional branch.
