@@ -652,3 +652,35 @@ def test_find_local_file_does_not_glob(tmp_path):
     (tmp_path / "a1.safetensors").write_bytes(b"123")
     assert rh.find_local_file("a[1].safetensors", 5, [tmp_path]) == tmp_path / "a[1].safetensors"
     assert rh.find_local_file("a[1].safetensors", 3, [tmp_path]) is None
+
+
+_WATCH_CHILD = r'''
+import sys, threading, time
+from rulztrainer.renderhelper import watch_stdin
+stop = threading.Event()
+threading.Thread(target=watch_stdin, args=(stop, 0.05), daemon=True).start()
+time.sleep(0.5)
+done = threading.Event()
+def load():
+    import torch  # noqa: F401 - loads many DLLs: the step that hung behind a blocking stdin read on Windows
+    done.set()
+threading.Thread(target=load, daemon=True).start()
+print("loaded" if done.wait(90) else "hung", flush=True)
+print("stopped" if stop.wait(30) else "running", flush=True)
+'''
+
+
+def test_watch_stdin_lets_dlls_load_and_stops_on_close():
+    """The WebUI starts the helper with stdin a pipe it keeps open. A blocking read of that pipe on Windows made the
+    worker's torch import wait until the pipe closed (the helper sat at Preparing). The watch must let DLLs load, and
+    still stop the helper when the pipe closes."""
+    pytest.importorskip("torch")
+    proc = subprocess.Popen([sys.executable, "-c", _WATCH_CHILD], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            text=True, cwd=str(Path(rh.__file__).resolve().parents[1]))
+    try:
+        assert proc.stdout.readline().strip() == "loaded"
+        proc.stdin.close()  # the WebUI stopping the helper
+        assert proc.stdout.readline().strip() == "stopped"
+    finally:
+        proc.kill()
+        proc.wait(10)
