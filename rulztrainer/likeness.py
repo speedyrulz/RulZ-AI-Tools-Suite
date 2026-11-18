@@ -218,6 +218,9 @@ class ProbeRecord:
     face_over: float | None = None
     body_over: float | None = None
     gold_over: float | None = None
+    # where this probe's pictures were rendered once remote render is on ("instance", or "<host> <gpu>" of the helper
+    # on the user's PC); "" without it and in records before it
+    rendered_on: str = ""
 
 
 # what a training state keeps of the controller (ceilings and shapes come back from the references and the config)
