@@ -156,11 +156,11 @@ def recommend(k: Knowledge, model_id: str, scan: DatasetScan | None, goals: Goal
     wizard('optimizer', 'adamw8bit', 'AdamW with 8-bit state uses less memory.')
     wizard('learning_rate', 0.0002 if model_id == 'qwen_image21' else 0.0001, 'The usual LoRA learning rate; lower it if samples look burnt.')
     wizard('network_type', 'oft' if model_id == 'krea2' else 'lora', 'The wizard character recipe for this model.')
-    rank = 8 if model_id == 'qwen_image21' else 16 if model_id in ('flux2_klein', 'flux2_klein4b', 'minimax_h3', 'minimax_h3_image', 'p_h3_image') else 32
+    rank = 8 if model_id == 'qwen_image21' else 16 if model_id in ('flux2_klein', 'flux2_klein4b', 'zimage', 'minimax_h3', 'minimax_h3_image', 'p_h3_image') else 32
     wizard('lora_rank', rank, 'The wizard character rank leaves room for face detail.')
     wizard('lora_alpha', float(rank), 'Alpha equal to rank keeps the adapter scale at 1.')
     wizard('lora_ema', 0.98, 'Weight averaging improves likeness and reduces checkpoint swings.')
-    if model_id in ('minimax_h3', 'minimax_h3_image', 'p_h3_image', 'sdxl', 'flux2_klein', 'flux2_klein4b'):
+    if model_id in ('minimax_h3', 'minimax_h3_image', 'p_h3_image', 'sdxl', 'flux2_klein', 'flux2_klein4b', 'zimage'):
         wizard('timestep_sampling', 'reference', 'Uses the model reference timestep schedule.')
     if model_id in ('minimax_h3', 'minimax_h3_image', 'p_h3_image', 'qwen_image21'):
         wizard('training_adapter', 'auto', 'Use the model training adapter to prevent drift.')
