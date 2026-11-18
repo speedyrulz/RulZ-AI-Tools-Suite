@@ -774,6 +774,61 @@ class Helper:
 # ---------------------------------------------------------------- command line
 
 
+STDIN_POLL = 0.5  # seconds between looks at stdin on Windows
+
+
+def _win_pipe_state(handle) -> tuple[str, int]:
+    """("open", bytes waiting) / ("closed", 0) / ("unknown", 0) for a Windows pipe handle, without blocking on it."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    waiting = wintypes.DWORD(0)
+    if kernel32.PeekNamedPipe(wintypes.HANDLE(handle), None, 0, None, ctypes.byref(waiting), None):
+        return "open", int(waiting.value)
+    return ("closed", 0) if ctypes.get_last_error() in (109, 232) else ("unknown", 0)  # broken pipe / being closed
+
+
+def watch_stdin(stop: threading.Event, poll: float = STDIN_POLL) -> None:
+    """Set `stop` when stdin closes: the WebUI's end of the pipe closes when it stops the helper or dies.
+
+    On Windows stdin is never read with a blocking call: a thread waiting in ReadFile on a pipe makes every other
+    thread's DLL load wait with it (a DLL's C runtime looks at the standard handles as it starts), so importing torch
+    in the worker hung for as long as the WebUI kept the pipe open, which stalled every helper at "Preparing" until it
+    was turned off. PeekNamedPipe asks without waiting. A stdin that is no pipe (a console) is not watched."""
+    try:
+        fd = sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError):  # no stdin (pythonw)
+        return
+    if sys.platform != "win32":
+        try:
+            while os.read(fd, 4096):
+                pass
+        except OSError:
+            pass
+        stop.set()
+        return
+    import msvcrt
+
+    try:
+        handle = msvcrt.get_osfhandle(fd)
+    except OSError:
+        return
+    while not stop.is_set():
+        state, waiting = _win_pipe_state(handle)
+        if state == "closed":
+            break
+        if state == "unknown":
+            return  # not a pipe: nothing to watch, and no reason to stop
+        if waiting:
+            try:
+                os.read(fd, waiting)  # data is there, so this does not wait
+            except OSError:
+                break
+        stop.wait(poll)
+    stop.set()
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(prog="python -m rulztrainer.renderhelper", description=__doc__.split("\n\n")[0])
     p.add_argument("--instance", help="the vast.ai instance id")
@@ -812,15 +867,7 @@ def main(argv=None) -> int:
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), stop)
     if not args.ignore_stdin:
-        def watch():  # the WebUI's end of our stdin closes when it dies: stop then
-            try:
-                while sys.stdin.buffer.read(4096):
-                    pass
-            except (OSError, ValueError):
-                pass
-            helper.stop.set()
-
-        threading.Thread(target=watch, daemon=True).start()
+        threading.Thread(target=watch_stdin, args=(helper.stop,), daemon=True, name="stdin-watch").start()
     log.info("Render helper for instance %s on %s", args.instance, args.device)
     helper.run()
     if helper._busy():  # a render that would not stop: leave without waiting for the interpreter's teardown
