@@ -31,7 +31,7 @@ from . import quant as Q
 from .config import AUTOMAGIC, KEEL, KEEL_FB, KEEL_ON_A3, MUON_EDGE_TARGETS, TrainConfig, effective_optimizer, keel_band_weights, keel_consensus_mode
 from .config import side_to_mp
 from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, dropout_text_path,
-                      items_for_side, load_batch,
+                      ideogram4_caption_warning, items_for_side, load_batch,
                       scan_dataset, scan_reg, text_cache_path, TEXT_BATCH)
 from .archs import detect_arch, get_arch
 from .idloss import effective_weight as idloss_weight
@@ -494,17 +494,26 @@ def loss_weight(cfg: TrainConfig, sigma: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Unknown loss_weighting {cfg.loss_weighting}")
 
 
+def _adam_betas(cfg: TrainConfig) -> tuple[float, float]:
+    """adamw / adamw8bit's betas: adam_beta1 and adam_beta2 (0.9 and 0.99 unless set)."""
+    return (float(cfg.adam_beta1), float(cfg.adam_beta2))
+
+
 def build_optimizer(cfg: TrainConfig, params, pairs=None, ref_norms=None, scales=None):
     """`params` may be a list of tensors or a list of param-group dicts (LoRA+). `pairs`: the (lora_down, lora_up)
     pairs among them (lora.lora_pairs), which Keel preconditions; the other optimizers ignore them. `ref_norms` and
     `scales`: each pair's frozen-weight norm and alpha / rank, for Hull."""
     name, lr, _ = effective_optimizer(cfg)
+    if name not in ("adamw", "adamw8bit") and (cfg.adam_beta1, cfg.adam_beta2, cfg.adam_eps) != (0.9, 0.99, 1e-8):
+        log.info("adam_beta1 / adam_beta2 / adam_eps are ignored with %s (they set adamw and adamw8bit only)", name)
     if name == "adamw":
-        return torch.optim.AdamW(params, lr=lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.99))
+        return torch.optim.AdamW(params, lr=lr, weight_decay=cfg.weight_decay, betas=_adam_betas(cfg),
+                                 eps=float(cfg.adam_eps))
     if name == "adamw8bit":
         import bitsandbytes as bnb
 
-        return bnb.optim.AdamW8bit(params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay, betas=(0.9, 0.99))
+        return bnb.optim.AdamW8bit(params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
+                                   betas=_adam_betas(cfg), eps=float(cfg.adam_eps))
     if name in ("muon", "normuon"):  # LoRA+ groups keep their own lr: lora_up's step is ratio x lora_down's
         from .optimizers.muon import Muon
 
@@ -647,27 +656,65 @@ def brake_detail(stats: dict, names=None) -> str:
     return s + ("; groups: " + "; ".join(parts) if len(parts) > 1 else "")
 
 
+def warmup_length(cfg: TrainConfig) -> int:
+    """Warm-up steps: round(warmup_fraction x steps) when warmup_fraction is above 0, else warmup_steps (never
+    read as a share, whatever its value)."""
+    if cfg.warmup_fraction > 0:
+        return max(0, int(round(cfg.warmup_fraction * cfg.steps)))
+    return max(0, int(cfg.warmup_steps))
+
+
+def lr_factor(cfg: TrainConfig, step: int) -> float:
+    """The learning rate's multiplier at a step: linear warm-up to 1, then the schedule from 1 down to lr_min_factor
+    (cosine, linear, rex: REX, Chen et al. 2021, f(z) = (1 - z) / (0.5 + 0.5 (1 - z)); cosine_restarts: cosine cycles
+    that each start again at 1). constant stays at 1."""
+    warm = warmup_length(cfg)
+    if step < warm:
+        return (step + 1) / (warm + 1)
+    p = min(1.0, (step - warm) / max(1, cfg.steps - warm))
+    kind = cfg.lr_scheduler
+    if kind == "cosine":
+        f = 0.5 * (1 + math.cos(math.pi * p))
+    elif kind == "linear":
+        f = max(0.0, 1 - p)
+    elif kind == "rex":
+        f = (1 - p) / (0.5 + 0.5 * (1 - p))
+    elif kind == "cosine_restarts":
+        q = 0.0 if p >= 1.0 else (p * max(1, int(cfg.lr_cycles))) % 1.0
+        f = 0.5 * (1 + math.cos(math.pi * q)) if p < 1.0 else 0.0
+    else:
+        return 1.0
+    m = min(1.0, max(0.0, float(cfg.lr_min_factor)))
+    return m + (1 - m) * f
+
+
 def build_scheduler(cfg: TrainConfig, optimizer, offset: int = 0):
     """offset: the run's step this optimizer starts at (a fine-tune rebuilds its optimizer every window)."""
-    warm = max(0, cfg.warmup_steps)
     if effective_optimizer(cfg)[0] in AUTOMAGIC:  # self-tuning lr: no warmup/decay from outside
+        if cfg.lr_scheduler != "constant" or cfg.lr_min_factor or cfg.warmup_fraction:
+            log.info("The learning-rate schedule is ignored with %s (it adapts its own rate)",
+                     effective_optimizer(cfg)[0])
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
-
-    def fn(step):
-        step += offset
-        if step < warm:
-            return (step + 1) / (warm + 1)
-        p = (step - warm) / max(1, cfg.steps - warm)
-        if cfg.lr_scheduler == "cosine":
-            return 0.5 * (1 + math.cos(math.pi * min(1.0, p)))
-        if cfg.lr_scheduler == "linear":
-            return max(0.0, 1 - p)
-        return 1.0
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, fn)
+    if not offset:  # (a fine-tune window's rebuild says nothing again)
+        if cfg.warmup_fraction > 0:
+            log.info("Warm-up: %d steps (warmup_fraction %g of %d steps; warmup_steps %d is not used)",
+                     warmup_length(cfg), cfg.warmup_fraction, cfg.steps, cfg.warmup_steps)
+        else:
+            log.info("Warm-up: %d steps (warmup_steps)", warmup_length(cfg))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_factor(cfg, step + offset))
 
 
 class Trainer(RaceParallelMixin):
+    # remote render (remoterender.py): the renderer while a run offers its samples and probes to a helper on the user's
+    # PC, the probe round and the shadow probe it has out, the sample rounds it has out, and where a probe record's
+    # pictures were rendered (class defaults: stand-ins built without __init__ render on the instance)
+    remote = None
+    remote_probe = None
+    remote_shadow = None
+    remote_samples: tuple = ()
+    remote_plan: tuple = ()
+    probe_rendered_on = "instance"
+
     def __init__(self, cfg: TrainConfig):
         self.cfg = cfg
         self.job_dir = cfg.job_dir()
@@ -1253,6 +1300,7 @@ class Trainer(RaceParallelMixin):
             raise
         finally:
             self._close_probe_worker()
+            self._close_remote()
 
     def _run(self):
         cfg = self.cfg
@@ -1271,8 +1319,12 @@ class Trainer(RaceParallelMixin):
         rng = random.Random(cfg.seed)
         gen = torch.Generator("cpu").manual_seed(cfg.seed)
         self.ts_strata = make_strata(cfg)
-        from .comfy_files import resolve_downloads
+        from .comfy_files import planned_downloads, resolve_downloads
 
+        try:  # (what the downloads will be, for remote render: the helper fetches those files itself)
+            self.remote_plan = tuple(planned_downloads(cfg)) if cfg.remote_render == "auto" else ()
+        except Exception:  # noqa: BLE001
+            self.remote_plan = ()
         self.status.update(stage="model files")
         cfg = self.cfg = resolve_downloads(cfg, progress=self._stage_progress)
         self.arch = get_arch(cfg)  # a downloaded single file names its own family
@@ -1304,6 +1356,9 @@ class Trainer(RaceParallelMixin):
             self.race_base = cfg
             cfg = self.cfg = self._race_prep_config(cfg)
         items = scan_dataset(cfg)
+        id4_note = ideogram4_caption_warning(items, cfg)
+        if id4_note:
+            log.warning(id4_note)
         # the regularisation dataset (reg_dir): read now, so a folder without captions stops the run before the
         # analysis and the caching. Kept out of `items`: nothing below that reads the subject sees its pictures
         self.reg_items = scan_reg(cfg)
@@ -1606,6 +1661,7 @@ class Trainer(RaceParallelMixin):
             self._noise_stage(model)
             return
         self._setup_probe_worker()
+        self._setup_remote_render()
         self._setup_maps(cfg, step)
         if self.maps is not None and self.maps.due(step):  # the baseline (or a resumed run's starting point)
             self._side_job(f"Training maps at step {step}", lambda: self._capture_maps(model, injected, step))
@@ -2084,7 +2140,7 @@ class Trainer(RaceParallelMixin):
             elif self.ft is not None and self.ft_pending_save and self._finetune_cycle_done(step) and step < cfg.steps:
                 self.save(injected, step)
             if cfg.sample_prompts and cfg.sample_every > 0 and step % cfg.sample_every == 0 and step < cfg.steps:
-                self._side_job(f"Sampling at step {step}", lambda: self.sample_images(model, step))
+                self._side_job(f"Sampling at step {step}", lambda: self._sample_round(model, step))
                 model.train()
             if self.maps is not None and self.maps.due(step, last=step >= cfg.steps):
                 self._side_job(f"Training maps at step {step}", lambda: self._capture_maps(model, injected, step))
@@ -2100,6 +2156,8 @@ class Trainer(RaceParallelMixin):
             # the latest score)
             stop = self.probe_worker is not None and probe_safely(
                 lambda: self._probe_async_take(step, optimizer, scheduler, wait=step in rounds))
+            if self.remote is not None:  # remote render: pictures the helper brought in, rounds it was too slow for
+                stop = self._remote_poll(model, step, optimizer, scheduler, wait=step in rounds) or stop
             if self.controller is not None and (step % cfg.probe_every == 0 and (step < cfg.steps or racing
                                                                                   or final_too) or last):
                 if self.probe_worker is not None and not last:
@@ -2109,6 +2167,10 @@ class Trainer(RaceParallelMixin):
                         probe_safely(lambda: self._probe_async_start(step, injected))
                         if step in rounds:
                             stop = probe_safely(lambda: self._probe_async_take(step, optimizer, scheduler, wait=True))
+                elif self.remote is not None:  # a helper on the user's PC may render this one (or the instance does)
+                    stop = self._remote_probe_round(model, step, optimizer, scheduler, injected, last,
+                                                    step in rounds, probe_safely) or stop
+                    model.train()
                 else:  # (also when the probe process failed: from then on probes render here)
                     stop = probe_safely(lambda: self.run_probe(model, step, optimizer, scheduler, injected))
                     model.train()
@@ -2142,6 +2204,9 @@ class Trainer(RaceParallelMixin):
                 break
         if self.probe_worker is not None:  # a probe still rendering when training stopped: its score still counts
             probe_safely(lambda: self._probe_async_take(step, optimizer, scheduler, wait=True))
+        if self.remote is not None:  # a probe still out counts; the sample rounds are in before the final samples
+            probe_safely(lambda: self._remote_probe_take(model, step, step, optimizer, scheduler, wait=True))
+            self._remote_finish(model)
         if self.compiled:
             compiling.report("end of training")
             self._save_compile_cache()
@@ -3814,7 +3879,9 @@ class Trainer(RaceParallelMixin):
         if reg and cfg.resolution_step_up:
             reg = items_for_side(reg, self.sides[self.res_stage])
         old = getattr(self, "batcher", None)
-        self.batcher = BucketBatcher(items + reg, cfg.batch_size, cfg.seed + step, reg_per_epoch=cfg.reg_per_epoch)
+        self.batcher = BucketBatcher(items + reg, cfg.batch_size, cfg.seed + step, reg_per_epoch=cfg.reg_per_epoch,
+                                     dataset_samples={str(Path(sp.path)): sp.samples for sp in cfg.dataset_specs()
+                                                      if sp.samples > 0})
         if reg:
             if carry_reg:
                 self.batcher.carry_reg_pass(old)
@@ -3913,7 +3980,8 @@ class Trainer(RaceParallelMixin):
                     items.append(Item(image=png, caption=caption, width=bw, height=bh,
                                       latent_path=cache / "latents" / f"{stem}{tag}.safetensors", latent_flip_path=None,
                                       text_path=text_cache_path(cfg, caption), category="pair", side=side,
-                                      repeats=reps, dataset=d, loss_scale=cfg.isolation_pair_weight,
+                                      repeats=reps, dataset=d,
+                                      loss_scale=cfg.isolation_pair_weight * float(spec.weight),  # x its dataset's
                                       pair_side=iso.pair_side(caption, s.fused)))
                     n_pairs += 1
         n_dop = 0
@@ -4234,8 +4302,10 @@ class Trainer(RaceParallelMixin):
         cfg = self.cfg
         per_step = max(1, cfg.batch_size * cfg.gradient_accumulation * len(self.replicas))
         images = 0
-        if self.batcher is not None:  # (with the epoch's regularisation pictures, which wait outside the buckets)
-            images = sum(len(v) for v in self.batcher.buckets.values()) + sum(
+        if self.batcher is not None:  # (the capped epoch: samples; with its regularisation pictures, which wait
+            sizes = getattr(self.batcher, "bucket_sizes", None)  # outside the buckets)
+            images = (sum(sizes.values()) if sizes is not None else
+                      sum(len(v) for v in self.batcher.buckets.values())) + sum(
                 (getattr(self.batcher, "reg_quota", None) or {}).values())
         return max(1, -(-images // per_step)), per_step
 
@@ -5041,7 +5111,10 @@ class Trainer(RaceParallelMixin):
             jobs = self._probe_jobs(step, tag, n_seeds, len(slots))
             title = f"probes at step {step} on {len(slots)} GPUs" if len(slots) > 1 and len(jobs) > 1 else ""
             board = _Board(self.status, title)
+            t0 = time.time()
             images = self._render_round(slots, jobs, neg_e, neg_m, board)
+            if not tag and n_seeds is None:
+                self._remote_note("probe", time.time() - t0, len(jobs))
         finally:
             for sl in slots:
                 lora_mod.set_extras_enabled(sl.model, False)
@@ -5251,6 +5324,9 @@ class Trainer(RaceParallelMixin):
         now = step if now is None else now
         self.last_probe = (face, body, images, seeds)
         rec, actions = self.controller.update(step, face, body, images, seeds)
+        if self.remote is not None:  # where these pictures were rendered (a line in the log when that changes)
+            rec.rendered_on = self.probe_rendered_on
+            self.remote.switch(rec.rendered_on)
         # the copy check reads the likeness renders alone, so its number does not depend on the extra prompts
         copy_note = self._copy_probe(rec, [p for p in images if "_check-" not in Path(p).name])
         if rec.gold is not None or rec.gold_norm_ema is not None:
@@ -5438,16 +5514,23 @@ class Trainer(RaceParallelMixin):
         if got is None:
             return False
         p, images = got
-        face, body, seeds = self._score_probe(p.jobs, images, p.step)
         took = f"{time.time() - p.queued:.1f}s on {w.device}" + (f", in at step {now}" if now != p.step else "")
+        return self._probe_act(p.step, p.jobs, images, p.state, took, now, optimizer, scheduler)
+
+    def _probe_act(self, step: int, jobs: list, images: list, state: dict, took: str, now: int, optimizer,
+                   scheduler) -> bool:
+        """Score a probe that was rendered away from training (probe_async, remote render) and act on it. `state` is
+        the LoRA it is a picture of: best saves write it (swapped in for the moment), not training's newer weights,
+        and the Keel lookahead anchors it. True to stop."""
+        face, body, seeds = self._score_probe(jobs, images, step)
         live = lora_mod.lora_state(self.injected)
-        lora_mod.mirror_lora(lora_mod.lora_snapshots(p.state), self.injected)
+        lora_mod.mirror_lora(lora_mod.lora_snapshots(state), self.injected)
         try:
-            stop = self._probe_finish(p.step, face, body, images, seeds, took, optimizer, scheduler, self.injected,
+            stop = self._probe_finish(step, face, body, images, seeds, took, optimizer, scheduler, self.injected,
                                       now=now)
         finally:
             lora_mod.mirror_lora(lora_mod.lora_snapshots(live), self.injected)
-        self._keel_probe(optimizer, scored=p.state)  # the lookahead anchors the weights that scored, pulls the live ones
+        self._keel_probe(optimizer, scored=state)  # the lookahead anchors the weights that scored, pulls the live ones
         return stop
 
     def _close_probe_worker(self) -> None:
@@ -5459,6 +5542,306 @@ class Trainer(RaceParallelMixin):
             log.info("probe_async: %d probes rendered on %s in %.0fs; training waited %.0fs for them", w.count,
                      w.device, w.rendered, w.waited)
         w.close()
+
+    # ------------------------------------------------------------ remote render (remoterender.py; a helper on the user's PC)
+    def _remote_note(self, kind: str, seconds: float, jobs: int) -> None:
+        """The instance rendered `jobs` pictures of `kind` in `seconds`: what a round's deadline is a multiple of."""
+        if self.remote is not None:
+            self.remote.note_own(kind, seconds, jobs)
+
+    def _setup_remote_render(self) -> None:
+        """remote_render auto: publish this run (clearing remote_render/, writing run.json and prepare/ with the text
+        embeds of every sample / probe prompt) so a helper can find it. Nothing is sent anywhere until a helper's
+        heartbeat is fresh and its ready file matches; every render stays on the instance until then."""
+        from . import promptcheck
+        from . import remoterender as RR
+
+        cfg = self.cfg
+        if cfg.remote_render != "auto" or not RR.supported_host():
+            self._clear_remote_folder()  # (a resumed job must not leave a helper an old run to prepare for)
+            return
+        samples = bool(cfg.sample_prompts) and cfg.sample_every > 0
+        probes = self.controller is not None and cfg.probe_every > 0
+        why = ("a race switches configurations at each probe" if self.race_rows is not None else
+               "a fine-tune has no LoRA to copy" if self.ft is not None else
+               f"multi_gpu {cfg.multi_gpu} uses both GPUs already" if cfg.multi_gpu != "off" else
+               "no samples or probes are due while training" if not (samples or probes) else "")
+        if why:
+            log.info("Remote render not used: %s", why)
+            self._clear_remote_folder()
+            return
+        try:
+            texts, negatives = [], {}
+            if samples:
+                texts += [render_prompt(self, p, "sample") for p in cfg.sample_prompts]
+                negatives["sample"] = render_negative(self, "sample")
+            if probes:
+                texts += [render_prompt(self, p, "probe") for p in (cfg.probe_face_prompt, cfg.probe_body_prompt) if p]
+                texts += [render_prompt(self, c.prompt, "probe") for c in promptcheck.extra_checks(cfg)]
+                negatives["probe"] = render_negative(self, "probe")
+            embeds = {}
+            for t in dict.fromkeys(texts + list(negatives.values())):
+                path = text_cache_path(cfg, t)
+                if not path.is_file():
+                    raise FileNotFoundError(f"no cached text embeds for {t[:40]!r}")
+                embeds[t] = path
+            plan = {f: (repo, file) for f, repo, file in self.remote_plan}
+            files = {}
+            for field in RR.FILE_FIELDS:
+                v = getattr(cfg, field, "")
+                if v and v != "auto" and Path(v).is_file():
+                    repo, file = plan.get(field, (None, None))
+                    files[field] = {"path": str(v), "name": Path(v).name, "size": Path(v).stat().st_size,
+                                    "repo": repo, "file": file}
+            rr = RR.RemoteRenderer(self.job_dir, self.arch.name)
+            rr.start_run(cfg.job_name, cfg.to_dict(), files, negatives, embeds)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Remote render is off for this run: it could not be prepared (%s: %s)", type(e).__name__, e)
+            self._clear_remote_folder()
+            return
+        self.remote, self.remote_samples = rr, []
+        log.info("Remote render: this run is open to a render helper on your PC (run %s); samples and probes render "
+                 "here until a helper is ready, then there, and here again whenever it is slow or gone", rr.run_token[:8])
+
+    def _clear_remote_folder(self) -> None:
+        """Remove the job's remote_render/ (an earlier run's run.json and prepare/ in a reused folder)."""
+        import shutil
+
+        shutil.rmtree(self.job_dir / "remote_render", ignore_errors=True)
+
+    def _close_remote(self) -> None:
+        rr, self.remote = self.remote, None
+        if rr is None:
+            return
+        self.remote_probe = self.remote_shadow = None
+        self.remote_samples = []
+        if rr.stats["rounds"] or rr.stats["taken_back"]:
+            log.info("Remote render: %s", rr.summary())
+
+    @torch.no_grad()
+    def _render_from_state(self, model, step: int, state: dict, jobs: list, negative_kind: str) -> list[str]:
+        """Render a round on the instance from `state`, the LoRA that was handed to the helper (a round that did not
+        come back in time), then put the live weights back. Its own path, not run_probe / sample_images: those average
+        (EMA) again, which would swap the average over the state mirrored here."""
+        live = lora_mod.lora_state(self.injected)
+        self._free_for_rendering()
+        lora_mod.mirror_lora(lora_mod.lora_snapshots(state), self.injected)
+        try:
+            with lora_mod.frozen_adapters(), self._sampling_slots(model, step) as slots:
+                try:
+                    for sl in slots:
+                        sl.model.eval()
+                        lora_mod.set_extras_enabled(sl.model, True)
+                    self.status.update(stage=f"rendering the {negative_kind}s of step {step} here")
+                    neg_e, neg_m = self.arch.pad_embeds([load_text_embeds(self.cfg,
+                                                                          render_negative(self, negative_kind))])
+                    return self._render_round(slots, jobs, neg_e, neg_m, _Board(self.status, ""))
+                finally:
+                    for sl in slots:
+                        lora_mod.set_extras_enabled(sl.model, False)
+        finally:
+            lora_mod.mirror_lora(lora_mod.lora_snapshots(live), self.injected)
+            self.status.update(stage="training")
+
+    def _remote_poll(self, model, step: int, optimizer, scheduler, wait: bool = False) -> bool:
+        """Once per step (a stat or two when nothing is out): the helper's heartbeat, a shadow probe that came in, the
+        probe round and the sample rounds that came in, and those that are late (taken back and rendered here from
+        their own weights). wait: the probe still out is waited for (a self-training round's bar is the latest score).
+        True to stop training (the controller said so on a probe that came in)."""
+        self.remote.poll()
+        stop = False
+        if self.remote_shadow is not None:
+            self._side_job("The remote shadow probe", lambda: self._remote_shadow_settle(step))
+        if self.remote_probe is not None:
+            stop = bool(self._side_job(f"The remote probe of step {self.remote_probe.step}",
+                                       lambda: self._remote_probe_take(model, step, step, optimizer, scheduler,
+                                                                       wait=wait), False))
+        for r in list(self.remote_samples):
+            self._side_job(f"The remote samples of step {r.step}", lambda r=r: self._remote_sample_take(model, r, False))
+        return stop
+
+    def _remote_probe_round(self, model, step: int, optimizer, scheduler, injected, last: bool, in_round: bool,
+                            safely) -> bool:
+        """A probe is due and a remote renderer is on: act on the probe still out (it was acted on in step order), then
+        render this one on the helper while training goes on, or here (the final probe, a self-training round's, and
+        whenever no helper is ready). The first probe a helper gets is a shadow round: rendered on both, the
+        instance's scores drive the decisions, the helper's are compared (_remote_shadow_settle). True to stop."""
+        rr = self.remote
+        rr.poll()
+        stop = safely(lambda: self._remote_probe_take(model, step, step, optimizer, scheduler, wait=True))
+        safely(lambda: self._remote_shadow_settle(step, force=True))
+        if stop and not last:
+            return True
+        delegate = (not last and not in_round and self.probe_worker is None and self.remote_probe is None
+                    and rr.can_delegate("probe"))
+        shadow = delegate and not rr.shadow_done
+        if delegate and not shadow:
+            safely(lambda: self._remote_probe_submit(step, injected, False))
+            if self.remote_probe is not None:
+                return stop
+            log.warning("Remote render: the probe of step %d could not be handed to the helper; it renders here", step)
+            shadow = False  # (nothing was handed over: the instance renders it below)
+        if shadow:
+            safely(lambda: self._remote_probe_submit(step, injected, True))
+        before = self.last_probe
+        stop = safely(lambda: self.run_probe(model, step, optimizer, scheduler, injected)) or stop
+        if self.remote_shadow is not None:
+            if self.last_probe is not before:  # the instance's own scores, to compare the helper's with
+                self.remote_shadow.update(face=self.last_probe[0], body=self.last_probe[1], set=True)
+            else:
+                self._remote_shadow_drop("the instance's own probe failed")
+        return stop
+
+    @torch.no_grad()
+    def _remote_probe_submit(self, step: int, injected, shadow: bool) -> None:
+        """Hand the helper this probe: the LoRA as probes score it (the weight average with lora_ema, taken the way
+        _probe_async_start takes it), with the probe's jobs. A shadow round's pictures go to remote_render/shadow so
+        they do not land on the instance's own."""
+        rr = self.remote
+        with self._averaged():
+            state = lora_mod.lora_state(injected)
+        jobs = self._probe_jobs(step)
+        if shadow:
+            folder = rr.root / "shadow"
+            folder.mkdir(exist_ok=True)
+            jobs = [dataclasses.replace(j, out_path=folder / j.out_path.name) for j in jobs]
+        r = rr.submit("probe", step, jobs, state, "probe", shadow=shadow)
+        if shadow:
+            self.remote_shadow = {"round": r, "face": None, "body": None, "set": False}
+            log.info("Remote render: the probe of step %d renders on the helper %s and here (a shadow round: the "
+                     "decisions follow the instance's scores, the two are compared)", step, rr.label)
+        else:
+            self.remote_probe = r
+            log.info("Remote render: the probe of step %d went to %s (training goes on; it is acted on once it is in, "
+                     "up to probe_every steps later, and rendered here if the helper is late)", step, rr.label)
+            self.status.update(stage=f"training; probe of step {step} rendering on {rr.label}")
+
+    def _remote_probe_take(self, model, step: int, now: int, optimizer, scheduler, wait: bool) -> bool:
+        """Act on the probe round the helper has, if any: score its pictures and act (best saves write the weights that
+        were scored). Late, failed or unreadable (or the helper gone): render it here from the same weights. wait:
+        until it is in or lost (bounded by the round's deadline and the helper's heartbeat). True to stop."""
+        rr = self.remote
+        r = self.remote_probe
+        if r is None:
+            return False
+        if wait and rr.check(r) == "open":
+            self.status.update(stage=f"waiting for the probe of step {r.step} on {rr.label}")
+        got, why = rr.collect(r, wait)
+        if why == "open":
+            return False
+        self.remote_probe = None
+        late = f", in at step {now}" if now != r.step else ""
+        if got is not None:
+            images, label = got.images, got.label
+            took = f"{time.time() - r.submitted:.1f}s on {label}, rendered in {got.seconds:.0f}s{late}"
+        else:
+            log.warning("Remote render: the probe of step %d did not come back (%s); rendering it here from the same "
+                        "weights", r.step, why)
+            t0 = time.time()
+            images, label = self._render_from_state(model, r.step, r.state, r.jobs, "probe"), "instance"
+            took = f"{time.time() - t0:.1f}s on the instance after the helper's miss{late}"
+        self.probe_rendered_on = label
+        try:
+            return self._probe_act(r.step, r.jobs, images, r.state, took, now, optimizer, scheduler)
+        finally:
+            self.probe_rendered_on = "instance"
+
+    def _remote_shadow_drop(self, why: str) -> None:
+        import shutil
+
+        sh, self.remote_shadow = self.remote_shadow, None
+        if sh is not None:
+            self.remote.reclaim(sh["round"])
+            shutil.rmtree(self.remote.root / "abandoned" / sh["round"].name, ignore_errors=True)
+            log.info("Remote render: the shadow probe of step %d is dropped (%s); the next probe is a shadow round "
+                     "again", sh["round"].step, why)
+
+    def _remote_shadow_settle(self, step: int, force: bool = False) -> None:
+        """Compare the shadow round's pictures with the instance's own once both are in (scores: the face's, else the
+        body's, as means over the seeds); more than likeness_noise_band apart (2 points when that is 0) ends remote
+        probes for the run (samples go on). force: a shadow round still out is dropped instead of waited for."""
+        sh = self.remote_shadow
+        if sh is None:
+            return
+        if not sh["set"]:  # (the instance's own probe is still to come: nothing to compare with yet)
+            if force:
+                self._remote_shadow_drop("the instance's own probe did not finish")
+            return
+        rr, r = self.remote, sh["round"]
+        got, why = rr.collect(r, False)
+        if why == "open":
+            if force:
+                self._remote_shadow_drop("it did not come in before the next probe")
+            return
+        self.remote_shadow = None
+        if got is None:
+            log.warning("Remote render: the shadow probe of step %d did not come back (%s); the next probe is a "
+                        "shadow round again", r.step, why)
+            return
+        face, body, _ = self._score_probe(r.jobs, got.images, r.step, check=False)
+        self.status.update(stage="training")
+        kind, mine, theirs = next(((k, a, b) for k, a, b in (("face", sh["face"], face), ("body", sh["body"], body))
+                                   if a is not None and b is not None), (None, None, None))
+        fmt = lambda v: "n/a" if v is None else f"{v:.1f}%"  # noqa: E731
+        log.info("Remote render: shadow probe of step %d on %s: face %s body %s; on the instance: face %s body %s",
+                 r.step, got.label, fmt(face), fmt(body), fmt(sh["face"]), fmt(sh["body"]))
+        rr.shadow_done = True
+        band = self.cfg.likeness_noise_band if self.cfg.likeness_noise_band > 0 else 2.0
+        if kind is not None and abs(mine - theirs) > band:
+            rr.stop_probes(f"the helper's {kind} score differs by {abs(mine - theirs):.1f} points")
+            log.warning("Remote render: the helper's %s score is %.1f points from the instance's (%s vs %s; the noise "
+                        "band is %.1f): probes render on the instance for the rest of the run, samples still go to "
+                        "the helper", kind, abs(mine - theirs), fmt(theirs), fmt(mine), band)
+
+    def _sample_round(self, model, step: int) -> None:
+        """The in-loop samples: to the helper when one is ready and fewer than two sample rounds are out (training goes
+        on; they are finished when they come in), else here as before."""
+        from . import remoterender as RR
+
+        rr = self.remote
+        if rr is None:
+            return self.sample_images(model, step)
+        rr.poll()
+        if not (rr.can_delegate("sample") and len(self.remote_samples) < RR.MAX_SAMPLE_ROUNDS):
+            return self.sample_images(model, step)
+        with self._averaged():
+            state = lora_mod.lora_state(self.injected)
+        try:
+            r = rr.submit("sample", step, self._sample_jobs(step), state, "sample")
+        except Exception as e:  # noqa: BLE001
+            log.warning("Remote render: the samples of step %d could not be handed to the helper (%s: %s); they "
+                        "render here", step, type(e).__name__, e)
+            return self.sample_images(model, step)
+        self.remote_samples.append(r)
+        log.info("Remote render: the samples of step %d went to %s (training goes on; %d out)", step, rr.label,
+                 len(self.remote_samples))
+
+    def _remote_sample_take(self, model, r, wait: bool) -> None:
+        """Finish a sample round that is in (or lost: render it here from its own weights, wait: until it is one):
+        the same work _sample_with does after rendering, on the trainer thread."""
+        got, why = self.remote.collect(r, wait)
+        if why == "open":
+            return
+        if r in self.remote_samples:
+            self.remote_samples.remove(r)
+        if got is not None:
+            paths = got.images
+            for p in paths:
+                log.info("Sample saved %s", p)
+            log.info("Remote render: the samples of step %d rendered on %s in %.0fs", r.step, got.label, got.seconds)
+        else:
+            log.warning("Remote render: the samples of step %d did not come back (%s); rendering them here from the "
+                        "same weights", r.step, why)
+            paths = self._render_from_state(model, r.step, r.state, r.jobs, "sample")
+        self._sample_finish(paths, r.step)
+
+    def _remote_finish(self, model) -> None:
+        """Training is over: the sample rounds still out are in (or rendered here) before the final samples, and a
+        shadow probe still out is dropped."""
+        for r in list(self.remote_samples):
+            self._side_job(f"The remote samples of step {r.step}", lambda r=r: self._remote_sample_take(model, r, True))
+        self.remote_samples = []
+        self._side_job("The remote shadow probe", lambda: self._remote_shadow_settle(0, force=True))
 
     def _copy_probe(self, rec, images) -> str:
         """The probe's highest SSCD match among the training photos (copy_check), into its record; the log line
@@ -5606,25 +5989,38 @@ class Trainer(RaceParallelMixin):
                 lora_mod.set_extras_enabled(sl.model, True)
             self.status.update(stage=f"sampling (step {step})")
             neg_e, neg_m = self.arch.pad_embeds([load_text_embeds(cfg, render_negative(self, "sample"))])
-            out_dir = self.job_dir / "samples"
-            out_dir.mkdir(exist_ok=True)
-            frames = render_frames(self, "sample")
-            jobs = [RenderJob(render_prompt(self, prompt, "sample"), cfg.sample_width, cfg.sample_height,
-                              cfg.sample_steps, cfg.sample_cfg, cfg.sample_seed + (i if cfg.sample_walk_seed else 0),
-                              out_dir / f"{self._image_prefix()}step{step:06d}_{i}.png",
-                              f"sampling {i + 1}/{n_prompts} at step {step}" if len(slots) == 1
-                              else f"sample {i + 1}/{n_prompts}", frames=frames, shown=prompt)
-                    for i, prompt in enumerate(cfg.sample_prompts)]
+            jobs = self._sample_jobs(step, len(slots))
             title = f"sampling at step {step} on {len(slots)} GPUs" if len(slots) > 1 and n_prompts > 1 else ""
             board = _Board(self.status, title)
             t0 = time.time()
             paths = self._render_round(slots, jobs, neg_e, neg_m, board,
                                        on_done=lambda i, job, p: log.info("Sample saved %s", p))
+            self._remote_note("sample", time.time() - t0, len(jobs))
         finally:
             for sl in slots:
                 lora_mod.set_extras_enabled(sl.model, False)
         log.info("Sampling took %.1fs for %d image(s) on %s", time.time() - t0, len(paths),
                  ", ".join(sorted({sl.device for sl in slots})))
+        self._sample_finish(paths, step)
+
+    def _sample_jobs(self, step: int, n_slots: int = 1) -> list:
+        """The sample round's RenderJobs, one per sample prompt."""
+        cfg = self.cfg
+        n_prompts = len(cfg.sample_prompts)
+        out_dir = self.job_dir / "samples"
+        out_dir.mkdir(exist_ok=True)
+        frames = render_frames(self, "sample")
+        return [RenderJob(render_prompt(self, prompt, "sample"), cfg.sample_width, cfg.sample_height,
+                          cfg.sample_steps, cfg.sample_cfg, cfg.sample_seed + (i if cfg.sample_walk_seed else 0),
+                          out_dir / f"{self._image_prefix()}step{step:06d}_{i}.png",
+                          f"sampling {i + 1}/{n_prompts} at step {step}" if n_slots == 1
+                          else f"sample {i + 1}/{n_prompts}", frames=frames, shown=prompt)
+                for i, prompt in enumerate(cfg.sample_prompts)]
+
+    def _sample_finish(self, paths: list, step: int) -> None:
+        """What follows a sample round's pictures, wherever they were rendered (on the trainer thread: the scorers are
+        not shared across threads): the status list, the similarity scores, the run history."""
+        cfg = self.cfg
         self.status.data["samples"] = paths + self.status.data["samples"]
         if (self.face_scorer is not None or self.body_scorer is not None) and paths:
             self.status.update(stage=f"similarity scoring (step {step})")
