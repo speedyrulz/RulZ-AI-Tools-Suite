@@ -253,6 +253,20 @@ def test_a_hung_vastai_call_gives_up(monkeypatch):
         remote.vastai("show", "instances")
 
 
+def test_vastai_runs_with_stdin_closed(monkeypatch):
+    """The CLI reads an open stdin to its end first: under the render helper (stdin an open pipe) it hung 120 s."""
+    monkeypatch.setattr(remote.shutil, "which", lambda name: "vastai")
+    seen = {}
+
+    def run(cmd, **k):
+        seen.update(k)
+        return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(remote.subprocess, "run", run)
+    remote.vastai("show", "instances", "--raw")
+    assert seen["stdin"] is subprocess.DEVNULL
+
+
 def tar_stream(name: str, data: bytes) -> io.BytesIO:
     out = io.BytesIO()
     with tarfile.open(fileobj=out, mode="w") as tar:
