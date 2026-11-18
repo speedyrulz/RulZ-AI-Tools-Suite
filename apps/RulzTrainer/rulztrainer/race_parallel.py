@@ -82,9 +82,10 @@ def forward_backward(job):
             mults.append(ctx.loss_watch.multiplier(it.key))
         if cfg.per_image_lr:
             weights = weights * torch.tensor(mults, device=weights.device, dtype=weights.dtype)
-    if any(getattr(it, "reg", False) for it in batch):  # the regularisation dataset's loss weight (reg_weight)
-        weights = weights * torch.tensor([it.loss_scale if getattr(it, "reg", False) else 1.0 for it in batch],
-                                         device=weights.device, dtype=weights.dtype)
+    scales = [float(getattr(it, "loss_scale", 1.0)) for it in batch]
+    if any(s != 1.0 for s in scales):  # each item's loss weight (its dataset's weight, reg_weight), as the
+        # single-copy training step applies it
+        weights = weights * torch.tensor(scales, device=weights.device, dtype=weights.dtype)
     loss = (per * weights).mean() / n_total  # the step's update is the mean over all of its batches
     loss.backward()
     return loss.item(), mults, None

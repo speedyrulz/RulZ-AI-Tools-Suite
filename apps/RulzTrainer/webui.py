@@ -28,7 +28,7 @@ from fastapi import Request
 from nicegui import app, background_tasks, run, ui
 
 from rulztrainer.archs import get_arch
-from rulztrainer.config import (AUTOMAGIC, KEEL, KEEL_FB, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
+from rulztrainer.config import (AUTOMAGIC, KEEL, LR_SCHEDULERS, KEEL_FB, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
                                 MODEL_PRESETS, ARCH_SAMPLE_LORA, VIDEO_ARCHS, VIDEO_EXTS, VIDEO_DATA_PRESETS,
                                 STILL_FFN_TARGETS, detect_video_data_preset, video_data_preset,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
@@ -1722,6 +1722,10 @@ class DatasetPicker:
                     d[key] = str(el.value).strip()
             if r["kind"].value and r["kind"].value != "auto":
                 d["kind"] = r["kind"].value
+            if r["wt"].value not in (None, "") and float(r["wt"].value) != 1.0:
+                d["weight"] = float(r["wt"].value)
+            if int(r["smp"].value or 0) > 0:
+                d["samples"] = int(r["smp"].value)
             out.append(d)
         return out
 
@@ -1741,6 +1745,8 @@ class DatasetPicker:
             r["trig"].value = str(d.get("trigger") or "")
             r["cls"].value = str(d.get("class") or "")
             r["kind"].value = str(d.get("kind") or "auto")
+            r["wt"].value = 1.0 if d.get("weight") is None else float(d.get("weight"))
+            r["smp"].value = int(d.get("samples") or 0)
             r["use"].value = True
         self.changed()
 
@@ -1772,6 +1778,12 @@ class DatasetPicker:
                 rep = ui.number("Repeats", value=1, min=1, max=1000, precision=0).classes("w-24") \
                     .tooltip("How many times each image of this dataset comes up per epoch: 2 counts a dataset "
                              "twice as much as one at 1.")
+                wt = ui.number("Loss weight", value=1.0, min=0.01, step=0.1).classes("w-24") \
+                    .tooltip("Multiplies the training loss of every picture of this dataset: 0.5 trains it half as "
+                             "firmly as a dataset at 1. Above 0.")
+                smp = ui.number("Per epoch", value=0, min=0, precision=0).classes("w-24") \
+                    .tooltip("0: every image times its repeats comes up each epoch. A count N: at most N pictures of "
+                             "this dataset per epoch, a different draw each epoch (after repeats).")
                 trig = ui.input("Trigger", placeholder="the run's").props("dense").classes("w-28") \
                     .tooltip("This dataset's own trigger word (empty: the Trigger word of the run). Several "
                              "subjects, each with its own trigger, train together (LoRA Isolation).")
@@ -1783,12 +1795,12 @@ class DatasetPicker:
                     .tooltip("LoRA Isolation: a person gets the fused trigger and the side-by-side pairs with "
                              "strangers, an animal or thing the fused trigger only, a style keeps its trigger as "
                              "written. auto: a person when the class is one.")
-        for el in (res, rep, trig, cls, kind):
+        for el in (res, rep, wt, smp, trig, cls, kind):
             el.bind_enabled_from(use, "value")
-        for el in (use, res, rep, trig, cls, kind):
+        for el in (use, res, rep, wt, smp, trig, cls, kind):
             el.on_value_change(lambda _: self.changed())
         self.rows[key] = {"path": path, "row": row, "use": use, "info": info, "res": res, "rep": rep, "trig": trig,
-                          "cls": cls, "kind": kind}
+                          "cls": cls, "kind": kind, "wt": wt, "smp": smp}
         self.empty.visible = False
         for fn in self.listeners:
             fn()
@@ -2140,6 +2152,9 @@ class Form:
             steps=0 if v("soup_run") or v("noise_run") else int(v("steps")), batch_size=int(v("batch_size")),
             gradient_accumulation=int(v("gradient_accumulation")), learning_rate=float(v("learning_rate")),
             optimizer=v("optimizer"), lr_scheduler=v("lr_scheduler"), warmup_steps=int(v("warmup_steps")),
+            warmup_fraction=num("warmup_fraction", float), lr_min_factor=num("lr_min_factor", float),
+            lr_cycles=num("lr_cycles", int), adam_beta1=num("adam_beta1", float), adam_beta2=num("adam_beta2", float),
+            adam_eps=num("adam_eps", float),
             max_grad_norm=float(v("max_grad_norm")), timestep_sampling=v("timestep_sampling"),
             automagic_min_lr=float(v("automagic_min_lr")), automagic_max_lr=float(v("automagic_max_lr")),
             automagic_polarity_history=int(v("automagic_polarity_history")), automagic_groups=v("automagic_groups"),
@@ -2323,7 +2338,9 @@ class Form:
                                    and any(p.key == e for p in promptcheck.PRESETS)],
                   "model_source": FILE_SOURCE if cfg.model_source == "files" else HF_SOURCE}
         values["datasets"] = [{"path": sp.path, "resolutions": list(sp.resolutions), "repeats": sp.repeats,
-                               "trigger": sp.trigger, "class": sp.subject_class, "kind": sp.subject_kind}
+                               "trigger": sp.trigger, "class": sp.subject_class, "kind": sp.subject_kind,
+                               **({"weight": sp.weight} if sp.weight != 1.0 else {}),
+                               **({"samples": sp.samples} if sp.samples else {})}
                               for sp in cfg.dataset_specs() if sp.path]  # a single-folder config: that folder
         values["sample_aspect"], values["sample_mp"] = size_aspect(cfg.sample_width, cfg.sample_height)
         values["turbo_mode"] = ("auto" if cfg.turbo_lora == "auto" else "file" if cfg.turbo_lora else "none")
@@ -2908,6 +2925,36 @@ THEME_HEAD = """<script>
   }
   track('.nicegui-header.rz-header', '--rz-head-h');
   track('.nicegui-footer.rz-footer', '--rz-foot-h');
+  // a log box marked rz-log-fit (the Monitor's train.log) reaches down to the action bar and no further, so its own
+  // scroll bar is the only one and the page above it stays in view: first stretched to the window's bottom, then
+  // shortened by what the page still overflows (the card's padding, the panel's margin, the action bar's room)
+  function fitLogs() {
+    document.querySelectorAll('.rz-log-fit').forEach(function (el) {
+      if (!el.rzWatched && window.ResizeObserver) {
+        // the page's own box keeps the window's height when its content gets shorter (a section folded), so the
+        // column the log sits in is watched too, and the header (its run strip moves everything below it)
+        el.rzWatched = true;
+        var ro = new ResizeObserver(fitLogs);
+        ro.observe(el.closest('.rz-monitor') || el.parentElement);
+        var head = document.querySelector('.nicegui-header.rz-header');
+        if (head) ro.observe(head);
+      }
+      if (!el.offsetParent) return;  // a hidden view, or the Log section folded
+      var top = el.getBoundingClientRect().top + window.scrollY;  // from the page's top, wherever it is scrolled
+      el.style.height = Math.max(260, window.innerHeight - top) + 'px';
+      var over = document.scrollingElement.scrollHeight - window.innerHeight;
+      el.style.height = Math.max(260, window.innerHeight - top - Math.max(0, over)) + 'px';
+    });
+  }
+  window.rzFitLogs = fitLogs;
+  window.addEventListener('resize', fitLogs);
+  function watchPage() {
+    if (!document.body) { setTimeout(watchPage, 300); return; }
+    // a view switched, a section opened or folded, the header's run strip grew: the page's size changes
+    if (window.ResizeObserver) new ResizeObserver(fitLogs).observe(document.body);
+    fitLogs();
+  }
+  watchPage();
 })();
 </script>
 <style>html[data-theme="light"], html[data-theme="light"] body { background: #FFFFFF; }</style>""" % {"key": THEME_KEY}
@@ -5255,6 +5302,8 @@ def build_maps_tab(f: Form):
 RACE_LABELS = {
     "learning_rate": "Learning rate", "optimizer": "Optimizer", "weight_decay": "Weight decay",
     "lr_scheduler": "Learning rate schedule", "warmup_steps": "Warm-up steps", "lora_plus_ratio": "LoRA+ ratio",
+    "warmup_fraction": "Warm-up share", "lr_min_factor": "Final lr share", "lr_cycles": "Restart cycles",
+    "adam_beta1": "Adam beta 1", "adam_beta2": "Adam beta 2", "adam_eps": "Adam epsilon",
     "automagic_min_lr": "Automagic min lr", "automagic_max_lr": "Automagic max lr",
     "automagic_polarity_history": "Automagic polarity history", "automagic_clip_threshold": "Automagic clip threshold",
     "automagic_groups": "Automagic lr groups", "automagic_sensitivity_quantile": "Automagic sensitivity quantile",
@@ -5946,10 +5995,15 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     n = (data or {}).get("images") or 0
     if n:
         counts = (data or {}).get("counts") or {}
-        reps = sum(counts.get(sp.path, 0) * sp.repeats for sp in cfg.dataset_specs() if sp.path in counts)
+        reps = sum(min(counts.get(sp.path, 0) * sp.repeats, sp.samples) if sp.samples > 0
+                   else counts.get(sp.path, 0) * sp.repeats for sp in cfg.dataset_specs() if sp.path in counts)
         items = reps or n  # pictures per epoch, repeats counted
         crops = {"face": 0.6, "face+bust": 1.2}.get(cfg.crop_augment, 0.0)  # extra items per picture (some are skipped)
         per_epoch = items * (1 + crops)
+        if reps:  # a dataset's `samples` caps its items after the crops are added
+            per_epoch = sum(min(counts.get(sp.path, 0) * sp.repeats * (1 + crops), sp.samples) if sp.samples > 0
+                            else counts.get(sp.path, 0) * sp.repeats * (1 + crops)
+                            for sp in cfg.dataset_specs() if sp.path in counts)
         steps = int(min(4000, max(1000, round(per_epoch * 100, -2))))
         r["steps"] = (steps, f"about 100 epochs: {n} images" + (f" x repeats = {items}" if items != n else "")
                              + (f", plus about {int(items * crops)} close-up crops" if crops else "")
@@ -10779,10 +10833,49 @@ def build_page(local: bool = True):
                             # a family rule can hang on the optimizer (SDXL's Keel face gain): check them again
                             w["optimizer"].on_value_change(
                                 lambda _: None if getattr(f, "family_released", False) else f.apply_family_support())
-                            w["lr_scheduler"] = ui.select(["constant", "cosine", "linear"], value=d.lr_scheduler,
-                                                          label="LR schedule").classes("w-36")
+                            w["lr_scheduler"] = ui.select(list(LR_SCHEDULERS), value=d.lr_scheduler,
+                                                          label="LR schedule").classes("w-40") \
+                                .tooltip("constant keeps the rate. cosine, linear and rex fall from the rate toward the "
+                                         "final share, reaching it at the end of the run (the last update is a "
+                                         "step short of it; rex stays higher for longer, then drops "
+                                         "fast; Chen et al. 2021). cosine_restarts runs the cosine fall several "
+                                         "times, jumping back to the full rate each time. Automagic and Keel "
+                                         "ignore the schedule.")
                             w["warmup_steps"] = ui.number("Warmup steps", value=d.warmup_steps, precision=0) \
-                                .classes("w-32")
+                                .classes("w-32") \
+                                .tooltip("Steps the rate climbs from near 0 to its full value. Ignored when the "
+                                         "warm-up share is above 0.")
+                            w["warmup_fraction"] = ui.number("Warm-up share (0 = use steps)",
+                                                             value=d.warmup_fraction, min=0, max=0.5, step=0.01) \
+                                .classes("w-48") \
+                                .tooltip("0 to 0.5. Above 0, the warm-up is this share of the Steps (0.05 of 2000 "
+                                         "is 100 steps) and replaces Warmup steps. A Warmup steps value like 1 is "
+                                         "one step, never 100%.")
+                            w["lr_min_factor"] = ui.number("Final lr share", value=d.lr_min_factor, min=0, max=1,
+                                                           step=0.05).classes("w-32") \
+                                .bind_visibility_from(w["lr_scheduler"], "value", lambda x: x != "constant") \
+                                .tooltip("0 to 1. The cosine, linear, rex and restart schedules end at the "
+                                         "Learning rate times this, not at 0 (0.1: a tenth of the rate).")
+                            w["lr_cycles"] = ui.number("Restart cycles", value=d.lr_cycles, min=1, precision=0) \
+                                .classes("w-32") \
+                                .bind_visibility_from(w["lr_scheduler"], "value", lambda x: x == "cosine_restarts") \
+                                .tooltip("cosine_restarts: how many cosine falls the steps after the warm-up are "
+                                         "split into; each starts again at the full rate.")
+                        with fields().bind_visibility_from(w["optimizer"], "value",
+                                                           lambda x: x in ("adamw", "adamw8bit")):
+                            w["adam_beta1"] = ui.number("Adam beta 1", value=d.adam_beta1, min=0, max=0.9999,
+                                                        step=0.01).classes("w-32") \
+                                .tooltip("AdamW and AdamW 8-bit only. The momentum of the gradient average "
+                                         "(0.9 is the usual value).")
+                            w["adam_beta2"] = ui.number("Adam beta 2", value=d.adam_beta2, min=0, max=0.9999,
+                                                        step=0.001).classes("w-32") \
+                                .tooltip("AdamW and AdamW 8-bit only. 0.99 is RulZ's default; PyTorch's and "
+                                         "OneTrainer's is 0.999 (slower to forget). Which is better here is not "
+                                         "tested: race the two.")
+                            w["adam_eps"] = ui.number("Adam epsilon", value=d.adam_eps, min=0, format="%.1e") \
+                                .classes("w-32") \
+                                .tooltip("AdamW and AdamW 8-bit only. Added to the divisor to keep it from "
+                                         "reaching 0 (1e-8 is the usual value).")
                         with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x == "hull"):
                             w["hull_rho"] = ui.number("Hull step", value=d.hull_rho, min=0, step=0.0001,
                                                       format="%.6f").classes("w-40") \
@@ -12887,7 +12980,7 @@ def build_page(local: bool = True):
                     job_files = JobFiles()
                     saved_label = ui.label("").classes("rz-mono whitespace-pre-wrap")
                 with section("Log", "train.log as it is written", "terminal") as log_exp:
-                    log_view = ui.log(max_lines=600).classes("w-full rz-log rz-log-tall rz-mono")
+                    log_view = ui.log(max_lines=600).classes("w-full rz-log rz-log-tall rz-log-fit rz-mono")
                 # the views: each section into its view's column, in this order
                 view_boxes: dict = {}
                 for name, members, empty in (
