@@ -588,10 +588,10 @@ def side_to_mp(side: int) -> float:
     return round(side * side / (1024 * 1024), 2)
 
 
-DATASET_KEYS = ("path", "resolutions", "repeats", "trigger", "class", "kind")
+DATASET_KEYS = ("path", "resolutions", "repeats", "trigger", "class", "kind", "weight", "samples")
 # the values the trainer acts on (trainer.build_scheduler, sample_sigmas, loss_weight): anything else is refused at
 # start, not taken as constant / failing at step 1 after the caching
-LR_SCHEDULERS = ("constant", "cosine", "linear")
+LR_SCHEDULERS = ("constant", "cosine", "linear", "rex", "cosine_restarts")
 TIMESTEP_SAMPLINGS = ("logit_normal", "sigmoid", "uniform", "identity", "content", "style", "logsnr", "reference",
                       "shift")
 LOSS_WEIGHTINGS = ("none", "min_snr", "sigma_sqrt")
@@ -611,6 +611,8 @@ class DatasetSpec:
     trigger: str = ""  # this dataset's trigger word (empty: the run's trigger_word)
     subject_class: str = ""  # LoRA Isolation: what the subject is ("man", "a woman"); empty: read from the captions
     subject_kind: str = "auto"  # LoRA Isolation: auto | person | thing | style
+    weight: float = 1.0  # loss weight of every picture of this dataset (above 0; 1 = as is)
+    samples: int = 0  # 0 = every image x repeats per epoch; N = at most N items of this dataset per epoch (a fresh draw)
 
 
 def soup_strength_list(text: str) -> list[float]:
@@ -863,8 +865,14 @@ class TrainConfig:
     hull_damping: float = 1e-6  # hull: the Grams' damping, as a fraction of their mean eigenvalue
     keel_body_weight: float = 1.0  # keel_fb: the body tokens' weight against the face's in the token gain (the
     #                                 person's cells outside the face box: needs person masks); 1 = equal, 0 = face only
-    lr_scheduler: str = "constant"  # constant | cosine | linear
+    lr_scheduler: str = "constant"  # constant | cosine | linear | rex | cosine_restarts
     warmup_steps: int = 50
+    warmup_fraction: float = 0.0  # 0..0.5: above 0 the warm-up is this share of the steps and replaces warmup_steps
+    lr_min_factor: float = 0.0  # 0..1: cosine / linear / rex / cosine_restarts end at learning_rate x this, not at 0
+    lr_cycles: int = 1  # cosine_restarts: how many cosine cycles the steps after the warm-up are split into
+    adam_beta1: float = 0.9  # adamw / adamw8bit only
+    adam_beta2: float = 0.99  # adamw / adamw8bit only (RulZ's default; PyTorch's and OneTrainer's is 0.999)
+    adam_eps: float = 1e-8  # adamw / adamw8bit only
     max_grad_norm: float = 1.0
     timestep_sampling: str = "logit_normal"  # logit_normal | sigmoid | uniform
     logit_mean: float = 0.0
@@ -1177,7 +1185,9 @@ class TrainConfig:
             out.append(DatasetSpec(str(d.get("path") or "").strip(),
                                    tuple(float(x) for x in (d.get("resolutions") or [])),
                                    1 if reps is None else int(reps), str(d.get("trigger") or "").strip(),
-                                   str(d.get("class") or "").strip(), str(d.get("kind") or "auto").strip() or "auto"))
+                                   str(d.get("class") or "").strip(), str(d.get("kind") or "auto").strip() or "auto",
+                                   1.0 if d.get("weight") is None else float(d.get("weight")),
+                                   0 if d.get("samples") is None else int(d.get("samples"))))
         return out
 
     def run_sides(self) -> list[int]:
@@ -1491,6 +1501,7 @@ class TrainConfig:
                              ("loss_weighting", LOSS_WEIGHTINGS)):
             if getattr(self, key) not in allowed:
                 raise ValueError(f"{key} must be one of {', '.join(allowed)}, got {getattr(self, key)!r}")
+        self.validate_schedule()
         if int(self.batch_size) < 1 or int(self.gradient_accumulation) < 1:
             raise ValueError("batch_size and gradient_accumulation must be 1 or more (gradient_accumulation 0 would "
                              "train no image and save the LoRA untrained)")
@@ -1767,6 +1778,21 @@ class TrainConfig:
         if self.finetune_rotate_epochs <= 0:
             raise ValueError("finetune_rotate_epochs must be above 0")
 
+    def validate_schedule(self) -> None:
+        """The learning-rate schedule's and Adam's numbers."""
+        if not 0.0 <= float(self.warmup_fraction) <= 0.5:
+            raise ValueError(f"warmup_fraction is a share of the steps, 0 to 0.5 (0 = use warmup_steps), got "
+                             f"{self.warmup_fraction!r}")
+        if not 0.0 <= float(self.lr_min_factor) <= 1.0:
+            raise ValueError(f"lr_min_factor is a share of learning_rate, 0 to 1, got {self.lr_min_factor!r}")
+        if int(self.lr_cycles) < 1:
+            raise ValueError(f"lr_cycles must be 1 or more, got {self.lr_cycles!r}")
+        for key in ("adam_beta1", "adam_beta2"):
+            if not 0.0 <= float(getattr(self, key)) < 1.0:
+                raise ValueError(f"{key} must be at least 0 and below 1, got {getattr(self, key)!r}")
+        if not float(self.adam_eps) > 0:
+            raise ValueError(f"adam_eps must be above 0, got {self.adam_eps!r}")
+
     def validate_datasets(self) -> None:
         """Every dataset has a path, at least one repeat and megapixel resolutions; none is listed twice or lies
         inside another (whose scan includes its sub-folders, so its images would train twice)."""
@@ -1784,6 +1810,11 @@ class TrainConfig:
                 raise ValueError("No dataset: pick at least one (datasets), or set dataset_dir")
             if spec.repeats < 1:
                 raise ValueError(f"Dataset {spec.path}: repeats must be at least 1, got {spec.repeats}")
+            if not spec.weight > 0:
+                raise ValueError(f"Dataset {spec.path}: weight must be above 0, got {spec.weight!r}")
+            if spec.samples < 0:
+                raise ValueError(f"Dataset {spec.path}: samples must be 0 (every picture) or a count, got "
+                                 f"{spec.samples!r}")
             for mp in spec.resolutions:
                 if not (0.0 < mp <= 16.0):
                     raise ValueError(f"Dataset {spec.path}: resolutions must be megapixel values in (0, 16], "
