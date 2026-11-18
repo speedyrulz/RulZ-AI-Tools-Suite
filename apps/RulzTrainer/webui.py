@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import copy
 import dataclasses
 import json
@@ -34,6 +35,7 @@ from rulztrainer.config import (AUTOMAGIC, KEEL, LR_SCHEDULERS, KEEL_FB, OPTIMIZ
 from rulztrainer import (__version__, bodysim, capabilities, facesim, history, lookfilter, machine, oom_recovery,
                          promptcheck)
 from rulztrainer.train_queue import TrainQueue
+from rulztrainer import renderhelper_ctl as rulz_renderctl
 from rulztrainer.dataset import skipped as dataset_skipped
 from rulztrainer.caption_text import read_caption_text
 from rulztrainer.pictures import to_rgb
@@ -2559,6 +2561,13 @@ h1, h2, h3, .rz-pane-title { font-family: "Segoe UI Variable Display", "Segoe UI
 .rz-subhead { font-size: 12.5px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--rz-muted); margin-top: 4px; }
 .rz-hint { font-size: 14px; color: var(--rz-muted); line-height: 1.55; max-width: 980px; }
 .rz-warn { color: var(--rz-warn); }
+.rz-render { border-top: 1px dashed var(--rz-border); padding-top: 8px; }
+.rz-rstat { font-size: 13px; color: var(--rz-muted); }
+.rz-rs-word { font-weight: 600; color: var(--rz-muted); }
+.rz-rs-icon { font-size: 18px; color: var(--rz-muted); }
+.rz-rs-icon.ok, .rz-rs-word.ok { color: var(--rz-ok-text); }
+.rz-rs-icon.warn, .rz-rs-word.warn { color: var(--rz-warn-text); }
+.rz-rs-icon.err, .rz-rs-word.err { color: var(--rz-err-text); }
 .rz-fields { gap: 14px 16px; align-items: center; flex-wrap: wrap; }
 
 /* form fields and buttons */
@@ -8841,6 +8850,24 @@ def fleet():
     return _FLEET
 
 
+_RENDER_HELPERS = None
+
+
+def render_helpers():
+    """The "Render on this PC" helpers of this WebUI (rulztrainer/renderhelper_ctl.py): one for the whole process.
+    They end when the WebUI exits (stop_render_helpers is on shutdown and at interpreter exit)."""
+    global _RENDER_HELPERS
+    if _RENDER_HELPERS is None:
+        _RENDER_HELPERS = rulz_renderctl.RenderHelpers()
+        atexit.register(stop_render_helpers)
+    return _RENDER_HELPERS
+
+
+def stop_render_helpers() -> None:
+    if _RENDER_HELPERS is not None:
+        _RENDER_HELPERS.stop_all()
+
+
 def fleet_loop() -> None:
     """Look at the fleet's instances while there are any (rulz_fleet's step: the queue moves on, due files come
     down, the watches are checked). A daemon or a wait started elsewhere may hold the looking instead; then this
@@ -9029,7 +9056,7 @@ def build_fleet_tab(form_config=None):
     fl = fleet()
     import rulz_fleet
 
-    state: dict = {"shape": None, "cards": {}, "seen": {}, "dl": {}, "accept": {}}
+    state: dict = {"shape": None, "cards": {}, "seen": {}, "dl": {}, "accept": {}, "render_wait": set()}
 
     async def act(func, *args, ok: str = "", **kw):
         """A fleet call off the page's thread (most of them go over ssh); a refusal becomes a notice."""
@@ -9224,7 +9251,107 @@ def build_fleet_tab(form_config=None):
                         w["watch_item"] = ui.menu_item("")
                         ui.menu_item("Remove from the fleet", on_click=lambda i=iid: act(
                             fl.remove_instance, i, ok=f"Instance {i} removed; its runs stay on record"))
+            make_render_controls(iid, w)
         return w
+
+    # ------------------------------------------- "Render on this PC" (the helper: rulztrainer.renderhelper)
+    def render_pref(iid) -> dict:
+        return state.setdefault("render_pref", {}).setdefault(iid, {"gpu": None, "model": "", "quant": "auto"})
+
+    def make_render_controls(iid: int, w: dict) -> None:
+        pref = render_pref(iid)
+        helpers = render_helpers()
+        gpus = helpers.cached_gpus()  # only what an earlier listing found: building a card runs nothing
+        with ui.column().classes("w-full gap-1 rz-render"):
+            with ui.row().classes("w-full items-center gap-2"):
+                w["render"] = ui.switch("Render on this PC", value=helpers.running(iid),
+                                        on_change=lambda e, i=iid: toggle_render(i, bool(e.value))) \
+                    .tooltip("Renders this run's samples and likeness probes on one of this PC's GPUs. Turning it on "
+                             "lets the helper use that GPU until you turn it off or close this WebUI.")
+                w["render_gpu"] = ui.select({g["index"]: render_gpu_label(g) for g in gpus}, value=pref["gpu"],
+                                            label="GPU", on_change=lambda e, p=pref: p.update(gpu=e.value)) \
+                    .props("dense outlined options-dense").classes("w-64")
+                ui.button(icon="refresh", color=None, on_click=lambda _, i=iid: list_gpus(i)).props("flat dense round") \
+                    .tooltip("List this PC's GPUs again")
+            with ui.row().classes("w-full items-center gap-2 rz-tips"):
+                w["render_model"] = ui.input("Sampling model (samples only)", value=pref["model"],
+                                             on_change=lambda e, p=pref: p.update(model=e.value or "")) \
+                    .props("dense outlined clearable").classes("w-96 max-w-full") \
+                    .tooltip("Optional: a model file on this PC to render samples with. Likeness probes always render "
+                             "the run's own model. Empty: the files the run uses.")
+                w["render_quant"] = ui.select(QUANTS, value=pref["quant"], label="Quant (samples only)",
+                                              on_change=lambda e, p=pref: p.update(quant=e.value or "auto")) \
+                    .props("dense outlined options-dense").classes("w-44")
+            with ui.row().classes("w-full items-center gap-2 no-wrap rz-rstat"):
+                w["render_icon"] = ui.icon("stop_circle").classes("rz-rs-icon")
+                w["render_word"] = ui.label("Stopped").classes("rz-rs-word")
+                w["render_text"] = ui.label("").classes("rz-rs-text min-w-0")
+
+    def render_gpu_label(g: dict) -> str:
+        return rulz_renderctl.gpu_label(g)
+
+    async def list_gpus(iid: int) -> None:
+        helpers = render_helpers()
+        gpus, err = await run.io_bound(helpers.list_gpus, True)
+        for w in state["cards"].values():
+            if "render_gpu" in w:
+                w["render_gpu"].set_options({g["index"]: render_gpu_label(g) for g in gpus})
+        if err:
+            ui.notify(err, type="warning", multi_line=True)
+
+    async def toggle_render(iid: int, on: bool) -> None:
+        if iid in state["render_wait"]:
+            return
+        state["render_wait"].add(iid)  # the page's refresh must not flip the switch back while this works
+        try:
+            await switch_render(iid, on)
+        finally:
+            state["render_wait"].discard(iid)
+
+    async def switch_render(iid: int, on: bool) -> None:
+        helpers = render_helpers()
+        w = state["cards"].get(iid) or {}
+        if on == helpers.running(iid):
+            return
+        if not on:
+            await run.io_bound(helpers.stop, iid)
+            ui.notify(f"Instance {iid}: rendering on this PC is off.", type="info")
+            return
+        pref = render_pref(iid)
+        gpus, err = await run.io_bound(helpers.list_gpus)
+        if "render_gpu" in w:
+            w["render_gpu"].set_options({g["index"]: render_gpu_label(g) for g in gpus})
+        gpu = next((g for g in gpus if g["index"] == pref["gpu"]), None)
+        if gpu is None:
+            ui.notify(err or "Pick the GPU to render on first, then turn this on.", type="warning", multi_line=True)
+            w["render"].value = False
+            return
+        try:
+            await run.io_bound(helpers.start, iid, gpu, pref["model"], pref["quant"])
+        except rulz_renderctl.Refused as e:
+            ui.notify(str(e), type="warning", multi_line=True)
+            w["render"].value = False
+            return
+        ui.notify(f"Instance {iid}: rendering on {gpu['name']} (GPU {gpu['index']}) while this WebUI runs.",
+                  type="positive", multi_line=True)
+
+    def fill_render(w: dict, iid: int) -> None:
+        if "render" not in w:
+            return
+        helpers = render_helpers()
+        v = helpers.view(iid)
+        running = v["running"]
+        if w["render"].value != running and iid not in state["render_wait"]:
+            w["render"].value = running
+        for k in ("render_gpu", "render_model", "render_quant"):
+            w[k].set_enabled(not running)
+        w["render_icon"].props(f'name={v["icon"]}')
+        w["render_icon"].classes(replace=f"rz-rs-icon {v['level']}")
+        w["render_word"].text = v["word"]
+        w["render_word"].classes(replace=f"rz-rs-word {v['level']}")
+        # the chosen GPU's name always shows while the helper runs: turning the switch on was the consent to use it
+        parts = [p for p in (v["gpu_name"] if running else "", v["text"]) if p]
+        w["render_text"].text = " · ".join(parts)
 
     def fill_card(w: dict, inst: dict) -> None:
         iid, job = inst["id"], inst.get("job") or {}
@@ -9270,6 +9397,7 @@ def build_fleet_tab(form_config=None):
         off = inst["state"] == "off"
         w["watch_item"].text = "Watch it again" if off else "Stop watching it"
         w["watch_target"] = (iid, off)
+        fill_render(w, iid)
 
     def draw_instances(view: dict) -> None:
         instances = view["instances"]
@@ -14550,6 +14678,7 @@ if __name__ in {"__main__", "__mp_main__"}:
                                             daemon=True).start())
     if VAST_INSTANCE is None:  # this computer looks after the vast.ai instances; an instance looks after itself
         app.on_startup(lambda: threading.Thread(target=fleet_loop, name="rulz-fleet", daemon=True).start())
+        app.on_shutdown(stop_render_helpers)  # the "Render on this PC" helpers end with the WebUI
 
     @ui.page("/", reconnect_timeout=PAGE_KEEP_SECONDS)
     def index(request: Request):
