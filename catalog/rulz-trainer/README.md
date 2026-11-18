@@ -1397,6 +1397,42 @@ dashed), with a pin on the held-out subject's best sweep. A click on a name in a
 need no new setting: they appear with a run's second sweep, and for a run with sweeps but no region watch the section
 shows the charts without the per-picture table.
 
+## Block audit (`block_audit_every`, experimental)
+
+**Untested on a real model**: unit-tested only, never run on a GPU. It answers one question: which blocks carry the
+likeness? Every N probes, after the normal probe has been scored, the likeness prompts render again once per **block
+group** with that group's LoRA switched off (its layers run as the frozen model), at the probe's own seeds, so every
+score is paired with the same seed at full strength. A group's **credit** is the probe's score less the score without
+the group: what it adds at this point of the run, in raw points for the face, the body and the gold face (and on the
+normalized scale as well), plus how many more renders leave the frame their prompt asks for (the prompt check) when it
+is off.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `block_audit_every` | 0 (off) | Audit after every Nth probe (the step-0 baseline is not counted). Needs `probe_every` and `face_refs` / `body_refs`. |
+| `block_audit_groups` | 6 | The trained blocks cut into this many contiguous groups of near-equal size (2 to 16); layers in no block (embedders, final layers) form one more group, `other`. |
+| `block_audit_seeds` | 0 | Seeds per ablated render, the first of the probe's seeds; 0 = as many as the probe. More than `probe_seeds` adds nothing. |
+
+**Report only.** It changes nothing about training: no learning-rate change, no freezing, and the audit renders feed
+neither the likeness controller, the best checkpoint, Keel's probe-gated lookahead nor the patience. A failure turns the
+audits off for the rest of the run and training goes on.
+
+**Cost.** Groups x seeds x (face + body) extra renders per audit, logged at the start (6 groups, 2 seeds, both
+probes: 24 renders). The images go to `probes/` as `..._audit-g1-s000600_face_0.png`; they are not probe images, so
+the Monitor's probe gallery and the run report's probe pictures leave them out.
+
+**Where it is shown.** One log line per audit (`Block audit at step 600: g1 blocks 0-9 face +4.1±1.2 body +0.3 | ...`,
+mean ± standard deviation of the paired seeds), the Monitor's Region watch section, `block_audit.jsonl` (one line per
+audit) and `block_audit.json` (the state, read back on a resume), and a **Block audit** page in the run report: a
+group x audit table of the face and body credit, and the Spearman rank correlation of the groups' credits between
+consecutive audits (near 1 the groups keep their order, near 0 it is noise).
+
+**Not available** with a race, `probe_async` (it scores weights up to `probe_every` steps old, which the audit's renders
+could not be paired with), a full fine-tune, `noise_files` or `soup_files`, or `compile_model: true` (a compiled block
+guards on each layer's multiplier; with `auto` the compile turns itself off for the run). With `sample_model_path` the
+groups are switched off on the sampling model's copy of the LoRA; the sampling model is swapped in again for the audit.
+Two or three seeds make a credit a rough number: read the ranking over several audits, not one.
+
 ## Training maps (`training_maps`)
 
 Heatmaps over a few training pictures that show where training is going right or wrong, capture by capture. A
