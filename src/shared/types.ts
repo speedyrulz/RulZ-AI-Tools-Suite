@@ -244,6 +244,8 @@ export interface Settings {
   skippedUpdate?: string
   /** How the home page lists the apps: cards with a screenshot (the default) or one compact row each. */
   homeView?: 'grid' | 'list'
+  /** App ids in the order the user dragged the installed tiles into; installed apps not listed follow in catalog order. */
+  installedOrder?: string[]
   /** The launch options turned on, per app id (LaunchSpec.options). */
   launchOptions?: Record<string, string[]>
 }

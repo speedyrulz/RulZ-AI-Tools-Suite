@@ -1,5 +1,6 @@
 import { copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { cleanOrder } from '@shared/arrange'
 import type { InstalledInfo, Settings } from '@shared/types'
 import { renameRetrying } from './archive'
 
@@ -78,6 +79,7 @@ export class Store {
   async init(): Promise<void> {
     await mkdir(this.dir, { recursive: true })
     this.settings = { ...defaultSettings(), ...(await readJson<Partial<Settings>>(join(this.dir, 'settings.json'), {})) }
+    this.cleanOrder()
     this.installed = await readInstalled(join(this.dir, 'installed.json'))
     this.detectHidden = await readJson(join(this.dir, 'detect-hidden.json'), [])
   }
@@ -88,8 +90,16 @@ export class Store {
 
   async updateSettings(patch: Partial<Settings>): Promise<Settings> {
     this.settings = { ...this.settings, ...patch }
+    this.cleanOrder()
     await writeJson(join(this.dir, 'settings.json'), this.settings)
     return this.settings
+  }
+
+  /** installedOrder must be a list of distinct strings; anything else, and an empty list, leaves it unset. */
+  private cleanOrder(): void {
+    const order = cleanOrder(this.settings.installedOrder)
+    if (order) this.settings.installedOrder = order
+    else delete this.settings.installedOrder
   }
 
   /** Turns one launch option of an app on or off. Other apps' options and this app's others are kept. */

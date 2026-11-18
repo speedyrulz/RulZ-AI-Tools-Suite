@@ -108,3 +108,30 @@ describe('launch options', () => {
     expect((await store.setLaunchOption('rulz-trainer', 'tailscale', false)).launchOptions).toEqual({ 'rulz-trainer': [] })
   })
 })
+
+describe('installedOrder', () => {
+  it('is kept as saved, without duplicates', async () => {
+    await writeFile(join(dir, 'settings.json'), JSON.stringify({ installedOrder: ['b', 'a', 'b'] }))
+    const store = new Store(dir)
+    await store.init()
+    expect(store.getSettings().installedOrder).toEqual(['b', 'a'])
+    await store.updateSettings({ installedOrder: ['a', 'c'] })
+    const again = new Store(dir)
+    await again.init()
+    expect(again.getSettings().installedOrder).toEqual(['a', 'c'])
+  })
+
+  it('is unset when hand-edited to anything but a list of strings, or saved empty', async () => {
+    for (const bad of ['a', { a: 1 }, ['a', 2], [], null]) {
+      await writeFile(join(dir, 'settings.json'), JSON.stringify({ installedOrder: bad }))
+      const store = new Store(dir)
+      await store.init()
+      expect(store.getSettings().installedOrder, JSON.stringify(bad)).toBeUndefined()
+    }
+    const store = new Store(dir)
+    await store.updateSettings({ installedOrder: ['a'] })
+    await store.updateSettings({ installedOrder: [] })
+    expect('installedOrder' in store.getSettings()).toBe(false)
+    expect(JSON.parse(await readFile(join(dir, 'settings.json'), 'utf8')).installedOrder).toBeUndefined()
+  })
+})

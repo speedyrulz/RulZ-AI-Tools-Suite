@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { arrangeHome, categoryOrder, homeCounts, homeOrder, matchesQuery, neighbors } from '@shared/arrange'
+import { arrangeHome, categoryOrder, cleanOrder, homeCounts, homeOrder, matchesQuery, moveInOrder, neighbors } from '@shared/arrange'
 import { CATALOG, CATEGORIES } from '@shared/catalog'
 import type { AppView, InstalledInfo } from '@shared/types'
 
@@ -194,5 +194,69 @@ describe('matchesQuery', () => {
 describe('catalog text', () => {
   it('keeps taglines short enough for two lines on a card', () => {
     for (const app of CATALOG) expect(app.tagline.length, `${app.id}: "${app.tagline}"`).toBeLessThanOrEqual(72)
+  })
+})
+
+describe('saved order of the installed apps', () => {
+  const some = ['llm-suite', 'image-grid', 'hf-manager']
+  const installedIds = (order?: string[]): string[] => ids(arrangeHome(views(some), 'all', '', order)[0].views)
+
+  it('sorts the installed section by it; apps not in it follow in catalog order', () => {
+    const catalogOrder = CATALOG.map((a) => a.id).filter((id) => some.includes(id))
+    expect(installedIds()).toEqual(catalogOrder)
+    expect(installedIds(['hf-manager', 'llm-suite', 'image-grid'])).toEqual(['hf-manager', 'llm-suite', 'image-grid'])
+    // image-grid is newly installed (not listed), ids that are not installed are ignored.
+    expect(installedIds(['hf-manager', 'rulz-trainer', 'llm-suite'])).toEqual(['hf-manager', 'llm-suite', 'image-grid'])
+    expect(installedIds([])).toEqual(catalogOrder)
+  })
+
+  it('applies to the Installed filter, a category filter (installed first) and Previous / Next', () => {
+    const order = ['hf-manager', 'image-grid', 'llm-suite']
+    expect(ids(arrangeHome(views(some), 'installed', '', order)[0].views)).toEqual(order)
+    expect(homeOrder(views(some), order).slice(0, 3)).toEqual(order)
+    const cat = CATALOG.find((a) => a.id === 'hf-manager')!.category
+    const inCat = ids(arrangeHome(views(some), `cat:${cat}`, '', order)[0].views)
+    expect(inCat.filter((id) => some.includes(id))).toEqual(order.filter((id) => inCat.includes(id)))
+    expect(inCat.slice(0, inCat.filter((id) => some.includes(id)).length).every((id) => some.includes(id))).toBe(true)
+  })
+
+  it('leaves search results alone', () => {
+    const plain = ids(arrangeHome(views(some), 'all', 'image', undefined).flatMap((s) => s.views))
+    expect(ids(arrangeHome(views(some), 'all', 'image', ['image-grid', 'hf-manager']).flatMap((s) => s.views))).toEqual(plain)
+  })
+})
+
+describe('moveInOrder', () => {
+  it('moves one app to the place it ends up in', () => {
+    const shown = ['a', 'b', 'c', 'd']
+    expect(moveInOrder(undefined, shown, 'a', 2)).toEqual(['b', 'c', 'a', 'd'])
+    expect(moveInOrder(undefined, shown, 'd', 0)).toEqual(['d', 'a', 'b', 'c'])
+    expect(moveInOrder(undefined, shown, 'b', 1)).toEqual(shown)
+    expect(moveInOrder(undefined, shown, 'a', 99)).toEqual(['b', 'c', 'd', 'a'])
+    expect(moveInOrder(undefined, shown, 'a', -3)).toEqual(shown)
+  })
+
+  it('saves the whole shown order, including apps that were not in the old one', () => {
+    expect(moveInOrder(['c'], ['a', 'b', 'c'], 'b', 0)).toEqual(['b', 'a', 'c'])
+  })
+
+  it('keeps ids of apps that are not installed beside the id they followed', () => {
+    expect(moveInOrder(['x', 'a', 'y', 'b'], ['a', 'b'], 'b', 0)).toEqual(['x', 'b', 'a', 'y'])
+    expect(moveInOrder(['a', 'x', 'b'], ['a', 'b'], 'a', 1)).toEqual(['b', 'a', 'x'])
+  })
+
+  it('ignores an id that is not shown', () => {
+    expect(moveInOrder(['a', 'b'], ['a', 'b'], 'z', 0)).toEqual(['a', 'b'])
+  })
+})
+
+describe('cleanOrder', () => {
+  it('keeps a list of strings without duplicates and drops anything else', () => {
+    expect(cleanOrder(['a', 'b', 'a'])).toEqual(['a', 'b'])
+    expect(cleanOrder([])).toBeUndefined()
+    expect(cleanOrder('a')).toBeUndefined()
+    expect(cleanOrder(['a', 1])).toBeUndefined()
+    expect(cleanOrder({ 0: 'a' })).toBeUndefined()
+    expect(cleanOrder(null)).toBeUndefined()
   })
 })
