@@ -114,6 +114,29 @@ class StubVAE:
         return (z,)
 
 
+def test_qwen_vae_still_cache_matches_and_video_is_unchanged():
+    torch.manual_seed(23)
+    vae = diffusers.AutoencoderKLQwenImage(base_dim=8, z_dim=4, dim_mult=[1, 2], num_res_blocks=1,
+                                          temperal_downsample=[True]).eval()
+    image = torch.randn(1, 3, 1, 8, 8)
+    video = torch.randn(1, 3, 5, 8, 8)
+    latent = torch.randn(1, 4, 1, 4, 4)
+    video_latent = torch.randn(1, 4, 2, 4, 4)
+    with torch.no_grad():
+        want_enc = vae.encode(image).latent_dist.parameters
+        want_dec = vae.decode(latent).sample
+        video_enc = vae.encode(video).latent_dist.parameters
+        video_dec = vae.decode(video_latent).sample
+        with KL._still_vae_cache_disabled(vae, "encoder"):
+            got_enc = vae.encode(image).latent_dist.parameters
+        with KL._still_vae_cache_disabled(vae, "decoder"):
+            got_dec = vae.decode(latent).sample
+        torch.testing.assert_close(got_enc, want_enc)
+        torch.testing.assert_close(got_dec, want_dec)
+        torch.testing.assert_close(vae.encode(video).latent_dist.parameters, video_enc)
+        torch.testing.assert_close(vae.decode(video_latent).sample, video_dec)
+
+
 def test_latent_layout_matches_pipeline_packing():
     raw = torch.randn(1, 16, 1, 6, 8)
     vae = StubVAE(raw)

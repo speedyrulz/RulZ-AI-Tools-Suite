@@ -165,7 +165,10 @@ def _adapter_gb(cfg, o: dict) -> float:
     kind = str(get("network_type", "lora") or "lora")
     n = adapter_params(shapes, kind, int(get("lora_rank", 16) or 16), int(get("lokr_factor", 8) or 8),
                        int(get("oft_block_size", 32) or 32), bool(get("dora", False)))
-    per = bytes_per_param(get("optimizer", "adamw"), float(get("lora_ema", 0) or 0) > 0,
+    opt = str(get("optimizer", "adamw") or "adamw").lower()
+    if get("isolation", False) and float(get("dop_weight", 0) or 0) > 0 and opt in _AUTOMAGIC:
+        opt = "adamw"  # (config.effective_optimizer: isolation trains an Automagic pick with AdamW)
+    per = bytes_per_param(opt, float(get("lora_ema", 0) or 0) > 0,
                           int(get("automagic_polarity_history", 8) or 8), bool(get("keel_lookahead", False)))
     return n * per / 1e9
 
@@ -206,6 +209,32 @@ def adapter_extra_gb(cfg, overrides: dict | None = None) -> float:
 PICTURE_DIRS = ("samples", "probes", "training_maps")
 PICTURE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm")
 BASELINE = "step000000"
+
+
+def check_state_paths(cfg, must_exist: bool = True) -> None:
+    """Reject misplaced or incomplete training states before a run is started. must_exist=False (validate(): a queued
+    run may resume from a state a run ahead of it writes) lets a resume folder that does not exist yet pass."""
+    def is_state(path):
+        return path.is_dir() and (path / "train_state.pt").is_file() and (path / "lora.safetensors").is_file()
+
+    output = cfg.job_dir()
+    if is_state(output):
+        raise ValueError(f"Output folder {output} is a saved training state; put that folder in resume_state and "
+                         "choose an output directory and job name for the run's parent folder.")
+    if not cfg.resume_state:
+        return
+    state = Path(cfg.resume_state)
+    if not must_exist and not state.exists():
+        return
+    if state.is_file():
+        state = state.parent
+    if is_state(state):
+        return
+    children = [p for p in state.glob("state_*") if is_state(p)] if state.is_dir() else []
+    if children:
+        newest = max(children, key=lambda p: p.name)  # state_<step, 6 digits>: the highest step
+        raise ValueError(f"Resume folder {state} contains saved states; select the newest state folder: {newest}")
+    raise ValueError(f"Resume folder {state} is not a saved training state (needs train_state.pt and lora.safetensors).")
 
 
 def holds_output(folder) -> bool:

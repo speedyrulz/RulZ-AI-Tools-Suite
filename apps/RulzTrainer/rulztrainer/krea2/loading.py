@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -197,6 +198,26 @@ def pad_embeds(rows: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
 # ---------------------------------------------------------------- VAE (Qwen-Image), the trainer's latent layout
 
 
+@contextmanager
+def _still_vae_cache_disabled(vae, component):
+    """Don't retain causal features during this one-frame operation, including spatial tiles."""
+    from diffusers import AutoencoderKLQwenImage
+
+    if not isinstance(vae, AutoencoderKLQwenImage):
+        yield
+        return
+
+    def no_cache(_module, args, kwargs):
+        kwargs["feat_cache"] = None
+        return args, kwargs
+
+    handle = getattr(vae, component).register_forward_pre_hook(no_cache, with_kwargs=True)
+    try:
+        yield
+    finally:
+        handle.remove()
+
+
 def _stats(vae, like: torch.Tensor):
     shape = (1, vae.config.z_dim, 1, 1)
     mean = torch.tensor(vae.config.latents_mean).view(shape).to(like)
@@ -208,7 +229,8 @@ def encode_images(vae, images: torch.Tensor) -> torch.Tensor:
     """images: [B,3,H,W] in [-1,1] (H,W multiples of 16). Returns normalized, patchified [B,64,H/16,W/16]; the 64
     features are (channel, dy, dx), the order Krea2Pipeline packs them in."""
     images = images.to(vae.device, vae.dtype).unsqueeze(2)  # a one-frame video
-    z = vae.encode(images).latent_dist.mode()[:, :, 0]
+    with _still_vae_cache_disabled(vae, "encoder"):
+        z = vae.encode(images).latent_dist.mode()[:, :, 0]
     mean, std = _stats(vae, z)
     z = (z - mean) / std
     b, c, h, w = z.shape
@@ -221,7 +243,8 @@ def _decode(vae, latents: torch.Tensor) -> torch.Tensor:
     z = z.reshape(b, c // 4, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3).reshape(b, c // 4, 2 * h, 2 * w)
     mean, std = _stats(vae, z)
     z = (z * std + mean).to(vae.dtype)
-    return vae.decode(z.unsqueeze(2), return_dict=False)[0][:, :, 0]
+    with _still_vae_cache_disabled(vae, "decoder"):
+        return vae.decode(z.unsqueeze(2), return_dict=False)[0][:, :, 0]
 
 
 @torch.no_grad()

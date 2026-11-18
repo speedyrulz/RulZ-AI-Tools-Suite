@@ -14,8 +14,10 @@ dataset_dir: datasets/my_dataset   # images + same-name .txt captions
 resolution: 1024
 enable_buckets: true
 flip_augment: false
+folder_repeats: false
 trigger_word: ""
 caption_dropout: 0.05
+caption_lines: false
 max_token_length: 1024
 
 lora_rank: 16

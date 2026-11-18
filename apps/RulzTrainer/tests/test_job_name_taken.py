@@ -31,6 +31,7 @@ def a_state(job: Path, step: int = 250) -> Path:
     d = job / f"state_{step:06d}"
     d.mkdir()
     (d / "lora.safetensors").write_bytes(b"x")
+    (d / "train_state.pt").write_bytes(b"x")  # written last: what makes a saved state complete
     return d
 
 

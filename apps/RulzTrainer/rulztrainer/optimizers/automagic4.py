@@ -662,6 +662,64 @@ class Automagic4(Automagic3):
         return [float(t) if t is not None else float(group["lr"])
                 for t, group in zip(self._group_lr, self.param_groups)]
 
+    @torch.no_grad()
+    def brake_stats(self) -> Optional[dict]:
+        """Read-only: how hard the sensitivity balance brakes the steps, recomputed from the second moments and the
+        reference the last step left (the same formula as _update_bucket; nothing is written, so the update and
+        state_dict are untouched). The group lr alone sits at its cap while the weights move by lr x balance.
+        Returns {"lr", "lr_working", "mean_balance", "braked_share", "reference", "groups": [per group: lr,
+        lr_working, mean_balance, braked_share, reference]} (element-weighted; lr and lr_working are the means over
+        groups), or None before the first measured step. One GPU sync per group: call it every few steps."""
+        if self._ref is None:
+            return None
+        lrs = self.get_learning_rates()
+        slab_elems = self.bucket_elems or (1 << 24)
+        groups = []
+        for group, lr in zip(self.param_groups, lrs):
+            sums, braked, n, unbraked, ref0 = [], [], 0, 0, None
+            for p in group["params"]:
+                st = self.state.get(p)
+                if not st or "step" not in st or not int(st["step"]):
+                    continue
+                n += p.numel()
+                ref = st.get("sens_ref")
+                if not isinstance(ref, torch.Tensor):
+                    unbraked += p.numel()  # no reference yet for this tensor: unbraked
+                    continue
+                if ref0 is None:
+                    ref0 = float(ref)
+                k = ref.float() * math.sqrt(1.0 - group["beta2"] ** int(st["step"]))
+                if p.dim() >= 2:
+                    row, col = st["exp_avg_sq_row"].float(), st["exp_avg_sq_col"].float()
+                    r = (row / row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)
+                    c = col.unsqueeze(-2).rsqrt()
+                    step_rows = max(1, slab_elems // max(1, p.shape[-1])) if p.dim() == 2 else r.shape[-2]
+                    for i0 in range(0, r.shape[-2], step_rows):
+                        bal = torch.mul(r[..., i0:i0 + step_rows, :] * k, c).clamp_(max=1.0)
+                        sums.append(bal.sum(dtype=torch.float64))
+                        braked.append((bal < 1.0).sum(dtype=torch.float64))
+                else:
+                    bal = (st["exp_avg_sq"].float() + group["eps"]).rsqrt_().mul_(k).clamp_(max=1.0)
+                    sums.append(bal.sum(dtype=torch.float64))
+                    braked.append((bal < 1.0).sum(dtype=torch.float64))
+            if not n:
+                groups.append({"lr": lr, "lr_working": lr, "mean_balance": 1.0, "braked_share": 0.0,
+                               "reference": ref0})
+                continue
+            dev = sums[0].device if sums else None
+            tot = float(torch.stack([s.to(dev) for s in sums]).sum()) if sums else 0.0
+            brk = float(torch.stack([b.to(dev) for b in braked]).sum()) if braked else 0.0
+            mean_bal = (tot + unbraked) / n
+            groups.append({"lr": lr, "lr_working": lr * mean_bal, "mean_balance": mean_bal,
+                           "braked_share": brk / n, "reference": ref0, "_n": n})
+        k = max(1, len(groups))
+        total = sum(g.get("_n", 0) for g in groups)
+        out = {"lr": sum(g["lr"] for g in groups) / k, "lr_working": sum(g["lr_working"] for g in groups) / k,
+               "reference": float(self._ref), "groups": [{a: v for a, v in g.items() if a != "_n"} for g in groups]}
+        out["mean_balance"] = (sum(g["mean_balance"] * g.get("_n", 0) for g in groups) / total) if total else 1.0
+        out["braked_share"] = (sum(g["braked_share"] * g.get("_n", 0) for g in groups) / total) if total else 0.0
+        return out
+
     def load_state_dict(self, state_dict):
         exact = self._saved_fp32(state_dict, "sens_ref")
         super().load_state_dict(state_dict)
