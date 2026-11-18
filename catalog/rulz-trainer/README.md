@@ -2343,6 +2343,72 @@ Measured on Qwen 2.1 int8 at 0.5 MP, training on an RTX 5060 Ti, probes on an RT
 It saves the most when one probe on the second GPU finishes in less time than `probe_every` training steps take; with
 3 seeds at 1024 px every 20 steps it was 28% slower (training waited for each probe). Off by default.
 
+A run on a vast.ai instance has no second GPU to use; it can hand its renders to your own PC instead: see
+[Samples and probes on your PC](#samples-and-probes-on-your-pc-remote_render).
+
+## Samples and probes on your PC (`remote_render`)
+
+A run on a vast.ai instance can hand its sample pictures and likeness probes to a GPU in your own PC. A helper on your
+PC connects to the instance over ssh, renders each round with the trainer's own renderer (the same code, so the pictures
+are the ones the instance would have made) and sends the pictures back. Training does not pause for rendering, and it
+never waits on your PC: when the helper is slow, gone, failing or on different code, the instance renders that round
+itself, as it does without a helper. Probes are scored and acted on when they come back, at most one probe interval late,
+the same as with [`probe_async`](#probes-on-a-second-gpu-probe_async); a best checkpoint still saves exactly the weights
+that were scored.
+
+**How to use it**
+
+1. Open the Fleet tab of the WebUI **on your PC**, not the one on the instance.
+2. On the instance's card, pick a GPU and turn on **Render on this PC**. Turning it on lets the helper use that GPU until
+   you turn it off or close the WebUI.
+3. Keep the local WebUI open for the length of the run: the helper ends when it closes. The card's status line says
+   what the helper is doing (preparing, ready, rendering, not ready) and how long the last render took.
+
+`remote_render: auto` (the default) uses a helper when one is ready and does nothing when there is none. `off` always
+renders on the instance. A trainer running on Windows never uses it.
+
+**What renders where**
+
+- **Step 0** (the baseline probe and samples) renders on the instance. That also tells it how long a render takes, so a
+  kind of picture is handed out only after the instance has timed one render of it.
+- **The first probe handed out is a shadow round**: the helper and the instance both render it, the instance's scores
+  drive the decisions, and the log compares the two. If the face scores differ by more than `likeness_noise_band`
+  (2 points when it is 0), probes stay on the instance for the rest of the run; samples carry on with the helper. The
+  helper's shadow pictures are kept in `remote_render/shadow/` in the job folder.
+- **Later samples and probes** go to the helper. At most 2 sample rounds are out at once; a third renders on the
+  instance. Before the final samples, the trainer waits for the sample rounds still out, as long as the helper is alive
+  and inside their deadlines.
+- **The final samples and the final probe** render on the instance.
+
+**When the instance renders a round itself**
+
+- A round has a deadline of the larger of 90 s and 3 times what the instance itself took for that many pictures; the
+  first round after the helper is ready gets twice that, because its first renders warm up. When the deadline passes,
+  the instance takes the round back and renders it.
+- The helper writes a heartbeat every few seconds; one older than 30 s counts as gone (a sleeping PC goes stale), and
+  its rounds are taken back.
+- Two misses or errors in a row end delegation for the rest of the run (the log says so).
+- If the instance's code or render settings differ from your PC's, the helper reports **Not ready** and nothing is sent
+  to it. Both installs must be the same RulzTrainer version.
+
+**A distilled sampling model.** The card's **Sampling model (samples only)** and **Quant (samples only)** apply to
+samples only. Probes must render the run's own recipe on both sides, so with a local override the helper takes samples
+and the instance keeps the probes. To render probes with a distilled model as well, set `sample_model_path` in the run
+itself (see [Sampling with a different model](#sampling-with-a-different-model)).
+
+**Models.** The helper needs the run's model files on your PC, and does not need the text encoder: the instance sends
+the text embeds of the prompts once. A file the instance downloaded from Hugging Face is downloaded on your PC the same
+way; any other file is matched by name and size under the models folder. If one is missing, the card says **Not ready**
+and lists what is missing. The GPU needs to hold the model without block swap; a card that cannot is reported as not
+ready with the reason.
+
+**Not used** in a configuration race, a fine-tune or with `multi_gpu` other than `off`, the same as `probe_async`, and
+never together with it for probes: while a helper is ready the probe goes to the helper. The protocol and file layout
+are in [docs/remote-render-contract.md](docs/remote-render-contract.md).
+
+**Not yet tested on a real instance or GPU.** The tests cover the instance side, the bridge and the helper with fake
+renderers and connections; no run has used a real vast.ai instance or a real render yet.
+
 ## Copy check (`copy_check`)
 
 A LoRA trained on a few photos can learn to redraw one of them: the same pose, outfit and background. Self-training
