@@ -56,7 +56,10 @@ def planned_downloads(cfg: TrainConfig) -> list[tuple[str, str, str]]:
             from .config import COMFY_QUANT_NAMES
 
             quant = COMFY_QUANT_NAMES.get(fam, {}).get(model_quant, model_quant)
-            if isinstance(pattern, dict):  # one repo per format (FLUX.2 Klein's)
+            if isinstance(pattern, dict):  # one repo per format (FLUX.2 Klein's, Z-Image's)
+                if quant not in pattern:  # (Z-Image Base has no nvfp4 file)
+                    raise ValueError(f"model_file_quant {cfg.model_file_quant!r}: {cfg.model_path} has "
+                                     f"{', '.join(pattern)}")
                 out.append(("transformer_file", *pattern[quant]))
             else:
                 out.append(("transformer_file", repo, pattern.format(quant=quant)))
@@ -76,7 +79,9 @@ def planned_downloads(cfg: TrainConfig) -> list[tuple[str, str, str]]:
     if cfg.sample_lora == "auto" and fam in ARCH_SAMPLE_LORA and cfg.samples_on_base_model():
         out.append(("sample_lora", ARCH_SAMPLE_LORA[fam]["repo"], ARCH_SAMPLE_LORA[fam]["file"]))
     if cfg.training_adapter == "auto" and fam in ARCH_TRAINING_ADAPTER and not cfg.finetune:
-        out.append(("training_adapter", *training_adapter_for(fam, cfg.model_path)))
+        adapter = training_adapter_for(fam, cfg.model_path, cfg)
+        if adapter is not None:  # (Z-Image Base has none: the field resolves to "" below)
+            out.append(("training_adapter", *adapter))
     return out
 
 

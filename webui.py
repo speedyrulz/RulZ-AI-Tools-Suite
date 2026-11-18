@@ -57,11 +57,12 @@ EXTRA_TARGETS = {
                                 "recipe leaves them under-trained)"),
     "text_in": (("qwen_image21", "flux3_klein", "flux2_klein", "flux2_klein4b"),
                 "the text projection that brings the text encoder's features into the model"),
-    "embed": (("fibo2", "krea2", "qwen_image21", "flux3_klein", "flux2_klein", "flux2_klein4b"),
+    "embed": (("fibo2", "krea2", "qwen_image21", "flux3_klein", "flux2_klein", "flux2_klein4b", "zimage"),
               "image / text / timestep embedders and the final layer"),
     "mode_blocks": (("flux3_klein",), "the 5 text and 5 image per-mode blocks that run before the 28 joint ones (on by "
                                       "default: the attention / feed-forward groups apply there too)"),
-    "modulation": (("flux3_klein", "flux2_klein", "flux2_klein4b"), "the shift / scale / gate projections of the timestep"),
+    "modulation": (("flux3_klein", "flux2_klein", "flux2_klein4b", "zimage"),
+                   "the shift / scale / gate projections of the timestep"),
     "token_refiner": (("minimax_h3",), "the 2 token-refiner blocks over the text (musubi-tuner leaves them out; the "
                                        "training adapters train them)"),
 }
@@ -69,6 +70,7 @@ N_BLOCKS = {"moss_image": 42, "fibo2": 44, "krea2": 28, "qwen_image21": 32, "flu
             "flux2_klein4b": 25}  # Klein 4B: 5 double + 20 single
 # Ideogram 4: 34 blocks; its per-block modulation, text projection and embedders are LoRA targets too
 N_BLOCKS["ideogram4"] = 34
+N_BLOCKS["zimage"] = 30  # Z-Image: 30 main blocks (the 2 noise-refiner and 2 context-refiner blocks stay resident)
 for _t in ("adaln", "text_in", "embed"):
     EXTRA_TARGETS[_t] = (EXTRA_TARGETS[_t][0] + ("ideogram4",), EXTRA_TARGETS[_t][1])
 N_BLOCKS["minimax_h3"] = 50
@@ -2070,6 +2072,8 @@ class Form:
             nvfp4_matmul=bool(v("nvfp4_matmul")), nvfp4_backward=v("nvfp4_backward"),
             attention_backend=v("attention_backend"),
             sdxl_prediction=v("sdxl_prediction"), sdxl_zero_terminal_snr=bool(v("sdxl_zero_terminal_snr")),
+            **({"zimage_variant": v("zimage_variant") or "auto"}
+               if "zimage_variant" in TrainConfig.__dataclass_fields__ and "zimage_variant" in self.w else {}),
             datasets=self.w["datasets"].value, dataset_dir=(self.w["datasets"].selected or [""])[0],
             resolutions=sorted(float(x) for x in (v("resolutions") or [1.0])),
             resolution_step_up=bool(v("resolution_step_up")), step_up_patience=int(v("step_up_patience")),
@@ -5405,6 +5409,9 @@ MODEL_GB["flux2_klein"] = {"bf16": 16.9, "int8": 9.6, "nvfp4": 5.6}
 # FLUX.2 Klein 4B: 3.9 B weights, bf16 7.75 GB (the file); int8 and nvfp4 are the 9B's ratios (0.57 and 0.33), an
 # estimate, not measured
 MODEL_GB["flux2_klein4b"] = {"bf16": 7.75, "int8": 4.4, "nvfp4": 2.6}
+# Z-Image (Base and Turbo, 6.15 B weights): bf16 12.3 GB. int8 6.2 GB (Fizgig). nvfp4 is an estimate (about 4.5 bits a
+# weight on the blocks, the embedders and refiners kept bf16), not measured.
+MODEL_GB["zimage"] = {"bf16": 12.3, "int8": 6.2, "nvfp4": 3.6}
 # SDXL: the UNet is 2.6 B weights, bf16 5.1 GB (about 5 here). int8 / int8_convrot quantize the linears of its
 # transformer blocks only (about 2 B of the weights; the convolutions and the rest stay bf16), so about 3.2 GB: an
 # estimate, not measured. nvfp4 is not available (capabilities.py; its 5.0 is a placeholder). The two text encoders
@@ -5473,7 +5480,7 @@ def plan_quant_of(fam: str, model_source: str, model_file_quant: str, vram: floa
     if fam == "sdxl":
         return "int8" if quant in ("int8", "int8_convrot") else "bf16"
     if quant == "auto":
-        if model_source == "files" and fam not in ("flux2_klein", "flux2_klein4b"):  # their float files are quantized for the memory
+        if model_source == "files" and fam not in ("flux2_klein", "flux2_klein4b", "zimage"):  # their float files are quantized for the memory
             quant = "bf16" if model_file_quant == "bf16" else "int8"
             quant = "nvfp4" if model_file_quant == "nvfp4_mixed" else quant  # Ideogram 4's 5.5 GB file
         elif vram is None:
@@ -5484,6 +5491,9 @@ def plan_quant_of(fam: str, model_source: str, model_file_quant: str, vram: floa
                      "flux3_klein": "bf16" if vram >= 15 else "int8" if vram >= 9.5 else "nvfp4",
                      "flux2_klein": "bf16" if vram >= 30 else "int8" if vram >= 18 else "nvfp4",
                      "flux2_klein4b": "bf16" if vram >= 20 else "int8" if vram >= 10 else "nvfp4",  # flux2/loading.py
+                     # Fizgig's measured peaks (rank 16, 1 MP, checkpointing, preview included): bf16 17.2, int8 12.3,
+                     # nf4 10.1 GB -> bf16 from 22 GB, int8 from 10 GB, else nvfp4 (zimage/loading.py's auto)
+                     "zimage": "bf16" if vram >= 22 else "int8" if vram >= 10 else "nvfp4",
                      "ideogram4": "bf16" if vram >= 30 else "int8" if vram >= 15 else "nvfp4"}.get(fam, "bf16")
     return {"int8_convrot": "int8", "none": "bf16"}.get(quant, quant)
 
@@ -5501,7 +5511,7 @@ ESTIMATED_NOTE = "; estimated (no comparable finished run of yours yet)"
 
 # Families whose `auto` quantization of a model that is quantized as it loads is known by card size (plan_quant_of)
 AUTO_QUANT_BY_CARD = ("krea2", "fibo2", "qwen_image21", "flux3_klein", "flux2_klein", "flux2_klein4b", "ideogram4",
-                      "sdxl")
+                      "sdxl", "zimage")
 # Families whose bf16 file is quantized for the card too (h3_recommendations: "a bf16 source is quantized for the GPUs")
 QUANTIZED_FROM_BF16 = H3_PLAN_FAMILIES + ("pan2",)
 
@@ -5512,7 +5522,7 @@ def measured_quant(fam: str, model_source: str, model_file_quant: str, vram: flo
     it must not be taken for the same model. Unknown: auto on a repo of a family with no rule by card size, and
     auto on a bf16 file of a family that quantizes it for the card."""
     if quant == "auto":
-        from_file = model_source == "files" and fam not in ("flux2_klein", "flux2_klein4b")
+        from_file = model_source == "files" and fam not in ("flux2_klein", "flux2_klein4b", "zimage")
         if from_file and model_file_quant == "bf16" and fam in QUANTIZED_FROM_BF16:
             return None
         if not from_file and fam not in AUTO_QUANT_BY_CARD:
@@ -5674,6 +5684,18 @@ MODEL_NOTES = {
     "FLUX-2-Klein-4B": ("Not for training", "The 4-step distilled FLUX.2 Klein 4B. Train on FLUX-2-Klein-4B-Base and "
                                             "set this as the sampling model: a Base LoRA runs on it at 4 steps, "
                                             "CFG 1."),
+    "Z-Image": ("", "Tongyi's Z-Image Base (6.15B), the checkpoint to train on, and the one to pick for a full "
+                    "fine-tune. Apache 2.0 and not gated. Comfy-Org's bf16 file is 12.3 GB, with the Qwen3-4B text "
+                    "encoder (8 GB) and the FLUX.1 VAE. Fizgig's measured peaks (rank 16, 1 MP, checkpointing, previews "
+                    "included): 17.2 GB bf16, 12.3 GB int8, 10.1 GB 4-bit: a 24 GB card trains bf16, 16 GB int8, "
+                    "12 GB int8 with block swap. Samples 25 steps at CFG 4. LoRAs load in ComfyUI. Never run on real "
+                    "weights here."),
+    "Z-Image-Turbo": ("", "Tongyi's Z-Image Turbo (6.15B), the 8-step distilled model. A LoRA trains on it with a "
+                          "training adapter on (default: Fizgig's, Apache 2.0, downloaded; ostris' v2 by file), which "
+                          "is off for samples and never saved; the LoRA then works on Turbo itself. Fizgig's A/B on a "
+                          "170-photo character set: no adapter 54.8 likeness, ostris v2 72.3, Fizgig's 78.1. A full "
+                          "fine-tune of Turbo loses its few-step behaviour: fine-tune Z-Image (Base). Apache 2.0, not "
+                          "gated. Samples 8 steps at CFG 1. Never run on real weights here."),
     "Ideogram-4": ("", "Ideogram 4 (9.3B), strong at typography and layout, trained on structured JSON captions. "
                        "Comfy-Org's single files (int8, 9.6 GB, with the 9.4 GB Qwen3-VL-8B text encoder) train on "
                        "one 16 GB card; its LoRAs load in ComfyUI and diffusers. Ideogram Non-Commercial Model "
@@ -5720,6 +5742,17 @@ MODEL_NOTES["SDXL-Base-1.0"] = (
                     "SDXL). LoRAs are saved in kohya's format and load in ComfyUI. Not yet run on the real model.")
 
 
+def zimage_variant_of(variant: str, model_path: str) -> str:
+    """The Z-Image checkpoint a zimage_variant setting means: "base" or "turbo". auto reads the model name: "turbo" in it
+    and not De-Turbo (de-turbo / deturbo / de_turbo, ostris' un-distilled Turbo, trained as Base) is Turbo, anything
+    else Base. The trainer logs the same value."""
+    if variant in ("base", "turbo"):
+        return variant
+    name = (model_path or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    de = any(x in name for x in ("de-turbo", "deturbo", "de_turbo"))
+    return "turbo" if "turbo" in name and not de else "base"
+
+
 def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict], data: dict | None,
                            focus: str = "face_focus") -> dict[str, tuple]:
     """Recommended (value, reason) per setting key, from the goal (and a character's focus, a key of
@@ -5738,6 +5771,11 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     klein2_distilled = klein2 and get_arch(cfg).distilled_sample_model(cfg.sample_model_path or "")
     ideo = cfg.arch_name() == "ideogram4"
     sdxl = cfg.arch_name() == "sdxl"
+    zimage = cfg.arch_name() == "zimage"
+    zi_turbo = zimage and zimage_variant_of(getattr(cfg, "zimage_variant", "auto"),
+                                            cfg.transformer_file if cfg.model_source == "files" and cfg.transformer_file
+                                            else cfg.model_path) == "turbo"
+    zi_note = " (Fizgig's measurement, not RulZ's)"
     character = goal == "character"
     vram = min(g["total"] for g in gpus) / 1024 if gpus else None
     gpu_name = "your smallest GPU" if len(gpus) > 1 else "your GPU"
@@ -5798,6 +5836,11 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         r["transformer_quant"] = ("auto", "FLUX.2 Klein 4B (bf16 7.75 GB) picks for the memory it runs in: bf16 from "
                                           "20 GB, int8 (4.4 GB) from 10 GB, else nvfp4 (2.6 GB); estimated, not measured")
         r["text_encoder_quant"] = ("auto", "Qwen3-4B (bf16 8 GB) runs as it is from 12 GB, else int8 ConvRot (half)")
+    elif zimage:
+        r["transformer_quant"] = ("auto", "Z-Image (bf16 12.3 GB) picks for the memory it runs in: bf16 from 24 GB "
+                                          "(a 1 MP LoRA step peaked at 17.2 GB), int8 (6.2 GB; peak 12.3 GB) from 11 GB "
+                                          "with block swap on a 12 GB card, else nvfp4" + zi_note)
+        r["text_encoder_quant"] = ("auto", "Qwen3-4B (bf16 8 GB) runs as it is from 12 GB, else int8 ConvRot (half)")
     elif klein2:
         r["transformer_quant"] = ("auto", "FLUX.2 Klein (bf16 17 GB) picks for the memory it runs in: bf16 from 30 GB, "
                                           "int8 (9.6 GB) from 18 GB, else nvfp4 (5.6 GB)")
@@ -5822,6 +5865,9 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     if qwen and target >= 0.5:
         target, reason = 0.5, ("Fizgig's sweet spot for Qwen-Image 2.1: quicker than 1 MP, and a LoRA pulls less of the "
                                "model's sharpness toward the photos'")
+    if zimage and target >= 1.0:
+        reason += ("; Fizgig's Z-Image presets train at 0.5 MP (about 0.9 s a step at 1 MP), and 0.5 MP uses less "
+                   "memory than the 1 MP the memory figures here are for")
     r["resolutions"] = ([target], reason)
     r["enable_buckets"] = (True, "keeps every image's aspect ratio instead of cropping it square")
     if character:
@@ -5881,6 +5927,12 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     if cfg.finetune:
         r["learning_rate"] = (1e-5, "a full fine-tune needs about a tenth of a LoRA's rate (Fizgig's measured 1e-5)")
         r["optimizer"] = ("adafactor", "Fizgig's measured optimizer for a fine-tune: a much smaller state than AdamW")
+        if zimage:
+            r["learning_rate"] = (5e-5, "Fizgig's Z-Image fine-tune: 1e-5 changed nothing, 1e-4 was strong; Z-Image's "
+                                        "weights are about three times Qwen-Image's in magnitude" + zi_note)
+            r["optimizer"] = ("adafactor", "Adafactor, as Fizgig fine-tunes Z-Image: a much smaller state than AdamW"
+                              + (". Train Z-Image (Base) for a fine-tune: a fine-tuned Turbo loses its 8-step "
+                                 "behaviour" if zi_turbo else ""))
     else:
         r["optimizer"] = ("adamw8bit", "AdamW with 8-bit state: the same results as adamw with less memory")
         if cfg.optimizer not in AUTOMAGIC:  # it sets its own rate per layer type
@@ -5896,6 +5948,9 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                 r["learning_rate"] = (1e-4, "BFL's FLUX 3 Klein recipe: 1e-4, constant after 200 warm-up steps")
                 r["lr_scheduler"] = ("constant", "BFL's FLUX 3 Klein recipe")
                 r["warmup_steps"] = (200, "BFL's FLUX 3 Klein recipe")
+            if zimage and cfg.network_type == "lora":
+                r["learning_rate"] = (1e-4, "Fizgig's Z-Image LoRA recipe: 1e-4 to 2e-4 at rank 16 (ai-toolkit also "
+                                            "uses 1e-4; OneTrainer's 3e-4 is for rank 16 with alpha 1)" + zi_note)
             if klein2 and cfg.network_type == "lora":
                 r["learning_rate"] = (1e-4, "Fizgig's Klein 9B full-model recipe (\"Old Reliable\")" + k2_note)
         r["network_type"] = ("oft", "14 to 15 points over a plain LoRA on two seeds of one small set, face and body; "
@@ -5918,6 +5973,10 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
             if klein:
                 rank = 32
                 r["lora_rank"] = (rank, "BFL's FLUX 3 Klein recipe: rank 32, alpha 32")
+            if zimage:
+                rank = 16
+                r["lora_rank"] = (rank, "Fizgig's and OneTrainer's Z-Image rank 16 (ai-toolkit uses 32), alpha 16"
+                                  + zi_note)
             if klein2:
                 rank = 16
                 r["lora_rank"] = (rank, "Fizgig's Klein 9B full-model recipe (\"Old Reliable\"): rank 16, alpha 16"
@@ -5931,9 +5990,22 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                                                "Fizgig train SDXL (logit-normal draws noise levels it was not trained on)")
     elif klein2:
         r["timestep_sampling"] = ("reference", "Fizgig's flux2_shift for Klein: logit-normal, shifted by the image size")
+    elif zimage:
+        r["timestep_sampling"] = ("reference", "logit-normal draws with Z-Image's own shift of 3 built in (Fizgig; "
+                                               "ai-toolkit and Tongyi use shift 3 too)")
+        r["timestep_shift"] = (1.0, "leave it at 1: the reference timesteps already carry Z-Image's shift of 3, and "
+                                    "this setting would be applied on top of it")
     elif not character:  # the identity recipe sets logit_normal itself
         r["timestep_sampling"] = ("logit_normal", "the default: most steps at middle noise, fewer at the extremes")
     r["batch_size"] = (1, "small batches with more steps beat large batches for LoRAs")
+    if zimage and not cfg.finetune:
+        if zi_turbo:
+            r["adapter_mode"] = ("auto", "Fizgig's Z-Image Turbo training adapter (on while the LoRA trains, off for "
+                                         "samples, never saved): the model is distilled, and the adapter lets a LoRA "
+                                         "train like Base. Fizgig's A/B on a 170-photo character set: none 54.8 "
+                                         "likeness, ostris v2 72.3, Fizgig's 78.1")
+        else:
+            r["adapter_mode"] = ("none", "Z-Image Base is not distilled: it needs no training adapter")
     if qwen and not cfg.finetune:
         r["adapter_mode"] = ("auto", "Fizgig's training adapter: without one Qwen-Image 2.1 LoRAs collapse into "
                                      "texture or wobble part-way (likeness 77 with it, 56 without)")
@@ -5966,6 +6038,13 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     elif klein2_distilled:
         r["sample_steps"] = (4, "the distilled FLUX.2 Klein (your sampling model) is a 4-step model")
         r["sample_cfg"] = (1.0, "the distilled Klein samples without guidance")
+    elif zimage and zi_turbo:
+        r["sample_steps"] = (8, "Z-Image Turbo is an 8-step distill (shift 3)")
+        r["sample_cfg"] = (1.0, "Turbo samples without guidance")
+    elif zimage:
+        r["sample_steps"] = (25, "ComfyUI's Z-Image template and Fizgig's Base samples: 25 steps (Tongyi's own run "
+                                 "28-50)")
+        r["sample_cfg"] = (4.0, "the Z-Image template's CFG 4 for Base, with a negative prompt")
     elif klein2_4b and cfg.turbo_lora in ("auto", ""):  # no turbo LoRA exists for Klein 4B
         r["sample_steps"] = (50, "the diffusers Klein pipeline's 50 steps for Klein 4B Base (the distilled Klein 4B as "
                                  "the sampling model takes 4)")
@@ -6369,6 +6448,22 @@ def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus:
                             "huggingface.co/black-forest-labs/FLUX.2-klein-base-9b-fp8 (or -base-9B for bf16) and log "
                             "in with hf auth login before the first download. This trains text-to-image LoRAs, not "
                             "edit LoRAs."))
+    elif cfg.arch_name() == "zimage":
+        variant = zimage_variant_of(getattr(cfg, "zimage_variant", "auto"),
+                                    cfg.transformer_file if cfg.model_source == "files" and cfg.transformer_file
+                                    else cfg.model_path)
+        deturbo = any(x in (cfg.model_path or "").lower() for x in ("de-turbo", "deturbo", "de_turbo"))
+        out.append(("info", f"Z-Image is Apache 2.0 and not gated: no Hugging Face login is needed for Tongyi-MAI's "
+                            f"repos or Comfy-Org's z_image files. Trained as {variant}"
+                            + (" (De-Turbo is the un-distilled Turbo and is trained as Base)" if deturbo else "")
+                            + ". Never run on real weights here: check the first samples."))
+        if variant == "turbo" and cfg.finetune:
+            out.append(("warning", "A full fine-tune of Z-Image Turbo loses its few-step behaviour (its 8-step samples "
+                                   "degrade), and RulZ AI Trainer leaves the training adapter off for a fine-tune "
+                                   "(Fizgig keeps it on). Fine-tune Z-Image (Base) instead."))
+        if abs(cfg.timestep_shift - 1.0) > 1e-9:
+            out.append(("warning", f"Timestep shift {cfg.timestep_shift:g} on Z-Image: its reference timesteps already "
+                                   "carry the model's shift of 3, and this is applied on top. Leave it at 1."))
     elif cfg.arch_name() == "flux2_klein4b" and get_arch(cfg).distilled_sample_model(cfg.model_path):
         out.append(("warning", "FLUX-2-Klein-4B is the distilled model (4 steps, for samples). Train on "
                                "FLUX-2-Klein-4B-Base and set the distilled one as the sampling model."))
@@ -7150,7 +7245,7 @@ class Wizard:
                 ("transformer_file", "Diffusion model file", "A ComfyUI models/diffusion_models file you already "
                                                              "have (SDXL: its all-in-one checkpoint).", "file"),
                 ("text_encoder_file", "Text encoder file", "Qwen3.5-9B for MOSS-Image, Qwen3-VL-4B for Krea 2, FIBO 2.0 "
-                                                           "and FLUX 3 Klein, Qwen3-8B for FLUX.2 Klein 9B, Qwen3-4B for FLUX.2 Klein 4B, "
+                                                           "and FLUX 3 Klein, Qwen3-8B for FLUX.2 Klein 9B, Qwen3-4B for FLUX.2 Klein 4B and Z-Image, "
                                                            "Qwen3-VL-8B for Qwen-Image 2.1 and "
                                                            "Ideogram 4, Qwen3-VL-32B (cut to 50 layers) for MiniMax "
                                                            "H3 and MiniMax-H3-Image (the same file), P-H3-Image's "
@@ -7369,7 +7464,7 @@ class Wizard:
                           "Every Krea 2 attention has a sigmoid gate on its output. Krea's own LoRAs train it.",
                           show_if=is_krea, adv=True):
             self.bind(ui.switch("Attention gate"), "target_attn_gate")
-        is_qwen = ("model_preset", lambda p: preset_arch(p, self.w["model_path"].value) in ("qwen_image21",
+        is_qwen = ("model_preset", lambda p: preset_arch(p, self.w["model_path"].value) in ("qwen_image21", "zimage",
                                                                                               "minimax_h3",
                                                                                               "p_h3_image",
                                                                                               "minimax_h3_image"))
@@ -7378,7 +7473,7 @@ class Wizard:
                           "never saved into it. Fizgig measured on Qwen-Image 2.1: without one, LoRAs collapse into "
                           "texture or wobble part-way; with it likeness reached 77 against 56. MiniMax H3's, "
                           "P-H3-Image's and MiniMax-H3-Image's are ostris' (the ones ai-toolkit uses; H3 has one for "
-                          "each of its two bases).",
+                          "each of its two bases). Z-Image Turbo's is Fizgig's (Apache 2.0): Turbo only, Base gets none.",
                           show_if=is_qwen, adv=True):
             self.bind(ui.select(ADAPTER_MODES, label="Training adapter"), "adapter_mode").classes("w-full")
         hw = ui.column().classes("w-full gap-3 pt-2")
@@ -9850,10 +9945,36 @@ def build_page(local: bool = True):
                             path_input(f, "vae_file", "VAE file (optional)", "file", "", "w-[40rem]") \
                                 .tooltip("Empty: downloaded. Flux2's for MOSS-Image, FIBO 2.0, both Kleins and "
                                          "Ideogram 4; Qwen-Image's for Krea 2; its own for Qwen-Image 2.1; the video "
-                                         "VAE for MiniMax H3; its own image VAE for MiniMax-H3-Image. SDXL: empty = the checkpoint's "
+                                         "VAE for MiniMax H3; its own image VAE for MiniMax-H3-Image; the FLUX.1 VAE (ae.safetensors) for Z-Image. SDXL: empty = the checkpoint's "
                                          "own (nothing is downloaded for SDXL).")
                             path_input(f, "tokenizer_path", "Tokenizer folder (optional)", "dir", "", "w-[40rem]") \
                                 .tooltip("Empty: downloaded with the model.")
+                        with fields().bind_visibility_from(
+                                w["model_preset"], "value", lambda p: preset_arch(p, w["model_path"].value) == "zimage"):
+                            w["zimage_variant"] = ui.select(
+                                {"auto": "auto (from the model name)", "base": "Base", "turbo": "Turbo"},
+                                value=getattr(d, "zimage_variant", "auto"), label="Z-Image variant") \
+                                .classes("w-72") \
+                                .tooltip("Which Z-Image checkpoint this is. It sets the training adapter (Turbo only), "
+                                         "the sample steps and CFG (Turbo 8 at 1, Base 25 at 4 with a negative prompt) "
+                                         "and the fine-tune warning. auto reads the model name: Turbo in it, and not "
+                                         "De-Turbo (the un-distilled Turbo, trained as Base), means Turbo. Set it by "
+                                         "hand for a file whose name does not say.")
+                            zimage_resolved = ui.label().classes("text-sm opacity-70")
+
+                            def show_zimage_variant(_=None):
+                                path = ((w["model_path"].value or "") if w["model_preset"].value == CUSTOM
+                                        else MODEL_PRESETS.get(w["model_preset"].value, ""))
+                                file = (w["transformer_file"].value or "").strip()
+                                if w["model_source"].value == FILE_SOURCE and file:
+                                    path = file
+                                zimage_resolved.text = "Trained as: " + zimage_variant_of(
+                                    w["zimage_variant"].value, path)
+
+                            for _k in ("zimage_variant", "model_preset", "model_path", "transformer_file",
+                                       "model_source"):
+                                w[_k].on_value_change(show_zimage_variant)
+                            show_zimage_variant()
                         with fields().bind_visibility_from(
                                 w["model_preset"], "value", lambda p: preset_arch(p, w["model_path"].value) == "sdxl"):
                             w["sdxl_prediction"] = ui.select({"auto": "auto (from the model's own files)",
@@ -10330,7 +10451,9 @@ def build_page(local: bool = True):
                                          "into texture or wobble part-way (likeness 77 with it, 56 without). "
                                          "MiniMax H3's are ostris' v3 adapters, one for FL2VA and one for "
                                          "Ref2VA (0.31 GB each), P-H3-Image's and MiniMax-H3-Image's are ostris' "
-                                         "adapters for them (0.16 GB each). The other models have none of their own; a file "
+                                         "adapters for them (0.16 GB each). Z-Image Turbo's default is Fizgig's (70 MB; ostris' v2 "
+                                         "works as a file); Z-Image Base uses none. The other models have none of "
+                                         "their own; a file "
                                          "works on any.")
                             path_input(f, "training_adapter", "Training adapter file", "file", "", "w-[30rem]")
                             f.w["training_adapter"].parent_slot.parent.bind_visibility_from(w["adapter_mode"], "value",
@@ -10939,6 +11062,13 @@ def build_page(local: bool = True):
                              "needs no turbo LoRA.").bind_visibility_from(
                             w["model_preset"], "value",
                             lambda p: preset_arch(p, w["model_path"].value) == "flux2_klein")
+                        hint("Z-Image: Turbo samples 8 steps at CFG 1, Base 25 steps at CFG 4 with a negative prompt "
+                             "(the sampler's shift of 3 is built in). No turbo LoRA applies. Which one it is comes "
+                             "from the model name (Z-Image variant, under Model and files); the training adapter is "
+                             "on for Turbo only and off in samples."
+                             ).bind_visibility_from(
+                            w["model_preset"], "value",
+                            lambda p: preset_arch(p, w["model_path"].value) == "zimage")
                         hint("FLUX.2 Klein 4B: no turbo LoRA exists. Base samples 50 steps at CFG 4.0 (the diffusers "
                              "Klein pipeline's defaults); the distilled "
                              "black-forest-labs/FLUX.2-klein-4B as the sampling model below takes 4 steps at CFG 1."
