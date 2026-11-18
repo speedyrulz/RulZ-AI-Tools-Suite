@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rulz-ai-trainer-optimizer"
-version = "0.3.3"
+version = "0.3.4"
 description = "RulZ AI Trainer Optimizer: starting settings, run analysis and an AI advisor for character LoRAs in RulZ AI Trainer."
 readme = "README.md"
 requires-python = ">=3.10"
