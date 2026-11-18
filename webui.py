@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import copy
 import dataclasses
 import json
@@ -27,13 +28,14 @@ from fastapi import Request
 from nicegui import app, background_tasks, run, ui
 
 from rulztrainer.archs import get_arch
-from rulztrainer.config import (AUTOMAGIC, KEEL, KEEL_FB, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
+from rulztrainer.config import (AUTOMAGIC, KEEL, LR_SCHEDULERS, KEEL_FB, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
                                 MODEL_PRESETS, ARCH_SAMPLE_LORA, VIDEO_ARCHS, VIDEO_EXTS, VIDEO_DATA_PRESETS,
                                 STILL_FFN_TARGETS, detect_video_data_preset, video_data_preset,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
 from rulztrainer import (__version__, blockaudit, bodysim, capabilities, facesim, history, lookfilter, machine, oom_recovery,
                          promptcheck)
 from rulztrainer.train_queue import TrainQueue
+from rulztrainer import renderhelper_ctl as rulz_renderctl
 from rulztrainer.dataset import skipped as dataset_skipped
 from rulztrainer.caption_text import read_caption_text
 from rulztrainer.pictures import to_rgb
@@ -1720,6 +1722,10 @@ class DatasetPicker:
                     d[key] = str(el.value).strip()
             if r["kind"].value and r["kind"].value != "auto":
                 d["kind"] = r["kind"].value
+            if r["wt"].value not in (None, "") and float(r["wt"].value) != 1.0:
+                d["weight"] = float(r["wt"].value)
+            if int(r["smp"].value or 0) > 0:
+                d["samples"] = int(r["smp"].value)
             out.append(d)
         return out
 
@@ -1739,6 +1745,8 @@ class DatasetPicker:
             r["trig"].value = str(d.get("trigger") or "")
             r["cls"].value = str(d.get("class") or "")
             r["kind"].value = str(d.get("kind") or "auto")
+            r["wt"].value = 1.0 if d.get("weight") is None else float(d.get("weight"))
+            r["smp"].value = int(d.get("samples") or 0)
             r["use"].value = True
         self.changed()
 
@@ -1770,6 +1778,12 @@ class DatasetPicker:
                 rep = ui.number("Repeats", value=1, min=1, max=1000, precision=0).classes("w-24") \
                     .tooltip("How many times each image of this dataset comes up per epoch: 2 counts a dataset "
                              "twice as much as one at 1.")
+                wt = ui.number("Loss weight", value=1.0, min=0.01, step=0.1).classes("w-24") \
+                    .tooltip("Multiplies the training loss of every picture of this dataset: 0.5 trains it half as "
+                             "firmly as a dataset at 1. Above 0.")
+                smp = ui.number("Per epoch", value=0, min=0, precision=0).classes("w-24") \
+                    .tooltip("0: every image times its repeats comes up each epoch. A count N: at most N pictures of "
+                             "this dataset per epoch, a different draw each epoch (after repeats).")
                 trig = ui.input("Trigger", placeholder="the run's").props("dense").classes("w-28") \
                     .tooltip("This dataset's own trigger word (empty: the Trigger word of the run). Several "
                              "subjects, each with its own trigger, train together (LoRA Isolation).")
@@ -1781,12 +1795,12 @@ class DatasetPicker:
                     .tooltip("LoRA Isolation: a person gets the fused trigger and the side-by-side pairs with "
                              "strangers, an animal or thing the fused trigger only, a style keeps its trigger as "
                              "written. auto: a person when the class is one.")
-        for el in (res, rep, trig, cls, kind):
+        for el in (res, rep, wt, smp, trig, cls, kind):
             el.bind_enabled_from(use, "value")
-        for el in (use, res, rep, trig, cls, kind):
+        for el in (use, res, rep, wt, smp, trig, cls, kind):
             el.on_value_change(lambda _: self.changed())
         self.rows[key] = {"path": path, "row": row, "use": use, "info": info, "res": res, "rep": rep, "trig": trig,
-                          "cls": cls, "kind": kind}
+                          "cls": cls, "kind": kind, "wt": wt, "smp": smp}
         self.empty.visible = False
         for fn in self.listeners:
             fn()
@@ -2138,6 +2152,9 @@ class Form:
             steps=0 if v("soup_run") or v("noise_run") else int(v("steps")), batch_size=int(v("batch_size")),
             gradient_accumulation=int(v("gradient_accumulation")), learning_rate=float(v("learning_rate")),
             optimizer=v("optimizer"), lr_scheduler=v("lr_scheduler"), warmup_steps=int(v("warmup_steps")),
+            warmup_fraction=num("warmup_fraction", float), lr_min_factor=num("lr_min_factor", float),
+            lr_cycles=num("lr_cycles", int), adam_beta1=num("adam_beta1", float), adam_beta2=num("adam_beta2", float),
+            adam_eps=num("adam_eps", float),
             max_grad_norm=float(v("max_grad_norm")), timestep_sampling=v("timestep_sampling"),
             automagic_min_lr=float(v("automagic_min_lr")), automagic_max_lr=float(v("automagic_max_lr")),
             automagic_polarity_history=int(v("automagic_polarity_history")), automagic_groups=v("automagic_groups"),
@@ -2323,7 +2340,9 @@ class Form:
                                    and any(p.key == e for p in promptcheck.PRESETS)],
                   "model_source": FILE_SOURCE if cfg.model_source == "files" else HF_SOURCE}
         values["datasets"] = [{"path": sp.path, "resolutions": list(sp.resolutions), "repeats": sp.repeats,
-                               "trigger": sp.trigger, "class": sp.subject_class, "kind": sp.subject_kind}
+                               "trigger": sp.trigger, "class": sp.subject_class, "kind": sp.subject_kind,
+                               **({"weight": sp.weight} if sp.weight != 1.0 else {}),
+                               **({"samples": sp.samples} if sp.samples else {})}
                               for sp in cfg.dataset_specs() if sp.path]  # a single-folder config: that folder
         values["sample_aspect"], values["sample_mp"] = size_aspect(cfg.sample_width, cfg.sample_height)
         values["turbo_mode"] = ("auto" if cfg.turbo_lora == "auto" else "file" if cfg.turbo_lora else "none")
@@ -2544,6 +2563,13 @@ h1, h2, h3, .rz-pane-title { font-family: "Segoe UI Variable Display", "Segoe UI
 .rz-subhead { font-size: 12.5px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--rz-muted); margin-top: 4px; }
 .rz-hint { font-size: 14px; color: var(--rz-muted); line-height: 1.55; max-width: 980px; }
 .rz-warn { color: var(--rz-warn); }
+.rz-render { border-top: 1px dashed var(--rz-border); padding-top: 8px; }
+.rz-rstat { font-size: 13px; color: var(--rz-muted); }
+.rz-rs-word { font-weight: 600; color: var(--rz-muted); }
+.rz-rs-icon { font-size: 18px; color: var(--rz-muted); }
+.rz-rs-icon.ok, .rz-rs-word.ok { color: var(--rz-ok-text); }
+.rz-rs-icon.warn, .rz-rs-word.warn { color: var(--rz-warn-text); }
+.rz-rs-icon.err, .rz-rs-word.err { color: var(--rz-err-text); }
 .rz-fields { gap: 14px 16px; align-items: center; flex-wrap: wrap; }
 
 /* form fields and buttons */
@@ -5278,6 +5304,8 @@ def build_maps_tab(f: Form):
 RACE_LABELS = {
     "learning_rate": "Learning rate", "optimizer": "Optimizer", "weight_decay": "Weight decay",
     "lr_scheduler": "Learning rate schedule", "warmup_steps": "Warm-up steps", "lora_plus_ratio": "LoRA+ ratio",
+    "warmup_fraction": "Warm-up share", "lr_min_factor": "Final lr share", "lr_cycles": "Restart cycles",
+    "adam_beta1": "Adam beta 1", "adam_beta2": "Adam beta 2", "adam_eps": "Adam epsilon",
     "automagic_min_lr": "Automagic min lr", "automagic_max_lr": "Automagic max lr",
     "automagic_polarity_history": "Automagic polarity history", "automagic_clip_threshold": "Automagic clip threshold",
     "automagic_groups": "Automagic lr groups", "automagic_sensitivity_quantile": "Automagic sensitivity quantile",
@@ -5971,10 +5999,15 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     n = (data or {}).get("images") or 0
     if n:
         counts = (data or {}).get("counts") or {}
-        reps = sum(counts.get(sp.path, 0) * sp.repeats for sp in cfg.dataset_specs() if sp.path in counts)
+        reps = sum(min(counts.get(sp.path, 0) * sp.repeats, sp.samples) if sp.samples > 0
+                   else counts.get(sp.path, 0) * sp.repeats for sp in cfg.dataset_specs() if sp.path in counts)
         items = reps or n  # pictures per epoch, repeats counted
         crops = {"face": 0.6, "face+bust": 1.2}.get(cfg.crop_augment, 0.0)  # extra items per picture (some are skipped)
         per_epoch = items * (1 + crops)
+        if reps:  # a dataset's `samples` caps its items after the crops are added
+            per_epoch = sum(min(counts.get(sp.path, 0) * sp.repeats * (1 + crops), sp.samples) if sp.samples > 0
+                            else counts.get(sp.path, 0) * sp.repeats * (1 + crops)
+                            for sp in cfg.dataset_specs() if sp.path in counts)
         steps = int(min(4000, max(1000, round(per_epoch * 100, -2))))
         r["steps"] = (steps, f"about 100 epochs: {n} images" + (f" x repeats = {items}" if items != n else "")
                              + (f", plus about {int(items * crops)} close-up crops" if crops else "")
@@ -8821,6 +8854,24 @@ def fleet():
     return _FLEET
 
 
+_RENDER_HELPERS = None
+
+
+def render_helpers():
+    """The "Render on this PC" helpers of this WebUI (rulztrainer/renderhelper_ctl.py): one for the whole process.
+    They end when the WebUI exits (stop_render_helpers is on shutdown and at interpreter exit)."""
+    global _RENDER_HELPERS
+    if _RENDER_HELPERS is None:
+        _RENDER_HELPERS = rulz_renderctl.RenderHelpers()
+        atexit.register(stop_render_helpers)
+    return _RENDER_HELPERS
+
+
+def stop_render_helpers() -> None:
+    if _RENDER_HELPERS is not None:
+        _RENDER_HELPERS.stop_all()
+
+
 def fleet_loop() -> None:
     """Look at the fleet's instances while there are any (rulz_fleet's step: the queue moves on, due files come
     down, the watches are checked). A daemon or a wait started elsewhere may hold the looking instead; then this
@@ -9009,7 +9060,7 @@ def build_fleet_tab(form_config=None):
     fl = fleet()
     import rulz_fleet
 
-    state: dict = {"shape": None, "cards": {}, "seen": {}, "dl": {}, "accept": {}}
+    state: dict = {"shape": None, "cards": {}, "seen": {}, "dl": {}, "accept": {}, "render_wait": set()}
 
     async def act(func, *args, ok: str = "", **kw):
         """A fleet call off the page's thread (most of them go over ssh); a refusal becomes a notice."""
@@ -9204,7 +9255,107 @@ def build_fleet_tab(form_config=None):
                         w["watch_item"] = ui.menu_item("")
                         ui.menu_item("Remove from the fleet", on_click=lambda i=iid: act(
                             fl.remove_instance, i, ok=f"Instance {i} removed; its runs stay on record"))
+            make_render_controls(iid, w)
         return w
+
+    # ------------------------------------------- "Render on this PC" (the helper: rulztrainer.renderhelper)
+    def render_pref(iid) -> dict:
+        return state.setdefault("render_pref", {}).setdefault(iid, {"gpu": None, "model": "", "quant": "auto"})
+
+    def make_render_controls(iid: int, w: dict) -> None:
+        pref = render_pref(iid)
+        helpers = render_helpers()
+        gpus = helpers.cached_gpus()  # only what an earlier listing found: building a card runs nothing
+        with ui.column().classes("w-full gap-1 rz-render"):
+            with ui.row().classes("w-full items-center gap-2"):
+                w["render"] = ui.switch("Render on this PC", value=helpers.running(iid),
+                                        on_change=lambda e, i=iid: toggle_render(i, bool(e.value))) \
+                    .tooltip("Renders this run's samples and likeness probes on one of this PC's GPUs. Turning it on "
+                             "lets the helper use that GPU until you turn it off or close this WebUI.")
+                w["render_gpu"] = ui.select({g["index"]: render_gpu_label(g) for g in gpus}, value=pref["gpu"],
+                                            label="GPU", on_change=lambda e, p=pref: p.update(gpu=e.value)) \
+                    .props("dense outlined options-dense").classes("w-64")
+                ui.button(icon="refresh", color=None, on_click=lambda _, i=iid: list_gpus(i)).props("flat dense round") \
+                    .tooltip("List this PC's GPUs again")
+            with ui.row().classes("w-full items-center gap-2 rz-tips"):
+                w["render_model"] = ui.input("Sampling model (samples only)", value=pref["model"],
+                                             on_change=lambda e, p=pref: p.update(model=e.value or "")) \
+                    .props("dense outlined clearable").classes("w-96 max-w-full") \
+                    .tooltip("Optional: a model file on this PC to render samples with. Likeness probes always render "
+                             "the run's own model. Empty: the files the run uses.")
+                w["render_quant"] = ui.select(QUANTS, value=pref["quant"], label="Quant (samples only)",
+                                              on_change=lambda e, p=pref: p.update(quant=e.value or "auto")) \
+                    .props("dense outlined options-dense").classes("w-44")
+            with ui.row().classes("w-full items-center gap-2 no-wrap rz-rstat"):
+                w["render_icon"] = ui.icon("stop_circle").classes("rz-rs-icon")
+                w["render_word"] = ui.label("Stopped").classes("rz-rs-word")
+                w["render_text"] = ui.label("").classes("rz-rs-text min-w-0")
+
+    def render_gpu_label(g: dict) -> str:
+        return rulz_renderctl.gpu_label(g)
+
+    async def list_gpus(iid: int) -> None:
+        helpers = render_helpers()
+        gpus, err = await run.io_bound(helpers.list_gpus, True)
+        for w in state["cards"].values():
+            if "render_gpu" in w:
+                w["render_gpu"].set_options({g["index"]: render_gpu_label(g) for g in gpus})
+        if err:
+            ui.notify(err, type="warning", multi_line=True)
+
+    async def toggle_render(iid: int, on: bool) -> None:
+        if iid in state["render_wait"]:
+            return
+        state["render_wait"].add(iid)  # the page's refresh must not flip the switch back while this works
+        try:
+            await switch_render(iid, on)
+        finally:
+            state["render_wait"].discard(iid)
+
+    async def switch_render(iid: int, on: bool) -> None:
+        helpers = render_helpers()
+        w = state["cards"].get(iid) or {}
+        if on == helpers.running(iid):
+            return
+        if not on:
+            await run.io_bound(helpers.stop, iid)
+            ui.notify(f"Instance {iid}: rendering on this PC is off.", type="info")
+            return
+        pref = render_pref(iid)
+        gpus, err = await run.io_bound(helpers.list_gpus)
+        if "render_gpu" in w:
+            w["render_gpu"].set_options({g["index"]: render_gpu_label(g) for g in gpus})
+        gpu = next((g for g in gpus if g["index"] == pref["gpu"]), None)
+        if gpu is None:
+            ui.notify(err or "Pick the GPU to render on first, then turn this on.", type="warning", multi_line=True)
+            w["render"].value = False
+            return
+        try:
+            await run.io_bound(helpers.start, iid, gpu, pref["model"], pref["quant"])
+        except rulz_renderctl.Refused as e:
+            ui.notify(str(e), type="warning", multi_line=True)
+            w["render"].value = False
+            return
+        ui.notify(f"Instance {iid}: rendering on {gpu['name']} (GPU {gpu['index']}) while this WebUI runs.",
+                  type="positive", multi_line=True)
+
+    def fill_render(w: dict, iid: int) -> None:
+        if "render" not in w:
+            return
+        helpers = render_helpers()
+        v = helpers.view(iid)
+        running = v["running"]
+        if w["render"].value != running and iid not in state["render_wait"]:
+            w["render"].value = running
+        for k in ("render_gpu", "render_model", "render_quant"):
+            w[k].set_enabled(not running)
+        w["render_icon"].props(f'name={v["icon"]}')
+        w["render_icon"].classes(replace=f"rz-rs-icon {v['level']}")
+        w["render_word"].text = v["word"]
+        w["render_word"].classes(replace=f"rz-rs-word {v['level']}")
+        # the chosen GPU's name always shows while the helper runs: turning the switch on was the consent to use it
+        parts = [p for p in (v["gpu_name"] if running else "", v["text"]) if p]
+        w["render_text"].text = " · ".join(parts)
 
     def fill_card(w: dict, inst: dict) -> None:
         iid, job = inst["id"], inst.get("job") or {}
@@ -9250,6 +9401,7 @@ def build_fleet_tab(form_config=None):
         off = inst["state"] == "off"
         w["watch_item"].text = "Watch it again" if off else "Stop watching it"
         w["watch_target"] = (iid, off)
+        fill_render(w, iid)
 
     def draw_instances(view: dict) -> None:
         instances = view["instances"]
@@ -10686,10 +10838,49 @@ def build_page(local: bool = True):
                             # a family rule can hang on the optimizer (SDXL's Keel face gain): check them again
                             w["optimizer"].on_value_change(
                                 lambda _: None if getattr(f, "family_released", False) else f.apply_family_support())
-                            w["lr_scheduler"] = ui.select(["constant", "cosine", "linear"], value=d.lr_scheduler,
-                                                          label="LR schedule").classes("w-36")
+                            w["lr_scheduler"] = ui.select(list(LR_SCHEDULERS), value=d.lr_scheduler,
+                                                          label="LR schedule").classes("w-40") \
+                                .tooltip("constant keeps the rate. cosine, linear and rex fall from the rate toward the "
+                                         "final share, reaching it at the end of the run (the last update is a "
+                                         "step short of it; rex stays higher for longer, then drops "
+                                         "fast; Chen et al. 2021). cosine_restarts runs the cosine fall several "
+                                         "times, jumping back to the full rate each time. Automagic and Keel "
+                                         "ignore the schedule.")
                             w["warmup_steps"] = ui.number("Warmup steps", value=d.warmup_steps, precision=0) \
-                                .classes("w-32")
+                                .classes("w-32") \
+                                .tooltip("Steps the rate climbs from near 0 to its full value. Ignored when the "
+                                         "warm-up share is above 0.")
+                            w["warmup_fraction"] = ui.number("Warm-up share (0 = use steps)",
+                                                             value=d.warmup_fraction, min=0, max=0.5, step=0.01) \
+                                .classes("w-48") \
+                                .tooltip("0 to 0.5. Above 0, the warm-up is this share of the Steps (0.05 of 2000 "
+                                         "is 100 steps) and replaces Warmup steps. A Warmup steps value like 1 is "
+                                         "one step, never 100%.")
+                            w["lr_min_factor"] = ui.number("Final lr share", value=d.lr_min_factor, min=0, max=1,
+                                                           step=0.05).classes("w-32") \
+                                .bind_visibility_from(w["lr_scheduler"], "value", lambda x: x != "constant") \
+                                .tooltip("0 to 1. The cosine, linear, rex and restart schedules end at the "
+                                         "Learning rate times this, not at 0 (0.1: a tenth of the rate).")
+                            w["lr_cycles"] = ui.number("Restart cycles", value=d.lr_cycles, min=1, precision=0) \
+                                .classes("w-32") \
+                                .bind_visibility_from(w["lr_scheduler"], "value", lambda x: x == "cosine_restarts") \
+                                .tooltip("cosine_restarts: how many cosine falls the steps after the warm-up are "
+                                         "split into; each starts again at the full rate.")
+                        with fields().bind_visibility_from(w["optimizer"], "value",
+                                                           lambda x: x in ("adamw", "adamw8bit")):
+                            w["adam_beta1"] = ui.number("Adam beta 1", value=d.adam_beta1, min=0, max=0.9999,
+                                                        step=0.01).classes("w-32") \
+                                .tooltip("AdamW and AdamW 8-bit only. The momentum of the gradient average "
+                                         "(0.9 is the usual value).")
+                            w["adam_beta2"] = ui.number("Adam beta 2", value=d.adam_beta2, min=0, max=0.9999,
+                                                        step=0.001).classes("w-32") \
+                                .tooltip("AdamW and AdamW 8-bit only. 0.99 is RulZ's default; PyTorch's and "
+                                         "OneTrainer's is 0.999 (slower to forget). Which is better here is not "
+                                         "tested: race the two.")
+                            w["adam_eps"] = ui.number("Adam epsilon", value=d.adam_eps, min=0, format="%.1e") \
+                                .classes("w-32") \
+                                .tooltip("AdamW and AdamW 8-bit only. Added to the divisor to keep it from "
+                                         "reaching 0 (1e-8 is the usual value).")
                         with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x == "hull"):
                             w["hull_rho"] = ui.number("Hull step", value=d.hull_rho, min=0, step=0.0001,
                                                       format="%.6f").classes("w-40") \
@@ -14520,6 +14711,7 @@ if __name__ in {"__main__", "__mp_main__"}:
                                             daemon=True).start())
     if VAST_INSTANCE is None:  # this computer looks after the vast.ai instances; an instance looks after itself
         app.on_startup(lambda: threading.Thread(target=fleet_loop, name="rulz-fleet", daemon=True).start())
+        app.on_shutdown(stop_render_helpers)  # the "Render on this PC" helpers end with the WebUI
 
     @ui.page("/", reconnect_timeout=PAGE_KEEP_SECONDS)
     def index(request: Request):

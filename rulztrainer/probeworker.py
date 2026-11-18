@@ -223,7 +223,7 @@ class Renderer:
         log.info("Probe model ready on %s in %.0fs (%s)", device, time.time() - t0, self.memory)
 
     @torch.no_grad()
-    def render(self, jobs: list, payload: bytes) -> tuple[list[str], float]:
+    def render(self, jobs: list, payload: bytes, negative_kind: str = "probe") -> tuple[list[str], float]:
         from . import lora as lora_mod
         from .trainer import _Board, load_text_embeds
 
@@ -232,8 +232,9 @@ class Renderer:
         lora_mod.mirror_lora(lora_mod.lora_snapshots(state), self.injected)
         tr = self.tr
         self.slot.model.eval()  # mirror_lora may have handed it a new dropout module
-        # the probes' negative (PAN 2's clip probes have one for their length, cached by prepare_cache)
-        neg_e, neg_m = tr.arch.pad_embeds([load_text_embeds(tr.cfg, tr.negative_prompt("probe"))])
+        # the round's negative: the probes' by default (PAN 2's clip probes have one for their length, cached by
+        # prepare_cache), the samples' for a remote-render sample round
+        neg_e, neg_m = tr.arch.pad_embeds([load_text_embeds(tr.cfg, tr.negative_prompt(negative_kind))])
         with lora_mod.frozen_adapters():
             images = tr._render_round([self.slot], jobs, neg_e, neg_m, _Board(tr.status, ""))
         return images, time.time() - t0
