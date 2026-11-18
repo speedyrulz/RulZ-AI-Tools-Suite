@@ -70,8 +70,10 @@ def vastai(*args: str) -> str:
     if exe is None:
         raise Unreachable("The vastai CLI is not installed: pip install vastai && vastai set api-key <your key>")
     try:
+        # stdin closed: the CLI reads an open stdin to its end before it does anything, so under a parent whose
+        # stdin is a pipe that stays open (the render helper's) every call hung until the timeout
         done = subprocess.run([exe, *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              timeout=VASTAI_TIMEOUT)
+                              timeout=VASTAI_TIMEOUT, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired as e:
         raise Unreachable(f"vastai {args[0]} did not answer in {VASTAI_TIMEOUT} s") from e
     if done.returncode != 0:
