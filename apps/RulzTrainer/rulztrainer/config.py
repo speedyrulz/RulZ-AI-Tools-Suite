@@ -1079,6 +1079,9 @@ class TrainConfig:
     probe_ema: float = 0.5  # smoothing of probe scores (weight on the previous value)
     probe_async: bool = False  # render probes on a second GPU while training goes on (multi_gpu off, no race)
     probe_device: str = ""  # probe_async's GPU; empty = the first of devices that is not the training GPU
+    remote_render: str = "auto"  # auto | off: hand samples and probes to a render helper on the user's PC when one is
+    #                              connected (remoterender.py; nothing happens without a helper; not in a race, a
+    #                              fine-tune or with multi_gpu)
     # the prompt check (promptcheck.py): does a probe render still show the frame its prompt asks for? Observe only
     # unless likeness_best_min_kept or race_drop_drift act on it
     probe_subject: str = ""  # what the preset prompts call the person ("a young woman with long dark brown hair");
@@ -1622,6 +1625,8 @@ class TrainConfig:
             raise ValueError(f"copy_max is a cosine above 0 and at most 1, got {self.copy_max!r}")
         if self.probe_device and not self.probe_device.strip().startswith("cuda"):
             raise ValueError(f"probe_device is a CUDA GPU such as cuda:1, got {self.probe_device!r}")
+        if self.remote_render not in ("auto", "off"):
+            raise ValueError(f"remote_render must be auto or off, got {self.remote_render!r}")
         if not 0.0 <= self.lora_ema < 1.0:
             raise ValueError(f"lora_ema must be 0 (off) or a decay below 1, got {self.lora_ema!r}")
         if self.dp_balance not in ("off", "auto", "grow"):
