@@ -37,6 +37,7 @@ ARCH_NAMES += ("p_h3_image",)
 ARCH_NAMES += ("minimax_h3_image",)
 ARCH_NAMES += ("pan2",)
 ARCH_NAMES += ("sdxl",)
+ARCH_NAMES += ("zimage",)
 
 
 def _match_suffix(name: str, suffixes: Iterable[str]) -> bool:
@@ -1781,6 +1782,135 @@ class SdxlArch(Arch):
 
 
 _ARCHS["sdxl"] = SdxlArch
+
+
+class ZImageArch(Arch):
+    """Z-Image (Tongyi-MAI): the S3-DiT of Z-Image Base and Z-Image-Turbo as one family (rulztrainer.zimage; the
+    variant is the loaded checkpoint, model.is_distilled), Qwen3-4B text features (35 layers, hidden_states[-2]) and the
+    FLUX.1 VAE read in 2x2 patches [B, 64, H/16, W/16]."""
+
+    name = "zimage"
+    label = "Z-Image"
+    modelspec = "Z-Image"
+    # diffusers' module names under diffusion_model. (the facade keeps them; ComfyUI's z_image_to_diffusers map slices
+    # to_q / to_k / to_v onto its fused attention.qkv and maps to_out.0 to attention.out), lora_A / lora_B with alpha
+    # folded into lora_B and no .alpha key (read at alpha = rank, scale 1): ai-toolkit and Fizgig write the same names
+    lora_format = "comfy_ab"
+    n_blocks = 30
+    GROUPS = {
+        "q": ("attention.to_q",), "k": ("attention.to_k",), "v": ("attention.to_v",), "o": ("attention.to_out.0",),
+        "ffn_up_gate": ("feed_forward.w1", "feed_forward.w3"), "ffn_down": ("feed_forward.w2",),
+        "modulation": ("adaLN_modulation.0",),
+    }
+    EMBED = ("t_embedder", "all_x_embedder", "all_final_layer")
+    TEXT_IN = "cap_embedder"
+    target_groups = {"q": "attention query", "k": "attention key", "v": "attention value", "o": "attention out",
+                     "ffn_up_gate": "feed-forward w1 / w3 (gate and up)", "ffn_down": "feed-forward w2 (down)",
+                     "modulation": "each layer's timestep modulation Linear (not trained by default)",
+                     "text_in": "caption embedder (the encoder's features into the model)",
+                     "embed": "timestep embedder, caption embedder, image patch embedder and the final layer (not "
+                              "trained by default; Fizgig saw a LoRA on the timestep embedder break rendering)"}
+    default_targets = ARCH_DEFAULT_TARGETS["zimage"]
+    text_prefixes = ("cap_embedder",)
+    supports_single_files = True  # Comfy-Org/z_image_turbo and z_image: DiT, Qwen3-4B text encoder, FLUX.1 VAE
+    default_sample_steps, default_sample_cfg = ARCH_FULL_SAMPLE["zimage"]
+    default_negative = ("blurry, low detail, noisy, washed out, oversaturated, distorted anatomy, extra limbs, "
+                        "duplicate objects, text, watermark, logo, frame, cropped subject, flat lighting, muddy "
+                        "colors")  # Base samples with it (CFG 4); Turbo, at CFG 1, ignores it
+    latent_tag = "_flux1vae"  # the FLUX.1 VAE's latents (not the FLUX.2 VAE's: those are the untagged ones)
+    size_multiple = 16
+
+    def __init__(self):
+        from .zimage import loading
+
+        self._loading = loading
+
+    def resolve_for_config(self, cfg):
+        return self._loading.resolve_for_config(cfg)
+
+    def get_transformer(self, cfg, model_dir, device=None):
+        return self._loading.get_transformer(cfg, model_dir, device)
+
+    def get_vae(self, cfg, model_dir):
+        return self._loading.get_vae(cfg, model_dir)
+
+    def get_text_encoder(self, cfg, model_dir):
+        return self._loading.get_text_encoder(cfg, model_dir)
+
+    def load_any_transformer(self, path, device, quant="auto", models_dir="models"):
+        return self._loading.load_any_transformer(path, device, quant, models_dir)
+
+    def encode_prompt(self, text_encoder, tokenizer, prompt, max_length):
+        return self._loading.encode_prompt(text_encoder, tokenizer, prompt, max_length)
+
+    def pad_embeds(self, rows):
+        return self._loading.pad_embeds(rows)
+
+    def encode_images(self, vae, images):
+        return self._loading.encode_images(vae, images)
+
+    def decode_latents(self, vae, latents):
+        return self._loading.decode_latents(vae, latents)
+
+    def decode_latents_grad(self, vae, latents):
+        return self._loading.decode_latents_grad(vae, latents)
+
+    def grad_vae(self, vae):
+        return self._loading.grad_vae(vae)
+
+    def sample(self, model, pos_e, pos_m, neg_e, neg_m, **kw):
+        from .zimage.sampler import sample
+
+        return sample(model, pos_e, pos_m, neg_e, neg_m, **kw)
+
+    def sample_sigmas(self, model, steps, height, width, shift):
+        from .zimage.sampler import model_shift, zimage_sigmas
+
+        return zimage_sigmas(steps, model_shift(model))
+
+    def distilled_sample_model(self, path: str) -> bool:
+        """Z-Image Turbo by its name (Z-Image-Turbo, z_image_turbo_bf16.safetensors), not ostris' De-Turbo, which a
+        plain "turbo" in the name would call distilled."""
+        from .config import zimage_name_is_turbo
+
+        return zimage_name_is_turbo(path)
+
+    def lora_module_names(self, model, targets, blocks, include_text_embedder=False):
+        from .lora import _is_linear_like
+
+        targets = set(targets)
+        if include_text_embedder:
+            targets.add("text_in")
+        block_set = None if blocks is None else {int(b) for b in blocks}
+        in_block = [s for t in targets for s in self.GROUPS.get(t, ())]
+        names = []
+        for name, module in model.named_modules():
+            if not _is_linear_like(module):
+                continue
+            head = name.split(".")[0]
+            if head == "layers":  # the 30 main layers only: the noise / context refiners are never targeted
+                if block_set is not None and int(name.split(".")[1]) not in block_set:
+                    continue
+                if _match_suffix(name, in_block):
+                    names.append(name)
+            elif head == self.TEXT_IN:
+                if "text_in" in targets or "embed" in targets:
+                    names.append(name)
+            elif "embed" in targets and head in self.EMBED:
+                names.append(name)
+        return names
+
+    def reference_sigmas(self, n, gen, tokens):
+        # Z-Image's training noise levels: logit-normal sigmas with the static shift 3 of its sampler (Fizgig;
+        # ai-toolkit and Tongyi use shift 3), not exact: the model is not trained on its sampling steps only
+        from .config import ZIMAGE_VARIANT_DATA
+
+        shift = ZIMAGE_VARIANT_DATA["base"]["train_shift"]
+        s = torch.sigmoid(torch.randn(n, generator=gen))
+        return (shift * s / (1 + (shift - 1) * s)).clamp(0.0, 1.0)
+
+
+_ARCHS["zimage"] = ZImageArch
 _cache: dict[str, Arch] = {}
 
 
@@ -1822,7 +1952,16 @@ def arch_from_transformer_file(path: str) -> str | None:
             with safe_open(str(p), "pt") as f:
                 names = {k.split("diffusion_model.", 1)[-1] for k in f.keys()}
                 klein2 = _klein2_family_of_file(f)  # (9B or 4B, used if the keys say FLUX.2 Klein)
-            if "txtfusion.projector.weight" in names or "text_fusion.projector.weight" in names:
+                zkind = None
+                if "cap_pad_token" in names:  # Z-Image (Base / Turbo / De-Turbo) or Omni / Edit, by keys and shapes
+                    from .zimage.single_file import zimage_kind
+
+                    zkind = zimage_kind({k: f.get_slice(k).get_shape() for k in f.keys()})
+            if zkind == "zimage":
+                found = "zimage"
+            elif zkind == "zimage_omni":
+                found = "zimage_omni"
+            elif "txtfusion.projector.weight" in names or "text_fusion.projector.weight" in names:
                 found = "krea2"
             elif "txt_in.text_norm.weight" in names and "modulation.1.weight" in names:
                 found = "qwen_image21"
@@ -1849,6 +1988,8 @@ def arch_from_transformer_file(path: str) -> str | None:
         except Exception:  # noqa: BLE001
             found = None
         _FILE_ARCH_CACHE[key] = found
+    if _FILE_ARCH_CACHE[key] == "zimage_omni":  # the Z-Image family, so a path typed in the WebUI does not throw;
+        return "zimage"  # loading refuses it by name (zimage.loading.to_model_layout)
     return _FILE_ARCH_CACHE[key]
 
 
@@ -1911,7 +2052,8 @@ def detect_arch(cfg: TrainConfig, model_dir: Path | None) -> Arch:
                  "Ideogram4Transformer2DModel": "ideogram4",
                  "MiniMaxH3Transformer3DModel": "minimax_h3", "MiniMaxH3DiTModel": "minimax_h3",
                  "MiniMaxH3ImageTransformer2DModel": "minimax_h3_image",
-                 "PAN2Transformer3DModel": "pan2", "UNet2DConditionModel": "sdxl"}.get(cls)
+                 "PAN2Transformer3DModel": "pan2", "UNet2DConditionModel": "sdxl",
+                 "ZImageTransformer2DModel": "zimage"}.get(cls)
         if found == "flux2_klein" and tconf.get("joint_attention_dim") == 7680:
             found = "flux2_klein4b"  # Klein 4B reads Qwen3-4B's 3 x 2560 features; the 9B's are 12288
         if found in (None, "minimax_h3"):

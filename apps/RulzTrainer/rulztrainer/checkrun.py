@@ -181,6 +181,15 @@ CASES: tuple[Case, ...] = (
          families=("minimax_h3_image",),
          expect={"log": [r"clean_share on .*: the share is the steps at its last noise level"]},
          note="A short run sees the first epoch's share only; it shows that the recipe trains, not how well."),
+    Case("zimage_turbo_lora", "A rank-16 LoRA on Z-Image Turbo under Fizgig's training adapter, the first run of the "
+                              "Z-Image family on real weights (training_adapter auto, 8-step sample at CFG 1)",
+         overrides={"network_type": "lora", "lora_rank": 16, "lora_alpha": 16.0, "dora": False, "finetune": False,
+                    "training_adapter": "auto"},
+         families=("zimage",),
+         note="Needs a Z-Image Turbo base config (Tongyi-MAI/Z-Image-Turbo or Comfy-Org's z_image_turbo files). The "
+              "run passes on the checks every run gets (it trains, saves the LoRA and renders the 8-step sample); "
+              "read train.log for the training adapter's 'matched N modules' line and the sample for whether Turbo "
+              "still renders at 8 steps with the adapter off."),
     Case("run_report", "The run report written when a training ends (run_report, 3.5.0); needs matplotlib",
          overrides={"run_report": True},
          expect={"log": [r"Run report: .*_report\.(png|pdf)"]}),

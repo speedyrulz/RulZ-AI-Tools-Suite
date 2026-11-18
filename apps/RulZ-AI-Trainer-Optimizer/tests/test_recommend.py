@@ -23,6 +23,26 @@ def test_flux2_klein4b():
     assert rec.config()['turbo_lora'] == ''
 
 
+def test_zimage_base_and_turbo():
+    from rulz_optimizer.knowledge import load
+    knowledge = load()
+    model = knowledge.models['zimage']
+    assert [v['id'] for v in model.variants] == ['base', 'turbo']
+    base = recommend(knowledge, model.id, None, Goals()).config()
+    assert base['model_arch'] == 'zimage'
+    assert base['model_path'] == 'Tongyi-MAI/Z-Image'
+    assert base['lora_rank'] == 16 and base['lora_alpha'] == 16.0
+    assert base['learning_rate'] == 1e-4
+    assert base['timestep_sampling'] == 'reference'
+    assert (base['sample_steps'], base['sample_cfg']) == (25, 4.0)
+    assert base['training_adapter'] == ''
+    turbo = recommend(knowledge, model.id, None, Goals(variant='turbo')).config()
+    assert turbo['model_path'] == 'Tongyi-MAI/Z-Image-Turbo'
+    assert turbo['training_adapter'] == 'auto'
+    assert (turbo['sample_steps'], turbo['sample_cfg']) == (8, 1.0)
+    assert (turbo['probe_steps'], turbo['probe_cfg']) == (8, 1.0)
+
+
 def test_variant(knowledge):
     rec = recommend(knowledge, 'minimax_h3', None, Goals(variant='ref2va'))
     assert rec.config()['model_path'].endswith('#ref2va')

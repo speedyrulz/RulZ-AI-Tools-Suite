@@ -28,6 +28,8 @@ MODEL_PRESETS = {
     "FLUX-2-Klein-9B": "black-forest-labs/FLUX.2-klein-9B",
     "FLUX-2-Klein-4B-Base": "black-forest-labs/FLUX.2-klein-base-4B",  # Apache 2.0, not gated
     "FLUX-2-Klein-4B": "black-forest-labs/FLUX.2-klein-4B",
+    "Z-Image-Turbo": "Tongyi-MAI/Z-Image-Turbo",  # Apache 2.0, not gated
+    "Z-Image": "Tongyi-MAI/Z-Image",
     "MiniMax-H3-FL2VA": "MiniMaxAI/MiniMax-H3",  # one repository holds both: transformer/ (FL2VA), transformer_ref/
     "MiniMax-H3-Ref2VA": "MiniMaxAI/MiniMax-H3#ref2va",
 }
@@ -100,6 +102,10 @@ def family_named_in(text: str) -> str | None:
     hint = (text or "").lower()
     if "qwen-image" in hint or "qwen_image" in hint or "qwenimage" in hint:
         return "qwen_image21"
+    # Tongyi-MAI/Z-Image-Turbo, z_image_turbo_bf16, zimage_turbo_...: the last path part only, so a FLUX.2 Klein file
+    # in a folder named "zimage" stays Klein
+    if re.search(r"(?<![a-z0-9])z[-_ ]?image", re.split(r"[\\/]", hint.rstrip("\\/"))[-1]):
+        return "zimage"
     if any(s in hint for s in ("flux-3", "flux3", "flux_3", "flux.3")):
         return "flux3_klein"
     if any(s in hint for s in ("flux-2", "flux2", "flux_2", "flux.2")):
@@ -214,12 +220,17 @@ ARCH_TRAINING_ADAPTER = {
 }
 
 
-def training_adapter_for(family: str, model_path: str = "") -> tuple[str, str] | None:
+def training_adapter_for(family: str, model_path: str = "", cfg=None) -> tuple[str, str] | None:
     """(repo, file) of a family's own training adapter for this model_path (MiniMax H3: the Ref2VA base,
-    "MiniMaxAI/MiniMax-H3#ref2va", gets its own), or None when the family has none."""
+    "MiniMaxAI/MiniMax-H3#ref2va", gets its own), or None when the family has none. Z-Image: only the Turbo variant
+    has one (cfg: the config, whose zimage_variant and files name it; without one the model_path does), Base gets None."""
     entry = ARCH_TRAINING_ADAPTER.get(family)
     if entry is None:
         return None
+    if family == "zimage":
+        variant = cfg.zimage_variant_resolved() if cfg is not None else resolve_zimage_variant("auto", model_path)
+        if variant != "turbo":
+            return None
     ref = str(model_path or "").strip().lower().endswith("#ref2va")
     return entry["repo"], entry.get("ref2va_file") if ref and entry.get("ref2va_file") else entry["file"]
 # Each family's sampling LoRA (sample_lora: auto downloads it), applied with the turbo LoRA while samples render the
@@ -446,6 +457,60 @@ def detect_video_data_preset(family: str, values) -> str:
                 continue  # photos without "all": H3 trains blocks 20-49 on its own, not this recipe
             return name
     return ""
+
+# Z-Image (Tongyi-MAI, rulztrainer.zimage): one family for both checkpoints, Base (Tongyi-MAI/Z-Image, undistilled) and
+# Turbo (Tongyi-MAI/Z-Image-Turbo, distilled to 8 steps without guidance): the same 6.15B S3-DiT, Qwen3-4B text encoder
+# and FLUX.1 VAE. Which one a run trains is the checkpoint (zimage_variant: auto reads the name, "turbo" and not
+# "de-turbo"). LoRA and full fine-tune. A LoRA on Turbo trains under a frozen training adapter (Fizgig's, Apache 2.0, rank
+# 16: its A/B on a 170-photo character set, likeness none 54.8, ostris v2 72.3, Fizgig 78.1); Base has none. ostris'
+# v2 adapter (ZIMAGE_OSTRIS_ADAPTER, no alpha, adaLN_modulation.0 too) can be set by path.
+# Single files: Comfy-Org/z_image_turbo (Turbo DiT bf16 / int8_convrot / nvfp4, Qwen3-4B bf16 / fp8_mixed, the FLUX.1
+# VAE ae.safetensors) and Comfy-Org/z_image (Base DiT bf16 / int8_convrot); the Base's text encoder and VAE are Turbo's.
+ZIMAGE_VARIANTS = ("auto", "base", "turbo")
+ZIMAGE_VARIANT_DATA = {  # per variant, as data: sample steps and CFG, the static sampling shift (sigma = shift * s /
+    # (1 + (shift - 1) s)) and the shift of the reference training noise levels. Turbo: 8 steps, no guidance (the model
+    # card; ComfyUI's template). Base: ComfyUI's template, 25 steps at CFG 4 with a negative prompt (Tongyi's own
+    # reference is shift 6 and guidance 4, which is CFG 5 here, 28-50 steps)
+    "turbo": {"steps": 8, "cfg": 1.0, "shift": 3.0, "train_shift": 3.0},
+    "base": {"steps": 25, "cfg": 4.0, "shift": 3.0, "train_shift": 3.0},
+}
+ARCH_NAMES += ("zimage",)
+ARCH_DEFAULT_TARGETS["zimage"] = _CORE_TARGETS  # attention + feed-forward of the 30 main layers; never the refiners
+ARCH_FULL_SAMPLE["zimage"] = (25, 4.0)  # Base's: the Turbo variant samples 8 steps at CFG 1 (ZIMAGE_VARIANT_DATA)
+ARCH_TRAINING_ADAPTER["zimage"] = {"repo": "ShootTheSound/Fizgig-Z-Image-Turbo-Training-Adapter",
+                                   "file": "fizgig_z_image_turbo_training_adapter.safetensors"}
+ZIMAGE_OSTRIS_ADAPTER = {"repo": "ostris/zimage_turbo_training_adapter",
+                         "file": "zimage_turbo_training_adapter_v2.safetensors"}
+COMFY_REPOS["zimage"] = "Comfy-Org/z_image_turbo"  # the Turbo repo holds the text encoder and VAE of both variants
+COMFY_DIFFUSION_FILES["Tongyi-MAI/Z-Image-Turbo"] = {
+    "bf16": ("Comfy-Org/z_image_turbo", "split_files/diffusion_models/z_image_turbo_bf16.safetensors"),
+    "int8_convrot": ("Comfy-Org/z_image_turbo", "split_files/diffusion_models/z_image_turbo_int8_convrot.safetensors"),
+    "nvfp4": ("Comfy-Org/z_image_turbo", "split_files/diffusion_models/z_image_turbo_nvfp4.safetensors")}
+COMFY_DIFFUSION_FILES["Tongyi-MAI/Z-Image"] = {
+    "bf16": ("Comfy-Org/z_image", "split_files/diffusion_models/z_image_bf16.safetensors"),
+    "int8_convrot": ("Comfy-Org/z_image", "split_files/diffusion_models/z_image_int8_convrot.safetensors")}
+COMFY_DIFFUSION_QUANTS["zimage"] = ("int8_convrot", "nvfp4", "bf16")  # (Base has no nvfp4 file: comfy_files refuses it)
+COMFY_TEXT_ENCODER_FILES["zimage"] = {"bf16": "split_files/text_encoders/qwen_3_4b.safetensors",
+                                      "fp8_scaled": "split_files/text_encoders/qwen_3_4b_fp8_mixed.safetensors"}
+COMFY_TEXT_ENCODER_QUANTS["zimage"] = ("bf16", "fp8_scaled")  # the fp4 file is not read (as Klein 4B's)
+COMFY_VAE_FILES["zimage"] = "split_files/vae/ae.safetensors"
+COMFY_DEFAULT_QUANT["zimage"] = "bf16"  # the text encoder's default int8_convrot has no Qwen3-4B file; the DiT's follows
+
+
+def zimage_name_is_turbo(name: str) -> bool:
+    """Does a model path or file name (its last part) name Z-Image Turbo: "turbo" in it, and not ostris' De-Turbo
+    (z_image_de_turbo_v1_bf16.safetensors, Z-Image-De-Turbo), which is a de-distilled Base."""
+    last = re.split(r"[\\/]", str(name or "").strip().rstrip("\\/"))[-1].lower()
+    return "turbo" in last and not re.search(r"de[-_ ]?turbo", last)
+
+
+def resolve_zimage_variant(variant: str, name: str) -> str:
+    """"base" or "turbo": zimage_variant as set, or for "auto" read from the model's name."""
+    v = str(variant or "auto").lower()
+    if v in ("base", "turbo"):
+        return v
+    return "turbo" if zimage_name_is_turbo(name) else "base"
+
 
 # SDXL (Stability AI's UNet, rulztrainer.sdxl): LoRA on the UNet only, as OneTrainer, ai-toolkit and Fizgig train it. Its
 # text encoders (CLIP-L and OpenCLIP bigG) read 77 tokens, so max_token_length is held at SDXL_TOKENS. The default
@@ -819,6 +884,8 @@ class TrainConfig:
     training_adapter: str = "auto"  # a LoRA on while training and off while sampling, never saved (ARCH_TRAINING_ADAPTER;
     #   Qwen-Image 2.1: Fizgig's): auto = the model family's (downloaded; the others have none), "" = none, or a path
     training_adapter_strength: float = 1.0
+    zimage_variant: str = "auto"  # Z-Image only: auto (from the model's name: "turbo", not de-turbo) | base | turbo; sets
+    #   the training adapter (Turbo only), the sample defaults and is_distilled
     # --- face similarity (character LoRAs) ---
     face_refs: list[str] = field(default_factory=list)  # dataset images whose largest face is the reference identity
     face_provider: str = "cpu"  # cpu | cuda (onnxruntime provider for InsightFace)
@@ -1109,12 +1176,19 @@ class TrainConfig:
             return self.model_arch
         return family_named_in(" ".join([self.model_path or "", self.transformer_file or ""])) or "moss_image"
 
+    def zimage_variant_resolved(self) -> str:
+        """Z-Image: "base" or "turbo" (zimage_variant, or for auto the transformer file's name, else the model_path's)."""
+        name = self.transformer_file if self.model_source == "files" and self.transformer_file else self.model_path
+        return resolve_zimage_variant(self.zimage_variant, name)
+
     def samples_on_distilled_model(self) -> bool:
         """The model that renders samples and probes is a distilled checkpoint: sample_model_path, else the trained
         model (its file when it has one), by the family's naming rule (Arch.distilled_sample_model: a "turbo" name such
         as Krea-2-Turbo or Qwen-Image-2.1-Turbo; Klein without "base"). A turbo LoRA on top would distil it twice."""
         from .archs import get_arch
 
+        if not self.sample_model_path and get_arch(self).name == "zimage":
+            return self.zimage_variant_resolved() == "turbo"  # the variant, not the name alone (zimage_variant)
         if self.sample_model_path:
             name = self.sample_model_path
         else:
@@ -1357,8 +1431,12 @@ class TrainConfig:
                              f"{self.sdxl_prediction!r}")
         if not isinstance(self.sdxl_zero_terminal_snr, bool):
             raise ValueError(f"sdxl_zero_terminal_snr must be true or false, got {self.sdxl_zero_terminal_snr!r}")
+        if str(self.zimage_variant).lower() not in ZIMAGE_VARIANTS:
+            raise ValueError(f"zimage_variant must be one of {', '.join(ZIMAGE_VARIANTS)}, got {self.zimage_variant!r}")
         for msg in _capabilities.violations(self.family(), self).values():
             raise ValueError(msg)  # every family's table (capabilities.py), the same one the WebUI greys out
+        if self.family() == "zimage":
+            self.validate_zimage()
         if self.family() == "sdxl":
             self.validate_sdxl()
         if self.optimizer.lower() == "hull":
@@ -1589,6 +1667,31 @@ class TrainConfig:
         from .archs import guess_arch_name
 
         return guess_arch_name(self)
+
+    def validate_zimage(self) -> None:
+        """Z-Image notes (warnings, nothing is refused): the resolved variant, a Turbo fine-tune, a timestep shift."""
+        import logging
+
+        log = logging.getLogger("rulztrainer")
+        variant = self.zimage_variant_resolved()
+        log.info("Z-Image variant: %s (zimage_variant %s)", variant, self.zimage_variant)
+        if self.finetune and variant == "turbo":
+            log.warning("Fine-tuning Z-Image Turbo loses its few-step behaviour (8 steps, no guidance): train Base "
+                        "for a fine-tune. Fizgig keeps its training adapter on for a Turbo fine-tune; RulZ AI "
+                        "Trainer does not use an adapter on a fine-tune")
+        if self.timestep_shift != 1.0:
+            log.warning("timestep_shift %g on Z-Image: its reference noise levels already carry the static shift 3 "
+                        "(timestep_sampling: reference), and the shift here is applied on top of whatever "
+                        "timestep_sampling draws; leave it at 1 unless you mean it", self.timestep_shift)
+        if self.timestep_sampling != "reference":
+            log.warning("timestep_sampling %s on Z-Image draws without the static shift 3 that Fizgig, ai-toolkit and "
+                        "Tongyi train with; timestep_sampling: reference is the Z-Image recipe (logit-normal, then "
+                        "shift 3)", self.timestep_sampling)
+        adapter = str(self.training_adapter or "").strip()
+        if variant == "base" and adapter.lower() not in ("", "auto", "none") and not self.finetune:
+            log.warning("training_adapter %s is set on Z-Image Base: the Turbo training adapters de-distill Turbo and "
+                        "do not belong on Base, which trains without one; set training_adapter to auto (none for "
+                        "Base) unless you mean it", adapter)
 
     def validate_sdxl(self) -> None:
         """What an SDXL run cannot do (v1 is a LoRA on the UNet): each refusal names the setting, none is a silent
