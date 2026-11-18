@@ -686,7 +686,7 @@ def test_list_and_dry_run_queue_nothing(cli, tmp_path, capsys):
     assert checkrun.main(["queue", "--config", str(config), "--dry-run", "--vram", "16", "--reg-dir",
                           str(tmp_path / "reg"), "--tag", "dry"]) == 0
     out = capsys.readouterr().out
-    assert "dry run: nothing is queued" in out and "12 of 14 cases" in out
+    assert "dry run: nothing is queued" in out and "12 of 15 cases" in out
     assert out.count(": job check_dry_") >= 8  # a plan for at least eight cases
     assert "optimizer: \"normuon\"  (was \"adamw\")" in out and "steps: 30  (was 2000)" in out
     assert "block_swap: 12  (was 0)" in out and "h3_image_likeness: SKIPPED" in out

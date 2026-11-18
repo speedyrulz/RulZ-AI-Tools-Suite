@@ -212,7 +212,8 @@ def text_config(size: str | None) -> dict:
     return TEXT_CONFIG_4B if size == "4b" else TEXT_CONFIG
 
 
-def build_text_model(state: dict, quant: str = "none", work_device=None, config: dict | None = None):
+def build_text_model(state: dict, quant: str = "none", work_device=None, config: dict | None = None,
+                     keep: int | None = None):
     """Text-only Qwen3-8B (or the 4B with config=TEXT_CONFIG_4B), its first TE_LAYERS layers without the final norm, from an HF-style state dict, which is
     consumed (the layers past the cut and the norm are dropped unread). work_device: where to quantize. Its quantized
     layers run weight-only (moss.single_file.weight_only).
@@ -223,7 +224,9 @@ def build_text_model(state: dict, quant: str = "none", work_device=None, config:
     from transformers import Qwen3Config, Qwen3Model
 
     config = TEXT_CONFIG if config is None else config
-    keep = min(TE_LAYERS, int(config["num_hidden_layers"]))
+    keep = min(TE_LAYERS if keep is None else keep, int(config["num_hidden_layers"]))
+    if keep < 1:
+        raise ValueError("keep must be at least 1")
     cfg = Qwen3Config(**{**config, "num_hidden_layers": keep})
     state = sf.strip_prefix(sf.take_state(state, ("lm_head.",)), ("model.",))
     for k in list(state):

@@ -149,6 +149,7 @@ _ONLY_READ_BY: list[tuple[list[Rule], tuple]] = [
       _only("sample_skip_layer", "skip-layer guidance is MOSS-Image only", 22, ignored=True)], ("moss_image",)),
     ([_only("sdxl_prediction", "only SDXL has an epsilon / v-prediction choice", "auto", ignored=True),
       _only("sdxl_zero_terminal_snr", "only SDXL has a zero terminal SNR option", False, ignored=True)], ("sdxl",)),
+    ([_only("zimage_variant", "only Z-Image has a Base / Turbo variant choice", "auto", ignored=True)], ("zimage",)),
     ([_only("train_video_mode", "only video models train on clips", "fps", ignored=True),
       _only("still_lora_targets", "only video models mix clips and stills (it picks what a batch of stills trains)",
             [], ignored=True),

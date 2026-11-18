@@ -1,0 +1,153 @@
+# Z-Image (Base and Turbo): unmeasured character LoRA starting recipe.
+id: zimage
+name: Z-Image
+kind: image
+updated: 2026-11-17
+summary: >-
+  Z-Image is one model entry with two checkpoints: Base (Tongyi-MAI/Z-Image, the default here) and the 8-step
+  distilled Turbo (Tongyi-MAI/Z-Image-Turbo). Train a LoRA on either; on Turbo the trainer keeps a frozen training
+  adapter on while the LoRA trains (off in samples, never saved), on Base it uses none. For a full fine-tune use Base.
+  Every setting below is reasoned from three other trainers' published defaults (Fizgig, ai-toolkit, OneTrainer) and
+  has not been measured in RulZ AI Trainer: nothing has been run on real Z-Image weights or a GPU here.
+model_preset: Z-Image
+model_path: Tongyi-MAI/Z-Image
+variants:
+  - id: base
+    label: Z-Image Base (the checkpoint to train and fine-tune on)
+    model_path: Tongyi-MAI/Z-Image
+    base:
+      training_adapter: {value: "", why: "Base is not distilled, so it takes no training adapter; unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11]}
+      sample_steps: {value: 25, why: "ComfyUI's Z-Image template and Fizgig's Base previews; Tongyi's own pipeline runs 28 to 50. Unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11, hf_zimage_2026_11]}
+      sample_cfg: {value: 4.0, why: "The same template and Fizgig's Base CFG (with a negative prompt); unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11]}
+      probe_steps: {value: 25, why: "Match Base previews; unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11]}
+      probe_cfg: {value: 4.0, why: "Match Base previews; unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11]}
+  - id: turbo
+    label: Z-Image Turbo (8-step distilled; trains with the training adapter)
+    model_path: Tongyi-MAI/Z-Image-Turbo
+    base:
+      training_adapter: {value: auto, why: "Turbo is distilled and drifts when a LoRA trains on it bare. auto is Fizgig's Z-Image Turbo adapter; in Fizgig's A/B (170-photo character set, rank 16, 1e-4, 3000 steps) likeness was 54.8 with none, 72.3 with ostris' v2 and 78.1 with Fizgig's. Their numbers, not RulZ's.", confidence: GUESS, sources: [fizgig_zimage_2026_11, atk_zimage_2026_11]}
+      sample_steps: {value: 8, why: "Turbo is an 8-step distill (ai-toolkit samples 9); unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11, atk_zimage_2026_11]}
+      sample_cfg: {value: 1.0, why: "Turbo samples without guidance; unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11]}
+      probe_steps: {value: 8, why: "Match Turbo previews; unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11]}
+      probe_cfg: {value: 1.0, why: "Match Turbo previews; unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11]}
+facts:
+  - text: "Z-Image Base (Tongyi-MAI/Z-Image) and Turbo (Tongyi-MAI/Z-Image-Turbo) are Apache 2.0 and not gated. The transformer is a 6.15 billion parameter single-stream DiT: 30 main blocks (dim 3840, 30 heads) plus 2 noise-refiner and 2 context-refiner blocks, with a Qwen3-4B text encoder and the FLUX.1 16-channel VAE."
+    confidence: DOC
+    sources: [hf_zimage_2026_11, fizgig_zimage_2026_11]
+  - text: "Turbo needs a training adapter for LoRAs: ai-toolkit merges ostris' v2 adapter before training and inverts it for samples and the saved LoRA; Fizgig keeps its own adapter as a frozen LoRA under the trainable one, off for previews and not saved. RulZ AI Trainer follows Fizgig's way (default ShootTheSound/Fizgig-Z-Image-Turbo-Training-Adapter, ostris' v2 selectable as a file) and applies it to Turbo only."
+    confidence: REP
+    sources: [fizgig_zimage_2026_11, atk_zimage_2026_11]
+  - text: "Fizgig's A/B on a 170-photo character set (rank 16, 1e-4, 3000 steps, ArcFace likeness): no adapter 54.8, ostris v2 72.3, Fizgig's adapter 78.1; ostris' looked oversaturated and glossy. One report from one set, and not repeated here."
+    confidence: REP
+    sources: [fizgig_zimage_2026_11]
+  - text: "ai-toolkit also offers a De-Turbo checkpoint (ostris/Z-Image-De-Turbo, an un-distilled Turbo) that trains without an adapter. RulZ AI Trainer treats a name with de-turbo as Base."
+    confidence: REP
+    sources: [atk_zimage_2026_11]
+  - text: "Defaults across trainers: Fizgig's presets are Muon with EMA 0.98, 30 epochs, 0.5 MP, rank 16 at 1e-4 to 2e-4 (a fast preset is rank 8 at 2e-4 to 4e-4 at 0.25 MP). ai-toolkit uses rank/alpha 32, 1e-4 with AdamW8bit, 3000 steps, caption dropout 0.05 and 512/768/1024 buckets. OneTrainer uses 3e-4 with rank 16 and alpha 1 at 512, and 1e-5 with Adafactor for a fine-tune."
+    confidence: DISP
+    sources: [fizgig_zimage_2026_11, atk_zimage_2026_11, onetrainer_zimage_2026_11]
+  - text: "Training noise: logit-normal draws with a static shift of 3 (Fizgig; ai-toolkit and Tongyi also use 3). RulZ AI Trainer builds the shift into its reference timesteps, so timestep_shift stays 1."
+    confidence: DOC
+    sources: [fizgig_zimage_2026_11, atk_zimage_2026_11]
+  - text: "Full fine-tune (Fizgig): 5e-5 with Adafactor; 1e-5 changed nothing and 1e-4 was strong. A fine-tuned Turbo loses its few-step behaviour, so fine-tune Base."
+    confidence: REP
+    sources: [fizgig_zimage_2026_11]
+  - text: "Memory, Fizgig's measurements on its own code (rank 16 LoRA, 1 MP, gradient checkpointing, preview included): peak 17.2 GB in bf16, 12.3 GB in int8, 10.1 GB in 4-bit; a block is about 0.36 GB in bf16 and 0.18 GB in int8. Roughly 24 GB for bf16, 16 GB for int8, and 12 GB with int8 plus block swap. Not measured on RulZ AI Trainer's port."
+    confidence: REP
+    sources: [fizgig_zimage_2026_11]
+  - text: "ComfyUI files: Comfy-Org/z_image_turbo has split_files/diffusion_models/z_image_turbo_bf16.safetensors, split_files/text_encoders/qwen_3_4b.safetensors and split_files/vae/ae.safetensors; Comfy-Org/z_image has split_files/diffusion_models/z_image_bf16.safetensors. ae.safetensors is the FLUX.1 VAE, not the FLUX.2 one."
+    confidence: DOC
+    sources: [hf_zimage_2026_11]
+base:
+  network_type: {value: lora, why: "A plain LoRA is the starting point every compared trainer uses; no other adapter type has been tried on Z-Image here.", confidence: GUESS, sources: [fizgig_zimage_2026_11, atk_zimage_2026_11]}
+  lora_rank: {value: 16, why: "Fizgig's and OneTrainer's rank (ai-toolkit uses 32); unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11, onetrainer_zimage_2026_11]}
+  lora_alpha: {value: 16.0, why: "Alpha equal to rank keeps the adapter's scale at 1; OneTrainer's alpha 1 goes with a 3e-4 rate and is not copied. Unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11]}
+  optimizer: {value: adamw8bit, why: "ai-toolkit's optimizer; Fizgig's Muon presets are not reproduced here. Unmeasured on Z-Image.", confidence: GUESS, sources: [atk_zimage_2026_11]}
+  learning_rate: {value: 1.0e-4, why: "The low end of Fizgig's 1e-4 to 2e-4 range for rank 16 and ai-toolkit's rate; OneTrainer uses 3e-4 with alpha 1. Unmeasured here, lower it if samples look burnt.", confidence: GUESS, sources: [fizgig_zimage_2026_11, atk_zimage_2026_11, onetrainer_zimage_2026_11]}
+  lr_scheduler: {value: constant, why: "A constant rate, as the compared recipes; unmeasured here.", confidence: GUESS, sources: [atk_zimage_2026_11]}
+  timestep_sampling: {value: reference, why: "Logit-normal draws with Z-Image's shift of 3 built in, as Fizgig trains it. timestep_shift stays 1. Unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11]}
+  batch_size: {value: 1, why: "A conservative memory starting point; unmeasured here.", confidence: GUESS, sources: []}
+  resolutions: {value: [0.5], why: "Fizgig's presets train at 0.5 MP (about 0.9 s a step at 1 MP and less memory below it); ai-toolkit mixes 512, 768 and 1024. Unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11, atk_zimage_2026_11]}
+  caption_dropout: {value: 0.05, why: "ai-toolkit's Z-Image default; unmeasured here.", confidence: GUESS, sources: [atk_zimage_2026_11]}
+  isolation: {value: false, why: "Start without isolation; its benefit on Z-Image is unmeasured here.", confidence: GUESS, sources: []}
+  turbo_lora: {value: "", why: "No sampling-speed LoRA applies: Turbo is its own checkpoint.", confidence: GUESS, sources: [fizgig_zimage_2026_11]}
+  training_adapter: {value: "", why: "Base needs none; the turbo variant sets Fizgig's adapter.", confidence: GUESS, sources: [fizgig_zimage_2026_11]}
+  sample_steps: {value: 25, why: "ComfyUI's Z-Image template and Fizgig's Base previews; unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11]}
+  sample_cfg: {value: 4.0, why: "The same template and Fizgig's Base CFG with a negative prompt; unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11]}
+  probe_steps: {value: 25, why: "Match Base previews; unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11]}
+  probe_cfg: {value: 4.0, why: "Match Base previews; unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11]}
+  probe_seeds: {value: 4, why: "Several seeds help compare checkpoints; unmeasured here.", confidence: GUESS, sources: []}
+steps:
+  epochs: 30
+  min: 1000
+  max: 3000
+  round_to: 50
+  why: "Fizgig's presets run 30 epochs and ai-toolkit 3000 steps; this is an unmeasured middle between them. Crop augmentation and the minimum can raise the number of passes."
+  confidence: GUESS
+  sources: [fizgig_zimage_2026_11, atk_zimage_2026_11]
+adjust:
+  - id: tiny_dataset
+    when: {images_max: 14}
+    set:
+      lora_rank: {value: 8, why: "A smaller adapter may overfit less on a very small set; Fizgig's fast preset is rank 8. Unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11]}
+      lora_alpha: {value: 8.0, why: "Alpha equal to rank.", confidence: GUESS, sources: []}
+    note: "A small dataset and the minimum step count can mean many passes; inspect early checkpoints."
+  - id: goal_quick
+    when: {goal: quick}
+    set:
+      resolutions: {value: [0.25], why: "Fizgig's fast preset trains at 0.25 MP; unmeasured here.", confidence: GUESS, sources: [fizgig_zimage_2026_11]}
+  - id: no_captions
+    when: {has_captions: false}
+    set:
+      caption_dropout: {value: 0.0, why: "There are few caption files to drop.", confidence: GUESS, sources: []}
+    note: "Write descriptive captions of the scene and what changes."
+evaluate:
+  strength: "Start at 1.0; compare the same strength across checkpoints."
+  sampler: "Compare on the checkpoint you trained: Base previews at 25 steps and CFG 4, Turbo at 8 and CFG 1. Samples render without the training adapter."
+  steps: "Base: 25 (ComfyUI's template; Tongyi's pipeline runs 28 to 50) as an unmeasured starting point. Turbo: 8."
+  cfg: "Base: 4 with a negative prompt as an unmeasured starting point. Turbo: 1."
+  notes:
+    - "A LoRA trained on Turbo with the adapter loads on plain Turbo; one trained on Base also loads on Turbo in ComfyUI, but that pairing has not been compared here."
+    - "Test a new prompt, a full-body shot and another person."
+flaws:
+  - symptom: out_of_memory
+    causes: ["Weights plus activations exceed the card; Fizgig's peaks (bf16 17.2 GB, int8 12.3 GB, 4-bit 10.1 GB at 1 MP, rank 16) are not measured on this port."]
+    fixes:
+      - set: {resolutions: {value: [0.25, 0.5]}}
+        why: "Smaller buckets cut activation memory; the effect on Z-Image has not been measured here."
+        confidence: GUESS
+        sources: [fizgig_zimage_2026_11]
+open_questions:
+  - "Which rank, learning rate, step budget and optimizer work best for Z-Image character LoRAs in RulZ AI Trainer? None has been measured here."
+  - "Does Fizgig's adapter gain (78.1 against 72.3 and 54.8 likeness) repeat on another set and on this port?"
+  - "Does a LoRA trained on Base work as well on Turbo as one trained on Turbo with the adapter?"
+  - "Actual training VRAM and speed on real weights, and the file names of the ComfyUI downloads, are unchecked here."
+sources:
+  hf_zimage_2026_11:
+    kind: official
+    where: "Hugging Face: Tongyi-MAI/Z-Image and Tongyi-MAI/Z-Image-Turbo (model cards, diffusers config), Comfy-Org/z_image and Comfy-Org/z_image_turbo (file lists)"
+    date: "2026-11"
+    people: null
+    url: https://huggingface.co/Tongyi-MAI/Z-Image
+    note: "Apache 2.0, not gated; S3-DiT 30 layers, dim 3840; Qwen3-4B text encoder; Comfy-Org split_files layout."
+  fizgig_zimage_2026_11:
+    kind: community
+    where: "Fizgig (shootthesound/Fizgig) Z-Image trainer: presets, memory table, Turbo training adapter and its A/B"
+    date: "2026-11"
+    people: 1
+    url: https://github.com/shootthesound/Fizgig
+    note: "Muon presets with EMA 0.98, rank 16 at 1e-4 to 2e-4 at 0.5 MP; fine-tune 5e-5 with Adafactor; adapter A/B on a 170-photo set: none 54.8, ostris v2 72.3, Fizgig 78.1; peaks bf16 17.2 / int8 12.3 / 4-bit 10.1 GB."
+  atk_zimage_2026_11:
+    kind: community
+    where: "ai-toolkit (ostris) Z-Image Turbo and Base examples and the ostris/zimage_turbo_training_adapter and De-Turbo repos"
+    date: "2026-11"
+    people: 1
+    url: https://github.com/ostris/ai-toolkit
+    note: "Rank/alpha 32, 1e-4 with AdamW8bit, 3000 steps, caption dropout 0.05, buckets 512/768/1024; Turbo adapter merged then inverted; De-Turbo needs no adapter."
+  onetrainer_zimage_2026_11:
+    kind: community
+    where: "OneTrainer Z-Image presets (Base and De-Turbo)"
+    date: "2026-11"
+    people: 1
+    url: https://github.com/Nerogar/OneTrainer
+    note: "LoRA 3e-4, rank 16, alpha 1, 512 px, AdamW; fine-tune 1e-5 with Adafactor; no Turbo adapter path. Read second-hand and not rechecked."

@@ -22,6 +22,8 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
   Klein ([details](#flux2-klein-9b)).
 - **FLUX.2 Klein 4B** (4B, Black Forest Labs, Apache 2.0, not gated): the 9B's loaders and LoRA format at 7.75 GB in
   bf16, with the Qwen3-4B text encoder; its own model entry ([details](#flux2-klein-4b)).
+- **Z-Image** (6.15B, Tongyi-MAI, Apache 2.0, not gated): LoRAs and full fine-tunes for Base and the 8-step Turbo, with
+  a training adapter for Turbo; 12 GB cards with block swap ([details](#z-image)).
 - **Ideogram 4** (9.3B): LoRAs on one 16 GB card from the fp8 release, structured JSON captions or wrapped plain
   ones; non-commercial license ([details](#ideogram-4)).
 - **MiniMax H3** (33B video + audio): experimental LoRAs for H3 video generation from pictures (one-frame, as
@@ -648,6 +650,7 @@ the file was there):
 | Qwen-Image 2.1 / Turbo | [Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1) | int8_convrot 7.3 GB, bf16 14.2 GB | Qwen3-VL-8B int8_convrot 9.4 GB, bf16 17.5 GB | `qwen_image_2.1_vae_bf16` |
 | FLUX.2 Klein 9B Base / distilled | BFL's [FLUX.2-klein-base-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9b-fp8) and [-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8) (gated); bf16 in FLUX.2-klein-base-9B and -9B | fp8 8.9 GB, bf16 16.9 GB (read up to bf16, then quantized for your GPU) | [Comfy-Org/Flux-2-Klein-9B](https://huggingface.co/Comfy-Org/Flux-2-Klein-9B) Qwen3-8B fp8 mixed 8.1 GB, bf16 15.3 GB | `flux2-vae` |
 | FLUX.2 Klein 4B Base / distilled | [Comfy-Org/Flux-2-Klein-4B](https://huggingface.co/Comfy-Org/Flux-2-Klein-4B) (Apache 2.0, not gated) | bf16 7.75 GB (the only format; quantized for your GPU on load) | Qwen3-4B bf16 8.0 GB (its fp4 file is not read) | `flux2-vae` (the 9B's) |
+| Z-Image Base / Turbo | [Comfy-Org/z_image](https://huggingface.co/Comfy-Org/z_image) (`z_image_bf16`) and [Comfy-Org/z_image_turbo](https://huggingface.co/Comfy-Org/z_image_turbo) (`z_image_turbo_bf16`), Apache 2.0, not gated | bf16 12.3 GB (quantized for your GPU on load) | Qwen3-4B bf16 8 GB (`qwen_3_4b`, from Comfy-Org/z_image_turbo) | `ae` (the FLUX.1 VAE, not the FLUX.2 one) |
 | FLUX 3 Klein Base / distilled | [black-forest-labs/flux-3-image-klein-comfy](https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy) (BFL's own, gated) | int8_convrot 5.8 GB, nvfp4 5.3 GB, bf16 11.1 GB (files; 5.1 / 4.8 / 9.7 GB loaded) | Qwen3-VL-4B int8_convrot 4.9 GB, bf16 8.9 GB | `flux2-vae` |
 | Ideogram 4 | [Comfy-Org/Ideogram-4](https://huggingface.co/Comfy-Org/Ideogram-4) | int8_convrot 9.6 GB, fp8_scaled 9.3 GB, nvfp4_mixed 5.5 GB (no bf16 release) | Qwen3-VL-8B: int8_convrot 9.4 GB and bf16 17.5 GB from Comfy-Org/Qwen-Image-2.1 (the same model), fp8_scaled 10.6 GB and nvfp4 6.3 GB from Comfy-Org/Ideogram-4 | `flux2-vae` |
 | MiniMax H3 FL2VA / Ref2VA | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) | pruned_int8_convrot 21.0 GB, pruned_bf16 40.2 GB, int8_convrot 34.0 GB, bf16 66.3 GB | Qwen3-VL-32B (50 layers) int8_convrot 27.1 GB, nvfp4_awq 15.7 GB, bf16 51.5 GB | `minimax_h3_video_vae_fp16` (5.2 GB) + `minimax_h3_audio_vae_fp32` (0.6 GB) |
@@ -3331,6 +3334,56 @@ the meta device, both entries refusing each other's files, the distilled-name ru
 from files and folders, downloads, caches, thresholds and the wizard text. **Not run yet: a training run on real 4B
 weights, the real Qwen3-4B encoder, and a trained LoRA in ComfyUI.**
 
+## Z-Image
+
+Z-Image (since 3.34.0) is one model entry (`zimage`, shown as Z-Image) for both of Tongyi-MAI's checkpoints: **Z-Image**
+([Tongyi-MAI/Z-Image](https://huggingface.co/Tongyi-MAI/Z-Image), Base, the one to train on and to fine-tune) and
+**Z-Image-Turbo** ([Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo), distilled to 8 steps).
+Both are Apache 2.0 and not gated. It is a 6.15B single-stream DiT with 30 main blocks (plus 2 noise-refiner and 2
+context-refiner blocks that stay in memory), the Qwen3-4B text encoder (its second-to-last hidden layer) and the FLUX.1
+VAE (16 channels; the FLUX.2 VAE, also called `ae.safetensors`, is refused). LoRAs and full fine-tunes are supported.
+
+- **Variant.** `zimage_variant` is `auto`, `base` or `turbo`. `auto` reads the model name: Turbo in it, and not De-Turbo
+  (ostris' un-distilled Turbo, which is trained as Base), means Turbo. The variant sets the training adapter, the sample
+  defaults and the fine-tune warning; the form shows the resolved value.
+- **Training adapter (Turbo only).** A distilled Turbo drifts when a LoRA trains on it bare, so Turbo trains with a frozen
+  adapter that is on for every step, off for samples and never saved (`training_adapter: auto`). The default is
+  [ShootTheSound/Fizgig-Z-Image-Turbo-Training-Adapter](https://huggingface.co/ShootTheSound/Fizgig-Z-Image-Turbo-Training-Adapter)
+  (Apache 2.0, about 70 MB, rank 16); ostris' v2 adapter
+  ([ostris/zimage_turbo_training_adapter](https://huggingface.co/ostris/zimage_turbo_training_adapter)) loads as a file.
+  Base gets none. Fizgig's A/B on a 170-photo character set (rank 16, 1e-4, 3000 steps, ArcFace likeness): no adapter
+  54.8, ostris v2 72.3, Fizgig's 78.1, ostris' with a glossier look. These are Fizgig's numbers, not RulZ AI Trainer's.
+- **Defaults.** Training noise is logit-normal with Z-Image's shift of 3 built into the reference timesteps, so
+  `timestep_shift` stays at 1 (the wizard and the review say so). The default LoRA targets are the Linears of the 30
+  blocks (`q`, `k`, `v`, `o`, `ffn_up_gate`, `ffn_down`); `modulation` and `embed` are extras and off. The wizard suggests
+  rank 16 with alpha 16, learning rate 1e-4 and 0.5 to 1 MP for a LoRA (Fizgig: rank 16, 1e-4 to 2e-4 at 0.5 MP;
+  ai-toolkit: rank 32, 1e-4; OneTrainer: 3e-4 with alpha 1), and for a full fine-tune 5e-5 with Adafactor (Fizgig: 1e-5
+  changed nothing, 1e-4 was strong). A fine-tune of Turbo loses its few-step behaviour and RulZ AI Trainer leaves the
+  adapter off for it (Fizgig keeps it on): fine-tune Base.
+- **Samples.** Turbo 8 steps at CFG 1; Base 25 steps at CFG 4 with a negative prompt (ComfyUI's template; Tongyi's own
+  pipeline uses shift 6 and 28 to 50 steps).
+- **Memory.** Fizgig's peaks for a rank-16 LoRA at 1 MP with gradient checkpointing and a preview included, on its own
+  code (not measured on this port): bf16 17.2 GB, int8 12.3 GB, 4-bit 10.1 GB. `transformer_quant: auto` follows them:
+  bf16 from 24 GB, int8 from 11 GB, else nvfp4; a 12 GB card needs int8 with block swap. A block is about 0.36 GB in
+  bf16 and 0.18 GB in int8; weights are 12.3 GB bf16 and about 6.2 GB int8, and the text encoder takes 8 GB in bf16
+  (it only runs to cache the captions).
+
+  | Quantization | Weights | Peak, rank 16, 1 MP (Fizgig) | Card |
+  |---|---|---|---|
+  | bf16 | 12.3 GB | 17.2 GB | 24 GB and up |
+  | int8 | 6.2 GB | 12.3 GB | 16 GB; 12 GB with block swap |
+  | 4-bit | about 3.6 GB | 10.1 GB | smaller cards (estimate) |
+- **Files.** The default `files` source takes Comfy-Org's `z_image_bf16.safetensors` (Base) or
+  `z_image_turbo_bf16.safetensors` (Turbo), `qwen_3_4b.safetensors` and `ae.safetensors`; the `hf` source reads the
+  Tongyi-MAI diffusers folders. A file with Omni or Edit parts (`siglip_embedder`) is refused.
+- **ComfyUI.** LoRAs are saved as `diffusion_model.layers.N.attention.to_q.lora_A.weight` and so on, with alpha, the layout
+  ComfyUI's Z-Image loader maps (the same as Fizgig and ai-toolkit write); the form's own file names are the ones Comfy-Org
+  lists, not yet confirmed against a download here.
+
+**Not run yet: a training run on real Z-Image weights, a GPU, the real Qwen3-4B encoder, the adapters, and a trained LoRA
+in ComfyUI.** The unit tests (CPU, tiny configs) cover the port against diffusers, the key layouts, the VAE scaling, the
+text encoding, the adapter, the LoRA keys and the form's recommendations.
+
 ## FLUX 3 Klein
 
 RulZ AI Trainer trains text-to-image LoRAs for Black Forest Labs' FLUX 3 Image Klein
@@ -4201,7 +4254,7 @@ same prompt and seed.
 
 Copy the trained `.safetensors` into `ComfyUI/models/loras/` and add a standard **Load LoRA** node after *Load
 Diffusion Model*. Current ComfyUI builds run MOSS-Image, Krea 2, Qwen-Image 2.1, FLUX 3 Klein, FLUX.2 Klein 9B,
-Ideogram 4, MiniMax H3, P-H3-Image and MiniMax-H3-Image natively, so no plugin is needed (SDXL LoRAs load in the
+Z-Image, Ideogram 4, MiniMax H3, P-H3-Image and MiniMax-H3-Image natively, so no plugin is needed (SDXL LoRAs load in the
 same node: see [SDXL](#sdxl)). Two exceptions:
 
 - **FIBO 2.0**: ComfyUI runs the model, but its LoRA loader does not map the diffusers layout RulZ AI Trainer saves FIBO

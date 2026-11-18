@@ -41,7 +41,8 @@ FAMILY_MODEL = {"moss_image": ("moss", "MOSSImageTransformer"), "fibo2": ("fibo"
                 "flux2_klein4b": ("flux2", "Flux2KleinTransformer", KLEIN_4B_CONFIG),
                 "ideogram4": ("ideogram4", "Ideogram4Transformer"), "minimax_h3": ("h3", "MiniMaxH3Transformer"),
                 "p_h3_image": ("h3", "MiniMaxH3Transformer"), "minimax_h3_image": ("h3", "MiniMaxH3Transformer"),
-                "pan2": ("pan2", "PAN2Transformer"), "sdxl": ("sdxl", "SdxlUNet")}
+                "pan2": ("pan2", "PAN2Transformer"), "sdxl": ("sdxl", "SdxlUNet"),
+                "zimage": ("zimage", "ZImageTransformer")}
 
 # Optimizer state per trainable fp32 parameter, in bytes, from the buffers each one keeps (trainer.build_optimizer):
 #   adamw      torch AdamW: exp_avg + exp_avg_sq in fp32                                                    8
