@@ -48,6 +48,21 @@ KEEL = ("keel", "keel_fb", "keel3", "keel3_fb")  # Keel and its face-and-body ve
 KEEL_FB = ("keel_fb", "keel3_fb")  # the face-and-body versions
 KEEL_ON_A3 = ("keel3", "keel3_fb")  # Keel on Automagic 3: no sensitivity balance, no vote setting, no max lr change
 KEEL_CONSENSUS_MODES = ("auto", "sign", "magnitude")
+
+
+def effective_optimizer(cfg):
+    """The optimizer and rate a run trains with, and why when that is not the one picked: isolation (DOP) trains an
+    Automagic or Keel pick with AdamW, as Fizgig 9.7.6 does, since DOP's pull-back every other step flips each
+    weight's update and Automagic reads that as overshooting, lowering its rate to the floor. AdamW takes the
+    learning rate when it is an AdamW-sized one (above 1e-6, at most 1e-3), else 2e-4."""
+    name, lr = cfg.optimizer.lower(), cfg.learning_rate
+    if cfg.isolation and float(getattr(cfg, "dop_weight", 0) or 0) > 0 and name in AUTOMAGIC:
+        lr = lr if 1e-6 < lr <= 1e-3 else 2e-4
+        return "adamw", lr, (f"Isolation with {name}: training with AdamW at {lr:g} instead, because DOP's "
+                             "every-other-step pull-back drives Automagic's rate to its floor")
+    return name, lr, None
+
+
 KEEL_BAND_LOGIT_RANGE = 4.0  # Keel's noise bands span logit(sigma) in [-range, range] (sigma 0.018 to 0.982)
 
 
@@ -690,6 +705,10 @@ class TrainConfig:
     min_bucket_side: int = 512
     max_bucket_side: int = 2048
     flip_augment: bool = False
+    # kohya style: a picture inside a sub-folder named "<N>_<name>" (10_portraits) trains N times per epoch, times its
+    # dataset's own repeats; the nearest such folder below the dataset's folder counts (the dataset folder itself never
+    # does). Not applied to the regularisation set
+    folder_repeats: bool = False
     # a video model (PAN 2, MiniMax H3): video files in the dataset train as clips of this many frames at the model's
     # 24 fps (snapped to what its VAE takes: PAN 2 4k + 1, H3 17n + 5); 1 = video files are skipped, pictures only
     train_frames: int = 1
@@ -702,6 +721,9 @@ class TrainConfig:
     trigger_word: str = ""
     caption_dropout: float = 0.05
     caption_dropout_keep_trigger: bool = True  # a dropped caption keeps the trigger word (else the empty prompt)
+    # every non-empty line of a .txt caption file is its own caption (the trigger word added to each); each time the
+    # picture trains one line is picked at random. Off: the file is one caption. A .json caption is always one
+    caption_lines: bool = False
     max_token_length: int = 1024  # SDXL: held at 77 (SDXL_TOKENS) by validate
     cache_dir: str = ""  # defaults to <dataset>/.rulz_cache per dataset (the run's own files: the first dataset's)
     recache: bool = False
@@ -1660,6 +1682,9 @@ class TrainConfig:
             if self.probe_every <= 0 or not (self.face_refs or self.body_refs):
                 raise ValueError("resolution_step_up needs likeness probes: set probe_every > 0 and face_refs "
                                  "and/or body_refs (the step-up decision is the probe likeness score)")
+        from .runplan import check_state_paths
+
+        check_state_paths(self, must_exist=False)  # last: a race's own "starts fresh" says more about its resume_state
 
     def family(self) -> str:
         """The model family this config trains, as the trainer will find it: model_arch when set, else the transformer
@@ -1808,7 +1833,7 @@ class TrainConfig:
         """Region maps (face cells, landmarks, the subject's cells) are needed by the region-weighted loss, the identity
         loss, attention localization, identity alignment and Keel's face-token gain."""
         return bool(self.region_weights or self.id_loss_weight > 0 or self.attn_localize or self.id_align
-                    or self.body_align or (self.optimizer.lower() in KEEL and self.keel_face_gain > 0)
+                    or self.body_align or (effective_optimizer(self)[0] in KEEL and self.keel_face_gain > 0)
                     or self.wants_part_maps() or self.race_prep_regions)
 
     def wants_parts(self) -> bool:
@@ -1854,7 +1879,8 @@ class TrainConfig:
         """Person masks in the region maps: the region-weighted loss's person weight, attention localization's
         subject, body alignment, the face-and-body Keel's token gain (its body share)."""
         return bool(self.region_weights or self.attn_localize or self.body_align
-                    or (self.optimizer.lower() in KEEL_FB and self.keel_face_gain > 0 and self.keel_body_weight > 0))
+                    or (effective_optimizer(self)[0] in KEEL_FB and self.keel_face_gain > 0
+                        and self.keel_body_weight > 0))
 
     def resolved_cache_dir(self) -> Path:
         """The run's cache (text embeddings, face analysis, loss-watch exclusions): cache_dir, else the first

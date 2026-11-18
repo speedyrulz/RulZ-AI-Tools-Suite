@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import random
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -17,7 +18,8 @@ from safetensors.torch import load_file
 from .archs import get_arch
 from .atomic import save_safetensors
 from .config import VIDEO_EXTS, TrainConfig
-from .pictures import file_has_alpha, has_alpha, to_rgb
+from .caption_text import read_caption_text
+from .pictures import file_colour_tag, file_has_alpha, has_alpha, to_rgb
 
 log = logging.getLogger("rulztrainer")
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
@@ -60,6 +62,15 @@ class Item:
     frames: int = 1  # above 1: a video clip of that many frames (category "clip", `image` is the video file)
     latent_frames: int = 1  # its latent frames (the VAE packs several frames into one)
     reg: bool = False  # a picture of the regularisation dataset (scan_reg): trains whole and plain at reg_weight
+    repeat_mult: int = 1  # the part of `repeats` that comes from its "<N>_<name>" folder (folder_repeats)
+    # caption_lines: the picture's other caption lines (`caption` / `text_path` are the first); each time it trains one
+    # of all of them is picked at random
+    alt_captions: list = field(default_factory=list)
+    alt_text_paths: list = field(default_factory=list)
+
+    def all_text_paths(self) -> set[str]:
+        """Every cached text this picture can train on (caption dropout's aside)."""
+        return {str(self.text_path), *(str(p) for p in self.alt_text_paths)}
 
     @property
     def tokens(self) -> int:
@@ -140,15 +151,18 @@ def upright_size(path: Path) -> tuple[int, int]:
     return upright_header(path)[:2]
 
 
-def latent_key(path: Path, transparent: bool | None = None) -> str:
-    """What a picture's cached latents are named after: the file (path, date, size), and for a picture with
-    transparency the white it is laid on, so latents cached before that (on the colour under its transparent pixels)
-    are encoded again once."""
+def latent_key(path: Path, transparent: bool | None = None, colour: str | None = None) -> str:
+    """What a picture's cached latents are named after: the file (path, date, size), for a picture with transparency
+    the white it is laid on, and for one that is converted to sRGB (another colour profile) or scaled down from 16-bit
+    grey that conversion (colour_tag), so latents cached before that are encoded again once. Every other picture keeps
+    its old name, and its latents."""
     from .regions import _file_key
 
     if transparent is None:
         transparent = file_has_alpha(path)
-    return _file_key(path) + ("|on-white" if transparent else "")
+    if colour is None:
+        colour = file_colour_tag(path)
+    return _file_key(path) + ("|on-white" if transparent else "") + colour
 
 
 def load_image_fit(path: Path, w: int, h: int, src_box=None) -> Image.Image:
@@ -165,10 +179,49 @@ def read_caption(image: Path, cfg: TrainConfig, trigger: str | None = None) -> s
     belongs."""
     arch = get_arch(cfg)
     cap = arch.caption_file(image, cfg)
-    text = cap.read_text(encoding="utf-8").strip() if cap.is_file() else ""
+    text = read_caption_text(cap).strip() if cap.is_file() else ""
     if cap.suffix.lower() == ".json" and text:
         text = arch.clean_prompt(text)
     return arch.add_trigger(text, cfg.trigger_word if trigger is None else trigger)
+
+
+def read_captions(image: Path, cfg: TrainConfig, trigger: str | None = None) -> list[str]:
+    """The picture's captions, each with the trigger word: one (read_caption) unless caption_lines is on and the
+    caption is a plain-text file, then one per non-empty line (the same line twice counts once). A file with no
+    line in it is the one empty caption, as without the setting."""
+    first = read_caption(image, cfg, trigger)
+    if not cfg.caption_lines:
+        return [first]
+    arch = get_arch(cfg)
+    cap = arch.caption_file(image, cfg)
+    if not cap.is_file() or cap.suffix.lower() == ".json":
+        return [first]
+    trig = cfg.trigger_word if trigger is None else trigger
+    out: list[str] = []
+    for line in read_caption_text(cap).splitlines():
+        line = line.strip()
+        if line:
+            c = arch.add_trigger(line, trig)
+            if c not in out:
+                out.append(c)
+    return out or [first]
+
+
+FOLDER_REPEATS_RE = re.compile(r"^(\d+)_.+")
+
+
+def folder_repeat_of(path: Path, root: Path) -> tuple[int, str]:
+    """(N, the folder's path below `root`) for the nearest folder named "<N>_<name>" (N a whole number from 1) between
+    `root` and the file: kohya's repeats. `root` itself never counts. (1, "") when there is none."""
+    try:
+        parts = path.relative_to(root).parts[:-1]
+    except ValueError:
+        return 1, ""
+    for i in range(len(parts) - 1, -1, -1):
+        m = FOLDER_REPEATS_RE.match(parts[i])
+        if m and int(m.group(1)) >= 1:
+            return int(m.group(1)), "/".join(parts[:i + 1])
+    return 1, ""
 
 
 def _hash(s: str) -> str:
@@ -203,11 +256,16 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
         sides = cfg.dataset_sides(spec)
         n_images = 0
         n_skipped_videos = 0
+        folders: dict[str, list[int]] = {}  # folder_repeats: folder -> [its N, pictures]
         for p in sorted(root.rglob("*")):
+            mult, folder = folder_repeat_of(p, root) if cfg.folder_repeats else (1, "")
             if p.suffix.lower() in VIDEO_EXTS and not skipped(p, root):
                 if clip_frames > 1:
                     clip = _clip_item(p, cfg, spec, root, cache, tag, clip_frames, arch)
                     if clip is not None:
+                        clip.repeats, clip.repeat_mult = spec.repeats * mult, mult
+                        if folder:
+                            folders.setdefault(folder, [mult, 0])[1] += 1
                         items.append(clip)
                         n_images += 1
                 else:
@@ -221,14 +279,18 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
                 log.warning("Skipping unreadable image %s: %s", p, e)
                 continue
             n_images += 1
-            caption = read_caption(p, cfg, spec.trigger or cfg.trigger_word)
+            colour = file_colour_tag(p)
+            captions = read_captions(p, cfg, spec.trigger or cfg.trigger_word)
+            caption, alts = captions[0], captions[1:]
+            if folder:
+                folders.setdefault(folder, [mult, 0])[1] += 1
             seen: set[tuple[int, int]] = set()
             for side in sides:
                 bw, bh = bucket_size(w, h, cfg, side)
                 if (bw, bh) in seen:  # two resolutions clamped to the same bucket: keep one copy
                     continue
                 seen.add((bw, bh))
-                stem = _hash(latent_key(p, transparent)) + f"_{bw}x{bh}"
+                stem = _hash(latent_key(p, transparent, colour)) + f"_{bw}x{bh}"
                 items.append(Item(
                     image=p, caption=caption, width=bw, height=bh,
                     latent_path=cache / "latents" / f"{stem}{tag}.safetensors",
@@ -236,8 +298,13 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
                                       else None),
                     text_path=text_cache_path(cfg, caption),
                     region_path=cache / "regions" / f"{stem}_regions.safetensors",
-                    side=side, repeats=spec.repeats, dataset=str(root),
+                    side=side, repeats=spec.repeats * mult, dataset=str(root), repeat_mult=mult,
+                    alt_captions=alts, alt_text_paths=[text_cache_path(cfg, c) for c in alts],
                 ))
+        for folder, (n, count) in sorted(folders.items()):
+            log.info("Dataset %s: folder %s: %d picture%s, %d repeat%s per epoch (from its name%s)", root, folder,
+                     count, "" if count == 1 else "s", n * spec.repeats, "" if n * spec.repeats == 1 else "s",
+                     f" x the dataset's {spec.repeats}" if spec.repeats != 1 else "")
         if n_skipped_videos:
             log.info("Dataset %s: %d video file(s) left out: %s", root, n_skipped_videos,
                      "set train_frames above 1 to train them as clips" if getattr(arch, "supports_video", False)
@@ -311,7 +378,7 @@ def scan_reg(cfg: TrainConfig) -> list[Item]:
             log.warning("Skipping unreadable regularisation image %s: %s", p, e)
             continue
         cap_file = arch.caption_file(p, cfg)  # the file itself: a family with JSON captions wraps an empty one
-        raw = cap_file.read_text(encoding="utf-8").strip() if cap_file.is_file() else ""
+        raw = read_caption_text(cap_file).strip() if cap_file.is_file() else ""
         if raw and cap_file.suffix.lower() == ".json":
             try:
                 raw = raw if json.loads(raw) else ""  # {} or [] describes nothing
@@ -321,6 +388,7 @@ def scan_reg(cfg: TrainConfig) -> list[Item]:
             uncaptioned.append(p)
             continue
         caption = read_caption(p, cfg, "")
+        colour = file_colour_tag(p)
         n_images += 1
         if any(t in caption.lower() for t in triggers):
             triggered.append(p)
@@ -330,7 +398,7 @@ def scan_reg(cfg: TrainConfig) -> list[Item]:
             if (bw, bh) in seen:
                 continue
             seen.add((bw, bh))
-            stem = _hash(latent_key(p, transparent)) + f"_{bw}x{bh}"
+            stem = _hash(latent_key(p, transparent, colour)) + f"_{bw}x{bh}"
             items.append(Item(
                 image=p, caption=caption, width=bw, height=bh,
                 latent_path=cache / "latents" / f"{stem}{tag}.safetensors",
@@ -451,6 +519,11 @@ def augment_items(items: list[Item], cfg: TrainConfig, analysis: dict[str, dict]
                 continue
             bw, bh = bucket_size(box[2] - box[0], box[3] - box[1], cfg, it.side or None)
             caption = crop_caption(template, it.caption, cfg)
+            alts = []  # caption_lines: the picture's other lines, each in the crop's template
+            for c in getattr(it, "alt_captions", None) or []:
+                c = crop_caption(template, c, cfg)
+                if c != caption and c not in alts:
+                    alts.append(c)
             stem = _hash(f"{latent_key(it.image)}|crop{box[0]},{box[1]},{box[2]},{box[3]}") + f"_{bw}x{bh}"
             tag = get_arch(cfg).latent_tag
             cache = it.latent_path.parent.parent  # the source image's dataset cache
@@ -461,7 +534,8 @@ def augment_items(items: list[Item], cfg: TrainConfig, analysis: dict[str, dict]
                 text_path=text_cache_path(cfg, caption),
                 src_box=box, category=category,
                 region_path=cache / "regions" / f"{stem}_regions.safetensors",
-                side=it.side, repeats=it.repeats, dataset=it.dataset,
+                side=it.side, repeats=it.repeats, dataset=it.dataset, repeat_mult=it.repeat_mult,
+                alt_captions=alts, alt_text_paths=[text_cache_path(cfg, c) for c in alts],
             ))
             added[category] += 1
     log.info("Crop augmentation: +%d face crops, +%d bust crops (%d items total)", added["face_crop"],
@@ -584,6 +658,8 @@ def text_jobs(items: list[Item], cfg: TrainConfig, extra_prompts: list[str] | No
     jobs: dict[Path, str] = {}
     for it in items:
         jobs.setdefault(it.text_path, it.caption)
+        for c, tp in zip(it.alt_captions, it.alt_text_paths):  # caption_lines: its other lines
+            jobs.setdefault(tp, c)
         if it.dop_text_path is not None and it.dop_caption is not None:  # LoRA Isolation's trigger-free captions
             jobs.setdefault(it.dop_text_path, it.dop_caption)
     jobs.setdefault(dropout_text_path(cfg), dropout_prompt(cfg))
@@ -827,6 +903,9 @@ def load_batch(batch: list[Item], cfg: TrainConfig, rng: random.Random):
         # (caption_dropout_keep_trigger), which would teach the trigger that picture
         drop = cfg.caption_dropout > 0 and not it.reg and rng.random() < cfg.caption_dropout
         tp = empty if drop else it.text_path
+        alts = getattr(it, "alt_text_paths", None)
+        if alts and not drop:  # caption_lines: one of the picture's lines, drawn from the run's generator
+            tp = rng.choice([it.text_path, *alts])
         rows.append(load_file(str(tp))["embeds"])
         paths.append(tp)
         if want_regions:

@@ -28,7 +28,7 @@ from . import profiling
 from . import race as race_mod
 from .ema import LoraEMA
 from . import quant as Q
-from .config import AUTOMAGIC, KEEL, KEEL_FB, KEEL_ON_A3, MUON_EDGE_TARGETS, TrainConfig, keel_band_weights, keel_consensus_mode
+from .config import AUTOMAGIC, KEEL, KEEL_FB, KEEL_ON_A3, MUON_EDGE_TARGETS, TrainConfig, effective_optimizer, keel_band_weights, keel_consensus_mode
 from .config import side_to_mp
 from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, dropout_text_path,
                       items_for_side, load_batch,
@@ -254,7 +254,7 @@ def _longest_text_path(items, pad_embeds) -> Path:
             shape = f.get_slice("embeds").get_shape()
         return pad_embeds([torch.empty(shape, device="meta")])[1].shape[1]
 
-    return max({it.text_path for it in items}, key=length)
+    return max({it.text_path for it in items} | {p for it in items for p in getattr(it, "alt_text_paths", [])}, key=length)
 
 
 def load_text_embeds(cfg: TrainConfig, prompt: str) -> torch.Tensor:
@@ -434,7 +434,7 @@ def sample_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, logit_shift: f
 
 def pairs_sigma(cfg: TrainConfig) -> bool:
     """Whether a step's micro-batches share one sigma (Keel's keel_pair_sigma)."""
-    return cfg.optimizer.lower() in KEEL and bool(cfg.keel_pair_sigma)
+    return effective_optimizer(cfg)[0] in KEEL and bool(cfg.keel_pair_sigma)
 
 
 def draw_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, shift: float, tokens: int, arch,
@@ -498,9 +498,9 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None, ref_norms=None, scales
     """`params` may be a list of tensors or a list of param-group dicts (LoRA+). `pairs`: the (lora_down, lora_up)
     pairs among them (lora.lora_pairs), which Keel preconditions; the other optimizers ignore them. `ref_norms` and
     `scales`: each pair's frozen-weight norm and alpha / rank, for Hull."""
-    name = cfg.optimizer.lower()
+    name, lr, _ = effective_optimizer(cfg)
     if name == "adamw":
-        return torch.optim.AdamW(params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay, betas=(0.9, 0.99))
+        return torch.optim.AdamW(params, lr=lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.99))
     if name == "adamw8bit":
         import bitsandbytes as bnb
 
@@ -619,10 +619,38 @@ def current_lr(optimizer, scheduler) -> float:
     return float(scheduler.get_last_lr()[0])
 
 
+BRAKE_EVERY = 20  # steps between reads of Automagic 4's brake (one GPU sync per param group)
+BRAKE_DETAIL_EVERY = 100  # steps between the log line with each group's working rate and reference
+
+
+def brake_stats(optimizer):
+    """Automagic 4's (and Keel's) working rate and braked share (Automagic4.brake_stats), None for any other
+    optimizer or on a failed read (a log line must not stop a run)."""
+    fn = getattr(optimizer, "brake_stats", None)
+    if fn is None:
+        return None
+    try:
+        return fn()
+    except Exception:
+        return None
+
+
+def brake_detail(stats: dict, names=None) -> str:
+    """"rate 2.50e-04 x mean brake 0.93, 18% of weights braked" plus each param group's working rate and reference."""
+    s = (f"rate {stats['lr']:.2e} x mean brake {stats['mean_balance']:.2f}, "
+         f"{100 * stats['braked_share']:.0f}% of weights braked (working rate {stats['lr_working']:.2e})")
+    parts = []
+    for i, g in enumerate(stats.get("groups", [])):
+        name = names[i] if names and i < len(names) and names[i] else i
+        ref = f", reference {g['reference']:.2e}" if g.get("reference") is not None else ""
+        parts.append(f"{name} {g['lr_working']:.2e}{ref}")
+    return s + ("; groups: " + "; ".join(parts) if len(parts) > 1 else "")
+
+
 def build_scheduler(cfg: TrainConfig, optimizer, offset: int = 0):
     """offset: the run's step this optimizer starts at (a fine-tune rebuilds its optimizer every window)."""
     warm = max(0, cfg.warmup_steps)
-    if cfg.optimizer.lower() in AUTOMAGIC:  # self-tuning lr: no warmup/decay from outside
+    if effective_optimizer(cfg)[0] in AUTOMAGIC:  # self-tuning lr: no warmup/decay from outside
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
 
     def fn(step):
@@ -1038,6 +1066,7 @@ class Trainer(RaceParallelMixin):
             not it.latent_path.exists() or (it.latent_flip_path and not it.latent_flip_path.exists()) for it in items)
         need_text = cfg.recache or not dropout_text_path(cfg).exists() or any(
             not it.text_path.exists() or (it.dop_text_path is not None and not it.dop_text_path.exists())
+            or any(not p.exists() for p in it.alt_text_paths)  # caption_lines: its other lines
             for it in items) or any(
             not text_cache_path(cfg, p).exists() for p in prompts)
         devices = self.side_devices()
@@ -1227,6 +1256,16 @@ class Trainer(RaceParallelMixin):
     def _run(self):
         cfg = self.cfg
         cfg.validate()
+        from .runplan import check_state_paths
+
+        check_state_paths(cfg)  # (validate() lets a state not written yet pass: a queued run waits for it)
+        rows = race_mod.variant_configs(cfg) if cfg.race else [("", cfg, {})]
+        for row_name, row_cfg, _ in rows:
+            name, lr, reason = effective_optimizer(row_cfg)
+            if reason:
+                log.warning("%s%s", f"{row_name}: " if row_name else "", reason)
+        if not cfg.race:
+            self.status.update(optimizer=effective_optimizer(cfg)[0])
         torch.manual_seed(cfg.seed)
         rng = random.Random(cfg.seed)
         gen = torch.Generator("cpu").manual_seed(cfg.seed)
@@ -1485,7 +1524,7 @@ class Trainer(RaceParallelMixin):
             log.warning("block_swap_compile is experimental and untested: each block's forward is compiled, the swap "
                         "hooks run outside it. Check the compile report for recompiles and the step time against a "
                         "run without it")
-        if do_compile and any(c.optimizer.lower() in KEEL and c.keel_face_gain > 0 for c in
+        if do_compile and any(effective_optimizer(c)[0] in KEEL and c.keel_face_gain > 0 for c in
                               ([r[1] for r in self.race_rows] if self.race_rows is not None else [cfg])):
             do_compile, why = False, "Keel's face-token gain hooks the LoRA layers' outputs (keel_face_gain)"
         if do_compile and any(c.wants_parts() for c in
@@ -1706,7 +1745,7 @@ class Trainer(RaceParallelMixin):
                     self.region_watch.observe(
                         [batch[i].key for i in own], [sig_cpu[i] for i in own],
                         *([row[i] for i in own] for row in region_obs),
-                        skip=[str(batch[i].text_path) != regions.text_paths[i] for i in own])
+                        skip=[regions.text_paths[i] not in batch[i].all_text_paths() for i in own])
             if any(it.loss_scale != 1.0 for it in batch):  # LoRA Isolation's side-by-side pairs, self-training's
                 # pictures, the regularisation dataset's (reg_weight)
                 weights = weights * torch.tensor([it.loss_scale for it in batch], device=weights.device,
@@ -1953,13 +1992,20 @@ class Trainer(RaceParallelMixin):
             total_steps = self.race.estimate["total"] if self.race is not None else cfg.steps - start_step
             eta = elapsed / done_steps * max(0, total_steps - compute_done)
             lr_now = current_lr(optimizer, scheduler)
-            if cfg.optimizer.lower() in AUTOMAGIC and not self._lr_floor_warned:
+            if effective_optimizer(cfg)[0] in AUTOMAGIC and not self._lr_floor_warned:
                 self._lr_floor_steps = self._lr_floor_steps + 1 if lr_at_floor(optimizer, lr_now) else 0
                 if self._lr_floor_steps >= LR_FLOOR_WARN_STEPS:
                     self._lr_floor_warned = True
                     log.warning("%s's adapted lr has sat on its floor (%.3g) for %d steps: learning may have "
                                 "stalled. Check the samples; raise automagic_min_lr or switch to adamw if it has",
                                 cfg.optimizer, lr_now, LR_FLOOR_WARN_STEPS)
+            if (step % BRAKE_EVERY == 0 or compute_done == 1 or getattr(self, "_brake", None) is None
+                    or getattr(self, "_brake_of", None) is not optimizer):  # (a race or fine-tune window: new one)
+                self._brake, self._brake_of = brake_stats(optimizer), optimizer  # (the floor check above stays on the raw rate)
+                if self._brake is not None and step % BRAKE_DETAIL_EVERY == 0:
+                    log.info("Automagic 4 brake at step %d: %s", step,
+                             brake_detail(self._brake, [g.get("name") for g in optimizer.param_groups]))
+            brake = self._brake if hasattr(optimizer, "brake_stats") else None  # (a race may switch optimizers)
             id_extra = {}
             if step_id:
                 n_id = sum(r[1] for r in step_id)
@@ -1992,13 +2038,23 @@ class Trainer(RaceParallelMixin):
                 self.align_values["pairs"].clear()
                 last = step_times[-5:]
                 who = f"[{self.race.active.name}] " if self._race_running() else ""
-                log.info("%sstep %d/%d loss %.4f avg %.4f lr %.2e grad %s %.1fs/it (last %d steps %.2fs each)%s", who,
-                         step, cfg.steps, accum_loss, avg, lr_now, format_grad_norm(grad_norm, cfg.clip_norm),
+                if brake is not None:
+                    lr_s = f"{lr_now:.2e} (working {brake['lr_working']:.2e}, {100 * brake['braked_share']:.0f}% braked)"
+                else:
+                    lr_s = f"{lr_now:.2e}"
+                log.info("%sstep %d/%d loss %.4f avg %.4f lr %s grad %s %.1fs/it (last %d steps %.2fs each)%s", who,
+                         step, cfg.steps, accum_loss, avg, lr_s, format_grad_norm(grad_norm, cfg.clip_norm),
                          elapsed / done_steps, len(last), sum(last) / len(last), id_s)
             peak = {str(d): round(torch.cuda.max_memory_allocated(torch.device(d)) / 1e9, 2) for d in self.devices
                     if str(d).startswith("cuda")} if torch.cuda.is_available() else {}
             if self.race is not None:  # progress over every configuration's steps; the race table separately
                 id_extra = {**id_extra, "race": self._race_status(), "race_step": step}
+            if brake is not None:  # Automagic 4 / Keel: lr is the raw group rate, these are what the weights moved by
+                id_extra = {**id_extra, "lr_working": brake["lr_working"], "braked_share": brake["braked_share"],
+                            "mean_brake": brake["mean_balance"], "brake_reference": brake["reference"]}
+            elif self.status.data.get("lr_working") is not None:  # (status merges: clear an earlier optimizer's)
+                id_extra = {**id_extra, "lr_working": None, "braked_share": None, "mean_brake": None,
+                            "brake_reference": None}
             self.status.update(step=compute_done if self.race is not None else step,
                                total=self.race.estimate["total"] if self.race is not None else cfg.steps,
                                loss=accum_loss, avg_loss=avg, elapsed=elapsed, eta=eta, lr=lr_now,
@@ -2361,7 +2417,7 @@ class Trainer(RaceParallelMixin):
                 "torch_gen": gen.get_state(), "py_rng": rng.getstate(), "torch_rng": torch.get_rng_state(),
                 "ts_strata": getattr(self, "ts_strata", None) and self.ts_strata.state_dict(),
                 "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-                "config": self.cfg.to_dict(),
+                "config": self.cfg.to_dict(), "effective_optimizer": effective_optimizer(self.cfg)[0],
                 "ema": self.ema.state_dict() if self.ema is not None else None,  # lora.safetensors: the raw weights
                 "dp_counts": self.balancer.counts if self.balancer is not None else None,
                 "controller": controller.resume_state() if controller is not None else None,
@@ -2470,15 +2526,29 @@ class Trainer(RaceParallelMixin):
         if n != len(injected):
             raise ValueError(f"State has {n} LoRA modules but the model has {len(injected)}; same rank/targets?")
         st = torch.load(state_dir / "train_state.pt", map_location="cpu", weights_only=False)
+        # the optimizer the state holds (an isolation run's AdamW, effective_optimizer; older states: the one named)
+        saved_opt = str(st.get("effective_optimizer")
+                        or (st.get("config") or {}).get("optimizer", "") or "").lower()
+        now_opt = effective_optimizer(self.cfg)[0]
+        if saved_opt in AUTOMAGIC and effective_optimizer(self.cfg)[2]:
+            log.warning("Training state was saved with %s before isolation runs trained with AdamW: its LoRA "
+                        "weights carry on, AdamW and its schedule start fresh at step %d", saved_opt,
+                        int(st["step"]))
+            sched = scheduler.state_dict()
+            sched["last_epoch"], sched["_step_count"] = int(st["step"]), int(st["step"]) + 1  # on the run's step
+            st = {**st, "optimizer": optimizer.state_dict(), "scheduler": sched}
+            saved_opt = now_opt  # (nothing of the old optimizer is loaded below)
+            fresh_at = int(st["step"])
+        else:
+            fresh_at = None
         saved_groups = len(st["optimizer"].get("param_groups", []))
         if saved_groups and saved_groups != len(optimizer.param_groups):
             saved_cfg = st.get("config", {})
             raise ValueError(f"Training state was saved with lora_plus_ratio={saved_cfg.get('lora_plus_ratio', 0)} "
                              f"and automagic_groups={saved_cfg.get('automagic_groups', 'single')} ({saved_groups} "
                              f"param groups); set the same values to resume")
-        saved_opt = str((st.get("config") or {}).get("optimizer", "") or "").lower()
-        if saved_opt and saved_opt != self.cfg.optimizer.lower():
-            if saved_opt in AUTOMAGIC and self.cfg.optimizer.lower() in AUTOMAGIC:
+        if saved_opt and saved_opt != now_opt:
+            if saved_opt in AUTOMAGIC and now_opt in AUTOMAGIC:
                 log.info("Training state was saved with %s; continuing with %s (the adapted lr and sign history carry "
                          "over%s)", saved_opt, self.cfg.optimizer,
                          "; the sensitivity reference is measured on the first step"
@@ -2490,6 +2560,9 @@ class Trainer(RaceParallelMixin):
                                  f"4 and Keel states convert into each other)")
         optimizer.load_state_dict(st["optimizer"])
         scheduler.load_state_dict(st["scheduler"])
+        if fresh_at is not None and getattr(scheduler, "lr_lambdas", None):  # the schedule's rate at that step
+            for g, base, fn in zip(optimizer.param_groups, scheduler.base_lrs, scheduler.lr_lambdas):
+                g["lr"] = base * fn(fresh_at)
         gen.set_state(st["torch_gen"])
         if getattr(self, "ts_strata", None) is not None:  # (a state saved without buckets: a fresh deck)
             self.ts_strata.load_state_dict(st.get("ts_strata"))
@@ -3144,15 +3217,16 @@ class Trainer(RaceParallelMixin):
         return f"{self.race.active.name}_" if self._race_running() else ""
 
     def _make_optimizer(self, cfg, injected):
-        if cfg.optimizer.lower() in AUTOMAGIC and cfg.automagic_groups == "by_type":
+        name, lr, _ = effective_optimizer(cfg)
+        if name in AUTOMAGIC and cfg.automagic_groups == "by_type":
             groups = lora_mod.lora_param_groups_by(injected, cfg.learning_rate, self.arch.param_group_of)
             log.info("%s: an adaptive lr per layer type (%s)", cfg.optimizer, ", ".join(
                 f"{g['name']} {sum(p.numel() for p in g['params']) / 1e6:.1f}M" for g in groups))
         else:
-            oft_scaled = bool(cfg.oft_scaled_lr) and cfg.optimizer.lower() not in AUTOMAGIC + ("hull",)
+            oft_scaled = bool(cfg.oft_scaled_lr) and name not in AUTOMAGIC + ("hull",)
             if cfg.oft_scaled_lr and not oft_scaled and cfg.network_type == "oft":
                 log.warning("oft_scaled_lr is ignored with %s (it sets its own step sizes)", cfg.optimizer)
-            groups = lora_mod.lora_param_groups(injected, cfg.learning_rate, cfg.lora_plus_ratio, oft_scaled=oft_scaled)
+            groups = lora_mod.lora_param_groups(injected, lr, cfg.lora_plus_ratio, oft_scaled=oft_scaled)
             named = {g["name"]: g for g in groups}
             if "lora_up" in named:
                 log.info("LoRA+: lora_up lr = %.2e (x%g), lora_down lr = %.2e", named["lora_up"]["lr"],
@@ -3449,7 +3523,7 @@ class Trainer(RaceParallelMixin):
             return None
         from .losswatch import LossWatch
 
-        if cfg.per_image_lr and cfg.optimizer.lower() in AUTOMAGIC:
+        if cfg.per_image_lr and effective_optimizer(cfg)[0] in AUTOMAGIC:
             log.warning("per_image_lr is not supported with %s (its step normalisation absorbs the scaling); "
                         "the loss watch will only observe", cfg.optimizer)
             cfg.per_image_lr = False
@@ -3699,12 +3773,18 @@ class Trainer(RaceParallelMixin):
         for it in items:
             it.caption = iso.fuse(it.caption, rules)
             it.text_path = text_cache_path(cfg, it.caption)
+            if it.alt_captions:  # caption_lines: every line is fused (its DOP caption comes from the first line)
+                it.alt_captions = [iso.fuse(c, rules) for c in it.alt_captions]
+                it.alt_text_paths = [text_cache_path(cfg, c) for c in it.alt_captions]
         if cfg.isolation_balance and len(by_ds) > 1:
             counts = {d: len({it.image for it in items if it.dataset == d and it.category == "image"}) for d in by_ds}
-            reps = iso.balance_repeats(counts, {d: spec.repeats for d, (_, spec) in by_ds.items()})
+            # each picture weighed by its folder's repeats (folder_repeats), which stay on top of the balance
+            weights = {d: sum({it.image: it.repeat_mult for it in items
+                               if it.dataset == d and it.category == "image"}.values()) for d in by_ds}
+            reps = iso.balance_repeats(weights, {d: spec.repeats for d, (_, spec) in by_ds.items()})
             for it in items:
                 if it.dataset in reps:
-                    it.repeats = reps[it.dataset]
+                    it.repeats = reps[it.dataset] * it.repeat_mult  # (folder_repeats keeps its folder's share)
             log.info("LoRA Isolation: subjects balanced: %s", ", ".join(
                 f"{by_ds[d][0].fused} {counts[d]} images x{r}" for d, r in reps.items()))
         n_pairs = 0
@@ -3718,7 +3798,7 @@ class Trainer(RaceParallelMixin):
             cache = cfg.dataset_cache_dir(Path(d))
             pairs = iso.build_pairs(s, photos, cache / "isolation" / s.fused, people, cfg.isolation_pairs, cfg.seed,
                                     getattr(self, "face_analysis", None))
-            reps = next((it.repeats for it in items if it.dataset == d), spec.repeats)
+            reps = next((it.repeats // max(1, it.repeat_mult) for it in items if it.dataset == d), spec.repeats)
             tag = get_arch(cfg).latent_tag
             for png, caption in pairs:
                 caption = iso.fuse(caption, rules)
@@ -3823,7 +3903,7 @@ class Trainer(RaceParallelMixin):
         cs = shares.get(id(cfg))
         if cs is None:
             cs = shares[id(cfg)] = CleanShare(cfg, self.arch, log)
-            if cfg.optimizer.lower() in AUTOMAGIC:  # (as per_image_lr: its own per-parameter lr ignores group["lr"])
+            if effective_optimizer(cfg)[0] in AUTOMAGIC:  # (as per_image_lr: its own per-parameter lr ignores group["lr"])
                 log.warning("clean_share with %s: its lower-share epochs train at the full learning rate, not half "
                             "(the optimizer sets its own per-parameter rate); the shares of steps still apply",
                             cfg.optimizer)
@@ -3942,7 +4022,7 @@ class Trainer(RaceParallelMixin):
         rows = [r[1] for r in self.race_rows] if self.race_rows is not None else [cfg]
         attn, align = any(c.attn_localize for c in rows), any(c.id_align or c.body_align for c in rows)
         if not (attn or align):
-            if (any((c.optimizer.lower() in KEEL and c.keel_face_gain > 0) or c.wants_parts() for c in rows)
+            if (any((effective_optimizer(c)[0] in KEEL and c.keel_face_gain > 0) or c.wants_parts() for c in rows)
                     and self.ft is None and not self.race_parallel):
                 for m, _, _ in self.replicas:
                     m._rz_taps = A.Taps()  # the token layout alone, for Keel's face tap and Hull's region gains
@@ -4177,6 +4257,8 @@ class Trainer(RaceParallelMixin):
         cfg = self.cfg
         triggers = self._trigger_words(rows)
         captions = {str(text_cache_path(cfg, it.caption)): it.caption for it in items}
+        for it in items:  # caption_lines: every line of a picture
+            captions.update({str(p): c for c, p in zip(it.alt_captions, it.alt_text_paths)})
         for c in rows:
             captions[str(text_cache_path(c, dropout_prompt(c)))] = dropout_prompt(c)
         tok = self.arch.get_tokenizer(cfg, self.model_dir)
