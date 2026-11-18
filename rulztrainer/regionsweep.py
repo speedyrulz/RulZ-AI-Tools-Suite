@@ -101,8 +101,9 @@ class RegionSweep:
         self.failed = False
         self.late = False  # the first sweep was of an already trained model (a resume without a saved state)
         self.history: list[dict] = []
-        self.best: tuple[float, int] | None = None  # the held-out subject score's best and its step
-        self.since_best = 0  # sweeps since then
+        self.best: tuple[float, int] | None = None  # the held-out subject score's highest and its step
+        self.mark: float | None = None  # the held-out subject score at its last rise of more than STALL
+        self.since_best = 0  # sweeps since that rise (what holdout_patience counts)
         self.held_best: dict[str, float] = {}  # region -> its best held-out learned share before the last sweep
         self.held_flat: dict[str, int] = {}  # region -> sweeps in a row without a new best on the held-out pictures
         if resume:
@@ -125,6 +126,8 @@ class RegionSweep:
             self.history = list(data.get("history") or [])
             best = data.get("best")
             self.best = (float(best[0]), int(best[1])) if best else None
+            mark = data.get("mark")  # (a state saved before 3.35.2 has none: its best was the mark)
+            self.mark = float(mark) if mark is not None else (self.best[0] if self.best else None)
             self.since_best = int(data.get("since_best", 0))
             self.held_best = {str(k): float(v) for k, v in (data.get("held_best") or {}).items()}
             self.held_flat = {str(k): int(v) for k, v in (data.get("held_flat") or {}).items()}
@@ -137,7 +140,7 @@ class RegionSweep:
     def _save(self) -> None:
         data = {"base": self.base, "latest": self.latest, "cursor": self.cursor, "late": self.late,
                 "held": [p["key"] for p in self.probes if p["held"]], "history": self.history[-400:],
-                "best": list(self.best) if self.best else None, "since_best": self.since_best,
+                "best": list(self.best) if self.best else None, "mark": self.mark, "since_best": self.since_best,
                 "held_best": self.held_best, "held_flat": self.held_flat}
         from .atomic import writing  # here, not at the top: atomic loads PyTorch, which this module leaves to callers
 
@@ -272,8 +275,14 @@ class RegionSweep:
         new_best = False
         score = held.get(SUBJECT)
         if score is not None and not first:  # (the first sweep is the start: nothing learned, nothing to keep)
-            if self.best is None or score > self.best[0] + STALL:
-                self.best, self.since_best, new_best = (score, int(step)), 0, True
+            # The best (the chart's marker, holdout_track_best's checkpoint) is the highest score: a sweep reads at
+            # fixed noise, so any rise is the weights. Only the stop waits for a rise of more than STALL, counted from
+            # the score at the last such rise, so a slow creep of 0.1 points a sweep neither stops the run nor leaves
+            # the best behind (with one band for both, a creep under STALL kept an early sweep as the best).
+            if self.best is None or score > self.best[0]:
+                self.best, new_best = (score, int(step)), True
+            if self.mark is None or score > self.mark + STALL:
+                self.mark, self.since_best = score, 0
             else:
                 self.since_best += 1
         for c in REGIONS:  # per region: has the held-out reading stopped getting better?

@@ -2916,6 +2916,36 @@ THEME_HEAD = """<script>
   }
   track('.nicegui-header.rz-header', '--rz-head-h');
   track('.nicegui-footer.rz-footer', '--rz-foot-h');
+  // a log box marked rz-log-fit (the Monitor's train.log) reaches down to the action bar and no further, so its own
+  // scroll bar is the only one and the page above it stays in view: first stretched to the window's bottom, then
+  // shortened by what the page still overflows (the card's padding, the panel's margin, the action bar's room)
+  function fitLogs() {
+    document.querySelectorAll('.rz-log-fit').forEach(function (el) {
+      if (!el.rzWatched && window.ResizeObserver) {
+        // the page's own box keeps the window's height when its content gets shorter (a section folded), so the
+        // column the log sits in is watched too, and the header (its run strip moves everything below it)
+        el.rzWatched = true;
+        var ro = new ResizeObserver(fitLogs);
+        ro.observe(el.closest('.rz-monitor') || el.parentElement);
+        var head = document.querySelector('.nicegui-header.rz-header');
+        if (head) ro.observe(head);
+      }
+      if (!el.offsetParent) return;  // a hidden view, or the Log section folded
+      var top = el.getBoundingClientRect().top + window.scrollY;  // from the page's top, wherever it is scrolled
+      el.style.height = Math.max(260, window.innerHeight - top) + 'px';
+      var over = document.scrollingElement.scrollHeight - window.innerHeight;
+      el.style.height = Math.max(260, window.innerHeight - top - Math.max(0, over)) + 'px';
+    });
+  }
+  window.rzFitLogs = fitLogs;
+  window.addEventListener('resize', fitLogs);
+  function watchPage() {
+    if (!document.body) { setTimeout(watchPage, 300); return; }
+    // a view switched, a section opened or folded, the header's run strip grew: the page's size changes
+    if (window.ResizeObserver) new ResizeObserver(fitLogs).observe(document.body);
+    fitLogs();
+  }
+  watchPage();
 })();
 </script>
 <style>html[data-theme="light"], html[data-theme="light"] body { background: #FFFFFF; }</style>""" % {"key": THEME_KEY}
@@ -12822,7 +12852,7 @@ def build_page(local: bool = True):
                     job_files = JobFiles()
                     saved_label = ui.label("").classes("rz-mono whitespace-pre-wrap")
                 with section("Log", "train.log as it is written", "terminal") as log_exp:
-                    log_view = ui.log(max_lines=600).classes("w-full rz-log rz-log-tall rz-mono")
+                    log_view = ui.log(max_lines=600).classes("w-full rz-log rz-log-tall rz-log-fit rz-mono")
                 # the views: each section into its view's column, in this order
                 view_boxes: dict = {}
                 for name, members, empty in (
