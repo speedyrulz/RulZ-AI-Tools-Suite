@@ -5,14 +5,14 @@
 
 `run_report: true` writes both when a training ends; the Previous Runs tab writes them for an earlier run whose job
 folder is still there. Everything is read from files the run already wrote (config.yaml, status.json, likeness.jsonl,
-probes/, training_maps/, region_sweep.jsonl, the dataset folders), so a report can be made long after the run and
+probes/, training_maps/, region_sweep.jsonl, block_audit.jsonl, the dataset folders), so a report can be made long after the run and
 nothing here touches a model or a GPU. A part whose files are missing is left out; the report never fails a run.
 
 The summary picture (<job>_report.png) shows the settings, the scores over the run, the probe renders at a handful of
 points with the best checkpoint's row marked and the top-scoring render of every row outlined, a race's outcome,
 examples of the dataset and the training maps. The PDF (<job>_report.pdf) has the same and more: every changed
-setting, every probe step's renders with their scores, the loss, the region sweeps, the dataset and its captions, the
-maps at three points of the run, the saved files and the log's warnings.
+setting, every probe step's renders with their scores, the loss, the region sweeps, the block audit, the dataset and its
+captions, the maps at three points of the run, the saved files and the log's warnings.
 
 Needs matplotlib (requirements.txt). The pictures in a report are the run's own: dataset photos and probe renders. It
 is written next to the run and sent nowhere.
@@ -51,6 +51,7 @@ SWITCHES = (  # settings worth naming on the summary when they are on
     ("likeness_lr_control", "likeness lr control"), ("likeness_track_best", "best checkpoint kept"),
     ("region_weights", "region-weighted loss"), ("loss_watch", "loss watch"), ("per_image_lr", "per-image lr"),
     ("isolation", "LoRA Isolation"), ("finetune", "full fine-tune"), ("dora", "DoRA"),
+    ("block_audit_every", "block audit"),
 )
 
 
@@ -67,6 +68,7 @@ class Run:
     probes: list = field(default_factory=list)  # likeness.jsonl's records, oldest first
     images: dict = field(default_factory=dict)  # (racer, step, kind) -> {seed: Path}
     sweeps: list = field(default_factory=list)
+    audits: list = field(default_factory=list)  # block_audit.jsonl's rows, oldest first (blockaudit.py)
     maps: dict = field(default_factory=dict)  # {"pictures": [...], "rows": [...], "dir": Path}
     dataset: list = field(default_factory=list)  # image paths
     lr: list = field(default_factory=list)  # [(step, lr)] from the log
@@ -150,6 +152,7 @@ def load(job_dir, root=None) -> Run:
     run.probes = _jsonl(job_dir / "likeness.jsonl") or list(run.status.get("probes") or [])
     run.images = probe_images(job_dir / "probes")
     run.sweeps = [r for r in _jsonl(job_dir / "region_sweep.jsonl") if not r.get("first")]
+    run.audits = [r for r in _jsonl(job_dir / "block_audit.jsonl") if isinstance(r, dict) and r.get("groups")]
     maps_dir = job_dir / "training_maps"
     pictures = (_json(maps_dir / "probes.json", {}) or {}).get("probes") or []
     rows = _jsonl(maps_dir / "maps.jsonl")
@@ -570,6 +573,62 @@ def sweep_chart(ax, run: Run):
     ax.legend(frameon=False, fontsize=7.5, loc="upper left")
 
 
+def audit_credits(rows: list, kind: str):
+    """(group names with their blocks, the steps, credits[group][step] as a number or None) of the block audit's rows
+    for one kind of score (the probe's score less the group off, raw points). Groups in the order they first show."""
+    names, spans = [], {}
+    for r in rows:
+        for g in r.get("groups") or []:
+            if g["name"] not in spans:
+                names.append(g["name"])
+            spans[g["name"]] = g.get("span") or ""
+    grid = []
+    for name in names:
+        line = []
+        for r in rows:
+            g = next((g for g in r.get("groups") or [] if g["name"] == name), None)
+            c = ((g or {}).get("credit") or {}).get(kind)
+            line.append(None if not c else c.get("mean"))
+        grid.append(line)
+    return [(n, spans[n]) for n in names], [r.get("step") for r in rows], grid
+
+
+def audit_heat(ax, rows: list, kind: str) -> bool:
+    """The block audit as a table of colours: a row per block group, a column per audit, each cell the credit in points
+    (the score less the score with that group off). False when no audit read this kind."""
+    groups, steps, grid = audit_credits(rows, kind)
+    if not groups or not any(v is not None for line in grid for v in line):
+        return False
+    top = max(1e-6, max(abs(v) for line in grid for v in line if v is not None))
+    data = [[float("nan") if v is None else v for v in line] for line in grid]
+    ax.imshow(data, cmap="RdYlGn", vmin=-top, vmax=top, aspect="auto")
+    ax.set_xticks(range(len(steps)))
+    ax.set_xticklabels([str(s) for s in steps], fontsize=7)
+    ax.set_yticks(range(len(groups)))
+    ax.set_yticklabels([f"{n}  {sp}" if sp else n for n, sp in groups], fontsize=7)
+    ax.grid(False)
+    for i, line in enumerate(grid):
+        for j, v in enumerate(line):
+            if v is not None:
+                ax.text(j, i, f"{v:+.1f}", ha="center", va="center", fontsize=7, color=INK)
+    ax.set_xlabel("training step of the audit", fontsize=7.5)
+    return True
+
+
+def audit_note(rows: list, kind: str = "face") -> str:
+    """One line on whether the groups' order holds from audit to audit (Spearman rank correlation of the credits of
+    consecutive audits)."""
+    from .blockaudit import stability
+
+    rhos = [(step, rho) for step, rho in stability(rows, kind) if rho is not None]
+    if not rhos:
+        return "Rank stability: needs two or more audits and three or more groups."
+    mean = sum(r for _, r in rhos) / len(rhos)
+    return (f"Rank stability of the {kind} credits between consecutive audits (Spearman): "
+            + ", ".join(f"{step} {rho:+.2f}" for step, rho in rhos[-8:]) + f"; mean {mean:+.2f} "
+            "(near 1 the groups keep their order, near 0 the order is noise).")
+
+
 def probe_grid(page: Page, x, y, run: Run, steps, kind: str, seeds: int, cell_h: float, racer: str = "",
                gap: float = 0.06, scores: bool = True):
     """Rows of probe renders, one row a step. The best checkpoint's row sits on a gold band and the top-scoring
@@ -914,6 +973,30 @@ def pdf(run: Run, path: Path) -> Path:
                     a, b2 = (s.get("train") or {}).get(part), (s.get("held") or {}).get(part)
                     page.text(x + 0.7 + j * 1.08, yy, f"{'' if a is None else f'{100 * a:.0f}'}"
                               + ("" if b2 is None else f" / {100 * b2:.0f}"), size=7.8)
+            done(out, page)
+
+        # 4b: the block audit
+        if run.audits:
+            page = new("Block audit")
+            rows_a = run.audits[-14:]
+            page.text(0.5, 0.85, "Each cell: the probe's score less the score with that block group switched off, in "
+                      "points (green = the group adds to it). Report only: training did not use it.", size=8.5, color=MUTED)
+            yy = 1.25
+            for kind, label in (("face", "face"), ("body", "body")):
+                if not any(((g.get("credit") or {}).get(kind)) for r in rows_a for g in r.get("groups") or []):
+                    continue
+                groups_n = len(audit_credits(rows_a, kind)[0])
+                height = min(4.6, 1.1 + 0.4 * groups_n)
+                x, y, w, h = page.card(0.5, yy, W - 1.0, height, f"What each block group adds to the {label} score")
+                audit_heat(page.axes(x + 1.1, y, w - 1.2, h - 0.65), rows_a, kind)
+                yy += height + 0.2
+            x, y, w, h = page.card(0.5, yy, W - 1.0, 1.3, "How steady it is")
+            page.text(x, y, "\n".join(_wrap(audit_note(run.audits, "face"), 118)[:4]), size=8, linespacing=1.35)
+            frames = [g for r in run.audits[-1:] for g in r.get("groups") or [] if g.get("frame")]
+            if frames:
+                page.text(x, y + 0.75, "Frame (renders that left the frame their prompt asks for, last audit, points of "
+                          "drift added by switching the group off): "
+                          + ", ".join(f"{g['name']} {100 * g['frame']['credit']:+.0f}" for g in frames), size=8, color=MUTED)
             done(out, page)
 
         # 5: a race
