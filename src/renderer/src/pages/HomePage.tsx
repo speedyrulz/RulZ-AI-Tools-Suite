@@ -1,6 +1,6 @@
-import { LayoutGrid, List, SearchX, X } from 'lucide-react'
-import { useMemo, type ReactNode } from 'react'
-import { arrangeHome, homeCounts, type HomeFilter } from '@shared/arrange'
+import { GripVertical, LayoutGrid, List, SearchX, X } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent, type ReactNode } from 'react'
+import { arrangeHome, homeCounts, moveInOrder, type HomeFilter } from '@shared/arrange'
 import type { AppView } from '@shared/types'
 import { AppCard, AppRow } from '../components/AppCard'
 import { PhoneAppButton } from '../components/PhoneAppQr'
@@ -29,10 +29,30 @@ export function HomePage({
   const updateSettings = useApps((s) => s.updateSettings)
 
   const counts = useMemo(() => homeCounts(apps), [apps])
-  const sections = useMemo(() => arrangeHome(apps, filter, query), [apps, filter, query])
+  const installedOrder = useApps((s) => s.settings?.installedOrder)
+  const sections = useMemo(() => arrangeHome(apps, filter, query, installedOrder), [apps, filter, query, installedOrder])
   const shown = sections.reduce((n, s) => n + s.views.length, 0)
   const searching = !!query.trim()
   const Item = view === 'list' ? AppRow : AppCard
+
+  // Re-arranging the installed tiles: the one being dragged and the gap (0..n) it would drop into.
+  const [dragId, setDragId] = useState<string | null>(null)
+  const [gap, setGap] = useState<number | null>(null)
+  const refocus = useRef<string | null>(null)
+
+  const saveMove = (shownIds: string[], id: string, toIndex: number): void => {
+    if (shownIds.indexOf(id) === toIndex) return
+    void act(() => updateSettings({ installedOrder: moveInOrder(installedOrder, shownIds, id, toIndex) }))
+  }
+  // An empty list clears it (the main process drops an empty installedOrder; undefined would not survive IPC).
+  const resetOrder = (): void => void act(() => updateSettings({ installedOrder: [] }))
+  // Moving a tile re-inserts its element, which drops the focus: put it back once the new order is drawn.
+  useEffect(() => {
+    const id = refocus.current
+    if (!id) return
+    refocus.current = null
+    document.querySelector<HTMLElement>(`[data-app-id="${CSS.escape(id)}"]`)?.focus()
+  }, [sections])
 
   return (
     <div className="mx-auto max-w-[1280px] px-8 pt-5 pb-16">
@@ -111,6 +131,12 @@ export function HomePage({
                     <span className="h-3 w-1 -skew-x-[20deg] bg-accent" /> {s.title}
                   </h2>
                   <span className="text-[13px] text-faint">{s.blurb ?? `${s.views.length} ${s.views.length === 1 ? 'app' : 'apps'}`}</span>
+                  {s.id === 'installed' && !!installedOrder?.length && <ResetOrder onClick={resetOrder} />}
+                </div>
+              )}
+              {!s.title && s.id === 'installed' && !!installedOrder?.length && (
+                <div className="mb-3">
+                  <ResetOrder onClick={resetOrder} />
                 </div>
               )}
               <div
@@ -118,16 +144,51 @@ export function HomePage({
                   view === 'list' ? 'flex flex-col gap-2' : 'grid grid-cols-[repeat(auto-fill,minmax(264px,1fr))] gap-4'
                 }
               >
-                {s.views.map((v) => (
-                  <Item
-                    key={v.app.id}
-                    view={v}
-                    // A category heading already names it.
-                    showCategory={!s.id.startsWith('cat:')}
-                    onOpen={() => onOpen(v.app.id)}
-                    onInstall={() => onInstall(v.app.id)}
-                  />
-                ))}
+                {s.views.map((v, i) => {
+                  const id = v.app.id
+                  const item = (
+                    <Item
+                      key={id}
+                      view={v}
+                      // A category heading already names it.
+                      showCategory={!s.id.startsWith('cat:')}
+                      onOpen={() => onOpen(id)}
+                      onInstall={() => onInstall(id)}
+                    />
+                  )
+                  // Only the installed tiles, and not in search results, can be moved.
+                  if (s.id !== 'installed' || searching || s.views.length < 2) return item
+                  const ids = s.views.map((x) => x.app.id)
+                  const stop = (): void => {
+                    setDragId(null)
+                    setGap(null)
+                  }
+                  return (
+                    <Movable
+                      key={id}
+                      list={view === 'list'}
+                      dragging={dragId === id}
+                      bar={dragId && dragId !== id ? (gap === i ? 'before' : gap === i + 1 ? 'after' : null) : null}
+                      onDragStart={() => setDragId(id)}
+                      onGap={(g) => setGap(g === null ? null : i + g)}
+                      onDrop={() => {
+                        // The gap counts the dragged tile; the move wants the place it ends up in.
+                        const from = dragId ? ids.indexOf(dragId) : -1
+                        if (dragId && gap !== null && from >= 0) saveMove(ids, dragId, gap > from ? gap - 1 : gap)
+                        stop()
+                      }}
+                      onDragEnd={stop}
+                      onMove={(by) => {
+                        const to = i + by
+                        if (to < 0 || to >= ids.length) return
+                        refocus.current = id
+                        saveMove(ids, id, to)
+                      }}
+                    >
+                      {item}
+                    </Movable>
+                  )
+                })}
               </div>
             </section>
           ))}
@@ -148,6 +209,103 @@ export function HomePage({
             </button>
           )}
         </div>
+      )}
+    </div>
+  )
+}
+
+function ResetOrder({ onClick }: { onClick: () => void }) {
+  return (
+    <button className="cursor-pointer text-[13px] text-link hover:underline" onClick={onClick}>
+      Reset order
+    </button>
+  )
+}
+
+/**
+ * Wraps an installed tile so it can be re-arranged. The whole tile is the drag source: a native HTML5 drag starts
+ * only once the pointer has moved a few pixels, so a plain click still opens the app and a finished drag fires no
+ * click; buttons inside the tile keep working. The grip is a hint shown on hover and focus, not a separate target,
+ * so there is no small handle to miss. Alt + arrow keys move the focused tile, for people who don't drag.
+ */
+function Movable({
+  list,
+  dragging,
+  bar,
+  onDragStart,
+  onGap,
+  onDrop,
+  onDragEnd,
+  onMove,
+  children
+}: {
+  list: boolean
+  dragging: boolean
+  bar: 'before' | 'after' | null
+  onDragStart: () => void
+  /** The gap the pointer is over: 0 before this tile, 1 after it; null when it left. */
+  onGap: (gap: 0 | 1 | null) => void
+  onDrop: () => void
+  onDragEnd: () => void
+  onMove: (by: -1 | 1) => void
+  children: ReactNode
+}) {
+  const over = (e: DragEvent<HTMLDivElement>): void => {
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+    const r = e.currentTarget.getBoundingClientRect()
+    const after = list ? e.clientY > r.top + r.height / 2 : e.clientX > r.left + r.width / 2
+    onGap(after ? 1 : 0)
+  }
+  const key = (e: KeyboardEvent<HTMLDivElement>): void => {
+    if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return
+    const by = e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? -1 : e.key === 'ArrowRight' || e.key === 'ArrowDown' ? 1 : 0
+    if (!by) return
+    e.preventDefault()
+    onMove(by)
+  }
+  return (
+    <div
+      draggable
+      aria-keyshortcuts="Alt+ArrowLeft Alt+ArrowRight"
+      onDragStart={(e) => {
+        e.dataTransfer.effectAllowed = 'move'
+        e.dataTransfer.setData('text/plain', '')
+        onDragStart()
+      }}
+      onDragOver={over}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) onGap(null)
+      }}
+      onDrop={(e) => {
+        e.preventDefault()
+        onDrop()
+      }}
+      onDragEnd={onDragEnd}
+      onKeyDown={key}
+      className={cn('group/move relative flex flex-col [&>[data-app-id]]:flex-1', dragging && 'opacity-50')}
+    >
+      {children}
+      <span
+        role="img"
+        title="Drag to re-arrange (Alt+arrow keys)"
+        aria-label="Drag to re-arrange (Alt+arrow keys)"
+        className={cn(
+          'absolute z-10 flex size-6 items-center justify-center rounded-md text-faint opacity-0 group-focus-within/move:opacity-100 group-hover/move:opacity-100 hover:text-text',
+          list ? 'top-1/2 -left-6 -translate-y-1/2' : 'top-2 left-1/2 -translate-x-1/2'
+        )}
+      >
+        <GripVertical className="size-4" />
+      </span>
+      {bar && (
+        <span
+          aria-hidden
+          className={cn(
+            'pointer-events-none absolute z-20 rounded-full bg-accent',
+            list ? 'right-0 left-0 h-0.5' : 'top-0 bottom-0 w-0.5',
+            list ? (bar === 'before' ? '-top-[5px]' : '-bottom-[5px]') : bar === 'before' ? '-left-[9px]' : '-right-[9px]'
+          )}
+        />
       )}
     </div>
   )

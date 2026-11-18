@@ -91,7 +91,8 @@ export function App() {
   }, [showing])
 
   // Previous / Next on an app's page follow the order of the home page.
-  const order = useMemo(() => homeOrder(apps), [apps])
+  const installedOrder = useApps((s) => s.settings?.installedOrder)
+  const order = useMemo(() => homeOrder(apps, installedOrder), [apps, installedOrder])
   const near = showing ? neighbors(order, showing) : null
   const neighbor = (which: 'previous' | 'next'): { name: string; go: () => void } | null => {
     const view = near && apps.find((a) => a.app.id === near[which])
