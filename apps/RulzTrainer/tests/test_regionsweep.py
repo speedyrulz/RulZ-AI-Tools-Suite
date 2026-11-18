@@ -150,6 +150,32 @@ def test_held_out_best_flat_regions_and_the_stop(tmp_path):
     assert not no_patience.run(10, 1.0, Toy(), "cpu")["stop"]
 
 
+def test_a_slow_creep_moves_the_best_but_not_the_stop(tmp_path):
+    """A held-out score that rises 0.1 points a sweep (under STALL): the best follows every rise (it once stayed on
+    the sweep before the creep), while the stop counts from the last rise of more than STALL."""
+    sweep = RS.RegionSweep(tmp_path, _probes(1, 1), every=10, patience=3)
+    scores = iter([None, 0.017, 0.018, 0.019, 0.020, 0.021, 0.023])
+    sweep._mean = lambda held: {c: (next(scores) if held and c == RS.SUBJECT else None) for c in RS.COLUMNS}
+    rows = []
+    for k in range(7):
+        rows.append(sweep._summarise(10 * k, float(k), 2, 0.0))
+        sweep.history.append(rows[-1])  # (as run() does: an empty history is the first sweep)
+    assert [r["new_best"] for r in rows] == [False, True, True, True, True, True, True]
+    assert [r["best"][1] if r["best"] else None for r in rows] == [None, 10, 20, 30, 40, 50, 60]
+    assert [r["since_best"] for r in rows] == [0, 0, 1, 2, 3, 4, 0]  # 0.023 is the first rise over 0.017 + 0.005
+    assert [r["stop"] for r in rows] == [False, False, False, False, True, True, False]
+
+
+def test_a_state_saved_without_a_mark_takes_its_best_as_the_mark(tmp_path):
+    sweep = RS.RegionSweep(tmp_path, _probes(1, 1), every=10)
+    sweep.run(0, 0.0, Toy(), "cpu")
+    data = json.loads((tmp_path / RS.STATE_FILE).read_text(encoding="utf-8"))
+    data.pop("mark", None)
+    data["best"] = [0.4, 10]
+    (tmp_path / RS.STATE_FILE).write_text(json.dumps(data), encoding="utf-8")
+    assert RS.RegionSweep(tmp_path, _probes(1, 1), every=10, resume=True).mark == 0.4
+
+
 def test_resume_reads_the_first_sweep_back_and_notices_other_held_pictures(tmp_path):
     model = Toy()
     sweep = RS.RegionSweep(tmp_path, _probes(2, 1), every=10)
