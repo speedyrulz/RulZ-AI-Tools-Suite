@@ -3,6 +3,7 @@
 (a late probe rendered from the retained weights, the sample queue, the shadow round). No GPU, no network, no ssh."""
 import contextlib
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -288,6 +289,23 @@ def test_a_failed_round_is_reported_and_counted(tmp_path):
     got, why = rr.collect(r)
     assert got is None and "CUDA out of memory" in why and rr.misses == 1 and rr.off_reason == ""
     assert not (rr.root / "failed" / r.name).exists()
+
+
+def test_a_heartbeat_rewritten_in_one_file_time_tick_is_still_read(tmp_path):
+    # a fast disk, or a copy with coarse file times, can rewrite helper.json at the same size within one tick: the
+    # time and size stay the same, so only a stale heartbeat's re-read sees the new one (this failed on CI runners)
+    rr, h, clock = _renderer(tmp_path)
+    path = rr.root / "helper.json"
+    h.beat()
+    h.ready()
+    os.utime(path, ns=(10**18, 10**18))
+    rr.poll()
+    assert rr.can_delegate("probe")
+    clock.t += RR.FRESH_SECONDS + 100  # same digit count: the rewrite has the same size
+    h.beat()
+    os.utime(path, ns=(10**18, 10**18))
+    rr.poll()
+    assert rr.can_delegate("probe")
 
 
 def test_two_misses_in_a_row_end_delegation_and_a_success_resets_the_count(tmp_path):

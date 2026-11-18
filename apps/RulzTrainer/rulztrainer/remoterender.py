@@ -303,8 +303,10 @@ class RemoteRenderer:
 
     def poll(self) -> None:
         """One small look per step: helper.json and the ready / not-ready files, each read only when it changed.
-        Logs when a helper becomes usable and when it goes quiet."""
-        if self._changed(self.root / "helper.json"):
+        Logs when a helper becomes usable and when it goes quiet. A heartbeat that looks stale is read again even when
+        the file's time and size did not change: a file system or copy with coarse file times can rewrite it within one
+        tick, at the same size."""
+        if self._changed(self.root / "helper.json") or (self.helper is not None and not self.helper_fresh()):
             self.helper = read_json(self.root / "helper.json")
         elif not (self.root / "helper.json").exists():
             self.helper = None
