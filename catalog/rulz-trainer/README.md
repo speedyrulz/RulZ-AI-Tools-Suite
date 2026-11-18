@@ -1364,7 +1364,7 @@ between two sweeps only the weights change and a picture's learned share is meas
 | `region_sweep_pictures` | 0 | Training pictures per sweep: 0 = all, K = K in turn, -1 = none (the held-out photos only). The first sweep always takes all of them. |
 | `holdout_images` | 0 | Photos kept out of training (with every crop made from them) and swept every time. |
 | `holdout_track_best` | off | Saves `<job>_holdout_best.safetensors` at each new best of the held-out subject score (face, hair and skin together). |
-| `holdout_patience` | 0 (never) | Stops training after this many sweeps without a better held-out subject score. |
+| `holdout_patience` | 0 (never) | Stops training after this many sweeps without the held-out subject score rising more than 0.5 points (counted from its last such rise, so a slow creep does not stop the run). The best checkpoint and the chart's "best" marker follow every rise. |
 | `region_steer_signal` | `steps` | With region steering: `sweep` makes the per-picture rules read the sweeps' contrast, not the training steps'. |
 | `region_steer_holdout` | 0 (off) | With region steering and held-out photos: a region learned this much further on the training pictures than on the held-out ones, and no better on those for two sweeps, is turned down in every picture. It may turn the face, hair or skin down. |
 | `region_steer_subject_ahead` | 0 (off) | With region steering and sweeps of the training pictures: a picture's face, hair or skin with less than this x the median picture's error left is turned down in that picture alone. The training steps have no clean reading of one picture's subject; the sweeps do. Needs at least 4 swept pictures with that region. |
