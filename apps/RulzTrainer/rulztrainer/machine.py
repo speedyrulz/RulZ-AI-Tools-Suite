@@ -189,7 +189,7 @@ def stop_instance(env=None, env_file: Path = _ENV_FILE, opener=urllib.request.ur
     if cli:
         try:
             done = subprocess.run([cli, "stop", "instance", str(info["id"]), "--api-key", key], capture_output=True,
-                                  text=True, timeout=60)
+                                  text=True, timeout=60, stdin=subprocess.DEVNULL)  # an open stdin stalls the CLI
             if done.returncode == 0:
                 return True, f"Stop sent to vast.ai for instance {info['id']} (vastai CLI)."
             api_error += f"; vastai CLI: {(done.stderr or done.stdout).strip()[:200]}"
