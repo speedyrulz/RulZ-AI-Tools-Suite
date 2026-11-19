@@ -105,6 +105,39 @@ def test_a_run_is_read_from_its_folder(tmp_path):
         "region watch" in rows["Also on"]
 
 
+def test_region_data_and_reports(tmp_path):
+    job = _job(tmp_path, maps=False)
+    (job / "region_sweep.jsonl").write_text("\n".join(json.dumps(row) for row in (
+        {"step": 20, "train": {"subject": 0.1, "face": 0.2}, "held": {"subject": 0.08, "face": 0.1}},
+        {"step": 40, "train": {"subject": 0.2, "face": 0.3}, "held": {"subject": -0.01, "face": 0.1}})), encoding="utf-8")
+    picture = "photos/person.jpg"
+    (job / "region_watch.json").write_text(json.dumps({
+        "epoch": 2, "frozen": True, "history": [{"epoch": 2, "step": 40,
+        "learned": {"face": 0.4}, "contrast": {}}],
+        "pictures": {picture: {"seen": 2, "contrast_log": {"background": 0.0, "clothes": 0.69314718056}}}
+    }), encoding="utf-8")
+    (job / "region_sweep.json").write_text(json.dumps({"latest": {picture: {
+        "contrast": {"background": 0.8, "clothes": 1.2}}}}), encoding="utf-8")
+    run = R.load(job)
+    assert R.sweep_series(run.sweeps, "face", "train") == [(20, 20.0), (40, 30.0)]
+    assert R.sweep_gaps(run.sweeps)["face"] == [(20, 10.0), (40, 20.0)]
+    assert R.growing_gap(run.sweeps)[0] == "subject"
+    row = run.watch["rows"][0]
+    assert row["image"] == "person.jpg" and row["background"] == 1.0
+    assert row["clothes"] == pytest.approx(2.0) and row["sweep_background"] == 0.8
+    assert run.watch["summary"]["learned"]["face"] == 0.4
+    assert any("memorised" in text for _, text in R.verdict(run))
+    assert all(path.is_file() for path in R.generate(job).values())
+
+
+def test_region_sweeps_without_held_out(tmp_path):
+    job = _job(tmp_path, maps=False)
+    (job / "region_sweep.jsonl").write_text(json.dumps({"step": 10, "train": {"subject": 0.2}}), encoding="utf-8")
+    run = R.load(job)
+    assert R.sweep_gaps(run.sweeps) == {} and R.growing_gap(run.sweeps) is None
+    assert all(path.is_file() for path in R.generate(job).values())
+
+
 def test_both_files_are_written_and_a_bare_run_still_gets_them(tmp_path):
     job = _job(tmp_path)
     done = R.generate(job)
