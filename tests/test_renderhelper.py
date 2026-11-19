@@ -373,7 +373,39 @@ def test_rounds_probe_first_with_negative_kind_and_upload(world):
     assert not list((w.base / "claimed").iterdir()) and not list((w.base / "rounds").iterdir())
     s = read_json(w.tmp / "status.json")
     assert s["rounds_done"] == 2 and s["last_round"] == "000001_sample_5" and s["last_seconds"] == 1.5
-    assert not (w.tmp / "work" / TOKEN / "rounds" / "000001_sample_5").exists()  # cleaned up
+    assert not (rh.run_folder(w.tmp / "work", TOKEN) / "rounds" / "000001_sample_5").exists()  # cleaned up
+
+
+def test_run_folder_is_a_hash_and_never_leaves_the_work_folder(tmp_path):
+    work = tmp_path / "work"
+    for token in ("../../..", "..\\..\\x", "/etc", "C:\\Windows", "tok123", ""):
+        folder = rh.run_folder(work, token)
+        assert folder.parent == work and len(folder.name) == 16 and rh.inside(folder, work) == folder
+    assert rh.run_folder(work, "a") != rh.run_folder(work, "b")
+    for bad in (work, work / "..", work / ".." / "elsewhere", tmp_path):
+        with pytest.raises(RuntimeError, match="leaves"):
+            rh.inside(bad, work)
+
+
+def test_a_hostile_run_token_keeps_the_cache_inside_the_work_folder(world):
+    w = world
+    token = "../../../../escape"
+    (w.base / "run.json").write_text(json.dumps({"protocol": 1, "run_token": token, "job": "job", "family": "zimage"}))
+    w.prep["run_token"] = token
+    ready_state(w)
+    cache = Path(w.loads[-1][0]["cache_dir"]).resolve()
+    assert (w.tmp / "work").resolve() in cache.parents and not (w.tmp / "escape").exists()
+
+
+def test_only_round_names_are_claimed(world):
+    w = world
+    h = ready_state(w)
+    w.add_round("x_probe_5", "probe", 5)  # not <seq>_<kind>_<step>: never claimed
+    w.add_round("000002_probe_10", "probe", 10)
+    drive(h, lambda: (w.base / "done/000002_probe_10").exists())
+    assert (w.base / "rounds/x_probe_5").exists() and len(w.renderer.calls) == 1
+    assert rh.ROUND_NAME.fullmatch("000001_probe_5") and not rh.ROUND_NAME.fullmatch("..")
+    assert not rh.ROUND_NAME.fullmatch("000001_probe_5/../../x")
 
 
 def test_render_exception_goes_to_failed_with_error_json_and_the_helper_goes_on(world):

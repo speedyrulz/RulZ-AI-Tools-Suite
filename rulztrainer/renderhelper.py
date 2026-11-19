@@ -21,9 +21,11 @@ real text-embed cache, which a prepared copy of someone else's prompts must not 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import socket
@@ -306,6 +308,26 @@ def remote():
     return remoterender
 
 
+# Names the instance sends that become folders on this PC. A round is remoterender.round_name's <seq>_<kind>_<step>;
+# anything else in rounds/ (a stray file, or "..", "a/b" from a bad or spoofed instance) is never claimed.
+ROUND_NAME = re.compile(r"[0-9]+_[A-Za-z0-9-]+_[0-9]+")
+
+
+def run_folder(work_dir: Path, token) -> Path:
+    """This PC's folder for a run: named by a hash of the instance's run token, never by the token itself, so no token
+    (say "../..") can point it outside work_dir."""
+    return work_dir / hashlib.sha256(str(token).encode("utf-8")).hexdigest()[:16]
+
+
+def inside(path: Path, root: Path) -> Path:
+    """path, after checking that it resolves to a folder under root (not root itself): the guard before anything is
+    written to it or removed from it."""
+    real, base = Path(path).resolve(), Path(root).resolve()
+    if base not in real.parents:
+        raise RuntimeError(f"{path} leaves the helper's work folder {root}")
+    return path
+
+
 def local_embed_path(cfg_dict: dict, prompt: str) -> Path:
     """Where the Renderer looks for a prompt's text embeds under this local config."""
     from .config import TrainConfig
@@ -481,7 +503,8 @@ class Helper:
         if now - self.last_beat >= HEARTBEAT_EVERY or self.last_beat == 0.0:
             self.hb.call("heartbeat", job=job, run_token=token, host=self.host, gpu=self.gpu_name)
             self.last_beat = now
-        mine = [r for r in entry.get("rounds") or [] if self._kind(r) in self.kinds]
+        mine = [r for r in entry.get("rounds") or []
+                if isinstance(r, str) and ROUND_NAME.fullmatch(r) and self._kind(r) in self.kinds]
         self.status.data["job"] = job
         if self._busy():
             self.status.update(behind=len(mine))
@@ -611,7 +634,7 @@ class Helper:
             same = False
         if not same:
             raise NotReady(VERSION_MISMATCH, retry=False)
-        work = self.work_dir / str(run["run_token"])[:16]
+        work = inside(run_folder(self.work_dir, run["run_token"]), self.work_dir)
         shutil.rmtree(self.work_dir, ignore_errors=True)  # an earlier run's embeds and rounds
         cfg = dict(prep["cfg"])
         override = bool(self.o.sample_model)
@@ -734,7 +757,9 @@ class Helper:
         claim_time = time.monotonic() - started
         claimed = f"{base}/claimed/{name}"
         self.status.update(state="rendering", job=job, message=f"Rendering {name}.")
-        work = self.work_dir / str(self.token)[:16] / "rounds" / name
+        if not ROUND_NAME.fullmatch(name):  # (_look only picks such names; this keeps _render safe on its own)
+            raise RuntimeError(f"not a round name: {name!r}")
+        work = inside(run_folder(self.work_dir, self.token) / "rounds" / name, self.work_dir)
         try:
             rnd = w.get_json(f"{claimed}/round.json")
             if rnd.get("run_token") != self.token:
