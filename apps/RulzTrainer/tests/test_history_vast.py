@@ -1,5 +1,6 @@
 """Previous Runs lists the training runs the Fleet tracked on vast.ai instances (history.import_fleet_runs)."""
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -119,6 +120,11 @@ def test_fleet_signature_changes_with_the_fleet(tmp_path):
     fleet, rec = fleet_record(tmp_path)
     a = history.fleet_signature(fleet)
     fleet_record(tmp_path, step=499, modified=2100)
+    # a rewrite of the same size within one tick of a coarse file clock keeps the old mtime (seen on the Windows CI
+    # runner); the Fleet's next write is seen then, so here the rewrite is dated a second later
+    path = fleet / f"{rec['key']}.json"
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
     assert history.fleet_signature(fleet) != a
 
 
