@@ -227,6 +227,43 @@ def test_downloaded_probe_images_become_comparison_entries(tmp_path):
     assert runs[0]["probe_images"][2]["face"] == 70.0 and runs[0]["probe_raw"]["records"][0]["face"] == 61.0
 
 
+def test_compared_runs_carry_their_downloaded_region_sweeps(tmp_path):
+    import json
+
+    a, b, c = tmp_path / "a", tmp_path / "b", tmp_path / "c"
+    for d in (a, b, c):
+        d.mkdir()
+    # a: only region_sweep.jsonl (a half-written last line is skipped)
+    (a / "region_sweep.jsonl").write_text(
+        json.dumps({"step": 100, "train": {"face": 0.2}, "held": {"face": 0.1}}) + "\n"
+        + json.dumps({"step": 200, "train": {"face": 0.4}, "held": {"face": 0.25}}) + "\n{\"step\": 3", encoding="utf-8")
+    # b: the status.json's sweep history wins over the jsonl
+    (b / "status.json").write_text(json.dumps({"region_sweep": {"history": [
+        {"step": 50, "train": {"face": 0.5, "hair": 0.3}, "held": {}}]}}), encoding="utf-8")
+    (b / "region_sweep.jsonl").write_text(json.dumps({"step": 999, "train": {"face": 0.9}}) + "\n", encoding="utf-8")
+    runs = webui.fleet_compare_runs([{"key": "a", "job": "ja", "instance": 1, "folder": str(a)},
+                                     {"key": "b", "job": "jb", "instance": 2, "folder": str(b)},
+                                     {"key": "c", "job": "jc", "instance": 3, "folder": str(c)},
+                                     {"key": "d", "job": "jd", "instance": 4}])
+    assert [e["step"] for e in runs[0]["sweeps"]] == [100, 200]
+    assert runs[1]["sweeps"] == [{"step": 50, "train": {"face": 0.5, "hair": 0.3}, "held": {}}]
+    assert runs[2]["sweeps"] == [] and runs[3]["sweeps"] == []
+
+    lines = webui.history_sweep_lines(runs, "face")
+    assert [s["id"] for s in lines] == ["ja · instance 1 · training", "ja · instance 1 · held-out",
+                                        "jb · instance 2 · training"]
+    assert lines[0]["data"] == [[100, 20.0], [200, 40.0]] and lines[1]["lineStyle"]["type"] == "dashed"
+    assert [s["id"] for s in webui.history_sweep_lines(runs, "face", ("held",))] == ["ja · instance 1 · held-out"]
+
+    # a new sweep row is read on the next draw (the cache follows the file)
+    with open(a / "region_sweep.jsonl", "a", encoding="utf-8") as f:
+        f.write("00}\n" + json.dumps({"step": 300, "train": {"face": 0.5}}) + "\n")
+    assert [e["step"] for e in webui.fleet_sweeps(a)][-1] == 300
+    # outside the downloads folder nothing is read
+    assert webui.fleet_compare_runs([{"key": "a", "job": "ja", "instance": 1, "folder": str(a)}],
+                                    tmp_path / "pulls")[0]["sweeps"] == []
+
+
 def test_the_page_only_follows_folders_inside_the_downloads_folder(tmp_path):
     root = tmp_path / "pulls"
     inside = root / "7" / "job"
