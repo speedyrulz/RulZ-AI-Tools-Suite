@@ -1128,3 +1128,10 @@ sources:
     people: null
     url: null
     note: "ArcFace, FaceNet and AdaFace compared; a face_refs picture without a face silently disables probes; CPU side jobs slowed a live run."
+  ot_resshift_2026_11:
+    kind: community
+    where: "OneTrainer Discord training-discussion"
+    date: "2026-11"
+    people: null
+    url: null
+    note: "1024 px learns slowly without a higher shift; BFL confirms dynamic shifting (the noise shift grows with image size)."

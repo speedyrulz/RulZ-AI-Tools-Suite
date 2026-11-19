@@ -375,6 +375,39 @@ def make_strata(cfg: TrainConfig) -> TimestepStrata | None:
     return TimestepStrata(cfg.timestep_buckets)
 
 
+_RESOLUTION_SHIFT_WARNED = False
+
+
+def resolution_shift(cfg: TrainConfig, tokens: int, arch=None) -> float:
+    """resolution_shift's factor exp(mu) for an image of `tokens` latent cells (Arch.resolution_mu), 1.0 when the image
+    size is unknown (tokens < 1: a warning, once)."""
+    global _RESOLUTION_SHIFT_WARNED
+    if tokens < 1:
+        if not _RESOLUTION_SHIFT_WARNED:
+            _RESOLUTION_SHIFT_WARNED = True
+            log.warning("resolution_shift: the image size is not known here (0 tokens); no resolution shift applied")
+        return 1.0
+    return math.exp((arch or get_arch(cfg)).resolution_mu(tokens))
+
+
+def resolution_shift_note(cfg: TrainConfig, arch) -> list[tuple[str, str]]:
+    """What the trainer says once at the start of a run with resolution_shift on, as (level, text) lines."""
+    if not cfg.resolution_shift:
+        return []
+    if cfg.timestep_sampling == "reference":
+        return [("warning", "resolution_shift has no effect with timestep_sampling: reference: the reference curve "
+                            "already carries the model family's own shift")]
+    sizes = sorted({max(0.01, float(mp)) for mp in cfg.resolutions}) or [1.0]
+    lo, hi = sizes[0], sizes[-1]
+
+    def at(mp: float) -> str:
+        side = math.sqrt(mp) * 1024  # pixels a side; one token is a 16 px cell
+        return f"x{math.exp(arch.resolution_mu(max(1, round(mp * 1024 * 1024 / 256)))):.2f} at {side:.0f} px"
+
+    text = at(lo) if lo == hi else f"{at(lo)} .. {at(hi)}"
+    return [("info", f"Resolution shift: {text} (on top of timestep_shift {cfg.timestep_shift:g})")]
+
+
 def sample_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, logit_shift: float = 0.0, tokens: int = 0,
                   arch=None, strata: TimestepStrata | None = None) -> torch.Tensor:
     """tokens: the batch's image token count (H/16 x W/16), which the architectures' own recipes depend on. strata:
@@ -419,6 +452,12 @@ def sample_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, logit_shift: f
         raise ValueError(f"Unknown timestep_sampling {mode}")
     if cfg.timestep_shift != 1.0:
         s = cfg.timestep_shift * s / (1 + (cfg.timestep_shift - 1) * s)
+    # the family's own image-size shift, on top of timestep_shift (shifts multiply); not for families trained on their
+    # own exact noise levels (SDXL, MiniMax-H3-Image), where capabilities.py greys it out as having no effect
+    if cfg.resolution_shift and mode != "reference" and not (arch := arch or get_arch(cfg)).reference_sigmas_exact:
+        rs = resolution_shift(cfg, tokens, arch)
+        if rs != 1.0:
+            s = rs * s / (1 + (rs - 1) * s)
     if cfg.sigma_min > 0.0 or cfg.sigma_max < 1.0:
         s = cfg.sigma_min + (cfg.sigma_max - cfg.sigma_min) * s
     # a family whose schedule does not cover (0, 1) (SDXL's epsilon models: about 0.03 to 0.94) has its levels moved
@@ -1431,6 +1470,12 @@ class Trainer(RaceParallelMixin):
         if not injected and not cfg.finetune:
             raise ValueError("No LoRA modules selected: check lora_targets / lora_blocks")
         self._attach_training_adapter(model, log_it=True)
+        if cfg.resolution_shift and not (self.arch.reference_sigmas_exact and not self.arch.reference_exact_curriculum):
+            for level, text in resolution_shift_note(cfg, self.arch):
+                (log.warning if level == "warning" else log.info)("%s", text)
+        elif cfg.resolution_shift:
+            log.warning("resolution_shift has no effect on %s: it trains on its own sampling noise levels as drawn",
+                        self.arch.label)
         if self.arch.reference_sigmas_exact and self.arch.reference_exact_curriculum:
             for level, text in self.arch.reference_exact_note(cfg):  # SDXL: its own wording (Arch.reference_exact_note)
                 (log.warning if level == "warning" else log.info)("%s", text)

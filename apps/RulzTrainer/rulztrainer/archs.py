@@ -196,6 +196,12 @@ class Arch:
     # the trainer uses them as drawn: no logit shift, timestep_shift, sigma range or 1000-step rounding
     reference_sigmas_exact = False
 
+    def resolution_mu(self, tokens: int) -> float:
+        """resolution_shift's mu for an image of `tokens` latent cells: the noise levels are shifted by exp(mu) (the
+        flow-matching samplers' dynamic shifting). The FLUX / SD3 line, 0.5 at 256 tokens to 1.15 at 4096, extended
+        past both ends as the samplers do; families whose sampler has its own override this."""
+        return 0.5 + (1.15 - 0.5) * (tokens - 256) / (4096 - 256)
+
     def reference_sigmas(self, n: int, gen: torch.Generator, tokens: int) -> torch.Tensor:
         """The family's own training noise-level distribution (timestep_sampling: reference)."""
         raise NotImplementedError(f"{self.name} has no reference timestep recipe")
@@ -441,6 +447,11 @@ class FiboArch(Arch):
     def compile_blocks(self, model):
         return [*model.noise_refiner, *model.layers]
 
+    def resolution_mu(self, tokens):
+        from .fibo.sampler import calculate_shift  # the sampler's own mu (linear in the token count, not clamped)
+
+        return calculate_shift(tokens)
+
     def reference_sigmas(self, n, gen, tokens):
         # Bria's trainer: sigma ~ sigmoid(N(shift, 1)) with probability 0.9, else uniform;
         # shift = 0.5 + 0.65 * (tokens - 256) / 3840 (the image's token count, as the sampler's time shift)
@@ -551,6 +562,11 @@ class Krea2Arch(Arch):
 
     def compile_blocks(self, model):
         return list(model.transformer_blocks)
+
+    def resolution_mu(self, tokens):
+        from .krea2.sampler import calculate_shift  # the sampler's own mu (linear in the token count, not clamped)
+
+        return calculate_shift(tokens)
 
     def reference_sigmas(self, n, gen, tokens):
         # Krea has not published its training noise distribution. This is the usual recipe for a model sampled with
@@ -679,6 +695,11 @@ class QwenImage21Arch(Arch):
 
     def compile_blocks(self, model):
         return list(model.transformer_blocks)
+
+    def resolution_mu(self, tokens):
+        from .qwen21.sampler import calculate_shift  # the sampler's own mu (linear in the token count, not clamped)
+
+        return calculate_shift(tokens)
 
     def reference_sigmas(self, n, gen, tokens):
         # Qwen has not published its training noise distribution. Fizgig trains it with the usual recipe for a model
@@ -940,6 +961,11 @@ class Flux2KleinArch(Arch):
             return "attn"
         return "other"
 
+    def resolution_mu(self, tokens):
+        # flux2_shift's mu (see reference_sigmas): linear in the latent token count, 0.5 at 256 tokens to 1.15 at 4096
+        slope = (1.15 - 0.5) / (4096 - 256)
+        return slope * tokens + 0.5 - slope * 256
+
     def reference_sigmas(self, n, gen, tokens):
         # flux2_shift, as Fizgig trains Klein: logit-normal sigmas, shifted by exp(mu), mu linear in the latent token
         # count from 0.5 at 256 tokens to 1.15 at 4096
@@ -1110,6 +1136,12 @@ class Ideogram4Arch(Arch):
 
     def compile_blocks(self, model):
         return list(model.layers)
+
+    def resolution_mu(self, tokens):
+        # the pipeline's resolution-aware logit mean (reference mu 0.5): 0.5 + 0.5 ln(pixels / 512^2), 16 px cells
+        from .ideogram4.sampler import resolution_mean
+
+        return resolution_mean(0.5, 16 * int(tokens), 16)
 
     def reference_sigmas(self, n, gen, tokens):
         # Ideogram has not published its training noise distribution. Its documented time distribution is the
