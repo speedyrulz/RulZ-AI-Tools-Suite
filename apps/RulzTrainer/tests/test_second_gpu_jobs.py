@@ -112,6 +112,7 @@ def _process(analysis=True):
     w.device, w.probes, w.queue, w.waited, w.rendered, w.count = "cuda:1", True, [], 0.0, 0.0, 0
     w.analysed, w.analysis_count, w.analysis_wanted, w.analysis_error = 0.0, 0, analysis, None
     w.conn, w.proc, w.log_path, w.started, w.memory = FakeConn(), SimpleNamespace(poll=lambda: None), "x.log", time.time(), None
+    w.error, w.free_since, w.done = None, None, {}
     return w
 
 
@@ -165,6 +166,7 @@ def test_a_computation_failure_is_reported_for_that_job_and_a_process_failure_is
     with pytest.raises(PW.ProbeProcessError, match="out of memory"):
         w.take_analysis("maps", True)
     assert [p.kind for p in w.outstanding()] == ["maps"]  # still out: the trainer reads it again itself
+    w.error = None  # (a new case on the same fake; a real process that sent its error has exited)
     w.queue = [PW.Pending(1, [], {}, kind="probe")]
     w.conn.inbox.append(("sweep_done", {}, 1.0))
     with pytest.raises(PW.ProbeProcessError, match="answered"):  # an answer of the wrong kind: out of step
@@ -1029,3 +1031,73 @@ def test_the_setup_reaches_a_separate_process_with_its_tensors(tmp_path):
             assert conn.poll(60)
             assert conn.recv() == 15.0
     assert proc.wait(60) == 0
+
+
+# ---------------------------------------------------------------- the Monitor's second-GPU tile
+
+
+def test_the_snapshot_follows_the_process_from_loading_to_each_job_and_idle():
+    w = _process()
+    assert w.snapshot()["state"] == "loading"
+    w.conn.inbox.append(("ready", "5 GB", None))
+    w.refresh()
+    snap = w.snapshot()
+    assert snap["state"] == "idle" and snap["memory"] == "5 GB" and snap["done"] == {}
+    w.submit_analysis("sweep", 10, _state(), keys=["a.png"], extra={"epoch": 1.0})
+    w.submit(20, ["job"], _state())
+    snap = w.snapshot()
+    assert (snap["state"], snap["kind"], snap["step"]) == ("working", "sweep", 10)
+    assert snap["queued"] == [{"kind": "probe", "step": 20}] and snap["since"] is not None
+    w.conn.inbox.append(("sweep_done", {"a.png": [1]}, 2.0))
+    w.refresh()  # the sweep is in (not yet taken): the probe is what it works on now
+    snap = w.snapshot()
+    assert (snap["kind"], snap["step"]) == ("probe", 20) and snap["ready"] == [{"kind": "sweep", "step": 10}]
+    assert w.take_analysis("sweep", False) is not None
+    w.conn.inbox.append(("done", ["x.png"], 3.0))
+    w.refresh()
+    assert w.take(False) is not None
+    snap = w.snapshot()
+    assert snap["state"] == "idle" and snap["done"] == {"sweep": 1, "probe": 1} and snap["queued"] == []
+
+
+def test_an_error_the_process_sent_is_raised_again_by_the_next_take():
+    """refresh() reads the error for the Monitor and swallows it; the trainer's next take must still see it."""
+    w = _process()
+    w.conn.inbox.append(("error", "Traceback: CUDA out of memory"))
+    w.submit(10, ["job"], _state())
+    w.refresh()
+    with pytest.raises(PW.ProbeProcessError, match="out of memory"):
+        w.take(False)
+
+
+def test_the_trainer_writes_the_snapshot_and_how_the_process_ended(tmp_path):
+    _, tr, status = _trainer(tmp_path)
+    w = _process()
+    w.conn.inbox.append(("ready", "5 GB", None))
+    w.close = lambda: None
+    tr.analysis_worker = w
+    assert tr._second_gpu_status()["second_gpu"]["state"] == "idle"
+    w.done = {"sweep": 2}
+    tr._close_probe_worker(redo=True)
+    assert status["second_gpu"]["state"] == "failed" and status["second_gpu"]["done"] == {"sweep": 2}
+    assert tr._second_gpu_status() == {}  # nothing to add: how it ended stays in status.json
+
+
+def test_the_tile_text_names_the_job_its_step_and_what_comes_next():
+    import webui
+
+    sg = {"device": "cuda:1", "state": "working", "kind": "sweep", "step": 1200, "since": 100.0,
+          "queued": [{"kind": "maps", "step": 1200}, {"kind": "probe", "step": 1250}], "done": {"probe": 3, "maps": 0}}
+    t = webui.second_gpu_text(sg, True, 142.0)
+    assert t["title"] == "Second GPU · cuda:1" and t["dot"] == "live" and t["value"] == "Region sweep"
+    assert t["detail"] == "step 1,200 · for 42 s"
+    assert t["sub"] == "next: training maps of step 1,200 (+1) · done: 3 probes"
+    loading = webui.second_gpu_text({**sg, "state": "loading"}, True, 142.0)
+    assert loading["value"] == "Loading models" and loading["detail"] == "for 42 s"
+    idle = webui.second_gpu_text({**sg, "state": "idle"}, True, 142.0)
+    assert idle["dot"] == "" and idle["value"] == "Waiting for work"
+    ended = webui.second_gpu_text(sg, False, 142.0)  # the run ended without closing it
+    assert ended["value"] == "Stopped" and ended["dot"] == "done"
+    failed = webui.second_gpu_text({"device": "cuda:1", "state": "failed", "note": "failed to start"}, False, 0)
+    assert failed["dot"] == "error" and failed["detail"] == "failed to start"
+    assert webui.second_gpu_text(None, True, 0) is None and webui.second_gpu_text({}, True, 0) is None
