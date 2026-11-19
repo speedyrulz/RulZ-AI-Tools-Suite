@@ -602,7 +602,8 @@ def test_status_file_format(world):
     ready_state(w)
     s = read_json(w.tmp / "status.json")
     assert set(s) == {"state", "instance", "job", "gpu", "message", "rounds_done", "last_round", "last_seconds", "behind",
-                      "time", "pid"}
+                      "time", "pid", "gpus"}
+    assert s["gpus"] == []  # one GPU in this process: no pool entries
     assert s["state"] == "ready" and s["instance"] == "42" and s["job"] == "job" and s["pid"] == os.getpid()
     assert abs(s["time"] - time.time()) < 60
 
