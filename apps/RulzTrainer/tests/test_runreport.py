@@ -105,6 +105,39 @@ def test_a_run_is_read_from_its_folder(tmp_path):
         "region watch" in rows["Also on"]
 
 
+def test_region_data_and_reports(tmp_path):
+    job = _job(tmp_path, maps=False)
+    (job / "region_sweep.jsonl").write_text("\n".join(json.dumps(row) for row in (
+        {"step": 20, "train": {"subject": 0.1, "face": 0.2}, "held": {"subject": 0.08, "face": 0.1}},
+        {"step": 40, "train": {"subject": 0.2, "face": 0.3}, "held": {"subject": -0.01, "face": 0.1}})), encoding="utf-8")
+    picture = "photos/person.jpg"
+    (job / "region_watch.json").write_text(json.dumps({
+        "epoch": 2, "frozen": True, "history": [{"epoch": 2, "step": 40,
+        "learned": {"face": 0.4}, "contrast": {}}],
+        "pictures": {picture: {"seen": 2, "contrast_log": {"background": 0.0, "clothes": 0.69314718056}}}
+    }), encoding="utf-8")
+    (job / "region_sweep.json").write_text(json.dumps({"latest": {picture: {
+        "contrast": {"background": 0.8, "clothes": 1.2}}}}), encoding="utf-8")
+    run = R.load(job)
+    assert R.sweep_series(run.sweeps, "face", "train") == [(20, 20.0), (40, 30.0)]
+    assert R.sweep_gaps(run.sweeps)["face"] == [(20, 10.0), (40, 20.0)]
+    assert R.growing_gap(run.sweeps)[0] == "subject"
+    row = run.watch["rows"][0]
+    assert row["image"] == "person.jpg" and row["background"] == 1.0
+    assert row["clothes"] == pytest.approx(2.0) and row["sweep_background"] == 0.8
+    assert run.watch["summary"]["learned"]["face"] == 0.4
+    assert any("memorised" in text for _, text in R.verdict(run))
+    assert all(path.is_file() for path in R.generate(job).values())
+
+
+def test_region_sweeps_without_held_out(tmp_path):
+    job = _job(tmp_path, maps=False)
+    (job / "region_sweep.jsonl").write_text(json.dumps({"step": 10, "train": {"subject": 0.2}}), encoding="utf-8")
+    run = R.load(job)
+    assert R.sweep_gaps(run.sweeps) == {} and R.growing_gap(run.sweeps) is None
+    assert all(path.is_file() for path in R.generate(job).values())
+
+
 def test_both_files_are_written_and_a_bare_run_still_gets_them(tmp_path):
     job = _job(tmp_path)
     done = R.generate(job)
@@ -172,3 +205,124 @@ def test_the_best_checkpoint_is_the_race_winner_s():
 def test_the_setting_is_off_by_default_and_round_trips():
     assert TrainConfig().run_report is False
     assert TrainConfig.from_dict(TrainConfig(run_report=True).to_dict()).run_report is True
+
+
+def _both(job):
+    done = R.generate(job)
+    assert done["image"].is_file() and done["pdf"].is_file()
+    return done
+
+
+@pytest.mark.parametrize("name", ["train_list", "history_dict", "pictures_list", "latest_list", "sweep_list"])
+def test_odd_region_files_never_stop_the_report(tmp_path, name):
+    job = _job(tmp_path, maps=False)
+    picture = "photos/person.jpg"
+    watch = {"epoch": 2, "frozen": True, "history": [{"epoch": 2, "step": 40, "learned": {"face": 0.4}, "contrast": {}}],
+             "pictures": {picture: {"seen": 2, "contrast_log": {"background": 0.0}}}}
+    sweep = {"latest": {picture: {"contrast": {"background": 0.8}}}}
+    rows = [{"step": 20, "train": {"subject": 0.1}, "held": {"subject": 0.08}},
+            {"step": 40, "train": {"subject": 0.2}, "held": {"subject": 0.05}}]
+    if name == "train_list":
+        rows[1]["train"] = [0.2]
+    elif name == "history_dict":
+        watch["history"] = {"epoch": 2}
+    elif name == "pictures_list":
+        watch["pictures"] = [picture]
+    elif name == "latest_list":
+        sweep["latest"] = [picture]
+    else:
+        sweep = [1, 2]
+    (job / "region_sweep.jsonl").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    (job / "region_watch.json").write_text(json.dumps(watch), encoding="utf-8")
+    (job / "region_sweep.json").write_text(json.dumps(sweep), encoding="utf-8")
+    _both(job)
+
+
+def test_odd_nested_watch_values_give_data_or_nothing(tmp_path):
+    job = _job(tmp_path, maps=False)
+    (job / "region_watch.json").write_text(json.dumps({"history": [[1]], "pictures": {"a.jpg": {"seen": 1, "contrast_log": [1]}}}),
+                                           encoding="utf-8")
+    (job / "region_sweep.json").write_text(json.dumps({"latest": {"a.jpg": [1]}}), encoding="utf-8")
+    data = R.watch_data(job)
+    assert data["rows"][0]["background"] is None and data["rows"][0]["sweep_background"] is None
+    (job / "region_sweep.json").write_text(json.dumps({"latest": {"a.jpg": {"contrast": [1]}}}), encoding="utf-8")
+    assert R.watch_data(job)["rows"][0]["sweep_clothes"] is None
+    _both(job)
+
+
+def test_an_empty_watch_state_has_no_page(tmp_path):
+    job = _job(tmp_path, maps=False)
+    (job / "region_watch.json").write_text(json.dumps({"epoch": None, "frozen": False, "history": [], "pictures": {}}),
+                                           encoding="utf-8")
+    assert R.watch_data(job) == {}
+    (job / "region_watch.json").write_text(json.dumps({"pictures": {"a.jpg": {"seen": 0}}}), encoding="utf-8")
+    assert R.watch_data(job) == {}
+    assert R.load(job).watch == {}
+    _both(job)
+
+
+def _rows(*gaps, late=False):
+    return [{"step": 10 * (i + 1), "train": {"subject": g / 100}, "held": {"subject": 0.0}, **({"late": True} if late else {})}
+            for i, g in enumerate(gaps)]
+
+
+def test_growing_gap_edges():
+    assert R.growing_gap(_rows(0, 15)) == ("subject", pytest.approx(15.0), pytest.approx(15.0))
+    assert R.growing_gap(_rows(10, 14.9)) is None  # the gap is below 15
+    assert R.growing_gap(_rows(-5, 10)) is None  # a rise of 15 but a gap under 15
+    assert R.growing_gap(_rows(30, 40)) is None  # a gap over 15 that did not rise by 15
+    assert R.growing_gap(_rows(20)) is None
+
+
+def test_a_resumed_baseline_counts_from_its_own_rows():
+    old = _rows(0, 30)  # grew 30 points before the resume
+    new = [{**r, "step": r["step"] + 100} for r in _rows(20, 22, late=True)]
+    assert R.growing_gap(old + new) is None  # the new baseline's gap only rose 2 points
+    assert [p[0] for p in R.sweep_gaps(old + new)["subject"]] == [110, 120]
+    assert R.growing_gap(old) is not None
+    assert R.since_baseline(_rows(1, 2, late=True)) == _rows(1, 2, late=True)  # a late run from the start: all of it
+
+
+def test_the_memorised_warning_survives_a_long_sweep_line(tmp_path):
+    job = _job(tmp_path, maps=False)
+    # a real summary row: describe() makes a long line from the train / held shares
+    shares = {c: 0.5 for c in ("face", "hair", "skin", "clothes", "background", "subject")}
+    rows = [{"step": 20, "train": {"subject": 0.1, "face": 0.2}, "held": {"subject": 0.08, "face": 0.1}},
+            {"step": 40, "train": dict(shares), "held": {c: 0.0 for c in shares}, "gap": dict(shares),
+             "pictures": 30, "held_pictures": 8, "swept": 38, "seconds": 12.5, "best": [0.08, 20]}]
+    (job / "region_sweep.jsonl").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    run = R.load(job)
+    assert len(R.regionsweep.describe(run.sweeps[-1])) > 240  # long enough to fill four wrapped lines
+    text = R.sweeps_text(run)
+    assert "may be memorised" in text and "Held-out photos peaked" in text and "Sweep at step 40" in text
+    assert len(text.splitlines()) <= 5
+    assert any("may be memorised" in t for _, t in R.verdict(run))
+    _both(job)
+
+
+def test_many_sweeps_and_pictures_paginate(tmp_path):
+    job = _job(tmp_path, maps=False)
+    rows = [{"step": 10 * i, "train": {"subject": i / 100, "face": i / 100}, "held": {"subject": i / 200}}
+            for i in range(1, 41)]
+    (job / "region_sweep.jsonl").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    pictures = {f"photos/p{i}.jpg": {"seen": 3, "contrast_log": {"background": 0.01 * i, "clothes": -0.01 * i}}
+                for i in range(37)}
+    (job / "region_watch.json").write_text(json.dumps({"epoch": 3, "frozen": True, "pictures": pictures,
+                                                       "history": [{"epoch": 3, "step": 40, "learned": {"face": 0.1}}]}),
+                                           encoding="utf-8")
+    assert len(R.watch_data(job)["rows"]) == 37
+    done = _both(job)
+    data = done["pdf"].read_bytes()
+    assert data.count(b"/Type /Page\n") + data.count(b"/Type /Page ") >= 10
+
+
+def test_a_watch_contrast_summary_goes_through_describe(tmp_path):
+    job = _job(tmp_path, maps=False)
+    (job / "region_watch.json").write_text(json.dumps({
+        "epoch": 3, "frozen": True, "pictures": {"photos/a.jpg": {"seen": 3, "contrast_log": {"background": 0.1}}},
+        "history": [{"epoch": 3, "step": 40, "learned": {"face": 0.4},
+                     "contrast": {"background": {"median": 0.8, "pictures": 3}}}]}), encoding="utf-8")
+    summary = R.watch_data(job)["summary"]
+    line = R.regionwatch.describe(summary)
+    assert "background against subject x0.80 (median of 3 pictures)" in line
+    _both(job)
