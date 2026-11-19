@@ -1,6 +1,6 @@
 """Start and stop the "render on this PC" helper (python -m rulztrainer.renderhelper) for the WebUI's Fleet tab.
 
-One helper per vast.ai instance, one GPU per helper. The helper is a child of the WebUI: its stdin is a pipe that
+One helper per vast.ai instance, on one or several GPUs (a GPU belongs to one helper at a time). The helper is a child of the WebUI: its stdin is a pipe that
 closes when the WebUI dies (the helper stops on stdin close), and stop_all() ends every helper when the WebUI exits.
 No GPU is touched here: --list-gpus and the helper itself are run only when the user asks for them.
 
@@ -34,6 +34,14 @@ STATES = {
     "error": ("Error", "error", "err"),
 }
 OFF = ("Stopped", "stop_circle", "")
+# state of one GPU of a helper's pool (the status file's gpus) -> (short word, Material icon, level)
+GPU_STATES = {
+    "loading": ("Loading", "downloading", "warn"),
+    "ready": ("Ready", "check_circle", "ok"),
+    "rendering": ("Rendering", "autorenew", "ok"),
+    "dropped": ("Dropped", "error", "err"),
+    "load_failed": ("Not loaded", "warning", "warn"),
+}
 
 
 class Refused(Exception):
@@ -88,20 +96,28 @@ def status_view(raw: dict | None, running: bool, exit_code: int | None = None, n
     behind = raw.get("behind")
     if isinstance(behind, (int, float)) and behind:
         parts.append(f"{int(behind)} behind")
+    gpus = [g for g in (raw.get("gpus") or []) if isinstance(g, dict)]
+    if len(gpus) > 1:
+        live = sum(1 for g in gpus if g.get("state") in ("ready", "rendering"))
+        parts.append(f"{live} of {len(gpus)} GPUs")
     if raw.get("message"):
         parts.append(str(raw["message"]))
     stamp = raw.get("time")
     if isinstance(stamp, (int, float)) and now - stamp > STALE_SECONDS and state in ("rendering", "ready", "idle"):
         parts.append(f"no news for {int(now - stamp)} s")
         level = "warn"
-    return {"word": word, "icon": icon, "level": level, "text": " · ".join(parts)}
+    return {"word": word, "icon": icon, "level": level, "text": " · ".join(parts),
+            "gpus": [{"device": g.get("device", ""), "name": g.get("name", ""),
+                      **dict(zip(("word", "icon", "level"), GPU_STATES.get(g.get("state"), ("", "", ""))))}
+                     for g in gpus]}
 
 
-def helper_command(instance, device_index: int, status_file: Path, sample_model: str = "", quant: str = "",
+def helper_command(instance, device_index, status_file: Path, sample_model: str = "", quant: str = "",
                    models_dir: str = "") -> list[str]:
-    """The helper's command line (contract section 5)."""
+    """The helper's command line (contract section 5). device_index: a GPU index, or several (cuda:1,cuda:3)."""
+    indices = [device_index] if isinstance(device_index, (int, str)) else list(device_index)
     cmd = [sys.executable, "-m", "rulztrainer.renderhelper", "--instance", str(instance),
-           "--device", f"cuda:{int(device_index)}", "--status-file", str(status_file)]
+           "--device", ",".join(f"cuda:{int(i)}" for i in indices), "--status-file", str(status_file)]
     if sample_model.strip():
         cmd += ["--sample-model", sample_model.strip()]
         if quant.strip() and quant.strip() != "auto":
@@ -164,50 +180,58 @@ class RenderHelpers:
         with self._lock:
             return self._alive(self._procs.get(str(instance)))
 
-    def gpu_of(self, instance) -> int | None:
+    def gpu_of(self, instance) -> list[int] | None:
+        """The GPU indices a running helper uses (None when it is not running)."""
         with self._lock:
             e = self._procs.get(str(instance))
-            return e["gpu"] if self._alive(e) else None
+            return list(e["gpus"]) if self._alive(e) else None
 
     def gpu_user(self, gpu: int, except_instance=None) -> str | None:
         """The instance whose running helper uses this GPU, if any."""
         with self._lock:
             for iid, e in self._procs.items():
-                if iid != str(except_instance) and e["gpu"] == gpu and self._alive(e):
+                if iid != str(except_instance) and gpu in e["gpus"] and self._alive(e):
                     return iid
         return None
 
-    def start(self, instance, gpu: dict, sample_model: str = "", quant: str = "", models_dir: str = "") -> list[str]:
-        """Start the helper for an instance on a GPU ({index, name, ...}); returns its command line."""
+    def start(self, instance, gpus, sample_model: str = "", quant: str = "", models_dir: str = "") -> list[str]:
+        """Start the helper for an instance on one GPU ({index, name, ...}) or several (a list of them); returns its
+        command line. A GPU another helper uses refuses the whole start."""
         iid = str(instance)
-        index = int(gpu["index"])
-        if self.running(iid):
-            raise Refused(f"The helper for instance {iid} is already running.")
-        other = self.gpu_user(index, except_instance=iid)
-        if other is not None:
-            raise Refused(f"GPU {index} ({gpu.get('name', '')}) is already rendering for instance {other}. "
-                          "Pick another GPU, or turn that one off first.")
+        picked: dict[int, dict] = {}
+        for g in ([gpus] if isinstance(gpus, dict) else list(gpus)):
+            picked.setdefault(int(g["index"]), g)
+        if not picked:
+            raise Refused("Pick a GPU to render on first.")
+        indices = list(picked)
         sample_model = (sample_model or "").strip()
         if sample_model and not Path(sample_model).expanduser().exists():
             raise Refused(f"The sampling model was not found: {sample_model}")
-        self.dir.mkdir(parents=True, exist_ok=True)
-        status = self.status_file(iid)
-        try:
-            status.unlink()  # a status from an earlier helper would pass for this one's
-        except OSError:
-            pass
-        cmd = helper_command(iid, index, status, sample_model, quant, models_dir)
-        log = open(self.dir / f"{iid}.log", "w", encoding="utf-8")
-        try:
-            proc = self._popen(cmd, cwd=str(ROOT), stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
-                               **_quiet(group=True))
-        except OSError as e:
-            log.close()
-            raise Refused(f"The helper did not start: {e}") from e
+        cmd = helper_command(iid, indices, self.status_file(iid), sample_model, quant, models_dir)
+        # one lock from the checks to the registration (Popen is quick), so two starts at once cannot both pass them
         with self._lock:
+            if self._alive(self._procs.get(iid)):
+                raise Refused(f"The helper for instance {iid} is already running.")
+            # a set intersection with every other running helper's GPUs
+            busy = {i: other for other, e in self._procs.items() if other != iid and self._alive(e) for i in e["gpus"]}
+            for index in sorted(set(indices) & set(busy)):
+                raise Refused(f"GPU {index} ({picked[index].get('name', '')}) is already rendering for instance "
+                              f"{busy[index]}. Pick another GPU, or turn that one off first.")
+            self.dir.mkdir(parents=True, exist_ok=True)
+            try:
+                self.status_file(iid).unlink()  # a status from an earlier helper would pass for this one's
+            except OSError:
+                pass
+            log = open(self.dir / f"{iid}.log", "w", encoding="utf-8")
+            try:
+                proc = self._popen(cmd, cwd=str(ROOT), stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
+                                   **_quiet(group=True))
+            except OSError as e:
+                log.close()
+                raise Refused(f"The helper did not start: {e}") from e
             old = self._procs.get(iid)
-            self._procs[iid] = {"proc": proc, "gpu": index, "gpu_name": str(gpu.get("name") or ""), "log": log,
-                                "stopped": False}
+            self._procs[iid] = {"proc": proc, "gpus": indices, "log": log, "stopped": False,
+                                "gpu_name": " + ".join(str(g.get("name") or "") for g in picked.values())}
         if old:  # a crashed helper's handles
             _close(old["proc"].stdin, old.get("log"))
         return cmd
