@@ -1737,6 +1737,7 @@ class DatasetPicker:
         self.rows: dict[str, dict] = {}
         self.on_change = on_change
         self.listeners: list = []  # called when rows are added or removed (the wizard's dataset choices)
+        self.tick_listeners: list = []  # called when a row is ticked or unticked or its settings change
         self.box = ui.column().classes("w-full gap-1")
         with self.box:
             self.empty = ui.label("No datasets yet: create one on the Dataset tab, or add a folder you already have.") \
@@ -1867,8 +1868,56 @@ class DatasetPicker:
                 r["info"].text = f"{r['path']}: {images_text(c[0])}, {c[1]} captioned"
 
     def changed(self) -> None:
+        for fn in self.tick_listeners:
+            fn()
         if self.on_change is not None:
             self.on_change()
+
+
+def add_ref_path(text: str, path: str) -> str:
+    """The reference textarea's text with `path` added on its own line; unchanged when that path is already listed
+    (compared without surrounding blanks, slash style, a trailing slash or case on Windows)."""
+    def norm(p: str) -> str:
+        return os.path.normcase(os.path.normpath(p.strip()))
+
+    path = (path or "").strip()
+    text = text or ""
+    if not path or any(line.strip() and norm(line) == norm(path) for line in text.splitlines()):
+        return text
+    lines = text.splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    lines.append(path)
+    return "\n".join(lines)
+
+
+def dataset_ref_button(picker, textarea) -> None:
+    """An "Add a training dataset" button with a menu of the run's ticked datasets; choosing one adds its folder as a
+    new line of the reference textarea."""
+    def add(path: str) -> None:
+        textarea.value = add_ref_path(textarea.value or "", path)
+
+    with ui.row().classes("items-center"):  # the tooltip sits on the row: a disabled button gets no hover
+        tip = ui.tooltip("")  # its own element (Element.tooltip() returns the row, whose .text is no tooltip)
+        btn = ui.button("Add a training dataset", icon="playlist_add", on_click=lambda: menu.open()) \
+            .props("outline")
+        with btn:
+            # opened by the click handler: Quasar never hooks a menu to a button that was disabled when it mounted
+            menu = ui.menu().props("no-parent-event")
+
+    def rebuild() -> None:
+        paths = picker.selected
+        menu.clear()
+        with menu:
+            for p in paths:
+                ui.menu_item(os.path.basename(os.path.normpath(p)) or p, on_click=lambda p=p: add(p)).tooltip(p)
+        btn.set_enabled(bool(paths))
+        tip.text = ("Adds a dataset of this run as a reference folder" if paths
+                    else "Tick a dataset under Basics > Dataset first")
+
+    rebuild()
+    picker.tick_listeners.append(rebuild)
+    picker.listeners.append(rebuild)
 
 
 class Form:
@@ -7546,12 +7595,14 @@ class Wizard:
                           "(ArcFace; 50%+ generally means the same person), which picks the best checkpoint and stops "
                           "early. A folder counts as all its photos; you can also tick Face ref on the Dataset tab.",
                           when=self.has_face, adv=True):
-            self.bind(ui.textarea("Face references (one path per line)"), "face_refs").classes("w-full")
+            face_ta = self.bind(ui.textarea("Face references (one path per line)"), "face_refs").classes("w-full")
+            dataset_ref_button(self.w["datasets"], face_ta)
         with self.setting("body_refs", "Body references",
                           "Photos that show the person's build, from the neck to mid-thigh or more. A folder counts as "
                           "all its photos (those without a usable view of the body are skipped).",
                           when=self.has_body, adv=True):
-            self.bind(ui.textarea("Body references (one path per line)"), "body_refs").classes("w-full")
+            body_ta = self.bind(ui.textarea("Body references (one path per line)"), "body_refs").classes("w-full")
+            dataset_ref_button(self.w["datasets"], body_ta)
         with self.setting("resolutions", "Training resolution",
                           "The image area training works at, in megapixels (1 MP = 1024x1024), with each photo's aspect "
                           "ratio kept. Higher learns finer detail but takes more memory and time.", adv=True):
@@ -12953,6 +13004,7 @@ def build_page(local: bool = True):
                              "include three-quarter or full-length shots.")
                         w["face_refs"] = ui.textarea("Face reference images or folders (one path per line)") \
                             .classes("w-full")
+                        dataset_ref_button(w["datasets"], w["face_refs"])
                         with fields():
                             w["face_provider"] = ui.select(["cpu", "cuda"], value=d.face_provider,
                                                            label="Face model device").classes("w-40")
@@ -12998,6 +13050,7 @@ def build_page(local: bool = True):
                         face_row = ui.row().classes("w-full gap-2")
                         w["body_refs"] = ui.textarea("Body reference images or folders (one path per line; "
                                                      "three-quarter or full-length shots)").classes("w-full")
+                        dataset_ref_button(w["datasets"], w["body_refs"])
                         with fields():
                             w["body_score"] = ui.select({"appearance": "appearance (DINOv2)",
                                                          "anchored": "anchored (SigLIP 2 + DINOv2)",

@@ -1131,7 +1131,9 @@ configuration that trains.
 
 Pick reference images on the Dataset tab (*Face ref* / *Body ref* toggles) or list them as `face_refs` /
 `body_refs`. After every sampling pass each sample is scored and the results go to `face_scores.jsonl`, the
-Monitor chart and the sample captions:
+Monitor chart and the sample captions. **Add a training dataset** (since 3.49.0), under each reference field on the
+Likeness section and in the wizard, lists the datasets ticked for the run and adds the chosen one's folder as a new line
+(a folder counts as all its images), so you need not type its path; typed paths work as before:
 
 - **Face**: the largest face in the sample is embedded with InsightFace (ArcFace, `buffalo_l`) and compared by
   cosine similarity to every reference face; the best match is reported as a percent (cosine x 100). For
