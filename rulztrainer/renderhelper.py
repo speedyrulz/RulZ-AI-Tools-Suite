@@ -34,6 +34,7 @@ import threading
 import time
 import traceback
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -48,6 +49,9 @@ BOOTSTRAP = ('import sys,struct;s=sys.stdin.buffer;'
 MAGIC = b"RZRB"
 HEARTBEAT_EVERY = 5.0  # seconds; the trainer calls a helper gone after 30
 TICK = 1.0  # seconds between looks at the instance
+LORA_STREAMS = 4  # a round's LoRA comes in this many byte ranges at once: one ssh stream fell to ~0.8 MB/s, four ~5 MB/s
+LORA_PARALLEL_MIN = 8 * 1024 * 1024  # bytes; smaller files come in one get
+SSH_CIPHERS = "^aes128-gcm@openssh.com"
 RETRY_PREPARE = 300.0  # seconds before a failed preparation is tried again (a model may have been put in place)
 BACKOFF = (2.0, 5.0, 10.0, 20.0, 30.0)  # seconds between connection tries
 VERSION_MISMATCH = "versions differ: update RulzTrainer on the instance or this PC"
@@ -93,7 +97,10 @@ class Bridge:
     def _read(self, size: int) -> bytes:
         chunks = []
         while size:
-            chunk = self.proc.stdout.read(size)
+            try:
+                chunk = self.proc.stdout.read(size)
+            except (OSError, ValueError) as e:  # (ValueError: closed by close() / shutdown)
+                raise Disconnected(f"the connection ended: {e}") from e
             if not chunk:
                 tail = "; ".join(e for e in self.errors if e)
                 raise Disconnected("the connection ended" + (f" ({tail})" if tail else ""))
@@ -124,8 +131,12 @@ class Bridge:
             raise BridgeError(str(reply.get("error") or f"{op} failed"))
         return reply, data
 
-    def get(self, path: str) -> bytes:
-        return self.call("get", path=path)[1]
+    def get(self, path: str, offset: int | None = None, length: int | None = None) -> bytes:
+        fields = {} if offset is None and length is None else {"offset": offset, "length": length}
+        return self.call("get", path=path, **fields)[1]
+
+    def size(self, path: str) -> int:
+        return self.call("size", path=path)[0]["size"]
 
     def get_json(self, path: str):
         return json.loads(self.get(path).decode("utf-8"))
@@ -171,7 +182,10 @@ class SshConnector:
     def _spawn(self, conn: dict) -> Bridge:
         shell = f"cd {self.remote.REMOTE_DIR} && {self.remote.PYTHON} -c {_quote(BOOTSTRAP)}"
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        proc = subprocess.Popen(self.remote.ssh_command(conn, self.key) + [shell], stdin=subprocess.PIPE,
+        cmd = self.remote.ssh_command(conn, self.key)
+        # AES-GCM first (the ^ keeps the default list behind it): a single stream ran 99 -> 72 s for 84 MB on a vast host
+        cmd = cmd[:-1] + ["-c", SSH_CIPHERS] + cmd[-1:] + [shell]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags)
         bridge = Bridge(proc, f"{conn.get('route')} {conn['host']}:{conn['port']}")
         script = BRIDGE_FILE.read_bytes()
@@ -392,6 +406,7 @@ class Helper:
         self.stop = threading.Event()
         self.hb: Bridge | None = None  # the main loop's connection
         self.wb: Bridge | None = None  # the worker's
+        self.range_bridges: list[Bridge] = []
         self.worker: threading.Thread | None = None
         self.renderer = None
         self.token: str | None = None  # the run this helper is prepared (or preparing) for
@@ -509,12 +524,14 @@ class Helper:
             self.status.update(state="error", message=f"{type(e).__name__}: {e}")
 
     def _drop_wb(self) -> None:
+        self._drop_ranges()
         if self.wb is not None:
             self.wb.close()
         self.wb = None
 
     def _reset(self, token: str | None) -> None:
         """A different run (or none): the old run's model goes, the next one is prepared from scratch."""
+        self._drop_ranges()
         self._free_renderer()
         self.token, self.prepared, self.kinds, self.next_prepare, self.not_ready_reason = token, False, [], 0.0, ""
         self.last_beat = 0.0
@@ -661,21 +678,70 @@ class Helper:
         except Exception as e:  # noqa: BLE001 - offline, gated, disk
             raise NotReady(f"Could not fetch {info['file']} from {info['repo']}: {e}") from e
 
+    def _drop_ranges(self) -> None:
+        bridges, self.range_bridges = self.range_bridges, []
+        for bridge in bridges:
+            bridge.close()
+
+    def _fetch_lora(self, w: Bridge, path: str) -> tuple[bytes, int]:
+        try:
+            size = w.size(path)
+            if size < LORA_PARALLEL_MIN:
+                return w.get(path), 1
+            while len(self.range_bridges) < LORA_STREAMS - 1:
+                if self.stop.is_set():  # stopping: no new connections for shutdown to miss
+                    raise BridgeError("the helper is stopping")
+                try:
+                    self.range_bridges.append(self.connect())
+                except Disconnected as e:
+                    raise BridgeError("could not open range connection") from e
+            bridges = [w, *self.range_bridges]
+            with ThreadPoolExecutor(max_workers=LORA_STREAMS) as pool:
+                futures = []
+                for i, bridge in enumerate(bridges):
+                    start, end = size * i // LORA_STREAMS, size * (i + 1) // LORA_STREAMS
+                    futures.append(pool.submit(bridge.get, path, start, end - start))
+                parts = []
+                for i, future in enumerate(futures):
+                    try:
+                        part = future.result()
+                    except Disconnected:
+                        if i == 0:
+                            raise
+                        raise BridgeError("range connection disconnected")
+                    expected = size * (i + 1) // LORA_STREAMS - size * i // LORA_STREAMS
+                    if len(part) != expected:
+                        raise BridgeError("short range read")
+                    parts.append(part)
+            payload = b"".join(parts)
+            if len(payload) != size:
+                raise BridgeError("incorrect LoRA length")
+            return payload, LORA_STREAMS
+        except Disconnected:
+            self._drop_ranges()
+            raise
+        except (BridgeError, OSError):
+            self._drop_ranges()
+            return w.get(path), 1
+
     def _render(self, entry: dict, name: str) -> None:
         job = entry["job"]
         base = f"{job}/remote_render"
         w = self._bridge()
+        started = time.monotonic()
         if not w.rename(f"{base}/rounds/{name}", f"{base}/claimed/{name}"):
             return  # the trainer took it back first
+        claim_time = time.monotonic() - started
         claimed = f"{base}/claimed/{name}"
         self.status.update(state="rendering", job=job, message=f"Rendering {name}.")
         work = self.work_dir / str(self.token)[:16] / "rounds" / name
         try:
-            started = time.time()
             rnd = w.get_json(f"{claimed}/round.json")
             if rnd.get("run_token") != self.token:
                 raise RuntimeError("the round belongs to another run")
-            payload = w.get(f"{claimed}/lora.safetensors")
+            fetch_start = time.monotonic()
+            payload, streams = self._fetch_lora(w, f"{claimed}/lora.safetensors")
+            fetch_time = time.monotonic() - fetch_start
             shared = remote()
             jobs = [shared.job_from_dict(d, work) for d in rnd["jobs"]]
             real = work.resolve()
@@ -684,14 +750,20 @@ class Helper:
                     raise RuntimeError(f"a picture path leaves the work folder: {j.out_path}")
             for j in jobs:  # the render saves with Image.save, which makes no folders
                 Path(j.out_path).parent.mkdir(parents=True, exist_ok=True)
+            render_start = time.monotonic()
             _, seconds = self.renderer.render(jobs, payload, rnd.get("negative_kind") or "probe")
+            render_time = time.monotonic() - render_start
+            upload_start = time.monotonic()
             files = self._upload(w, claimed, jobs, work)
+            upload_time = time.monotonic() - upload_start
             w.write_json(f"{claimed}/done.json", {"seconds": round(seconds, 2), "files": files, "host": self.host,
                                                   "gpu": self.gpu_name})
             if w.rename(claimed, f"{base}/done/{name}"):
                 self.rounds_done += 1
-                log.info("Round %s: %d files in %.1f s (%.1f s with the transfers)", name, len(files), seconds,
-                         time.time() - started)
+                mb = len(payload) / 1_000_000
+                log.info("Round %s: claim %.2f s, LoRA %.2f s (%.2f MB, %.2f MB/s, %d streams), "
+                         "render %.2f s, upload %.2f s, total %.2f s", name, claim_time, fetch_time, mb,
+                         mb / max(fetch_time, 1e-9), streams, render_time, upload_time, time.monotonic() - started)
                 self.status.update(state="ready", message="", rounds_done=self.rounds_done, last_round=name,
                                    last_seconds=round(seconds, 2))
             else:
@@ -700,7 +772,8 @@ class Helper:
         except Disconnected:
             raise
         except BridgeError as e:
-            if "round is gone" not in str(e):
+            # FileNotFoundError: the round's files went from claimed/ while they were read (taken back at the next probe)
+            if "round is gone" not in str(e) and not str(e).startswith("FileNotFoundError"):
                 raise
             # the bridge refuses writes into a round folder the instance has renamed away (its deadline passed)
             log.warning("Round %s: the instance took it back while it was sent; its pictures are dropped", name)
