@@ -9970,12 +9970,45 @@ def fleet_probe_entries(folder, probes: list[dict] | None = None, full: bool = F
     return out
 
 
+_FLEET_SWEEPS: dict[str, tuple] = {}  # folder -> ((status.json, region_sweep.jsonl signatures), sweeps)
+
+
+def fleet_sweeps(folder) -> list[dict]:
+    """A downloaded run's region sweeps as history.sweep_series gives them ([{"step", "train", "held"}], oldest
+    first): the downloaded status.json's sweep history, else its region_sweep.jsonl (the "logs" kind brings both).
+    Cached until either file changes. [] without a folder or without sweeps."""
+    if not folder:
+        return []
+    folder = Path(folder)
+
+    def sig(name: str):
+        try:
+            st = (folder / name).stat()
+            return st.st_mtime_ns, st.st_size
+        except OSError:
+            return None
+
+    key = (sig("status.json"), sig("region_sweep.jsonl"))
+    if key == (None, None):
+        return []
+    hit = _FLEET_SWEEPS.get(str(folder))
+    if hit is None or hit[0] != key:
+        try:
+            status = json.loads((folder / "status.json").read_text(encoding="utf-8")) if key[0] else {}
+        except (OSError, ValueError):
+            status = {}
+        hit = (key, history.sweep_series(status if isinstance(status, dict) else {}, folder))
+        _FLEET_SWEEPS[str(folder)] = hit
+    return hit[1]
+
+
 def fleet_compare_runs(recs: list[dict], root=None) -> list[dict]:
     """Past-run records of the fleet as the history-shaped runs the Previous runs charts take: "label", "config",
-    "probes" (the smoothed face, body and combined series), "probe_raw" (for the common scale), "loss" and the run's
-    kept probe images ("probe_images", from its downloaded folder, only when it lies inside `root`). The probe records
-    are the downloaded status.json's where there is one, else the record's own (probe columns only: no normalised
-    scores, which history.probe_series then reads from the *_norm_ema columns). Labels stay unique."""
+    "probes" (the smoothed face, body and combined series), "probe_raw" (for the common scale), "loss", the run's
+    kept probe images ("probe_images") and its region sweeps ("sweeps"), both from its downloaded folder, only when it
+    lies inside `root`. The probe records are the downloaded status.json's where there is one, else the record's own
+    (probe columns only: no normalised scores, which history.probe_series then reads from the *_norm_ema columns).
+    Labels stay unique."""
     out, seen = [], {}
     for r in recs:
         folder = fleet_folder(r, root) if root is not None else (Path(r["folder"]) if r.get("folder") else None)
@@ -9988,7 +10021,8 @@ def fleet_compare_runs(recs: list[dict], root=None) -> list[dict]:
         out.append({"id": r["key"], "label": label, "job": r.get("job") or "", "state": r.get("state") or "",
                     "config": r.get("config") or {}, "probes": history.probe_series(probes),
                     "probe_raw": history.probe_raw({"probes": probes}), "loss": r.get("losses") or [],
-                    "probe_images": fleet_probe_entries(folder, probes, full=bool(full))})
+                    "probe_images": fleet_probe_entries(folder, probes, full=bool(full)),
+                    "sweeps": fleet_sweeps(folder)})
     return out
 
 
@@ -10913,6 +10947,21 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
                             cchart.options["tooltip"][":formatter"] = HISTORY_TOOLTIP
                         charts.append(cchart)
                     cmp_charts[cname] = cchart
+            subhead("Region sweeps")
+            hint("How much of its starting error each ticked run has removed in a part of the picture, at every "
+                 "sweep. Held-out pictures are dashed. Needs the run's downloaded logs.")
+            with ui.row().classes("w-full items-center gap-3"):
+                cmp_sweep_region = ui.select(list(SWEEP_REGIONS), value="subject", label="Region",
+                                             on_change=lambda _: draw_compare()) \
+                    .props("dense options-dense outlined").classes("w-40")
+                cmp_sweep_sets = [ui.checkbox(name, value=True, on_change=lambda _: draw_compare()).tooltip(
+                    "Held-out pictures are drawn dashed" if key == "held" else "Solid lines")
+                    for key, name, _, _ in SWEEP_SETS]
+            cmp_sweep_note = hint("")
+            cmp_charts["sweep"] = RzChart(chart_options(_axis("step", min="dataMin"),
+                                                        _axis("share of starting error gone %"), [], [])) \
+                .classes("w-full h-60")
+            charts.append(cmp_charts["sweep"])
             subhead("Probe images")
             hint("The ticked runs' downloaded probe images at the same step, the same test picture side by side. Tick "
                  "two images to compare them large.")
@@ -11095,8 +11144,10 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
         sig = (tuple(r["id"] for r in runs),
                tuple((len(r["loss"]), last(r["loss"]), len(r["probes"].get("combined") or []),
                       last(r["probes"].get("combined") or []), last(r["probes"].get("face") or []),
-                      last(r["probes"].get("body") or []), len(r["probe_images"])) for r in runs),
-               json.dumps(cmp_scale(), sort_keys=True), kind, step, tuple(cmp["picks"]))
+                      last(r["probes"].get("body") or []), len(r["probe_images"]), len(r["sweeps"]),
+                      r["sweeps"][-1]["step"] if r["sweeps"] else None) for r in runs),
+               json.dumps(cmp_scale(), sort_keys=True), kind, step, tuple(cmp["picks"]),
+               cmp_sweep_region.value, tuple(box.value for box in cmp_sweep_sets))
         if sig == cmp["shown"]:
             return
         cmp["shown"] = sig
@@ -11123,6 +11174,17 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
         cmp_charts["loss"].options["series"] = loss_series
         cmp_charts["loss"].options["legend"]["data"] = [sr["name"] for sr in loss_series]
         charts.restyle(cmp_charts["loss"])
+        shown = [spec[0] for spec, box in zip(SWEEP_SETS, cmp_sweep_sets) if box.value]
+        sweep_series_ = history_sweep_lines(runs, cmp_sweep_region.value or "subject", shown)
+        cmp_charts["sweep"].options["series"] = sweep_series_
+        cmp_charts["sweep"].options["legend"]["data"] = list(dict.fromkeys(sr["name"] for sr in sweep_series_))
+        charts.restyle(cmp_charts["sweep"])
+        no_sweeps = [r["label"] for r in runs if not r["sweeps"]]
+        cmp_sweep_note.text = ("" if not no_sweeps else
+                               "None of the ticked runs has region sweeps downloaded: download their logs, or they "
+                               "ran without region sweeps." if len(no_sweeps) == len(runs) else
+                               f"No region sweeps downloaded: {', '.join(no_sweeps)}.")
+        cmp_sweep_note.visible = bool(cmp_sweep_note.text)
         diffs = probe_settings_differences(runs)
         cmp_warn.text = ("Probe settings differ, so these probes are not the same test: " + "; ".join(diffs)) \
             if diffs else ""
