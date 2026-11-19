@@ -443,3 +443,28 @@ def test_the_report_guard_is_shared_by_every_page():
     import inspect
 
     assert "_REPORT_BUSY" in inspect.getsource(webui.build_fleet_tab) and "report_busy" not in         inspect.getsource(webui.build_fleet_tab)
+
+
+def test_remove_plan_lists_runs_with_their_megabytes_and_skips_the_busy_ones(tmp_path):
+    root = tmp_path / "pulls"
+    folder = root / "7" / "done"
+    folder.mkdir(parents=True)
+    (folder / "f.bin").write_bytes(b"x" * 2_500_000)
+    recs = [{"key": "k1", "job": "done", "instance": 7, "state": "ended", "folder": str(folder)},
+            {"key": "k2", "job": "live", "instance": 7, "state": "running", "folder": str(folder)},
+            {"key": "k3", "job": "pulling", "instance": 8, "state": "ended"},
+            {"key": "k4", "job": "bare", "instance": 8, "state": "ended"},
+            {"key": "k5", "job": "away", "instance": 8, "state": "ended", "folder": str(tmp_path)}]
+    plan = webui.fleet_remove_plan(recs, root, lambda key: key == "k3")
+    assert [p["skip"] for p in plan] == ["", "still going", "a download of it is going", "", ""]
+    assert plan[0]["text"] == "done · instance 7: 2.5 MB downloaded" and plan[0]["mb"] == 2.5
+    assert plan[1]["mb"] == 0.0 and "skipped, still going" in plan[1]["text"]
+    assert plan[3]["text"].endswith("no downloaded files") and plan[4]["mb"] == 0.0  # outside the root: not measured
+
+
+def test_remove_summary_names_the_megabytes_and_the_failures():
+    done = [{"mb": 2.5, "folder": "a", "binned": True}, {"mb": 1.0, "folder": None, "binned": False}]
+    assert webui.fleet_remove_summary(done, []) == "2 runs removed, 2.5 MB moved to the Recycle Bin."
+    text = webui.fleet_remove_summary(done[:1], ["x · instance 1: still going"])
+    assert text.startswith("1 run removed") and "Not removed: x · instance 1: still going" in text
+    assert "no Recycle Bin" in webui.fleet_remove_summary([{"mb": 3.0, "folder": "a", "binned": False}], [])
