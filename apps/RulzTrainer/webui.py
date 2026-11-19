@@ -2231,6 +2231,8 @@ class Form:
             probe_seeds=int(v("probe_seeds")), probe_seed=int(v("probe_seed")), probe_size=int(v("probe_size")),
             probe_floor_seeds=int(v("probe_floor_seeds") or 4),
             probe_async=bool(v("probe_async")), probe_device=s("probe_device"),
+            sample_async=bool(v("sample_async")), maps_async=bool(v("maps_async")),
+            sweep_async=bool(v("sweep_async")),
             probe_steps=int(v("probe_steps")), probe_cfg=float(v("probe_cfg")), probe_ema=float(v("probe_ema")),
             likeness_noise_band=float(v("likeness_noise_band")), likeness_track_best=bool(v("likeness_track_best")),
             likeness_track_best_face=bool(v("likeness_track_best_face")),
@@ -13032,6 +13034,27 @@ def build_page(local: bool = True):
                                          "steps later; a best checkpoint still saves exactly the weights that were "
                                          "scored. Needs Multi-GPU off (data parallel already trains on both) and the "
                                          "model to fit the second GPU; not in a configuration race.")
+                            w["sample_async"] = ui.switch("Render samples on the second GPU", value=d.sample_async) \
+                                .tooltip("Experimental, never run on a real GPU yet. The in-loop sample rounds render "
+                                         "on the second GPU (the sampling model, in a separate process) while "
+                                         "training goes on; the pictures appear under that step's name when done, up "
+                                         "to Sample every steps later. Samples before training and the final ones "
+                                         "render on the training GPU. Takes precedence over Render on this PC. "
+                                         "Needs Multi-GPU off, no race and no full fine-tune.")
+                            w["maps_async"] = ui.switch("Training maps on the second GPU", value=d.maps_async) \
+                                .tooltip("Experimental, never run on a real GPU yet. The training maps are captured on "
+                                         "the second GPU with a copy of the model you train (its own quantization, "
+                                         "LoRA slots and training adapter) while training goes on, and recorded when "
+                                         "they come back, up to one interval later, from the weights they read. With "
+                                         "a separate sampling model the second GPU holds two models; if the training "
+                                         "copy does not fit, maps run on the training GPU as before.")
+                            w["sweep_async"] = ui.switch("Region sweeps on the second GPU", value=d.sweep_async) \
+                                .tooltip("Experimental, never run on a real GPU yet. The region sweeps (and the "
+                                         "held-out photos) are read on the second GPU with a copy of the model you "
+                                         "train while training goes on, and recorded when they come back, up to one "
+                                         "interval later. Best held-out checkpoint saves exactly the weights that "
+                                         "were swept; held-out patience and region steering act then. Same model "
+                                         "copy and fallback as the maps.")
                         w["probe_face_prompt"] = ui.input("Face probe prompt (headshot; empty = none)") \
                             .classes("w-full")
                         w["probe_body_prompt"] = ui.input("Body probe prompt (full body, upright; empty = none)") \
@@ -13407,9 +13430,20 @@ def build_page(local: bool = True):
                                     .classes("w-32")
                                 w["probe_device"] = ui.input("Probe GPU", value=d.probe_device,
                                                              placeholder="auto").classes("w-32") \
-                                    .bind_visibility_from(w["probe_async"], "value") \
-                                    .tooltip("The GPU that renders the probes (e.g. cuda:1); empty: the first of "
-                                             "Devices that is not the training GPU")
+                                    .tooltip("The second GPU (e.g. cuda:1) that renders the probes and reads the "
+                                             "region sweeps and training maps; empty: the first of Devices that is "
+                                             "not the training GPU")
+
+                                def show_probe_gpu(_=None):  # (probes or the analysis use it)
+                                    w["probe_device"].set_visibility(bool(w["probe_async"].value
+                                                                          or w["sample_async"].value
+                                                                          or w["maps_async"].value
+                                                                          or w["sweep_async"].value))
+
+                                w["probe_async"].on_value_change(show_probe_gpu)
+                                for key in ("sample_async", "maps_async", "sweep_async"):
+                                    w[key].on_value_change(show_probe_gpu)
+                                show_probe_gpu()
                                 w["probe_ema"] = ui.number("Score smoothing (EMA)", value=d.probe_ema, min=0,
                                                            max=0.95, step=0.05).classes("w-48")
                                 w["likeness_noise_band"] = ui.number("Noise band (% points)",

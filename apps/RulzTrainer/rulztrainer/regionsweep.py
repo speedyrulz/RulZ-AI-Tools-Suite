@@ -81,6 +81,46 @@ def fixed_noise(key: str, level: int, shape):
     return torch.randn(shape, generator=g)
 
 
+def forward_readings(model, device, chosen: list[dict], averaged=None) -> dict:
+    """key -> per noise level [losses, cells] (COLUMNS order) at the fixed noise."""
+    import torch
+
+    from .trainmaps import eager_stance
+
+    cpu_rng = torch.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    was_training = model.training
+    out = {}
+    try:
+        model.eval()
+        with (averaged() if averaged is not None else contextlib.nullcontext()), torch.no_grad(), eager_stance():
+            for pr in chosen:
+                latents, embeds, mask = pr["load"]()
+                latents = latents.to(device, torch.float32)
+                embeds, mask = embeds.to(device), mask.to(device)
+                rows = []
+                for i, s in enumerate(SIGMAS):
+                    noise = fixed_noise(pr["key"], i, latents.shape).to(device)
+                    noisy = ((1 - s) * latents + s * noise).to(torch.bfloat16)
+                    sigma = torch.full((latents.shape[0],), s * 1000.0, device=device)
+                    err = (model(noisy, sigma, embeds, mask).float() - (noise - latents)).pow(2)
+                    if err.dim() != 4:
+                        raise RuntimeError("the model's prediction is not a latent grid")
+                    losses, cells = region_losses(err, [pr["parts"]])
+                    if losses[0] is None:
+                        raise RuntimeError(f"the parts map of {Path(pr['key']).name} does not fit its latent")
+                    rows.append([losses[0], cells[0]])
+                    del noise, noisy, err
+                out[pr["key"]] = rows
+                del latents, embeds, mask
+    finally:
+        model.train(was_training)
+        torch.set_rng_state(cpu_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state_all(cuda_rng)
+    return out
+
+
 class RegionSweep:
     """probes: [{"key", "held": bool, "parts": the picture's parts tensor, "load": () -> (latents [1, C, h, w],
     embeds [1, S, D], mask [1, S])}]. every: steps between sweeps. rotate: training pictures per sweep (0 = all); the
@@ -176,17 +216,34 @@ class RegionSweep:
             chosen = self.chosen()
             readings = self._forward(model, device, chosen, averaged)
         except Exception as e:  # noqa: BLE001
-            self.failed = True
-            log.warning("Region sweep failed at step %d, so the sweeps are off for the rest of this run; training "
-                        "goes on (%s: %s)", step, type(e).__name__, str(e)[:200])
-            log.debug("region sweep error", exc_info=True)
+            self.fail(step, e)
             return None
         finally:
             self.last_step = step
             self.next_step = step + self.every
-        for pr in chosen:
-            self._record(pr["key"], readings[pr["key"]], step)
-        row = self._summarise(step, epoch, len(chosen), time.time() - t0)
+        return self.record(step, epoch, [pr["key"] for pr in chosen], readings, time.time() - t0)
+
+    def begin(self, step: int) -> list[dict]:
+        """A sweep of `step` that is computed elsewhere (probe_async's second GPU): its pictures, with the schedule
+        moved on now, so due() does not fire again while it is out. record() takes the readings when they are in."""
+        chosen = self.chosen()
+        self.last_step = step
+        self.next_step = step + self.every
+        return chosen
+
+    def fail(self, step: int, e) -> None:
+        """A sweep failed: the sweeps are off for the rest of the run, training goes on."""
+        self.failed = True
+        log.warning("Region sweep failed at step %d, so the sweeps are off for the rest of this run; training "
+                    "goes on (%s: %s)", step, type(e).__name__, str(e)[:200])
+        log.debug("region sweep error", exc_info=True)
+
+    def record(self, step: int, epoch: float, keys: list[str], readings: dict, seconds: float) -> dict:
+        """What follows a sweep's readings, wherever they were computed: each picture's reading against its own
+        first sweep, the summary row, the log and the saved state. Its summary."""
+        for key in keys:
+            self._record(key, readings[key], step)
+        row = self._summarise(step, epoch, len(keys), seconds)
         self.history.append(row)
         with contextlib.suppress(OSError):
             with open(self.job_dir / LOG_FILE, "a", encoding="utf-8") as f:
@@ -196,42 +253,7 @@ class RegionSweep:
 
     def _forward(self, model, device, chosen: list[dict], averaged) -> dict:
         """key -> per noise level [losses, cells] (COLUMNS order) at the fixed noise."""
-        import torch
-
-        from .trainmaps import eager_stance
-
-        cpu_rng = torch.get_rng_state()
-        cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-        was_training = model.training
-        out = {}
-        try:
-            model.eval()
-            with (averaged() if averaged is not None else contextlib.nullcontext()), torch.no_grad(), eager_stance():
-                for pr in chosen:
-                    latents, embeds, mask = pr["load"]()
-                    latents = latents.to(device, torch.float32)
-                    embeds, mask = embeds.to(device), mask.to(device)
-                    rows = []
-                    for i, s in enumerate(SIGMAS):
-                        noise = fixed_noise(pr["key"], i, latents.shape).to(device)
-                        noisy = ((1 - s) * latents + s * noise).to(torch.bfloat16)
-                        sigma = torch.full((latents.shape[0],), s * 1000.0, device=device)
-                        err = (model(noisy, sigma, embeds, mask).float() - (noise - latents)).pow(2)
-                        if err.dim() != 4:
-                            raise RuntimeError("the model's prediction is not a latent grid")
-                        losses, cells = region_losses(err, [pr["parts"]])
-                        if losses[0] is None:
-                            raise RuntimeError(f"the parts map of {Path(pr['key']).name} does not fit its latent")
-                        rows.append([losses[0], cells[0]])
-                        del noise, noisy, err
-                    out[pr["key"]] = rows
-                    del latents, embeds, mask
-        finally:
-            model.train(was_training)
-            torch.set_rng_state(cpu_rng)
-            if cuda_rng is not None:
-                torch.cuda.set_rng_state_all(cuda_rng)
-        return out
+        return forward_readings(model, device, chosen, averaged)
 
     def _record(self, key: str, rows: list, step: int) -> None:
         """A picture's reading against its own first sweep: the learned share per region (the mean over the noise

@@ -1352,6 +1352,8 @@ same settings and seed have differed by up to 15 points here, so one run of each
 
 ## Region sweeps and held-out photos (experimental)
 
+Sweeps pause training for a few seconds each; with `sweep_async` (3.43.0, never run on real GPUs) they run on the second GPU while training goes on and act up to one interval late, see [More jobs on the second GPU](#more-jobs-on-the-second-gpu-sample_async-maps_async-sweep_async-since-3430).
+
 **Measured in November 2026** on a Qwen-Image 2.1 fine-tune: four 2000-step runs, 59 training pictures, 3 held out. A
 sweep of all 62 pictures took 24 seconds on an RTX 5090.
 
@@ -1461,6 +1463,8 @@ groups are switched off on the sampling model's copy of the LoRA; the sampling m
 Two or three seeds make a credit a rough number: read the ranking over several audits, not one.
 
 ## Training maps (`training_maps`)
+
+With `maps_async` (3.43.0, never run on real GPUs) the captures run on the second GPU while training goes on, see [More jobs on the second GPU](#more-jobs-on-the-second-gpu-sample_async-maps_async-sweep_async-since-3430).
 
 Heatmaps over a few training pictures that show where training is going right or wrong, capture by capture. A
 port of [Fizgig's training maps](https://github.com/shootthesound/Fizgig/blob/master/docs/TRAINING_MAPS.md)
@@ -2405,6 +2409,54 @@ Measured on Qwen 2.1 int8 at 0.5 MP, training on an RTX 5060 Ti, probes on an RT
 
 It saves the most when one probe on the second GPU finishes in less time than `probe_every` training steps take; with
 3 seeds at 1024 px every 20 steps it was 28% slower (training waited for each probe). Off by default.
+
+### More jobs on the second GPU (`sample_async`, `maps_async`, `sweep_async`, since 3.43.0)
+
+**Never run on real GPUs yet: unit-tested with fakes only.** Four independent switches, all off by default, any
+combination, all on the same second GPU (`probe_device`) and the same single process. Each moves one kind of job
+that otherwise pauses training; with a switch off that job runs on the training GPU as before.
+
+| Switch (Likeness section) | What it moves | What acts late |
+|---|---|---|
+| `probe_async` | the likeness probes (above) | best checkpoint, early stop, lr control, curriculum |
+| `sample_async` | the in-loop sample rounds (`sample_prompts` every `sample_every`) | nothing acts on samples; the pictures and the sample scores appear when the round is in, up to `sample_every` steps later |
+| `maps_async` | the [training maps](#training-maps-training_maps) captures | nothing acts on maps; the capture is recorded (`maps.jsonl`, the Training maps tab) when it is in |
+| `sweep_async` | the [region sweeps](#region-sweeps-and-held-out-photos-experimental) (the held-out photos too) | the held-out best checkpoint, `holdout_patience`'s stop and region steering, when the sweep is recorded |
+
+- **The weights each job reads.** At the step a job is due, the trainer takes the LoRA as it stands (the `lora_ema`
+  average if on) and keeps it with the job; the process reads exactly that state, and the schedule moves on at once, so
+  the next job is due one interval later, not again at once. One job of each kind is out at a time: if the next is due
+  before the last is in, training waits for it. A result is recorded when it comes back ("Region sweep at step 400
+  (read on cuda:1, in at step 421)"). The held-out best checkpoint saves the weights that were swept, not training's
+  newer ones. The first sweep and the step-0 maps are queued at the start; training starts once they are queued,
+  which waits for the second GPU's models to finish loading.
+- **Samples.** A round's pictures are written under that step's name where they always are (`samples/`), so the
+  Monitor and the run report find them as usual. **Kept on the training GPU:** the samples before training
+  (`sample_before_training`) and the final samples at the end. A round still out at the end is in before the final
+  samples. With a remote helper (`remote_render`) connected, `sample_async` takes precedence for samples, as the
+  process does for probes: a run uses one or the other for a kind of job.
+- **Final jobs.** The last step's sweep and maps are queued on the second GPU too; training ends only once they are
+  in, and they are recorded before the final save.
+- **Two models.** Probes and samples use the **sampling model** (`sample_model_path`, else the training base, with the
+  sampling LoRAs on). Maps and sweeps use the **model you train**: the training base with the same quantization
+  (`int8` / `nvfp4`), the same LoRA slots (targets, blocks, rank, kind) and the training adapter, if the run has one,
+  with the sampling LoRAs off. Without `sample_model_path` one model serves both (the sampling LoRAs switched on and
+  off between jobs). With it, and with maps or sweeps on, a second model is loaded beside the sampling one: **the
+  second GPU then holds two models**, about one more copy of the base. If the training copy does not fit or fails to
+  load, one warning is logged, maps and sweeps run on the training GPU as before, and probes and samples keep using
+  the second GPU.
+- **What it cannot mirror** of the training model: `torch.compile`, block swap, activation offload and gradient
+  checkpointing (the second GPU reads eagerly with the whole model resident, so the numbers differ by rounding only; a
+  model too big for the second GPU fails to load and falls back as above).
+- **If the process fails** (an error, a closed connection, out of memory) it is closed with one warning and everything
+  goes back to the training GPU, probes included. A sample round, sweep or map capture it had not finished is read
+  again on the training GPU from the LoRA state it was queued with (an answer that had already come is used as it is);
+  readings from then on come from another GPU than the earlier ones, so a small step in a curve at that point is
+  rounding. A probe still out is lost, with a log line naming its step. A sweep or capture that fails in itself (a
+  parts map that does not fit its picture) turns that analysis off, as it does without the second GPU, and the process
+  goes on.
+- **Not used** in a configuration race, a fine-tune or with `multi_gpu` other than `off`, or with one GPU (the reason
+  is logged). The process's log is `probe_worker.log` in the job folder.
 
 A run on a vast.ai instance has no second GPU to use; it can hand its renders to your own PC instead: see
 [Samples and probes on your PC](#samples-and-probes-on-your-pc-remote_render).
