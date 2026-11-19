@@ -7,7 +7,7 @@ pictures. The instance scores them and acts as it does for probe_async, up to on
 never waits for this PC: the trainer takes a round back when its deadline passes or the heartbeat goes stale.
 The rules are in docs/remote-render-contract.md (sections 4 and 5).
 
-    python -m rulztrainer.renderhelper --instance 123456 --device cuda:1 [--sample-model PATH]
+    python -m rulztrainer.renderhelper --instance 123456 --device cuda:1[,cuda:3] [--sample-model PATH]
         [--sample-model-quant Q] [--models-dir DIR] [--status-file PATH]
     python -m rulztrainer.renderhelper --list-gpus      # JSON, loads no model
 
@@ -15,6 +15,9 @@ Two ssh connections, each used from one thread only: the main loop's (runs, hear
 worker's (preparing, rounds: big transfers). One connection would let a 300 MB LoRA download hold the heartbeat back
 until the trainer calls the helper gone. Windows OpenSSH has no ControlMaster, so each is its own ssh process; the
 bridge (scripts/vast/rulz_render_bridge.py) is piped to the instance, nothing is installed there.
+
+With several devices (or the hidden `--workers process`) the model loads once in one worker process per GPU and each
+round's pictures are dealt across them (renderpool.py); with one device the Renderer runs in this process as before.
 
 The helper's own folder (next to its status file) holds the text embeds and the rounds it works on: never this PC's
 real text-embed cache, which a prepared copy of someone else's prompts must not be mixed into."""
@@ -40,6 +43,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import renderpool  # (no torch at import: the pool imports probeworker only when it starts a worker)
+from .renderpool import Stopping
+
 log = logging.getLogger("rulztrainer")
 
 APP = Path(__file__).resolve().parent.parent
@@ -58,6 +64,7 @@ RETRY_PREPARE = 300.0  # seconds before a failed preparation is tried again (a m
 BACKOFF = (2.0, 5.0, 10.0, 20.0, 30.0)  # seconds between connection tries
 VERSION_MISMATCH = "versions differ: update RulzTrainer on the instance or this PC"
 STATES = ("connecting", "preparing", "ready", "rendering", "not_ready", "idle", "stopped", "error")
+GPU_STATES = ("loading", "ready", "rendering", "dropped", "load_failed")  # the states of an entry of the status file's gpus
 
 
 class BridgeError(Exception):
@@ -66,6 +73,16 @@ class BridgeError(Exception):
 
 class Disconnected(Exception):
     """The ssh connection is gone (or spoke nonsense): the caller reconnects."""
+
+
+def split_devices(text: str) -> list[str]:
+    """`cuda:1,cuda:3` as ["cuda:1", "cuda:3"] (a repeated device once, order kept); a single value is a list of one."""
+    out: list[str] = []
+    for d in str(text or "").split(","):
+        d = d.strip()
+        if d and d not in out:
+            out.append(d)
+    return out or ["cuda:0"]
 
 
 class NotReady(Exception):
@@ -240,7 +257,8 @@ class Status:
     def __init__(self, path: Path | None, instance, gpu: str):
         self.path, self.lock, self.closed = Path(path) if path else None, threading.Lock(), False
         self.data = {"state": "connecting", "instance": instance, "job": "", "gpu": gpu, "message": "", "rounds_done": 0,
-                     "last_round": "", "last_seconds": 0.0, "behind": 0, "time": time.time(), "pid": os.getpid()}
+                     "last_round": "", "last_seconds": 0.0, "behind": 0, "time": time.time(), "pid": os.getpid(),
+                     "gpus": []}  # gpus: one entry per GPU of a pool ({device, name, state, sec_per_unit}); [] for one GPU
 
     def update(self, **kw) -> None:
         with self.lock:
@@ -396,6 +414,7 @@ class Options:
     status_file: Path | None = None
     key: str | None = None
     work_dir: Path | None = None
+    workers: str = "auto"  # "process": one worker process per GPU even for one GPU (auto: only for two or more)
 
 
 def find_local_file(name: str, size: int, folders: list[Path]) -> Path | None:
@@ -431,6 +450,11 @@ class Helper:
         self.range_bridges: list[Bridge] = []
         self.worker: threading.Thread | None = None
         self.renderer = None
+        self.devices = split_devices(opts.device)
+        self.use_pool = len(self.devices) > 1 or opts.workers == "process"
+        self.pool = None  # renderpool.RenderPool when use_pool
+        self.pool_note = ""  # which GPUs did not load or were dropped, kept in the status message
+        self.pool_lost = False  # every GPU was dropped and the pool has not come back: no heartbeats until it does
         self.token: str | None = None  # the run this helper is prepared (or preparing) for
         self.prepared = False
         self.kinds: list[str] = []
@@ -500,7 +524,9 @@ class Helper:
                 return
             self._reset(token)
         self.job = job
-        if now - self.last_beat >= HEARTBEAT_EVERY or self.last_beat == 0.0:
+        # no heartbeat while every GPU of the pool is gone: the instance then sees the helper stale and stops delegating,
+        # instead of handing rounds to a helper that can only fail them
+        if (now - self.last_beat >= HEARTBEAT_EVERY or self.last_beat == 0.0) and not self.pool_lost:
             self.hb.call("heartbeat", job=job, run_token=token, host=self.host, gpu=self.gpu_name)
             self.last_beat = now
         mine = [r for r in entry.get("rounds") or []
@@ -520,7 +546,7 @@ class Helper:
             self.status.update(job=job, behind=len(mine) - 1)
             self._start(self._render, entry, sorted(mine, key=lambda r: (self._kind(r) != "probe", r))[0])
         else:
-            self.status.update(state="ready", job=job, behind=0, message="")
+            self.status.update(state="ready", job=job, behind=0, message=self.pool_note)
 
     @staticmethod
     def _kind(round_name: str) -> str:
@@ -542,6 +568,8 @@ class Helper:
             log.warning("The worker's connection dropped: %s", e)
             self._drop_wb()
             self.status.update(state="connecting", message=f"The connection dropped: {e}")
+        except Stopping:
+            log.info("The worker stopped with the helper.")
         except Exception as e:  # noqa: BLE001
             log.error("Worker failed: %s", traceback.format_exc())
             self.status.update(state="error", message=f"{type(e).__name__}: {e}")
@@ -559,15 +587,31 @@ class Helper:
         self.token, self.prepared, self.kinds, self.next_prepare, self.not_ready_reason = token, False, [], 0.0, ""
         self.last_beat = 0.0
         self.rounds_done = 0
-        self.status.update(rounds_done=0, last_round="", last_seconds=0.0)
+        self.pool_note, self.pool_lost = "", False
+        self.status.update(rounds_done=0, last_round="", last_seconds=0.0, gpus=[])
 
     # ------------------------------------------------------------ the worker's side
     def _free_renderer(self) -> None:
-        """Drop the model (the only reference), then collect."""
+        """Drop the model (the only reference), then collect; with a pool, stop its worker processes (which gives their
+        GPUs' memory back by dying). Bounded: the tick thread calls this too."""
         had = self.renderer is not None
         self.renderer = None
-        if had:
+        pool, self.pool = self.pool, None
+        if pool is not None:
+            pool.close()
+        elif had:
             release_gpu()
+
+    def _pool_changed(self) -> None:
+        """The pool's GPUs changed state: the status file's gpus (and the message, when one was dropped)."""
+        pool = self.pool
+        if pool is None:
+            return
+        self.pool_note = pool.note()
+        kw = {"gpus": pool.snapshot()}
+        if self.pool_note:
+            kw["message"] = self.pool_note
+        self.status.update(**kw)
 
     def _bridge(self) -> Bridge:
         """The worker's connection, with the same backoff as the main loop's."""
@@ -596,7 +640,7 @@ class Helper:
                 ready = self._prepare_run(job, base, run)
                 ready["load_seconds"] = round(time.time() - t0, 1)
                 self._bridge().write_json(f"{base}/prepare/ready.json", ready)
-            except (NotReady, Disconnected):
+            except (NotReady, Disconnected, Stopping):
                 raise
             except Exception as e:  # noqa: BLE001 - whatever it is, say so and wait: no retry every second
                 log.error("Preparing failed: %s", traceback.format_exc())
@@ -617,8 +661,10 @@ class Helper:
                     self._drop_wb()
             return
         self.prepared = True
+        self.pool_lost = False  # (a pool that came back beats at once)
+        self.last_beat = 0.0
         log.info("Ready to render %s on %s (%s) for kinds %s", job, self.gpu_name, self.host, ready["kinds"])
-        self.status.update(state="ready", gpu=self.gpu_name, message="")
+        self.status.update(state="ready", gpu=self.gpu_name, message=self.pool_note)
 
     def _prepare_run(self, job: str, base: str, run: dict) -> dict:
         shared = remote()
@@ -635,6 +681,8 @@ class Helper:
         if not same:
             raise NotReady(VERSION_MISMATCH, retry=False)
         work = inside(run_folder(self.work_dir, run["run_token"]), self.work_dir)
+        self._free_renderer()  # workers first: none may still write into the folder that goes next
+        self.pool_note = ""
         shutil.rmtree(self.work_dir, ignore_errors=True)  # an earlier run's embeds and rounds
         cfg = dict(prep["cfg"])
         override = bool(self.o.sample_model)
@@ -643,7 +691,8 @@ class Helper:
         models = Path(self.o.models_dir).expanduser() if self.o.models_dir else APP / "models"
         for field, info in (prep.get("files") or {}).items():
             cfg[field] = self._resolve_file(field, info, models, override)
-        cfg.update(cache_dir=str(work / "cache"), device=self.o.device, models_dir=str(models))
+        cfg.update(cache_dir=str(work / "cache"), device=self.devices[0] if self.use_pool else self.o.device,
+                   models_dir=str(models))
         if override:
             cfg["sample_model_path"] = self.o.sample_model
             cfg["sample_model_quant"] = self.o.sample_quant or "auto"
@@ -652,6 +701,8 @@ class Helper:
             target = local_embed_path(cfg, prompt)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(w.get(f"{base}/prepare/{rel}"))
+        if self.use_pool:
+            return self._load_pool(cfg, run, prep, override)
         self.status.update(message=f"Loading the model on {self.o.device}.")
         self._free_renderer()  # never a second model on top of the first
         failure = None
@@ -673,6 +724,31 @@ class Helper:
         return {"run_token": run["run_token"], "recipe_hash": prep.get("recipe_hash"), "render_hash": prep.get("render_hash"),
                 "host": self.host, "gpu": self.gpu_name, "vram_gb": info.get("vram_gb"), "kinds": list(self.kinds),
                 "time": time.time()}
+
+    def _load_pool(self, cfg: dict, run: dict, prep: dict, override: bool) -> dict:
+        """One worker process per GPU, loaded one after another. Ready when at least one loaded; the others are named in
+        the status (and left out of ready.json's gpu / vram_gb, which describe the GPUs that render)."""
+        log_dir = Path(self.o.status_file).parent if self.o.status_file else STATE_DIR
+        log_dir.mkdir(parents=True, exist_ok=True)
+        self.pool = renderpool.RenderPool(self.devices, log_dir, f"{self.o.instance}_worker", self.stop,
+                                          on_change=self._pool_changed)  # (set first: shutdown must reach it)
+        self.status.update(message=f"Loading the model on {', '.join(self.devices)}, one after another.")
+        model_dir = renderpool.resolve_model_dir(cfg, self.devices[0])
+        loaded = self.pool.load_all(cfg, model_dir)
+        self.pool_note = self.pool.note()
+        if not loaded:
+            failure = "Could not load the model on any GPU: " + "; ".join(
+                f"{s.device}: {s.error}" for s in self.pool.slots)
+            self._free_renderer()
+            self.pool_note = ""
+            raise NotReady(failure[:600])
+        sizes = [s.vram_gb for s in loaded if s.vram_gb]
+        self.gpu_name = " + ".join(s.name for s in loaded)
+        self.kinds = ["sample"] if override else ["sample", "probe"]
+        return {"run_token": run["run_token"], "recipe_hash": prep.get("recipe_hash"), "render_hash": prep.get("render_hash"),
+                "host": self.host, "gpu": self.gpu_name, "vram_gb": min(sizes) if sizes else None,
+                "gpus": [{"device": s.device, "name": s.name, "vram_gb": s.vram_gb} for s in loaded],
+                "kinds": list(self.kinds), "time": time.time()}
 
     def _resolve_file(self, field: str, info: dict, models: Path, override: bool) -> str:
         """This PC's copy of one of the run's files. With provenance (repo and file: it was a Comfy-Org / Hugging Face
@@ -756,6 +832,7 @@ class Helper:
             return  # the trainer took it back first
         claim_time = time.monotonic() - started
         claimed = f"{base}/claimed/{name}"
+        pool = self.pool  # (once: the tick thread may free it when the run ends)
         self.status.update(state="rendering", job=job, message=f"Rendering {name}.")
         if not ROUND_NAME.fullmatch(name):  # (_look only picks such names; this keeps _render safe on its own)
             raise RuntimeError(f"not a round name: {name!r}")
@@ -776,7 +853,11 @@ class Helper:
             for j in jobs:  # the render saves with Image.save, which makes no folders
                 Path(j.out_path).parent.mkdir(parents=True, exist_ok=True)
             render_start = time.monotonic()
-            _, seconds = self.renderer.render(jobs, payload, rnd.get("negative_kind") or "probe")
+            if pool is not None:  # (the instance's deadline runs from the claim: `started` is the claim's time)
+                seconds = pool.run_round(jobs, payload, self._kind(name), rnd.get("negative_kind") or "probe",
+                                         rnd.get("deadline_s"), claim=started)
+            else:
+                _, seconds = self.renderer.render(jobs, payload, rnd.get("negative_kind") or "probe")
             render_time = time.monotonic() - render_start
             upload_start = time.monotonic()
             files = self._upload(w, claimed, jobs, work)
@@ -789,7 +870,7 @@ class Helper:
                 log.info("Round %s: claim %.2f s, LoRA %.2f s (%.2f MB, %.2f MB/s, %d streams), "
                          "render %.2f s, upload %.2f s, total %.2f s", name, claim_time, fetch_time, mb,
                          mb / max(fetch_time, 1e-9), streams, render_time, upload_time, time.monotonic() - started)
-                self.status.update(state="ready", message="", rounds_done=self.rounds_done, last_round=name,
+                self.status.update(state="ready", message=self.pool_note, rounds_done=self.rounds_done, last_round=name,
                                    last_seconds=round(seconds, 2))
             else:
                 log.warning("Round %s: the instance took it back first; its pictures are dropped", name)
@@ -803,9 +884,14 @@ class Helper:
             # the bridge refuses writes into a round folder the instance has renamed away (its deadline passed)
             log.warning("Round %s: the instance took it back while it was sent; its pictures are dropped", name)
             self.status.update(state="ready", message=f"{name} was taken back by the instance.")
+        except Stopping:
+            # the helper is stopping: leave the claimed round to the instance's deadline, as a single GPU does
+            log.info("Round %s: stopped with the helper", name)
+            raise
         except Exception as e:  # noqa: BLE001 - the instance is told, then renders the round itself
             log.error("Round %s failed: %s", name, traceback.format_exc())
-            release_gpu()  # an OOM leaves cached blocks behind
+            if pool is None:
+                release_gpu()  # an OOM leaves cached blocks behind (a pool's workers are processes: they died with it)
             try:
                 w.write_json(f"{claimed}/error.json", {"error": f"{type(e).__name__}: {e}",
                                                        "traceback": traceback.format_exc()})
@@ -815,7 +901,16 @@ class Helper:
                 if isinstance(err, Disconnected):
                     raise
             self.status.update(state="ready", message=f"{name} failed: {type(e).__name__}: {e}")
+            if pool is not None and not pool.live and not self.stop.is_set():
+                # every GPU is gone: load them all again at once, and stay silent until one is back
+                log.warning("Every GPU of the pool was dropped; loading the model again.")
+                self.pool_lost, self.prepared, self.next_prepare = True, False, 0.0
+                note = self.pool_note
+                self._free_renderer()
+                self.status.update(state="preparing", message=f"Every GPU was dropped. {note}".strip(), gpus=[])
         finally:
+            if pool is not None:
+                pool.drain()  # answered or killed: nothing renders into work/ after this
             shutil.rmtree(work, ignore_errors=True)
 
     def _upload(self, w: Bridge, claimed: str, jobs: list, work: Path) -> list[str]:
@@ -860,11 +955,16 @@ class Helper:
         """Stop: close both connections (which unblocks a worker waiting on one), give a render a few seconds, and
         write "stopped". A render cannot be interrupted: the trainer's deadline takes its round back."""
         self.stop.set()
+        pool = self.pool
+        if pool is not None:
+            pool.kill_all()  # first of all: a worker process must not outlive the helper
         self._drop_hb()
         self._drop_wb()
         for t in (loop, self.worker):
             if t is not None and t.is_alive():
                 t.join(10)
+        if pool is not None:
+            pool.kill_all()  # (one that was still starting when the first call ran)
         self.status.close(state="stopped", message="Stopped.")
         log.info("Stopped.")
 
@@ -930,7 +1030,10 @@ def watch_stdin(stop: threading.Event, poll: float = STDIN_POLL) -> None:
 def parse_args(argv=None):
     p = argparse.ArgumentParser(prog="python -m rulztrainer.renderhelper", description=__doc__.split("\n\n")[0])
     p.add_argument("--instance", help="the vast.ai instance id")
-    p.add_argument("--device", default="cuda:0", help="the GPU of this PC to render on, e.g. cuda:1")
+    p.add_argument("--device", default="cuda:0", help="the GPU of this PC to render on, e.g. cuda:1; several, "
+                   "comma-separated (cuda:1,cuda:3), split each round's pictures between them")
+    p.add_argument("--workers", choices=("auto", "process"), default="auto", help=argparse.SUPPRESS)  # process: a worker
+    # process even for one GPU (auto: only for two or more); to prove the pool on real hardware
     p.add_argument("--sample-model", default="", help="render samples (not probes) with this sampling model instead")
     p.add_argument("--sample-model-quant", default="", help="its quantization (auto, none, int8, int8_convrot, nvfp4)")
     p.add_argument("--models-dir", default="", help="where this PC keeps its models (default: this install's models/)")
@@ -955,7 +1058,7 @@ def main(argv=None) -> int:
     status_file = Path(args.status_file) if args.status_file else STATE_DIR / f"{args.instance}.json"
     opts = Options(instance=args.instance, device=args.device, sample_model=args.sample_model,
                    sample_quant=args.sample_model_quant, models_dir=args.models_dir, status_file=status_file,
-                   key=args.key)
+                   key=args.key, workers=args.workers)
     helper = Helper(opts, SshConnector(int(args.instance) if str(args.instance).isdigit() else None, args.key))
 
     def stop(*_):

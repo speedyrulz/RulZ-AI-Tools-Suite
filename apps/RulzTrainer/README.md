@@ -2516,10 +2516,26 @@ that were scored.
 **How to use it**
 
 1. Open the Fleet tab of the WebUI **on your PC**, not the one on the instance.
-2. On the instance's card, pick a GPU and turn on **Render on this PC**. Turning it on lets the helper use that GPU until
-   you turn it off or close the WebUI.
+2. On the instance's card, pick a GPU (or several) and turn on **Render on this PC**. Turning it on lets the helper use
+   those GPUs until you turn it off or close the WebUI.
 3. Keep the local WebUI open for the length of the run: the helper ends when it closes. The card's status line says
    what the helper is doing (preparing, ready, rendering, not ready) and how long the last render took.
+
+**Several GPUs** (since 3.52.0, **never run on real GPUs yet**): pick more than one GPU in the card's GPU list and each
+round's pictures are split between them. The helper loads the model once on every chosen GPU, one after another, in a
+worker process per GPU; it fetches each round's LoRA once and deals the pictures out:
+
+- **Probes** go to the GPUs in a fixed split (equal parts, the same every round), because two kinds of card can make
+  slightly different pictures and a probe's score should not jump when it moves to another card.
+- **Samples** are split by how fast each GPU has been (seconds per pixel-step, measured from each GPU's second render
+  on; every GPU gets at least one picture so its speed stays measured).
+- The pictures go back to the instance in their own order, and the round counts as one round for the deadline.
+- **A GPU that fails** (out of memory, a crash, no answer in time) is left out for the rest of the run and the status
+  line names it; its pictures go to the other GPUs once, if that can still finish before the round's deadline.
+  Otherwise, or if the second try fails too, the round fails and the instance renders it, as with one GPU. A GPU that
+  cannot load the model is skipped: the helper is ready when at least one GPU loaded. If every GPU is dropped, the
+  helper stops its heartbeat (so the instance stops handing it rounds) and loads the model on all of them again.
+- With **one GPU** nothing changes: the model renders inside the helper as before.
 
 `remote_render: auto` (the default) uses a helper when one is ready and does nothing when there is none. `off` always
 renders on the instance. A trainer running on Windows never uses it.
