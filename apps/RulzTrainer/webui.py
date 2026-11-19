@@ -28,7 +28,7 @@ from fastapi import Request
 from nicegui import app, background_tasks, run, ui
 
 from rulztrainer.archs import get_arch
-from rulztrainer.config import (AUTOMAGIC, KEEL, alpha_differs, alpha_lr_note, effective_optimizer, lr_at_alpha_rank, LR_SCHEDULERS, KEEL_FB, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
+from rulztrainer.config import (AUTOMAGIC, KEEL, alpha_differs, alpha_lr_note, alpha_scale_reason, effective_optimizer, lr_at_alpha_rank, trained_optimizer, LR_SCHEDULERS, KEEL_FB, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
                                 MODEL_PRESETS, ARCH_SAMPLE_LORA, VIDEO_ARCHS, VIDEO_EXTS, VIDEO_DATA_PRESETS,
                                 STILL_FFN_TARGETS, detect_video_data_preset, video_data_preset,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
@@ -2165,7 +2165,7 @@ class Form:
             lora_rank=int(v("lora_rank")), lora_alpha=float(v("lora_alpha")),
             network_type=v("network_type"), lokr_factor=int(v("lokr_factor") or 8),
             oft_block_size=int(v("oft_block_size") or 32), oft_constraint=float(v("oft_constraint") or 0.0),
-            oft_scaled_lr=bool(v("oft_scaled_lr")),
+            oft_scaled_lr=bool(v("oft_scaled_lr")), lr_alpha_scale=bool(v("lr_alpha_scale")),
             dora=bool(v("dora")),
             finetune=bool(v("finetune")), finetune_rotate_epochs=float(v("finetune_rotate_epochs") or 1),
             finetune_window_gb=float(v("finetune_window_gb") or 0), finetune_reserve_gb=float(v("finetune_reserve_gb") or 0),
@@ -2648,6 +2648,7 @@ h1, h2, h3, .rz-pane-title { font-family: "Segoe UI Variable Display", "Segoe UI
 .q-btn.rz-danger:not(.rz-icon-only):hover { background: var(--rz-danger-hover); }
 .q-dialog .q-card { border-radius: 12px; }
 .q-btn.disabled { opacity: .38 !important; }
+.q-checkbox.disabled { opacity: .45 !important; }
 .q-table th { font-size: 13px; color: var(--rz-muted); font-weight: 600; }
 .q-table td { font-size: 14px; }
 .q-table.text-xs td { font-size: 13px; }
@@ -3509,6 +3510,23 @@ def fields():
 
 def hint(text: str = "", warn: bool = False):
     return ui.label(text).classes("rz-hint" + (" rz-warn" if warn else ""))
+
+
+ALPHA_SCALE_TIP = ("Takes the learning rate as the rate at alpha = rank and trains at that rate x rank / alpha, with "
+                   "weight decay divided by the same factor, so a LoRA whose alpha differs from its rank acts like "
+                   "one at alpha = rank. With Adam-type optimizers lora_up's updates then match alpha = rank "
+                   "exactly, but lora_down starts from the same random values and moves further relative to them: "
+                   "close, not identical. Does nothing with Automagic, Keel or Hull, a fine-tune, LoKr, OFT or "
+                   "when alpha equals rank. Off: the learning rate is the rate the optimizer gets.")
+
+
+def sync_alpha_scale(cfg, boxes, why) -> None:
+    """Grey out the Scale LR to alpha = rank checkbox(es) where it does nothing and say why in `why` (a hint label)."""
+    reason = alpha_scale_reason(cfg)
+    for box in boxes:
+        (box.disable if reason else box.enable)()
+    why.text = reason
+    why.visible = bool(reason)
 
 
 def subhead(text: str):
@@ -6432,7 +6450,10 @@ def extra_review_rows(cfg: TrainConfig) -> list[tuple[str, str]]:
         if alpha_differs(cfg):  # the rate this run acts like at alpha = rank, where the optimizer takes the rate as set
             eq = lr_at_alpha_rank(cfg)
             if eq is not None:
-                adapter += f" (lr {effective_optimizer(cfg)[1]:.1e} acts like {eq:.1e} at alpha = rank)"
+                trained = trained_optimizer(cfg)[1]
+                adapter += (f" (lr {effective_optimizer(cfg)[1]:.1e} scaled to alpha = rank: trains at {trained:.1e})"
+                            if trained != effective_optimizer(cfg)[1]
+                            else f" (lr {effective_optimizer(cfg)[1]:.1e} acts like {eq:.1e} at alpha = rank)")
     rows = [("Adapter", adapter),
             ("Memory", f"gradient checkpointing {'on' if cfg.gradient_checkpointing else 'off'}; "
                        + (f"block swap {cfg.block_swap} blocks" if cfg.block_swap else "no block swap"))]
@@ -6756,7 +6777,7 @@ def _show(widget, value) -> str:
 # recipe, and the recommendations it takes by itself (nothing to choose: hardware, resolution, references, samples)
 WIZARD_FOCUS = ("face_focus", "face_body", "face_only")
 WIZARD_BASICS = {"network_type": "lora", "finetune": False, "lora_rank": 32, "lora_alpha": 32.0,
-                 "optimizer": "adamw8bit", "learning_rate": 1e-4}
+                 "optimizer": "adamw8bit", "learning_rate": 1e-4, "lr_alpha_scale": False}
 WIZARD_AUTO = ("multi_gpu", "dp_balance", "transformer_quant", "text_encoder_quant", "gradient_checkpointing",
                "checkpoint_keep_blocks", "block_swap", "compile_model", "resolutions", "enable_buckets",
                "flip_augment", "face_refs", "body_refs", "adapter_mode", "target_text_fusion", "target_attn_gate",
@@ -7229,6 +7250,7 @@ class Wizard:
                     self.alpha_note.classes(add="rz-warn")
                 else:
                     self.alpha_note.classes(remove="rz-warn")
+            sync_alpha_scale(cfg, [self.alpha_scale_box], self.alpha_scale_why)
         if hasattr(self, "refs_note"):
             n_face, n_body = len(cfg.face_refs) if self.has_face() else 0, len(cfg.body_refs) if self.has_body() else 0
             self.refs_note.text = ("Likeness references: your photos in " + ", ".join(
@@ -7650,6 +7672,10 @@ class Wizard:
             self.bind(ui.number("Learning rate", format="%.1e", step=1e-5, min=0), "learning_rate").classes("w-full")
             self.alpha_note = hint("")  # shown only while alpha differs from rank: what the rate acts like at alpha = rank
             self.alpha_note.visible = False
+            self.alpha_scale_box = self.bind(ui.checkbox("Scale LR to alpha = rank"), "lr_alpha_scale") \
+                .tooltip(ALPHA_SCALE_TIP)
+            self.alpha_scale_why = hint("")  # why the checkbox is greyed out
+            self.alpha_scale_why.visible = False
         with self.setting(None, "LoRA rank",
                           "The size of the LoRA. 32 (the default) has room for a face's detail; higher mostly adds file "
                           "size and copies the photos more easily. Alpha follows the rank unless you set it under "
@@ -8237,7 +8263,9 @@ class Wizard:
             ("Training", f"{cfg.steps} steps, batch {cfg.batch_size}, lr {cfg.learning_rate:g}, {cfg.optimizer}"
                          + (f", LoRA rank {cfg.lora_rank} / alpha {cfg.lora_alpha:g}" if cfg.network_type == "lora"
                             and not cfg.finetune else "")
-                         + (f" (acts like lr {lr_at_alpha_rank(cfg):.1e} at alpha = rank)"
+                         + ((f" (scaled to alpha = rank: trains at {trained_optimizer(cfg)[1]:.1e})"
+                             if trained_optimizer(cfg)[1] != effective_optimizer(cfg)[1] else
+                             f" (acts like lr {lr_at_alpha_rank(cfg):.1e} at alpha = rank)")
                             if alpha_differs(cfg) and lr_at_alpha_rank(cfg) is not None else "")),
             ("Experimental", ", ".join(ex["title"] for ex in EXPERIMENTS if self.experiment_on(ex)) or "none"),
             ("Saving", f"every {cfg.save_every} steps; samples every {cfg.sample_every} steps "
@@ -12088,6 +12116,14 @@ def build_page(local: bool = True):
                                          "split into; each starts again at the full rate.")
                         alpha_note = hint("")  # only while a LoRA's alpha differs from its rank
                         alpha_note.visible = False
+                        w["lr_alpha_scale"] = ui.checkbox("Scale LR to alpha = rank", value=d.lr_alpha_scale) \
+                            .tooltip(ALPHA_SCALE_TIP)
+                        alpha_scale_why = hint("")  # why the checkbox is greyed out
+                        if d.lora_alpha == d.lora_rank:  # (the default: nothing to scale until alpha differs)
+                            w["lr_alpha_scale"].disable()
+                            alpha_scale_why.text = "Alpha equals rank, so there is nothing to scale."
+                        else:
+                            alpha_scale_why.visible = False
 
                         def show_alpha_note(_=None):
                             try:
@@ -12106,9 +12142,10 @@ def build_page(local: bool = True):
                                     alpha_note.classes(add="rz-warn")
                                 else:
                                     alpha_note.classes(remove="rz-warn")
+                            sync_alpha_scale(cfg, [w["lr_alpha_scale"]], alpha_scale_why)
 
                         for key in ("learning_rate", "optimizer", "lora_rank", "lora_alpha", "network_type",
-                                    "finetune"):
+                                    "finetune", "lr_alpha_scale"):
                             w[key].on_value_change(show_alpha_note)
                         with fields().bind_visibility_from(w["optimizer"], "value",
                                                            lambda x: x in ("adamw", "adamw8bit")):

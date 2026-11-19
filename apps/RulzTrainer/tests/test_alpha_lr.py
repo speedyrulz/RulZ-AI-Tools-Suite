@@ -122,3 +122,222 @@ def test_saved_config_without_dop_weight_uses_the_default():
     saved = {"optimizer": "keel", "isolation": True, "lora_rank": 16, "lora_alpha": 8, "learning_rate": 1e-6}
     assert alpha_equivalent_text(saved) == "acts like lr 1.0e-04 at alpha = rank"
     assert alpha_equivalent_text({**saved, "dop_weight": 0}) == ""  # no DOP: Keel sets its own rate
+
+
+# ---------------------------------------------------------------------------- lr_alpha_scale (3.47.0)
+from rulztrainer.config import alpha_lr_factor, alpha_scale_reason, alpha_trained_text, trained_optimizer  # noqa: E402
+
+
+def test_scale_is_off_by_default_and_changes_nothing():
+    c = cfg(optimizer="adamw", learning_rate=1e-4, lora_rank=16, lora_alpha=1.0)
+    assert c.lr_alpha_scale is False
+    assert alpha_lr_factor(c) == 1.0
+    assert trained_optimizer(c) == ("adamw", pytest.approx(1e-4), pytest.approx(0.01))
+    assert lr_at_alpha_rank(c) == pytest.approx(1e-4 / 16)
+
+
+@pytest.mark.parametrize("name", ["adamw", "adamw8bit", "adafactor", "muon", "normuon"])
+def test_scale_trains_at_rank_over_alpha_with_weight_decay_divided(name):
+    c = cfg(optimizer=name, learning_rate=1e-4, weight_decay=0.01, lora_rank=16, lora_alpha=1.0, lr_alpha_scale=True)
+    assert alpha_lr_factor(c) == pytest.approx(16.0)
+    got = trained_optimizer(c)
+    assert got[0] == name
+    assert got[1] == pytest.approx(1.6e-3) and got[2] == pytest.approx(6.25e-4)
+    assert lr_at_alpha_rank(c) == pytest.approx(1e-4)  # the entered rate IS the alpha = rank rate
+    assert c.learning_rate == 1e-4  # the entered value is never changed
+
+
+def test_scale_also_lowers_the_rate_when_alpha_is_above_rank():
+    c = cfg(optimizer="adamw", learning_rate=1e-4, weight_decay=0.01, lora_rank=16, lora_alpha=32.0, lr_alpha_scale=True)
+    assert alpha_lr_factor(c) == pytest.approx(0.5)
+    assert trained_optimizer(c)[1] == pytest.approx(5e-5) and trained_optimizer(c)[2] == pytest.approx(0.02)
+
+
+@pytest.mark.parametrize("kw", [
+    dict(optimizer="automagic3"), dict(optimizer="automagic4"), dict(optimizer="keel"), dict(optimizer="keel_fb"),
+    dict(optimizer="keel3"), dict(optimizer="keel3_fb"), dict(optimizer="hull", hull_rho=2e-4),
+    dict(finetune=True), dict(network_type="lokr"), dict(network_type="oft"), dict(lora_alpha=16.0),
+])
+def test_scale_does_nothing_where_it_does_not_apply(kw):
+    c = cfg(**{"optimizer": "adamw", "learning_rate": 1e-4, "lora_rank": 16, "lora_alpha": 1.0, **kw,
+               "lr_alpha_scale": True})
+    assert alpha_lr_factor(c) == 1.0
+    name, lr, wd = trained_optimizer(c)
+    assert lr == pytest.approx(1e-4) and wd == pytest.approx(0.01)
+    assert alpha_scale_reason(c)  # the WebUI says why it is greyed out
+
+
+def test_scale_applies_after_the_isolation_swap_not_before():
+    # Keel under isolation trains AdamW at 1e-4; x16 = 1.6e-3 is above effective_optimizer's 1e-3 limit but is kept
+    c = cfg(optimizer="keel", isolation=True, dop_weight=1.0, learning_rate=1e-4, lora_rank=16, lora_alpha=1.0,
+            lr_alpha_scale=True)
+    name, lr, wd = trained_optimizer(c)
+    assert name == "adamw" and lr == pytest.approx(1.6e-3) and wd == pytest.approx(6.25e-4)
+    # an out-of-range pick falls back to 2e-4 first, then scales
+    c2 = cfg(optimizer="keel", isolation=True, dop_weight=1.0, learning_rate=1e-6, lora_rank=16, lora_alpha=1.0,
+             lr_alpha_scale=True)
+    assert trained_optimizer(c2)[1] == pytest.approx(3.2e-3)
+    assert lr_at_alpha_rank(c2) == pytest.approx(2e-4)
+
+
+def test_scale_reason_texts():
+    assert alpha_scale_reason(cfg(lora_rank=16, lora_alpha=1.0)) == ""
+    assert "Alpha equals rank" in alpha_scale_reason(cfg(lora_rank=16, lora_alpha=16.0))
+    assert "sets its own rate" in alpha_scale_reason(cfg(optimizer="keel", lora_rank=16, lora_alpha=1.0))
+    assert "plain LoRA" in alpha_scale_reason(cfg(network_type="oft", lora_rank=16, lora_alpha=1.0))
+
+
+def test_scaled_note_text():
+    c = cfg(optimizer="adamw", learning_rate=1e-4, weight_decay=0.01, lora_rank=16, lora_alpha=1.0, lr_alpha_scale=True)
+    text, warn = alpha_lr_note(c)
+    assert text == ("LoRA alpha 1 at rank 16 scales each update by 1/16. Scale LR to alpha = rank is on: the learning "
+                    "rate 1.0e-04 x 16/1 trains at 1.6e-03, with weight decay 0.01 / 16 = 6.25e-04, so it acts like "
+                    "1.0e-04 at alpha = rank (RulZ AI Trainer's convention).")
+    assert not warn
+    # the 3x warning compares the entered rate (the alpha = rank equivalent) with the recommendation
+    text, warn = alpha_lr_note(cfg(learning_rate=4e-4, lora_rank=16, lora_alpha=1.0, lr_alpha_scale=True),
+                               recommended=1e-4)
+    assert warn and "4.0x above the recommended 1.0e-04" in text
+
+
+def test_note_when_on_but_not_applicable():
+    text, warn = alpha_lr_note(cfg(optimizer="keel", lora_rank=16, lora_alpha=1.0, lr_alpha_scale=True))
+    assert "sets its own rate" in text and "Scale LR to alpha = rank does nothing here" in text and not warn
+    text, _ = alpha_lr_note(cfg(lora_rank=16, lora_alpha=16.0, lr_alpha_scale=True))
+    assert text == "Scale LR to alpha = rank does nothing: alpha equals rank."
+    assert alpha_lr_note(cfg(network_type="oft", lora_rank=16, lora_alpha=1.0, lr_alpha_scale=True)) is None
+    # off: the old text, nothing added
+    assert "Scale LR" not in alpha_lr_note(cfg(lora_rank=16, lora_alpha=1.0))[0]
+
+
+def test_saved_dicts():
+    base = {"network_type": "lora", "lora_rank": 16, "lora_alpha": 1.0, "learning_rate": 1e-4, "optimizer": "adamw"}
+    assert alpha_equivalent_text(base) == "acts like lr 6.3e-06 at alpha = rank"  # no key: off
+    assert alpha_trained_text(base) == ""
+    on = {**base, "lr_alpha_scale": True}
+    assert alpha_equivalent_text(on) == "acts like lr 1.0e-04 at alpha = rank"
+    assert alpha_trained_text(on) == "trains at 1.6e-03 (scaled x16 to alpha = rank)"
+    assert alpha_trained_text({**on, "optimizer": "keel"}) == ""
+    assert runreport._learning_rate(on) == "0.0001; trains at 1.6e-03 (scaled x16 to alpha = rank)"
+    assert runreport._learning_rate(base) == "0.0001"
+
+
+def test_a_saved_config_without_the_key_loads_off(tmp_path):
+    c = cfg(lora_rank=16, lora_alpha=1.0, lr_alpha_scale=True)
+    path = tmp_path / "c.yaml"
+    c.save(path)
+    import yaml
+
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert data["lr_alpha_scale"] is True
+    del data["lr_alpha_scale"]
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    assert TrainConfig.load(path).lr_alpha_scale is False
+
+
+def _tiny_injected():
+    import torch
+    from rulztrainer import lora as lora_mod
+
+    class Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(8, 8)
+
+    return lora_mod.inject_lora(Tiny(), 4, 1.0, [], names=["proj"])
+
+
+def _build(c):
+    from rulztrainer import trainer
+
+    class Stub(trainer.Trainer):
+        def __init__(self):
+            self.race = None
+
+    return Stub()._make_optimizer(c, _tiny_injected())
+
+
+def test_trainer_builds_the_optimizer_at_the_scaled_rate_and_decay():
+    c = cfg(optimizer="adamw", learning_rate=1e-4, weight_decay=0.01, lora_rank=4, lora_alpha=1.0, lr_alpha_scale=True,
+            lora_plus_ratio=4.0)
+    opt, sched = _build(c)
+    by_name = {g["name"]: g for g in opt.param_groups}
+    assert by_name["lora_down"]["initial_lr"] == pytest.approx(4e-4)
+    assert by_name["lora_down"]["weight_decay"] == pytest.approx(0.0025)
+    assert by_name["lora_up"]["initial_lr"] == pytest.approx(1.6e-3)  # LoRA+ multiplies the scaled rate
+    assert by_name["lora_up"]["weight_decay"] == pytest.approx(0.0025)
+    assert sched.base_lrs == pytest.approx([4e-4, 1.6e-3])
+    assert c.learning_rate == 1e-4 and c.weight_decay == 0.01  # the config is not mutated
+
+
+def test_trainer_off_builds_the_entered_rate():
+    opt, _ = _build(cfg(optimizer="adamw", learning_rate=1e-4, weight_decay=0.01, lora_rank=4, lora_alpha=1.0))
+    g, = opt.param_groups
+    assert g["initial_lr"] == pytest.approx(1e-4) and g["weight_decay"] == pytest.approx(0.01)
+
+
+def test_trainer_isolation_keel_pick_trains_adamw_at_the_scaled_rate():
+    c = cfg(optimizer="keel", isolation=True, dop_weight=1.0, learning_rate=1e-4, weight_decay=0.01, lora_rank=4,
+            lora_alpha=1.0, lr_alpha_scale=True)
+    opt, _ = _build(c)
+    g, = opt.param_groups
+    assert g["initial_lr"] == pytest.approx(4e-4) and g["weight_decay"] == pytest.approx(0.0025)
+
+
+def test_trainer_automagic_ignores_the_toggle():
+    c = cfg(optimizer="automagic3", learning_rate=1e-4, lora_rank=4, lora_alpha=1.0, lr_alpha_scale=True)
+    opt, _ = _build(c)
+    assert all(g["initial_lr"] == pytest.approx(1e-4) for g in opt.param_groups)
+
+
+def test_trainer_logs_the_scaled_note(caplog):
+    from rulztrainer import trainer
+
+    with caplog.at_level(logging.INFO, logger=trainer.log.name):
+        _build(cfg(optimizer="adamw", learning_rate=1e-4, lora_rank=4, lora_alpha=1.0, lr_alpha_scale=True))
+    assert any("trains at 4.0e-04" in r.getMessage() for r in caplog.records)
+
+
+def _resume_with(saved_cfg, now_cfg):
+    """Build with saved_cfg, save its optimizer and scheduler state, load that into one built with now_cfg and
+    rescale, as Trainer's resume does."""
+    from rulztrainer import trainer
+
+    opt_saved, sched_saved = _build(saved_cfg)
+    opt, sched = _build(now_cfg)
+    opt.load_state_dict(opt_saved.state_dict())
+    sched.load_state_dict(sched_saved.state_dict())
+
+    class Stub(trainer.Trainer):
+        def __init__(self):
+            self.cfg = now_cfg
+
+    saved_lr = opt.param_groups[0]["lr"]  # (warmup: the step's rate is a share of the base rate)
+    Stub()._rescale_resumed_alpha_lr(opt, sched, saved_cfg.to_dict())
+    return opt, sched, saved_lr
+
+
+RESUME_BASE = dict(optimizer="adamw", learning_rate=1e-4, weight_decay=0.01, lora_rank=4, lora_alpha=1.0)
+
+
+def test_resume_after_turning_the_toggle_on_moves_to_the_scaled_rate():
+    opt, sched, saved_lr = _resume_with(cfg(**RESUME_BASE), cfg(**RESUME_BASE, lr_alpha_scale=True))
+    g, = opt.param_groups
+    assert g["lr"] == pytest.approx(saved_lr * 4) and g["initial_lr"] == pytest.approx(4e-4)
+    assert g["weight_decay"] == pytest.approx(0.0025)
+    assert sched.base_lrs == pytest.approx([4e-4])
+
+
+def test_resume_after_turning_the_toggle_off_moves_back():
+    opt, sched, saved_lr = _resume_with(cfg(**RESUME_BASE, lr_alpha_scale=True), cfg(**RESUME_BASE))
+    g, = opt.param_groups
+    assert g["lr"] == pytest.approx(saved_lr / 4) and g["weight_decay"] == pytest.approx(0.01)
+    assert sched.base_lrs == pytest.approx([1e-4])
+
+
+def test_resume_with_the_same_toggle_changes_nothing():
+    c = cfg(**RESUME_BASE, lr_alpha_scale=True)
+    opt, sched, saved_lr = _resume_with(c, c)
+    g, = opt.param_groups
+    assert g["lr"] == pytest.approx(saved_lr) and g["weight_decay"] == pytest.approx(0.0025)
+    assert sched.base_lrs == pytest.approx([4e-4])

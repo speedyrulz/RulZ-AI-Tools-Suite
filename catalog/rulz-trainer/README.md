@@ -1194,6 +1194,22 @@ defaults, saved configs and training are as before. It is left out for a full fi
 train at scale 1 whatever alpha says). Automagic, Keel and Hull set their own rate, so the learning rate field is not
 the rate their weights get: the note says so instead of giving a number (alpha still scales their updates).
 
+**Scale LR to alpha = rank (`lr_alpha_scale`, since 3.47.0, off by default).** With it on, the learning rate you enter is
+treated as the rate at alpha = rank, and the run compensates so it behaves like that. The optimizer trains at the entered
+rate x rank / alpha, and AdamW-style weight decay is divided by the same factor, so decay per step matches alpha = rank
+too. Example: rank 16, alpha 1, learning rate 1e-4 trains at 1e-4 x 16/1 = 1.6e-3 with weight decay 0.01 / 16 = 6.25e-4.
+The checkbox sits under Learning rate in the wizard and on the Train tab, next to the alpha note; the note then gives the
+trained rate and weight decay, and the 3x warning compares the rate you entered with the recommendation. The start log,
+the review and the run report show the rate actually trained at. The saved config keeps the rate you entered.
+
+It does nothing, and the checkbox is greyed out with the reason, for Automagic, Keel and Hull (they set their own rate),
+for a full fine-tune, LoKr and OFT, and when alpha equals rank. Under LoRA Isolation an Automagic or Keel pick trains with
+AdamW, so the scaling applies to that AdamW rate (the scaled rate is not held to the 1e-3 limit that picks AdamW's rate).
+LoRA+ multiplies the scaled rate as usual, and warm-up and schedules act on it. With Adam-type optimizers the scaling
+makes lora_up's updates match alpha = rank exactly, but lora_down starts from the same random values and so moves further
+relative to its start than it would at alpha = rank, and DoRA's magnitude vector is not scaled by alpha, so it gets the
+larger rate too. The result is close to a run at alpha = rank, not identical. Never run on a real model here.
+
 ## Per-image loss watch and per-image learning rate
 
 `loss_watch: true` records every image's loss normalised by the expected loss at its noise level (40 sigma
