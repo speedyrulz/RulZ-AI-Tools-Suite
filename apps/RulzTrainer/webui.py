@@ -8476,11 +8476,144 @@ def probe_compare(groups, step: int, kind: str) -> tuple[list[str], list[tuple[s
                      for seed in sorted(by_seed) for label, e, note in by_seed[seed]]
 
 
+SWEEP_REGIONS = ("subject", "face", "hair", "skin", "clothes", "background")
+# the region sweep's two sets of pictures: (key in a sweep row, the chip's name, the line's name, line style)
+SWEEP_SETS = (("train", "Training pictures", "training", {}), ("held", "Held-out pictures", "held-out", {"type": "dashed"}))
+
+
+def history_run_colors(runs: list[dict]) -> dict[str, str]:
+    """{run id: its colour} in the order history_series gives them (a race's configurations take one each, so a run
+    after a race is two or more colours on), so a run is the same colour on every Previous Runs chart."""
+    out, n = {}, 0
+    for r in runs:
+        out[r["id"]] = HISTORY_COLORS[n % len(HISTORY_COLORS)]
+        racers = (r.get("probes") or {}).get("racers")
+        n += len(racers) if racers else 1
+    return out
+
+
+def history_sweep_lines(runs: list[dict], region: str, shown=("train", "held")) -> list[dict]:
+    """ECharts line series of one region's sweeps over the runs: the share of its starting error that is gone, in
+    percent, per step; one colour per run, the held-out pictures dashed. A run's lines share its name (one legend
+    entry per run), each line's id is "<run> · training" or "<run> · held-out"."""
+    colors = history_run_colors(runs)
+    out = []
+    for r in runs:
+        label = history_label(r)
+        for key, _, word, style in SWEEP_SETS:
+            if key not in shown:
+                continue
+            pts = [[int(e["step"]), round(100 * e[key][region], 1)] for e in r.get("sweeps") or []
+                   if (e.get(key) or {}).get(region) is not None]
+            if pts:
+                color = colors[r["id"]]
+                out.append({"name": label, "id": f"{label} · {word}", "type": "line", "data": pts,
+                            "showSymbol": len(pts) < 60, "symbolSize": 4, "itemStyle": {"color": color},
+                            "lineStyle": {"color": color, "width": 2, **style}})
+    return out
+
+
+def history_maps_dir(rec: dict, runs: list[dict]) -> Path | None:
+    """Where a Previous Runs record's training maps are: the copy the history kept (it outlives the job folder),
+    else the job folder's own training_maps/ while that folder still holds this run, else None."""
+    from rulztrainer import trainmaps as TM
+
+    kept = history.HISTORY_DIR / rec["id"] / history.MAPS_SUBDIR
+    if (kept / "maps.jsonl").is_file():
+        return kept
+    job_dir = history_job_dir(rec, runs)
+    if job_dir is not None and (TM.maps_dir(job_dir) / "maps.jsonl").is_file():
+        return TM.maps_dir(job_dir)
+    return None
+
+
+def maps_signature(d: Path) -> tuple:
+    """Changes whenever the maps folder's two data files do."""
+    out = []
+    for name in ("probes.json", "maps.jsonl"):
+        try:
+            st = (Path(d) / name).stat()
+            out.append((name, st.st_mtime_ns, st.st_size))
+        except OSError:
+            out.append((name, 0, 0))
+    return tuple(out)
+
+
+def read_maps_dir(d: Path) -> dict | None:
+    """trainmaps.read for a maps folder itself (the history's kept copy is not named training_maps): {"probes",
+    "sigmas", "words", "dir", "captures"}, or None without probes.json."""
+    from rulztrainer import trainmaps as TM
+
+    d = Path(d)
+    try:
+        meta = json.loads((d / "probes.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    by = {}
+    try:
+        with open(d / "maps.jsonl", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue  # a line still being written
+                by[int(row.get("step", 0))] = row
+    except OSError:
+        pass
+    return {"probes": meta.get("probes") or [], "sigmas": meta.get("sigmas") or list(TM.SIGMAS),
+            "words": meta.get("words") or [], "dir": str(d),
+            "captures": [{"step": s, "epoch": by[s].get("epoch"), "maps": by[s].get("maps") or {},
+                          "bleed": by[s].get("bleed")} for s in sorted(by)]}
+
+
+def maps_steps(entries: list[tuple[str, dict]]) -> list[int]:
+    """Every step any of the runs has a map capture at, ascending."""
+    return sorted({int(c["step"]) for _, data in entries for c in data.get("captures") or []})
+
+
+def maps_capture_index(captures: list[dict], step: int) -> int | None:
+    """The capture to show at `step`: the latest one at or before it, else the run's first (it started later than
+    this step); None without captures."""
+    if not captures:
+        return None
+    before = [i for i, c in enumerate(captures) if int(c["step"]) <= step]
+    return before[-1] if before else 0
+
+
+def maps_compare(entries: list[tuple[str, dict]], picture: int, kind: str, level: str, how: str,
+                 step: int) -> tuple[list[dict], float]:
+    """(one item per run, the colour scale they share). An item: {"label", "data", "probe", "capture", "a" (the map,
+    numpy or None), "note"}, or {"label", "missing": why} for a run without that picture or without captures.
+    picture: the index in each run's own list of pictures. The scale is the largest any shown run needs, so the same
+    colour means the same in every picture (learned measured as "fixed" is one scale anyway)."""
+    from rulztrainer import trainmaps as TM
+
+    how = how if kind == "learned" else "amount"
+    items, tops = [], []
+    for label, data in entries:
+        probes, caps = data.get("probes") or [], data.get("captures") or []
+        if picture >= len(probes):
+            items.append({"label": label, "missing": f"has no picture {picture + 1}"})
+            continue
+        i = maps_capture_index(caps, step)
+        if i is None:
+            items.append({"label": label, "missing": "has no captures yet"})
+            continue
+        probe = probes[picture]
+        series = TM.series(data, probe["id"], kind, level, "", how)
+        tops.append(TM.scale(series, kind, how))
+        at = int(caps[i]["step"])
+        items.append({"label": label, "data": data, "probe": probe, "capture": caps[i],
+                      "a": series[i] if i < len(series) else None,
+                      "note": "" if at == step else f"its {'first' if at > step else 'latest'}: step {at:,}"})
+    return items, (max(tops) if tops else 1.0)
+
+
 def build_history_tab(charts: list):
     """Previous Runs: the saved likeness history of every run (output/_history), any number of them ticked to overlay
     their charts."""
     state = {"runs": [], "view": [], "own": [], "sig": None, "picks": [], "captions": [], "shown": None,
-             "fleet_sig": None}
+             "fleet_sig": None, "maps_cache": {}, "maps_pics": {}, "maps_shown": None}
 
     def selected_runs() -> list[dict]:
         ids = {row["id"] for row in table.selected}
@@ -8518,7 +8651,91 @@ def build_history_tab(charts: list):
                           "" if series else "The ticked runs have no scores of this kind.")
         compare.text = f"{len(picked)} run(s) overlaid" if picked else ""
         refresh_files()
+        draw_sweeps()
+        draw_maps()
         draw_probes()
+
+    def draw_sweeps(*_):
+        picked = selected_runs()
+        shown = [spec[0] for spec, box in zip(SWEEP_SETS, sweep_sets) if box.value]
+        series = history_sweep_lines(picked, sweep_region.value or "subject", shown)
+        sweep_chart.options["series"] = series
+        sweep_chart.options["legend"]["data"] = list(dict.fromkeys(sr["name"] for sr in series))
+        sweep_chart.update()
+        sweep_empty.text = ("Tick one or more runs above to draw them here." if not picked else
+                            "" if series else "The ticked runs have no region sweeps.")
+
+    def maps_data(d: Path) -> dict | None:
+        """A maps folder read, kept until its files change."""
+        sig = maps_signature(d)
+        hit = state["maps_cache"].get(str(d))
+        if hit is None or hit[0] != sig:
+            hit = state["maps_cache"][str(d)] = (sig, read_maps_dir(d))
+        return hit[1]
+
+    def maps_picture(data: dict, probe: dict):
+        key = (data["dir"], probe["image"])
+        if key not in state["maps_pics"]:
+            if len(state["maps_pics"]) > 40:
+                state["maps_pics"].clear()
+            state["maps_pics"][key] = map_picture(data, probe)
+        return state["maps_pics"][key]
+
+    def draw_maps(*_):
+        """The ticked runs' training maps side by side. Rendering is slow-ish, so it happens only when the ticked
+        runs, their map files or the card's own choices changed."""
+        from rulztrainer import trainmaps as TM
+
+        picked = selected_runs()
+        entries = []
+        for r in picked:
+            d = history_maps_dir(r, state["runs"])
+            data = maps_data(d) if d is not None else None
+            if data and data["probes"]:
+                entries.append((history_label(r), data))
+        pics = {i: f"Picture {i + 1}" for i in range(max((len(dt["probes"]) for _, dt in entries), default=0))}
+        if maps_pick.options != pics:
+            maps_pick.set_options(pics, value=maps_pick.value if maps_pick.value in pics else (0 if pics else None))
+        steps = maps_steps(entries)
+        opts = {s: TM.capture_label({"step": s}).capitalize() for s in steps}
+        if maps_step.options != opts:
+            maps_step.set_options(opts, value=maps_step.value if maps_step.value in opts else
+                                  (steps[-1] if steps else None))
+        kind, step = maps_kind.value or "learned", maps_step.value
+        sig = (tuple(r["id"] for r in picked), tuple((id(dt), len(dt["captures"])) for _, dt in entries),
+               maps_pick.value, kind, maps_level.value, maps_how.value, step)
+        if sig == state["maps_shown"]:
+            return
+        state["maps_shown"] = sig
+        maps_grid.clear()
+        with maps_grid:
+            if not picked:
+                hint("Tick one or more runs above to see their training maps side by side.")
+                return
+            if not entries or maps_pick.value is None or step is None:
+                hint("The ticked runs have no training maps (turn on Training maps before a run).")
+                return
+            how = maps_how.value or "fixed"
+            items, top = maps_compare(entries, int(maps_pick.value), kind, maps_level.value or "all", how, int(step))
+            hint(MAP_HINTS.get(kind, "") + (LEARNED_AS_HINTS.get(how, "") if kind == "learned" else ""))
+            with ui.element("div").classes("rz-gallery"):
+                for it in items:
+                    with ui.column().classes("rz-shot gap-0"):
+                        if "missing" in it:
+                            ui.label(it["label"]).classes("rz-shot-title")
+                            ui.label(f"This run {it['missing']}.").classes("rz-shot-sub")
+                            continue
+                        pic = maps_picture(it["data"], it["probe"])
+                        if pic is None:
+                            ui.label(it["label"]).classes("rz-shot-title")
+                            ui.label(f"{it['probe']['image']} is missing from {it['data']['dir']}") \
+                                .classes("rz-shot-sub")
+                            continue
+                        img = TM.render_overlay(pic, it["a"], kind, top, 1.0, True, False, width=384)
+                        ui.image(map_data_url(img, 85)).props("fit=contain").classes("w-full rz-imgbg")
+                        ui.label(it["label"]).classes("rz-shot-title")
+                        ui.label(" · ".join(x for x in (TM.capture_label(it["capture"]), it["note"]) if x)) \
+                            .classes("rz-shot-sub")
 
     def draw_probes(*_):
         picked = selected_runs()
@@ -8693,9 +8910,10 @@ def build_history_tab(charts: list):
             with ui.column().classes("gap-1 flex-1 min-w-[16rem]"):
                 ui.label("Previous runs").classes("rz-title")
                 hint("Every run with likeness scores is saved here while it trains. Tick runs to compare their "
-                     "likeness charts and probe images, and see which setup learned the person faster or better "
-                     "(0 = a stranger, 100 = your references). Runs on the vast.ai instances the Fleet tab "
-                     "watches are listed too (Where: vast.ai), with probe images once you download their probes.")
+                     "likeness charts, region sweeps, probe images and training maps, and see which setup learned "
+                     "the person faster or better (0 = a stranger, 100 = your references). Runs on the vast.ai "
+                     "instances the Fleet tab watches are listed too (Where: vast.ai), with probe images, sweeps "
+                     "and maps once you download their files.")
             ui.button("Import old runs", icon="move_to_inbox", on_click=import_old).props("outline") \
                 .tooltip("Add the runs whose job folders are in the output folder but not in this list yet")
     with card():
@@ -8810,6 +9028,45 @@ def build_history_tab(charts: list):
         scale_note = hint("", warn=True)
         probe_chart_h = RzChart(chart_options(_axis("step", min="dataMin"), _axis("likeness %", min=0),
                                                 [], [])).classes("w-full h-72")
+    with section("Region sweeps", "How much of its starting error each run has removed in a part of the picture "
+                 "(face, hair, skin, clothes, background)", "layers"):
+        with ui.row().classes("w-full items-center gap-3"):
+            sweep_region = ui.select(list(SWEEP_REGIONS), value="subject", label="Region",
+                                     on_change=draw_sweeps).props("dense options-dense outlined").classes("w-40")
+            sweep_sets = [ui.checkbox(name, value=True, on_change=draw_sweeps).tooltip(
+                "Held-out pictures are drawn dashed" if key == "held" else "Solid lines")
+                for key, name, _, _ in SWEEP_SETS]
+            sweep_empty = hint("")
+        sweep_chart = RzChart(chart_options(_axis("step", min="dataMin"), _axis("share of starting error gone %"),
+                                              [], [])).classes("w-full h-72")
+    with section("Training maps", "The ticked runs' heatmaps over the same training picture, side by side", "grid_on"):
+        from rulztrainer import trainmaps as TM_
+
+        with ui.row().classes("w-full items-center gap-2"):
+            maps_pick = ui.select({}, label="Picture", on_change=draw_maps).props("dense options-dense outlined") \
+                .classes("w-36")
+            maps_kind = ui.select(dict(TM_.MAP_KINDS), value="learned", label="Map", on_change=draw_maps) \
+                .props("dense options-dense outlined").classes("w-64 max-w-full")
+            maps_level = ui.select({"all": "All levels", **{f"{s:g}": TM_.sigma_label(f"{s:g}") for s in TM_.SIGMAS}},
+                                   value="all", label="Noise", on_change=draw_maps) \
+                .props("dense options-dense outlined").classes("w-52 max-w-full")
+            maps_how = ui.select(dict(TM_.LEARNED_AS), value="fixed", label="Learned, measured as",
+                                 on_change=draw_maps).props("dense options-dense outlined").classes("w-72 max-w-full")
+            maps_how.bind_visibility_from(maps_kind, "value", backward=lambda v: v == "learned")
+        with ui.row().classes("items-center gap-1 no-wrap rz-grow-phone"):
+            def maps_step_by(delta: int):
+                keys = list(maps_step.options)
+                if maps_step.value in keys:
+                    maps_step.value = keys[min(len(keys) - 1, max(0, keys.index(maps_step.value) + delta))]
+
+            ui.button(icon="chevron_left", on_click=lambda: maps_step_by(-1)).props("flat dense round") \
+                .tooltip("Earlier capture")
+            maps_step = ui.select({}, on_change=draw_maps).props("dense options-dense outlined") \
+                .classes("rz-step-pick min-w-[9rem]")
+            ui.button(icon="chevron_right", on_click=lambda: maps_step_by(1)).props("flat dense round") \
+                .tooltip("Later capture")
+        hint("A run with no capture at this step shows its latest one before it.")
+        maps_grid = ui.column().classes("w-full gap-2")
     with section("Probe images", "The ticked runs' probes at the same step, the same test picture side by side; "
                  "tick two images to compare them large", "compare"):
         with ui.row().classes("w-full items-center gap-2"):
@@ -8909,9 +9166,9 @@ def build_history_tab(charts: list):
                     cmp_imgs.append(ui.image("").props("fit=contain").classes("w-full rz-compare-img"))
                     cmp_caps.append(ui.label("").classes("text-xs text-white text-center"))
     show_full = image_viewer()
-    for chart in (id_chart, probe_chart_h):
+    for chart in (id_chart, probe_chart_h, sweep_chart):
         chart.options["tooltip"][":formatter"] = HISTORY_TOOLTIP
-    charts.extend([id_chart, probe_chart_h])
+    charts.extend([id_chart, probe_chart_h, sweep_chart])
     try:
         history.import_jobs()  # the runs from before the history existed, once
     except Exception:  # noqa: BLE001
