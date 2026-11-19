@@ -109,6 +109,9 @@ class ProbeProcess:
         self.analysis_count = 0
         self.analysis_wanted = analysis is not None
         self.analysis_error: str | None = None  # why its analysis model did not load (known once it is ready)
+        self.error: ProbeProcessError | None = None  # the error the process sent, raised again on every later read
+        self.free_since: float | None = None  # when it last finished a job (or loaded), for the job it is on now
+        self.done: dict[str, int] = {}  # jobs taken back, per kind
         key = os.urandom(32)
         listener = Listener(("127.0.0.1", 0), authkey=key)
         root = str(Path(__file__).resolve().parent.parent)
@@ -157,6 +160,8 @@ class ProbeProcess:
                                     f"{self.log_path}") from e
 
     def _recv(self):
+        if self.error is not None:  # (its message was read: a later read would only find the process gone)
+            raise self.error
         while not self._poll(0.5):
             if self.proc.poll() is not None:
                 raise ProbeProcessError(f"the probe process exited (code {self.proc.returncode}); see "
@@ -167,7 +172,8 @@ class ProbeProcess:
             raise ProbeProcessError(f"the probe process closed its connection ({type(e).__name__}); see "
                                     f"{self.log_path}") from e
         if msg[0] == "error":
-            raise ProbeProcessError(msg[1])
+            self.error = ProbeProcessError(msg[1])
+            raise self.error
         return msg
 
     def wait_ready(self) -> str:
@@ -177,6 +183,7 @@ class ProbeProcess:
             msg = self._recv()
             self.memory = msg[1]
             self.analysis_error = msg[2] if len(msg) > 2 else None
+            self.free_since = time.time()
             log.info("Probe process ready on %s in %.0fs (%s)", self.device, time.time() - self.started, self.memory)
         return self.memory
 
@@ -196,6 +203,8 @@ class ProbeProcess:
     def _pump(self, until: Pending | None = None) -> None:
         """Read the answers that are in, each into the job it belongs to (the process answers in the order it was
         sent them); with `until`, wait for that job's answer."""
+        if self.error is not None:  # the process sent its error (read by an earlier pump): it is gone
+            raise self.error
         if self.memory is None:
             if until is None and not self._poll():
                 return
@@ -211,6 +220,7 @@ class ProbeProcess:
                 raise ProbeProcessError(f"the probe process answered {msg[0]!r} to the {waiting.kind} of step "
                                         f"{waiting.step}")
             waiting.reply = msg
+            self.free_since = time.time()
 
     def _in(self, p: Pending, wait: bool) -> bool:
         """The answer to `p` has been read (with wait, after waiting for it: that time counts as waited)."""
@@ -274,6 +284,7 @@ class ProbeProcess:
         _, images, seconds = p.reply
         self.rendered += seconds
         self.count += 1
+        self.done[kind] = self.done.get(kind, 0) + 1
         return p, images
 
     def take_sample(self, wait: bool) -> tuple[Pending, list[str]] | None:
@@ -292,7 +303,32 @@ class ProbeProcess:
             return p, None, p.reply[2]
         self.analysed += p.reply[2]
         self.analysis_count += 1
+        self.done[kind] = self.done.get(kind, 0) + 1
         return p, p.reply[1], ""
+
+    def refresh(self) -> None:
+        """Read the answers that are in, without waiting, so snapshot() is current. A failure is left for the trainer's
+        next take to raise (an error the process sent is kept and raised again there)."""
+        try:
+            self._pump()
+        except ProbeProcessError:
+            pass
+
+    def snapshot(self) -> dict:
+        """What the process is doing, for the Monitor: "loading" its model(s), "working" on a job (its kind, the step
+        whose weights it uses, since when) or "idle"; the jobs queued behind it, the ones finished but not yet taken,
+        and the ones taken so far per kind."""
+        if self.memory is None:
+            state, job, since = "loading", None, getattr(self, "started", None)
+        else:
+            job = next((p for p in self.queue if p.reply is None), None)
+            state = "working" if job is not None else "idle"
+            since = max(job.queued, self.free_since or 0.0) if job is not None else self.free_since
+        return {"device": self.device, "state": state, "kind": job.kind if job else None,
+                "step": job.step if job else None, "since": since,
+                "queued": [{"kind": p.kind, "step": p.step} for p in self.queue if p.reply is None and p is not job],
+                "ready": [{"kind": p.kind, "step": p.step} for p in self.queue if p.reply is not None],
+                "done": dict(self.done), "memory": self.memory}
 
     def outstanding(self) -> list[Pending]:
         """The sample rounds, sweeps and maps still out (after a failure: the trainer takes the ones answered as they

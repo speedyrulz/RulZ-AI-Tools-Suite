@@ -2176,7 +2176,8 @@ class Trainer(RaceParallelMixin):
                                loss=accum_loss, avg_loss=avg, elapsed=elapsed, eta=eta, lr=lr_now,
                                losses=losses[-2000:], step_times=[round(t, 3) for t in step_times[-2000:]],
                                grad_norm=grad_norm, grad_norms=round_norms(grad_norms[-2000:]),
-                               grad_clip=cfg.clip_norm, peak_mem=peak, peak_ram=peak_ram.peak_gb(), **id_extra)
+                               grad_clip=cfg.clip_norm, peak_mem=peak, peak_ram=peak_ram.peak_gb(),
+                               **self._second_gpu_status(), **id_extra)
             if self.loss_watch is not None and self.loss_watch.epoch_complete():
                 summary = self.loss_watch.end_epoch(step)
                 log.info("Loss watch epoch %d: %s (median residual %.3f, %d/%d active)", summary["epoch"],
@@ -5594,10 +5595,13 @@ class Trainer(RaceParallelMixin):
         except ProbeProcessError as e:
             log.warning("The second GPU's process on %s failed to start, so everything runs on the training GPU "
                         "between steps: %s", dev, str(e).strip().splitlines()[-1])
+            self.status.update(second_gpu={"device": dev, "state": "failed", "since": time.time(),
+                                           "note": "failed to start; everything runs on the training GPU"})
             return
         self.probe_worker = w if probes else None
         self.sample_worker = w if samples else None
         self.analysis_worker = w if analysis else None
+        self.status.update(**self._second_gpu_status())  # "loading" on the Monitor until its models are in
         if samples:
             log.info("Samples render on %s in a separate process while training goes on (sample_async): each round "
                      "is queued with the LoRA as it stands (the weight average) and its pictures are written under "
@@ -5615,6 +5619,15 @@ class Trainer(RaceParallelMixin):
                      dev, "the same process" if probes else "a separate process",
                      "" if not self.cfg.sample_model_path else
                      ", with a second model beside the sampling one: if it does not fit they run here")
+
+    def _second_gpu_status(self) -> dict:
+        """status.json's second_gpu (the Monitor's tile) while the second GPU's process runs: what it is working on and
+        for which step (probeworker.ProbeProcess.snapshot); nothing to add without one, so how it ended stays."""
+        w = next((x for x in (self.probe_worker, self.sample_worker, self.analysis_worker) if x is not None), None)
+        if w is None or not hasattr(w, "snapshot"):
+            return {}
+        w.refresh()
+        return {"second_gpu": w.snapshot()}
 
     @staticmethod
     def _cpu(t):
@@ -5704,6 +5717,12 @@ class Trainer(RaceParallelMixin):
         self.probe_worker = self.sample_worker = self.analysis_worker = None
         if w is None:
             return
+        if hasattr(w, "snapshot"):  # the Monitor's second-GPU tile: how it ended, with what it did
+            last = w.snapshot()
+            self.status.update(second_gpu={
+                "device": last["device"], "state": "failed" if redo else "stopped", "since": time.time(),
+                "done": last["done"], "memory": last["memory"],
+                "note": "failed; everything runs on the training GPU" if redo else "finished its work"})
         lost = list(w.outstanding()) if redo and hasattr(w, "outstanding") else []
         for p in getattr(w, "queue", []):
             if p.kind == "probe":
@@ -5783,6 +5802,9 @@ class Trainer(RaceParallelMixin):
         self.analysis_worker = None
         if self.probe_worker is None and self.sample_worker is None:  # nothing else for it to do
             w.close()
+            self.status.update(second_gpu={"device": w.device, "state": "failed", "since": time.time(),
+                                           "note": "the trained model did not load; sweeps and maps run on the "
+                                                   "training GPU"})
 
     def _analysis_take_all(self, now: int, wait: bool = False) -> None:
         """Record every sweep and maps capture the second GPU has finished (with wait: all of them, blocking)."""
