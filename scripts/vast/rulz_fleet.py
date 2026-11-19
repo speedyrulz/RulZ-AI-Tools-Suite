@@ -30,12 +30,14 @@ from __future__ import annotations
 import argparse
 import copy
 import fnmatch
+import inspect
 import json
 import os
 import queue as queue_module
 import re
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import urllib.parse
@@ -87,6 +89,7 @@ EVENT_KINDS = WAIT_KINDS + ("run_started", "dispatched", "instance_up", "instanc
 RECENT_KEPT = 30
 FILLS_PER_TICK = 3  # runs whose settings and probes are fetched per instance and look
 PULL_RETRIES = 5
+STALE_DOWNLOAD = 60.0  # a download entry not updated for this long (seconds) has stopped answering
 DISPATCH_STALE = 900.0  # a dispatch that has not reported for this long is taken for dead
 SERIES_KEPT = 400
 # a rebooting instance may be out of reach, or not "running" on vast.ai, this long before that counts as usual
@@ -288,6 +291,8 @@ class Fleet:
         self.vast = vast or remote.vastai  # the vastai CLI: its arguments in, its output out
         self.lock = QueueLock(self.home / "state.lock")
         self.state_file = self.home / "state.json"
+        self.downloads_file = self.home / "downloads.json"
+        self.downloads_lock = QueueLock(self.home / "downloads.lock")
         self.events_file = self.home / "events.jsonl"
         self.snaps_file = self.home / "snapshots.json"
         self.runs_dir = self.home / "runs"
@@ -627,6 +632,9 @@ class Fleet:
         known = {r["key"]: r for r in self.runs(instance=iid)}
         seen, running_key = set(), None
         for line in snap.get("jobs") or []:
+            job_name = str(line.get("job") or "")
+            if not job_name or job_name in (".", "..") or Path(job_name).name != job_name:
+                continue  # not a plain folder name: never a run of ours (its files would land outside its folder)
             key = run_key(iid, line)
             if key in seen:
                 continue
@@ -640,6 +648,9 @@ class Fleet:
                 rec = {"key": key, "instance": int(iid), "job": line.get("job"), "run_id": line.get("run_id"),
                        "gpu": inst.get("gpu"), "dph": inst.get("dph"), "first_seen": now, "state": state, "fill": True,
                        "imported": state != "running" and not ours}
+                if rec["imported"] and state != "lost":
+                    # history, not news (no events), but its files are fetched by the download rules like a closed run's
+                    rec.update(final_pull=True, pull_fails=0)
                 if state == "running" or ours:
                     rec["started"] = now - float(line.get("elapsed") or 0)
                     rec.update((inst.get("pending") or {}).pop(line.get("job"), {}))
@@ -1134,23 +1145,90 @@ class Fleet:
 
         self.update_run(key, change)
 
-    def pull(self, inst: dict, key: str, kinds: list[str], final: bool = False) -> dict:
+    def downloads(self, keep: float = 15.0) -> list[dict]:
+        """Recent downloads, including copies that stopped answering."""
+        with self.downloads_lock:
+            return self._downloads(keep)
+
+    def _downloads(self, keep: float, raw: bool = False) -> list[dict]:
+        data = self._read_json(self.downloads_file, {})
+        if not isinstance(data, dict):
+            return []
+        now, found = self.now(), []
+        for entry in data.values():
+            if not isinstance(entry, dict) or not isinstance(entry.get("updated"), (int, float)):
+                continue
+            entry = dict(entry)
+            age = now - entry["updated"]
+            if entry.get("state") == "going" and age > STALE_DOWNLOAD:
+                if age > STALE_DOWNLOAD + keep:  # it shows as failed for `keep` s after it went stale, then goes
+                    continue
+                if not raw:  # (raw: as written, for the writer, so the entry keeps ageing from its last update)
+                    entry.update(state="failed", error="stopped answering")
+            elif entry.get("state") in ("done", "failed") and age > keep:
+                continue
+            found.append(entry)
+        return sorted(found, key=lambda entry: entry["updated"], reverse=True)
+
+    def _download_write(self, entry: dict) -> None:
+        with self.downloads_lock:
+            entries = {item["run"]: item for item in self._downloads(15.0, raw=True) if item.get("run")}
+            entries[entry["run"]] = dict(entry)
+            self._write_json(self.downloads_file, entries)
+
+    def pull(self, inst: dict, key: str, kinds: list[str], final: bool = False, *, manual: bool = False) -> dict:
         """Copy a run's files of these kinds here (the ones not here yet at their size)."""
         rec = self.load_run(key)
         if rec is None:
             return {}
         dest = self.pulls / str(rec["instance"])
         result: dict = {"folder": str(dest / rec["job"]), "fetched": 0, "mb": 0.0}
+        started = self.now()
+        entry = {"run": key, "job": str(rec["job"]), "instance": int(rec["instance"]), "kinds": list(kinds),
+                 "manual": manual, "state": "going", "files_done": 0, "files_total": 0, "bytes_done": 0,
+                 "bytes_total": 0, "started": started, "updated": started, "speed": 0.0,
+                 "fetched": 0, "mb": 0.0, "pid": os.getpid()}
+        self._download_write(entry)
+
+        def progress(byte_count, file_count):
+            entry["bytes_done"] = min(entry["bytes_total"], entry["bytes_done"] + byte_count)
+            entry["files_done"] = min(entry["files_total"], entry["files_done"] + file_count)
+            now = self.now()
+            if now - entry["updated"] >= 1:
+                entry["speed"] = entry["bytes_done"] / max(now - started, 0.001)
+                entry["updated"] = now
+                self._download_write(entry)
+
         try:
             target = self.remote_for(inst)
             listing = target.agent_json("files", rec["job"], *[a for kind in kinds for a in ("--what", kind)])
             todo = remote.pull_plan(listing["files"], dest)
+            entry.update(files_total=len(todo), bytes_total=sum(f["size"] for f in todo))
+            entry["updated"] = self.now()
+            self._download_write(entry)
             if todo:
-                self.fetch(target, listing["base"], [f["path"] for f in todo], dest)
+                args = (target, listing["base"], [f["path"] for f in todo], dest)
+                try:
+                    inspect.signature(self.fetch).bind(*args, progress=progress)
+                except (TypeError, ValueError):
+                    self.fetch(*args)
+                else:
+                    self.fetch(*args, progress=progress)
             result.update(fetched=len(todo), mb=round(sum(f["size"] for f in todo) / 1e6, 1))
             failure = None
-        except (SystemExit, remote.Unreachable, ValueError, KeyError, OSError, subprocess.SubprocessError) as e:
+        except (SystemExit, remote.Unreachable, ValueError, KeyError, OSError, subprocess.SubprocessError,
+                tarfile.TarError) as e:  # TarError: the stream broke (a dropped ssh)
             failure = str(e)[:300] or type(e).__name__
+
+        ended = self.now()
+        entry.update(state="done" if failure is None else "failed", updated=ended,
+                     speed=entry["bytes_done"] / max(ended - started, 0.001), **{k: result[k] for k in ("fetched", "mb")})
+        if failure is None:
+            entry.update(files_done=entry["files_total"], bytes_done=entry["bytes_total"])
+            entry["speed"] = entry["bytes_done"] / max(ended - started, 0.001)
+        else:
+            entry["error"] = failure
+        self._download_write(entry)
 
         def change(r):
             r["pulled_at"] = self.now()
@@ -1173,6 +1251,32 @@ class Fleet:
                 with self.edit() as st:
                     self.event(st, "download_failed", instance=rec["instance"], job=rec["job"], run=key, error=failure)
         return result
+
+    def pull_now(self, key: str, kinds: list[str]) -> dict:
+        """A download asked for by hand: refused while the looker is already pulling this run, or when the run's
+        instance is gone. Otherwise like pull()."""
+        rec = self.load_run(key)
+        if rec is None:
+            raise Refused(f"No run {key!r} on record (see runs).")
+        bad = [k for k in kinds if k not in DOWNLOAD_KINDS]
+        if bad or not kinds:
+            raise Refused(f"Pick what to download: {', '.join(DOWNLOAD_KINDS)}.")
+        iid = str(rec["instance"])
+        inst = self.read()["instances"].get(iid)
+        if inst is None or inst.get("gone"):
+            raise Refused(f"Instance {iid} is gone: its files can no longer be downloaded.")
+        mark = ("pull", key)
+        elsewhere = any(e.get("run") == key and e.get("state") == "going" and e.get("pid") not in (None, os.getpid())
+                        for e in self.downloads())  # another program (a daemon) is pulling it
+        with self.guard:
+            if mark in self.busy or elsewhere:
+                raise Refused("A download of this run is already going; it finishes on its own.")
+            self.busy.add(mark)
+        try:
+            return self.pull(inst, key, list(kinds), manual=True)
+        finally:
+            with self.guard:
+                self.busy.discard(mark)
 
     def stop_run(self, name: str, kill: bool = False) -> dict:
         """The WebUI's Stop (or Kill) on the instance that runs this job; name may be an instance id instead."""
@@ -1759,7 +1863,7 @@ def cmd_download(fleet: Fleet, args) -> int:
 
 def cmd_pull(fleet: Fleet, args) -> int:
     rec = fleet.find_run(args.name)
-    result = fleet.pull(fleet.instance(rec["instance"]), rec["key"], args.what or ["logs"])
+    result = fleet.pull_now(rec["key"], args.what or ["logs"])
     show(result)
     return 1 if result.get("error") else 0
 

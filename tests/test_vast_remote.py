@@ -285,6 +285,16 @@ def test_a_pulled_archive_lands_in_its_folder_and_cannot_leave_it(tmp_path):
     assert not (tmp_path / "escaped.txt").exists()
 
 
+def test_extract_reports_stream_bytes_and_unpacked_files(tmp_path):
+    stream = tar_stream("job/train.log", b"hello")
+    size = len(stream.getvalue())
+    updates = []
+    remote.extract(stream, tmp_path, progress=lambda b, f: updates.append((b, f)))
+    assert sum(b for b, _ in updates) == size
+    assert sum(f for _, f in updates) == 1
+    assert (tmp_path / "job/train.log").read_bytes() == b"hello"
+
+
 def test_files_sent_from_windows_keep_scripts_runnable():
     def mode(name, type_=tarfile.REGTYPE):
         info = tarfile.TarInfo(name)
@@ -742,3 +752,33 @@ def test_the_local_side_needs_only_the_standard_library():
     tree = (REPO / "scripts" / "vast" / "rulz_remote.py").read_text(encoding="utf-8")
     imports = {line.split()[1].split(".")[0] for line in tree.splitlines() if line.startswith(("import ", "from "))}
     assert imports <= set(sys.stdlib_module_names) | {"__future__"}, imports
+
+
+def test_fetch_closes_and_ends_the_process_when_the_stream_breaks(tmp_path, monkeypatch):
+    import io
+    import tarfile
+
+    class Proc:
+        returncode = None
+
+        def __init__(self, *a, **kw):
+            self.stdin, self.stdout, self.killed = io.BytesIO(), io.BytesIO(b"not a tar stream at all" * 50), False
+            self.stdin.close = lambda: None
+            Proc.last = self
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if not self.killed and timeout is not None:
+                raise remote.subprocess.TimeoutExpired("ssh", timeout)
+            return self.returncode
+
+        def kill(self):
+            self.killed, self.returncode = True, -9
+
+    monkeypatch.setattr(remote.subprocess, "Popen", Proc)
+    target = type("T", (), {"command": lambda self, *a, **kw: ["ssh"]})()
+    with pytest.raises(tarfile.TarError):
+        remote.fetch(target, "/base", ["job/a.log"], tmp_path)
+    assert Proc.last.stdout.closed and Proc.last.killed
