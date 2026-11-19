@@ -291,14 +291,26 @@ def pull_plan(files: list[dict], dest: Path) -> list[dict]:
     return [f for f in files if not here(f)]
 
 
-def extract(stream, dest: Path) -> None:
+def extract(stream, dest: Path, *, progress=None) -> None:
     """Unpack a tar stream from the instance. The data filter refuses paths that would land outside dest."""
     dest.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(fileobj=stream, mode="r|") as tar:
-        tar.extractall(dest, filter="data")
+    class CountingReader:
+        def read(self, size):
+            data = stream.read(size)
+            progress(len(data), 0)
+            return data
+
+    with tarfile.open(fileobj=CountingReader() if progress else stream, mode="r|") as tar:
+        def members():
+            for member in tar:
+                yield member
+                if member.isfile():
+                    progress(0, 1)
+
+        tar.extractall(dest, members=members() if progress else None, filter="data")
 
 
-def fetch(remote: Remote, base: str, files: list[str], dest: Path) -> None:
+def fetch(remote: Remote, base: str, files: list[str], dest: Path, *, progress=None) -> None:
     proc = subprocess.Popen(remote.command(f"tar -cf - -C {shlex.quote(base)} -T -", in_folder=False),
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 
@@ -307,8 +319,20 @@ def fetch(remote: Remote, base: str, files: list[str], dest: Path) -> None:
         proc.stdin.close()
 
     threading.Thread(target=feed, daemon=True).start()
-    extract(proc.stdout, dest)
-    if proc.wait() > 1:  # 1: a file changed while it was read, which a log of a running job does
+    try:
+        extract(proc.stdout, dest, progress=progress)
+    finally:  # also when the stream broke (a dropped ssh): no process or pipe is left behind
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+    if proc.returncode > 1:  # 1: a file changed while it was read, which a log of a running job does
         raise SystemExit(f"tar on the instance ended with {proc.returncode}: the copy may be incomplete")
 
 
