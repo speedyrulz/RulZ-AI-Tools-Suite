@@ -242,7 +242,7 @@ def probe_settings(data: dict, steps: int, which: str) -> dict:
     return {
         "probe_every": max(1, int(steps) // 2), "probe_at_start": True, "probe_seeds": 1, "probe_floor_seeds": 1,
         "probe_async": False, "sample_async": False, "maps_async": False,
-        "sweep_async": False,
+        "sweep_async": False, "sweep_split": False,
         "probe_face_prompt": (data.get("probe_face_prompt") or face_p.format(trigger=subject)) if face else "",
         "probe_body_prompt": (data.get("probe_body_prompt") or body_p.format(trigger=subject)) if body else "",
     }

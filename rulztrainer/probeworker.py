@@ -13,8 +13,8 @@ The same process can also run the region sweeps and the training maps (maps_asyn
 trains (the training base with the same quantization, the same LoRA slots and the training adapter, the sampling
 LoRAs off), so a second model loads beside the sampling one when sample_model_path sets another, and one model serves
 both when it does not. The pictures' paths and tensors go over once, with the setup; each job then carries the LoRA
-state only. Jobs of every kind queue in one FIFO: the process answers them in the order they were sent, and
-ProbeProcess hands each answer to its job.
+state only. Probes and samples can run between sweep pictures; replies carry job ids so ProbeProcess can match them
+even when they arrive in a different order.
 
 Run as `python -m rulztrainer.probeworker <port>` by ProbeProcess, which writes the connection key on its stdin."""
 from __future__ import annotations
@@ -90,6 +90,7 @@ class Pending:
     kind: str = "probe"  # probe | sample | sweep | maps
     extra: dict = field(default_factory=dict)  # what the trainer records it with (epoch; for maps, effect)
     reply: tuple | None = None  # the process's answer, once read
+    job_id: int = 0  # identifies the job on the connection
 
 
 class ProbeProcess:
@@ -102,6 +103,7 @@ class ProbeProcess:
         self.device = device
         self.probes = probes
         self.queue: list[Pending] = []  # the jobs sent and not yet taken, oldest first
+        self._next_id = 1
         self.waited = 0.0  # seconds training spent waiting for a job to come in
         self.rendered = 0.0  # seconds the probe GPU spent rendering
         self.count = 0
@@ -201,8 +203,7 @@ class ProbeProcess:
         return next((p for p in self.queue if p.kind == kind), None)
 
     def _pump(self, until: Pending | None = None) -> None:
-        """Read the answers that are in, each into the job it belongs to (the process answers in the order it was
-        sent them); with `until`, wait for that job's answer."""
+        """Read the answers that are in, each into the job identified by its id; with `until`, wait for that job."""
         if self.error is not None:  # the process sent its error (read by an earlier pump): it is gone
             raise self.error
         if self.memory is None:
@@ -215,7 +216,13 @@ class ProbeProcess:
                 return
             if until is not None and until.reply is not None:
                 return
-            msg = self._recv()
+            envelope = self._recv()
+            if len(envelope) != 3 or envelope[0] != "reply":
+                raise ProbeProcessError(f"the probe process answered with an invalid reply: {envelope[0]!r}")
+            _, job_id, msg = envelope
+            waiting = next((p for p in self.queue if p.job_id == job_id and p.reply is None), None)
+            if waiting is None:
+                raise ProbeProcessError(f"the probe process answered an unknown job {job_id!r}")
             if msg[0] != _REPLY[waiting.kind] and not (msg[0] == "analysis_failed" and waiting.kind in ANALYSIS):
                 raise ProbeProcessError(f"the probe process answered {msg[0]!r} to the {waiting.kind} of step "
                                         f"{waiting.step}")
@@ -251,8 +258,10 @@ class ProbeProcess:
         its kind must have been taken."""
         if self.pending_of(kind) is not None:
             raise RuntimeError(f"the {kind} of step {self.pending_of(kind).step} is still queued")
-        self._send(("probe", jobs, self._payload(state), "sample" if kind == "sample" else "probe"))
-        self.queue.append(Pending(step, jobs, state, kind=kind))
+        job_id = self._next_id
+        self._next_id += 1
+        self._send(("probe", job_id, jobs, self._payload(state), "sample" if kind == "sample" else "probe"))
+        self.queue.append(Pending(step, jobs, state, kind=kind, job_id=job_id))
 
     def submit_analysis(self, kind: str, step: int, state: dict, keys: list | None = None,
                         extra: dict | None = None) -> None:
@@ -263,8 +272,10 @@ class ProbeProcess:
         if self.pending_of(kind) is not None:
             raise RuntimeError(f"the {kind} of step {self.pending_of(kind).step} is still queued")
         extra = dict(extra or {})
-        self._send((kind, self._payload(state), list(keys or []) if kind == "sweep" else bool(extra.get("effect"))))
-        self.queue.append(Pending(step, list(keys or []), state, kind=kind, extra=extra))
+        job_id = self._next_id
+        self._next_id += 1
+        self._send((kind, job_id, self._payload(state), list(keys or []) if kind == "sweep" else bool(extra.get("effect"))))
+        self.queue.append(Pending(step, list(keys or []), state, kind=kind, extra=extra, job_id=job_id))
 
     def ready(self) -> bool:
         p = self.pending
@@ -500,6 +511,15 @@ class Renderer:
             lora_mod.set_extras_enabled(self.slot.model, on)
             self.extras = on
 
+    def _sweep_state(self, payload: bytes) -> None:
+        """Restore the training weights and switches before reading sweep pictures."""
+        from . import lora as lora_mod
+
+        state = torch.load(io.BytesIO(payload), weights_only=True)
+        self._set_extras(False)
+        lora_mod.mirror_lora(lora_mod.lora_snapshots(state), self.train_injected)
+        self.model.eval()
+
     @torch.no_grad()
     def render(self, jobs: list, payload: bytes, negative_kind: str = "probe") -> tuple[list[str], float]:
         from . import lora as lora_mod
@@ -579,29 +599,106 @@ def _read_into(conn, q: "queue.Queue") -> None:
             return
 
 
+def _sweep_picture(r, picture) -> dict:
+    """Read one sweep picture with the same code as a sweep on the training GPU (regionsweep.forward_readings, which
+    keeps the RNG and the model's train/eval switch as they were). Its noise comes from the picture's own generator,
+    so reading a sweep picture by picture, or splitting it between GPUs, gives the same numbers as one pass."""
+    from . import regionsweep
+
+    return regionsweep.forward_readings(r.model, r.device, [picture])
+
+
 def _serve(conn, r) -> None:
-    """Run the jobs the trainer sends, in order. A receiver thread reads each message as it arrives, so the trainer's
-    send of the next job never waits on this thread while it is blocked sending a large reply (which the trainer reads
-    only later): that was a deadlock. The thread starts only after the models have loaded (the caller sends "ready"
-    first): on Windows a blocking read on an anonymous pipe in a thread stalled other threads' DLL loads. This
-    connection is a socket, but the start stays after loading anyway."""
+    """Run renders before analysis, checking for new jobs between sweep pictures. Receiver and sender threads keep
+    socket traffic from blocking computation or each other. They start after the models have loaded."""
+    from collections import deque
     q: queue.Queue = queue.Queue()
+    outbound: queue.Queue = queue.Queue()
     threading.Thread(target=_read_into, args=(conn, q), daemon=True).start()
-    while True:
-        msg = q.get()
-        if msg[0] == "stop":
-            return
-        try:
-            if msg[0] == "probe":
-                conn.send(("done", *r.render(msg[1], msg[2], msg[3] if len(msg) > 3 else "probe")))
-            else:
-                conn.send(r.analyse(msg))
-        except Exception:  # noqa: BLE001
-            log.exception("Probe process job failed")
+    def send_out():
+        while True:
+            msg = outbound.get()
+            if msg is None:
+                return
             try:
-                conn.send(("error", traceback.format_exc()))
+                conn.send(msg)
             except (OSError, EOFError):
                 return
+
+    sender = threading.Thread(target=send_out, daemon=True)
+    sender.start()
+    urgent, analysis = deque(), deque()
+    sweep = None
+    try:
+        while True:
+            # Drain before choosing work, including immediately after each picture.
+            if not urgent and not analysis and sweep is None:
+                msg = q.get()
+                if msg[0] == "stop":
+                    return
+                (urgent if msg[0] == "probe" else analysis).append(msg)
+            while True:
+                try:
+                    msg = q.get_nowait()
+                except queue.Empty:
+                    break
+                if msg[0] == "stop":
+                    return
+                (urgent if msg[0] == "probe" else analysis).append(msg)
+            if urgent:
+                _, job_id, jobs, payload, kind = urgent.popleft()
+                if sweep is not None:
+                    torch.cuda.empty_cache()
+                reply = ("done", *r.render(jobs, payload, kind))
+                outbound.put(("reply", job_id, reply))
+                if sweep is not None and getattr(r, "shared", True):
+                    sweep["disturbed"] = True  # (one model for both: the render left its LoRA and switches on it)
+            elif sweep is not None:
+                if sweep.pop("disturbed", False):  # after the renders that cut in, once: free theirs, restore the sweep's
+                    torch.cuda.empty_cache()
+                    r._sweep_state(sweep["payload"])
+                try:
+                    if sweep["keys"]:
+                        key = sweep["keys"].popleft()
+                        t0 = time.monotonic()
+                        try:
+                            sweep["result"].update(_sweep_picture(r, r.sweep_pictures[key]))
+                        finally:
+                            sweep["seconds"] += time.monotonic() - t0
+                    if not sweep["keys"]:
+                        outbound.put(("reply", sweep["id"], ("sweep_done", sweep["result"], sweep["seconds"])))
+                        torch.cuda.empty_cache()
+                        sweep = None
+                except torch.cuda.OutOfMemoryError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    log.exception("The sweep failed")
+                    outbound.put(("reply", sweep["id"], ("analysis_failed", "sweep",
+                                 f"{type(e).__name__}: {str(e)[:300]}", sweep["seconds"])))
+                    torch.cuda.empty_cache()
+                    sweep = None
+            elif analysis:
+                kind, job_id, payload, arg = analysis.popleft()
+                if kind == "sweep":
+                    sweep = {"id": job_id, "payload": payload, "keys": deque(arg), "result": {}, "seconds": 0.0}
+                    try:
+                        r._sweep_state(payload)
+                    except torch.cuda.OutOfMemoryError:
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        log.exception("The sweep failed")
+                        outbound.put(("reply", job_id, ("analysis_failed", "sweep",
+                                     f"{type(e).__name__}: {str(e)[:300]}", 0.0)))
+                        torch.cuda.empty_cache()
+                        sweep = None
+                else:
+                    outbound.put(("reply", job_id, r.analyse((kind, payload, arg))))
+    except Exception:  # noqa: BLE001
+        log.exception("Probe process job failed")
+        outbound.put(("error", traceback.format_exc()))
+    finally:
+        outbound.put(None)
+        sender.join()
 
 
 if __name__ == "__main__":

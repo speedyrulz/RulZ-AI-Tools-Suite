@@ -121,6 +121,75 @@ def forward_readings(model, device, chosen: list[dict], averaged=None) -> dict:
     return out
 
 
+class SplitSizer:
+    """sweep_split: how many of a sweep's pictures go to the second GPU, the rest being read on the training GPU. It
+    learns seconds per picture on each side from the sweeps already done and keeps the second GPU's share inside
+    SHARE of the time before the next sweep is due, less what the probes, samples and maps take of it. When a sweep
+    was not in as the next one came due (training waited), the budget shrinks by that overrun, and grows back a little
+    with every sweep that was in time."""
+
+    SHARE = 0.8  # of the interval the second GPU may spend on a sweep (the rest is slack)
+    SMOOTH = 0.5  # weight of the older seconds per picture
+    LATE = 0.25  # seconds of waiting that count as an overrun
+
+    def __init__(self):
+        self.remote_spp: float | None = None  # seconds per picture on the second GPU (compute only)
+        self.local_spp: float | None = None  # and on the training GPU
+        self.scale = 1.0  # what the overrun feedback has left of the budget
+        self.remote_total = 0.0  # compute seconds of the sweeps' remote parts so far
+        self.mark: float | None = None  # the second GPU's other work (seconds) at the previous sweep
+
+    def _note(self, old: float | None, seconds: float, pictures: int) -> float | None:
+        if pictures <= 0 or seconds <= 0:
+            return old
+        new = seconds / pictures
+        return new if old is None else self.SMOOTH * old + (1 - self.SMOOTH) * new
+
+    def note_remote(self, seconds: float, pictures: int) -> None:
+        self.remote_total += max(0.0, seconds)
+        self.remote_spp = self._note(self.remote_spp, seconds, pictures)
+
+    def note_local(self, seconds: float, pictures: int) -> None:
+        self.local_spp = self._note(self.local_spp, seconds, pictures)
+
+    def note_wait(self, waited: float, interval: float | None) -> None:
+        """Training waited `waited` seconds for the last sweep when the next one came due, `interval` seconds after
+        it (None: not known)."""
+        if not interval or interval <= 0:
+            return
+        if waited > self.LATE:
+            self.scale = max(0.05, self.scale * interval / (interval + waited))
+        else:
+            self.scale = min(1.0, self.scale * 1.1)
+
+    def other_work(self, busy: float) -> float:
+        """Seconds the second GPU spent on other jobs since the previous sweep, from its busy seconds in all (the
+        sweeps' own are taken off)."""
+        other = max(0.0, busy - self.remote_total)
+        out = 0.0 if self.mark is None else max(0.0, other - self.mark)
+        self.mark = other
+        return out
+
+    def remote_count(self, n: int, held: int, every: int, step_seconds: float | None, other: float,
+                     last: bool = False) -> int:
+        """How many of this sweep's n pictures the second GPU reads: the first `held` ones (the held-out pictures
+        come first and always go there) and, of the rest, as many as fit in the budget. The first sweep and the last
+        (training ends after it) have nothing to wait for or to hide behind, so they split by speed; so does any sweep
+        before the second GPU's speed and the step time are known (an unmeasured side counts as equally fast)."""
+        if n <= 0:
+            return 0
+        held = max(0, min(held, n))
+        if last or self.remote_spp is None or not step_seconds:
+            r = self.remote_spp or self.local_spp or 1.0
+            lo = self.local_spp or self.remote_spp or 1.0
+            # (at least one picture while the second GPU's speed is unknown, or a small sweep would never measure it)
+            floor = held if self.remote_spp is not None else max(held, 1)
+            return min(n, max(floor, int(round(n * lo / (lo + r)))))
+        budget = self.SHARE * every * step_seconds * self.scale - other
+        fit = int(budget // self.remote_spp) if budget > 0 else 0
+        return min(n, max(held, fit))
+
+
 class RegionSweep:
     """probes: [{"key", "held": bool, "parts": the picture's parts tensor, "load": () -> (latents [1, C, h, w],
     embeds [1, S, D], mask [1, S])}]. every: steps between sweeps. rotate: training pictures per sweep (0 = all); the

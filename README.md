@@ -2479,6 +2479,24 @@ that otherwise pauses training; with a switch off that job runs on the training 
   rounding. A probe still out is lost, with a log line naming its step. A sweep or capture that fails in itself (a
   parts map that does not fit its picture) turns that analysis off, as it does without the second GPU, and the process
   goes on.
+- **Splitting a sweep with the training GPU: `sweep_split`** (since 3.50.0, **never run on real GPUs yet**, off by
+  default, needs `sweep_async`; the switch is *Split the region sweeps with the training GPU*). On a big dataset one
+  sweep takes longer than the sweep interval, so training waits for the last sweep when the next is due. With the switch
+  on, each sweep's pictures are divided: the second GPU reads as many as fit before the next sweep is due, and the
+  training GPU reads the rest at once, between steps, with the same weight average that was sent. The two parts are
+  merged into one sweep row (the numbers are the same as an unsplit sweep apart from GPU rounding: every picture's noise
+  is its own). The split is sized without extra settings: the seconds per picture on each GPU come from the run's own
+  sweeps, the budget is 0.8 of the sweep interval in steps times the recent seconds per step, less the second GPU's time
+  on probes, samples and maps; the held-out pictures always go to the second GPU (so a picture never changes GPU between
+  sweeps and fakes a held-out best), and the training pictures cross over in a fixed order. If the second GPU keeps
+  up, nothing is read on the training GPU and training never pauses. If training still had to wait for the last sweep,
+  the budget shrinks by that overrun for the later sweeps. The first sweep and the last one (training ends after it) are
+  split by the two GPUs' speed, half each before anything is measured. The log line reads *Region sweep at step 400
+  (30 on cuda:1 in 41.0s, 12 here in 18.5s)* and the Monitor's sweep status carries the split. If the second GPU fails,
+  its part is read again on the training GPU and merged with the part already read.
+- **Probes go first** (since 3.50.0, with or without `sweep_split`): the second GPU reads a sweep one picture at a
+  time and runs a probe or sample round that arrives in between before the next picture, so a long sweep no longer
+  holds the probes back. Each job's answer carries its id, so answers may come back in any order.
 - **Not used** in a configuration race, a fine-tune or with `multi_gpu` other than `off`, or with one GPU (the reason
   is logged). The process's log is `probe_worker.log` in the job folder.
 

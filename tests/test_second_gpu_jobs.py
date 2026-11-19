@@ -113,6 +113,7 @@ def _process(analysis=True):
     w.analysed, w.analysis_count, w.analysis_wanted, w.analysis_error = 0.0, 0, analysis, None
     w.conn, w.proc, w.log_path, w.started, w.memory = FakeConn(), SimpleNamespace(poll=lambda: None), "x.log", time.time(), None
     w.error, w.free_since, w.done = None, None, {}
+    w._next_id = 1
     return w
 
 
@@ -127,14 +128,15 @@ def test_jobs_of_every_kind_queue_and_each_answer_reaches_its_job():
     w.submit_analysis("maps", 10, _state(), extra={"epoch": 1.0, "effect": True})
     w.submit(10, ["job"], _state())
     assert [m[0] for m in w.conn.sent] == ["sweep", "maps", "probe"]
-    assert w.conn.sent[0][2] == ["a.png", "b.png"] and w.conn.sent[1][2] is True  # keys; whether to read the effect
+    assert w.conn.sent[0][3] == ["a.png", "b.png"] and w.conn.sent[1][3] is True  # keys; whether to read the effect
     with pytest.raises(RuntimeError, match="still queued"):  # one job of each kind at a time
         w.submit_analysis("sweep", 20, _state(), keys=[])
     with pytest.raises(RuntimeError, match="still queued"):
         w.submit(20, [], _state())
     assert w.take_analysis("sweep", False) is None and w.take(False) is None  # nothing in yet; ready is read on the way
     assert w.memory == "5 GB" and w.analysis_ok and w.analysis_error is None
-    w.conn.inbox += [("sweep_done", {"a.png": [1]}, 2.0), ("maps_done", {"0": {}}, 3.0), ("done", ["x.png"], 4.0)]
+    w.conn.inbox += [("reply", 3, ("done", ["x.png"], 4.0)), ("reply", 1, ("sweep_done", {"a.png": [1]}, 2.0)),
+                     ("reply", 2, ("maps_done", {"0": {}}, 3.0))]
     p, images = w.take(False)  # the probe is last in line: its answer is read through the other two
     assert (p.step, images) == (10, ["x.png"]) and w.pending is None
     assert w.ready_analysis("sweep") and w.ready_analysis("maps")
@@ -149,7 +151,7 @@ def test_waiting_for_a_job_counts_as_waited_and_blocks_until_its_answer():
     w = _process()
     w.memory = "mem"
     w.submit_analysis("sweep", 5, _state(), keys=["a"], extra={})
-    w.conn.inbox.append(("sweep_done", {"a": 1}, 1.0))
+    w.conn.inbox.append(("reply", 1, ("sweep_done", {"a": 1}, 1.0)))
     assert w.take_analysis("sweep", True)[1] == {"a": 1}
     assert w.waited >= 0.0
 
@@ -158,7 +160,7 @@ def test_a_computation_failure_is_reported_for_that_job_and_a_process_failure_is
     w = _process()
     w.memory = "mem"
     w.submit_analysis("sweep", 5, _state(), keys=["a"], extra={})
-    w.conn.inbox.append(("analysis_failed", "sweep", "RuntimeError: parts do not fit", 0.1))
+    w.conn.inbox.append(("reply", 1, ("analysis_failed", "sweep", "RuntimeError: parts do not fit", 0.1)))
     p, readings, why = w.take_analysis("sweep", True)
     assert readings is None and "parts do not fit" in why
     w.submit_analysis("maps", 5, _state(), extra={"effect": False})
@@ -168,7 +170,7 @@ def test_a_computation_failure_is_reported_for_that_job_and_a_process_failure_is
     assert [p.kind for p in w.outstanding()] == ["maps"]  # still out: the trainer reads it again itself
     w.error = None  # (a new case on the same fake; a real process that sent its error has exited)
     w.queue = [PW.Pending(1, [], {}, kind="probe")]
-    w.conn.inbox.append(("sweep_done", {}, 1.0))
+    w.conn.inbox.append(("reply", 0, ("sweep_done", {}, 1.0)))
     with pytest.raises(PW.ProbeProcessError, match="answered"):  # an answer of the wrong kind: out of step
         w.take(True)
 
@@ -851,10 +853,11 @@ def test_the_process_queues_sample_rounds_beside_probes_and_sweeps():
     w.submit(10, ["s"], _state(), kind="sample")
     w.submit_analysis("sweep", 10, _state(), keys=["a"])
     assert [m[0] for m in w.conn.sent] == ["probe", "probe", "sweep"]
-    assert (w.conn.sent[0][3], w.conn.sent[1][3]) == ("probe", "sample")
+    assert (w.conn.sent[0][4], w.conn.sent[1][4]) == ("probe", "sample")
     with pytest.raises(RuntimeError, match="still queued"):
         w.submit(20, ["s"], _state(), kind="sample")
-    w.conn.inbox += [("done", ["probe.png"], 1.0), ("done", ["sample.png"], 2.0), ("sweep_done", {}, 1.0)]
+    w.conn.inbox += [("reply", 1, ("done", ["probe.png"], 1.0)), ("reply", 2, ("done", ["sample.png"], 2.0)),
+                     ("reply", 3, ("sweep_done", {}, 1.0))]
     assert w.take_sample(True)[1] == ["sample.png"]  # read through the probe's answer
     assert w.take(False)[1] == ["probe.png"]
     assert [p.kind for p in w.outstanding()] == ["sweep"]
@@ -889,9 +892,8 @@ def test_the_worker_reads_the_next_job_while_it_is_blocked_sending_a_large_reply
     sent = []
 
     def send_jobs():  # job 1's reply blocks the worker (nobody reads it yet); job 2 is as large as a reply
-        trainer.send(("maps", b"a", False))
-        trainer.send(("maps", b"p" * big, False))
-        trainer.send(("stop",))
+        trainer.send(("maps", 1, b"a", False))
+        trainer.send(("maps", 2, b"p" * big, False))
         sent.append(True)
 
     sender = threading.Thread(target=send_jobs, daemon=True)
@@ -899,9 +901,10 @@ def test_the_worker_reads_the_next_job_while_it_is_blocked_sending_a_large_reply
     sender.join(30)
     assert not sender.is_alive(), "deadlock: the trainer's send never completed"
     replies = [trainer.recv(), trainer.recv()]
+    trainer.send(("stop",))
     server.join(30)
     assert not server.is_alive() and sent == [True] and seen == ["maps", "maps"]
-    assert [len(r[1]) for r in replies] == [big, big]
+    assert [len(r[2][1]) for r in replies] == [big, big]
     trainer.close()
     listener.close()
 
@@ -1048,12 +1051,12 @@ def test_the_snapshot_follows_the_process_from_loading_to_each_job_and_idle():
     snap = w.snapshot()
     assert (snap["state"], snap["kind"], snap["step"]) == ("working", "sweep", 10)
     assert snap["queued"] == [{"kind": "probe", "step": 20}] and snap["since"] is not None
-    w.conn.inbox.append(("sweep_done", {"a.png": [1]}, 2.0))
+    w.conn.inbox.append(("reply", 1, ("sweep_done", {"a.png": [1]}, 2.0)))
     w.refresh()  # the sweep is in (not yet taken): the probe is what it works on now
     snap = w.snapshot()
     assert (snap["kind"], snap["step"]) == ("probe", 20) and snap["ready"] == [{"kind": "sweep", "step": 10}]
     assert w.take_analysis("sweep", False) is not None
-    w.conn.inbox.append(("done", ["x.png"], 3.0))
+    w.conn.inbox.append(("reply", 2, ("done", ["x.png"], 3.0)))
     w.refresh()
     assert w.take(False) is not None
     snap = w.snapshot()
