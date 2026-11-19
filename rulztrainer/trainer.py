@@ -745,6 +745,11 @@ def build_scheduler(cfg: TrainConfig, optimizer, offset: int = 0):
 
 
 class Trainer(RaceParallelMixin):
+    # maps_async / sweep_async: the probe process (probeworker.ProbeProcess) while it also reads this run's region sweeps and
+    # training maps; the same object as probe_worker when probes use it too (class default: stand-ins built without
+    # __init__ have none)
+    analysis_worker = None
+    sample_worker = None  # the same process when the in-loop samples render on it (sample_async)
     # remote render (remoterender.py): the renderer while a run offers its samples and probes to a helper on the user's
     # PC, the probe round and the shadow probe it has out, the sample rounds it has out, and where a probe record's
     # pictures were rendered (class defaults: stand-ins built without __init__ render on the instance)
@@ -848,6 +853,8 @@ class Trainer(RaceParallelMixin):
         self.race = None  # race.RaceRun while a configuration race runs (and after, for its report)
         self.last_probe = None  # (face, body, images, per-seed scores) of the last probe
         self.probe_worker = None  # probeworker.ProbeProcess: probes render on a second GPU (probe_async)
+        self.analysis_worker = None  # the same process when it reads sweeps and maps (maps_async, sweep_async)
+        self.sample_worker = None  # ... and when the in-loop samples render on it (sample_async)
         self.race_base = None  # the run's own config when racing (the configurations change parts of it)
         self.race_rows = None  # [(name, config, overrides)] of the race
         self._lr_floor_steps, self._lr_floor_warned = 0, False  # steps a self-tuning lr has sat on its floor
@@ -1706,12 +1713,12 @@ class Trainer(RaceParallelMixin):
         if cfg.noise_files:  # the probes' own noise, measured on finished LoRAs instead of training
             self._noise_stage(model)
             return
-        self._setup_probe_worker()
         self._setup_remote_render()
         self._setup_maps(cfg, step)
+        self._setup_sweep(cfg, step)
+        self._setup_probe_worker()  # (after the maps and the sweep: maps_async / sweep_async send it their pictures)
         if self.maps is not None and self.maps.due(step):  # the baseline (or a resumed run's starting point)
             self._side_job(f"Training maps at step {step}", lambda: self._capture_maps(model, injected, step))
-        self._setup_sweep(cfg, step)
         self._setup_block_audit(cfg, model, injected, step)
         if self.sweep is not None and self.sweep.due(step):  # the first sweep: what every later one is measured from
             self._side_job(f"Region sweep at step {step}", lambda: self._run_sweep(model, injected, step))
@@ -1720,9 +1727,9 @@ class Trainer(RaceParallelMixin):
         at_start = self.controller is not None and step == 0 and self._probe_at_start()
         if at_start and self.remote is not None:  # the first probe interval (a delegated probe's deadline) starts here
             self.remote.note_probe_step()
-        if at_start and self.probe_worker is not None:
-            self._probe_async_start(step, injected)  # the baseline renders on the probe GPU while training starts
-        elif at_start:
+        if at_start and self.probe_worker is not None and self._probe_async_start(step, injected):
+            pass  # the baseline renders on the probe GPU while training starts
+        elif at_start:  # (also when the probe GPU's process could not take it: it renders here)
             self.run_probe(model, step, optimizer, scheduler, injected)
             if self.race is not None:  # every configuration starts from the same base model: one baseline for all
                 for v in self.race.variants[1:]:
@@ -2190,6 +2197,10 @@ class Trainer(RaceParallelMixin):
             if cfg.sample_prompts and cfg.sample_every > 0 and step % cfg.sample_every == 0 and step < cfg.steps:
                 self._side_job(f"Sampling at step {step}", lambda: self._sample_round(model, step))
                 model.train()
+            if self.sample_worker is not None:  # sample_async: finish a sample round the second GPU has rendered
+                self._side_job(f"The samples at step {step}", lambda: self._sample_take(step))
+            if self.analysis_worker is not None:  # maps_async / sweep_async: record what the second GPU has finished
+                self._side_job(f"The sweep and maps results at step {step}", lambda: self._analysis_take_all(step))
             if self.maps is not None and self.maps.due(step, last=step >= cfg.steps):
                 self._side_job(f"Training maps at step {step}", lambda: self._capture_maps(model, injected, step))
                 model.train()
@@ -2212,9 +2223,13 @@ class Trainer(RaceParallelMixin):
                     stop = probe_safely(lambda: self._probe_async_take(step, optimizer, scheduler, wait=True)) or stop
                 if self.probe_worker is not None and not last:  # queued on the probe GPU; training goes on
                     if not stop:
-                        probe_safely(lambda: self._probe_async_start(step, injected))
-                        if step in rounds:
-                            stop = probe_safely(lambda: self._probe_async_take(step, optimizer, scheduler, wait=True))
+                        if probe_safely(lambda: self._probe_async_start(step, injected)):
+                            if step in rounds:
+                                stop = probe_safely(
+                                    lambda: self._probe_async_take(step, optimizer, scheduler, wait=True))
+                        else:  # the process could not take it (closed): this probe renders on the training GPU
+                            stop = probe_safely(lambda: self.run_probe(model, step, optimizer, scheduler, injected))
+                            model.train()
                 elif self.remote is not None:  # a helper on the user's PC may render this one (or the instance does)
                     stop = self._remote_probe_round(model, step, optimizer, scheduler, injected, last,
                                                     step in rounds, probe_safely) or stop
@@ -2252,6 +2267,11 @@ class Trainer(RaceParallelMixin):
                 break
         if self.probe_worker is not None:  # a probe still rendering when training stopped: its score still counts
             probe_safely(lambda: self._probe_async_take(step, optimizer, scheduler, wait=True))
+        if self.sample_worker is not None:  # a sample round still out: its pictures are in before the final samples
+            self._side_job("The samples at the end", lambda: self._sample_take(step, wait=True))
+        if self.analysis_worker is not None:  # sweeps and maps still out (the final ones too): recorded before the save
+            self._side_job("The sweep and maps results at the end",
+                           lambda: self._analysis_take_all(step, wait=True))
         if self.remote is not None:  # a probe still out counts; the sample rounds are in before the final samples
             probe_safely(lambda: self._remote_probe_take(model, step, step, optimizer, scheduler, wait=True,
                                                          capped=True))
@@ -3703,7 +3723,9 @@ class Trainer(RaceParallelMixin):
                     embeds, mask = self.arch.pad_embeds([load_file(str(it.text_path))["embeds"]])
                     return latents, embeds, mask
 
-                return {"key": str(it.key), "held": held, "parts": None if rm is None else rm.parts, "load": load}
+                # (the paths: the second GPU's process rebuilds `load` from them, maps_async / sweep_async)
+                return {"key": str(it.key), "held": held, "parts": None if rm is None else rm.parts, "load": load,
+                        "latent_path": str(it.latent_path), "text_path": str(it.text_path)}
 
             def unique(pictures) -> list:
                 seen, out = set(), []
@@ -3836,10 +3858,12 @@ class Trainer(RaceParallelMixin):
             for g in r["groups"]]} for r in audit.history[-100:]]})
 
     def _run_sweep(self, model, injected, step: int) -> None:
-        """One sweep, then what follows from it: the watch's sweep readings, the held-out best file, the stop."""
+        """One sweep, then what follows from it: the watch's sweep readings, the held-out best file, the stop. With
+        sweep_async it is queued on the second GPU instead and followed when its readings are in."""
         if self.sweep is None:
             return
-        cfg = self.cfg
+        if self._analysis_start("sweep", step, injected):
+            return
         self.status.update(stage=f"region sweep (step {step})")
         self._free_for_rendering()
         try:
@@ -3850,7 +3874,13 @@ class Trainer(RaceParallelMixin):
             self.status.update(stage="training")
         if row is None:
             return
-        log.info("Region sweep at step %d: %s", step, regionsweep.describe(row))
+        self._sweep_after(row, injected, step)
+
+    def _sweep_after(self, row: dict, injected, step: int, state: dict | None = None, where: str = "") -> None:
+        """What follows a recorded sweep (here, or read on the second GPU: `state` is then the LoRA it read, `where`
+        says so in the log): the log line, the Monitor, the region watch, the held-out best file, the stop."""
+        cfg = self.cfg
+        log.info("Region sweep at step %d%s: %s", step, where, regionsweep.describe(row))
         self.status.update(region_sweep={**row, "line": regionsweep.describe(row),
                                          "history": [{k: r[k] for k in ("step", "train", "held")}
                                                      for r in self.sweep.history[-200:]]})
@@ -3858,17 +3888,27 @@ class Trainer(RaceParallelMixin):
             self.region_watch.set_sweep(self.sweep.contrasts(), row["gap"], row["flat"],
                                         learned=regionsweep.learned_by_picture(self.sweep))
         if row["new_best"] and cfg.holdout_track_best:
-            self._save_holdout_best(injected, step, row["best"][0])
+            if state is None:
+                self._save_holdout_best(injected, step, row["best"][0])
+            else:  # the best is the weights that were read, not training's newer ones (already the average)
+                live = lora_mod.lora_state(injected)
+                lora_mod.mirror_lora(lora_mod.lora_snapshots(state), injected)
+                try:
+                    self._save_holdout_best(injected, step, row["best"][0], averaged=False)
+                finally:
+                    lora_mod.mirror_lora(lora_mod.lora_snapshots(live), injected)
         if row["stop"]:
             self.holdout_stop = True
 
-    def _save_holdout_best(self, injected, step: int, score: float) -> None:
+    def _save_holdout_best(self, injected, step: int, score: float, averaged: bool = True) -> None:
+        """Write the held-out best LoRA: the weight average of `injected`, or with averaged=False its weights as they
+        are (they already are the scored average)."""
         cfg = self.cfg
         if getattr(self, "ft", None) is not None:
             path = self._finetune_save(step, True, label="_holdout_best")
         else:
             path = self.job_dir / f"{cfg.job_name}_holdout_best.safetensors"
-            with self._averaged():
+            with self._averaged() if averaged else contextlib.nullcontext():
                 lora_mod.save_lora(injected, path, metadata={"ss_steps": str(step), "holdout_best": f"{score:.4f}",
                                                              **arch_metadata(self.arch)},
                                    dtype=cfg.lora_save_dtype, fmt=self.arch.lora_format)
@@ -4462,6 +4502,8 @@ class Trainer(RaceParallelMixin):
 
     def _capture_maps(self, model, injected, step: int) -> None:
         if self.maps is None:
+            return
+        if self._analysis_start("maps", step, injected):  # maps_async: captured on the second GPU instead
             return
         steps, per_step = self._maps_epoch_steps()
         epoch = step / steps
@@ -5499,11 +5541,23 @@ class Trainer(RaceParallelMixin):
                  "face-heavy" if bias > 0 else "body/other", self.ts_logit_shift)
 
     # ------------------------------------------------------------ probes on a second GPU (probe_async; probeworker.py)
-    def _probe_async_device(self) -> str:
-        """The GPU that renders the probes while training goes on, or "" (the reason logged) when probe_async cannot
-        run here."""
+    def _worker_wants(self) -> tuple[bool, bool, bool, bool]:
+        """(probes, samples, maps, sweeps): what the second GPU's process would do here, each on its own switch
+        (probe_async, sample_async, maps_async, sweep_async) and only when there is something to do: probes due, sample
+        prompts, the training maps, the region sweep."""
         cfg = self.cfg
-        if not cfg.probe_async or self.controller is None or cfg.probe_every <= 0:
+        probes = bool(cfg.probe_async and self.controller is not None and cfg.probe_every > 0)
+        samples = bool(cfg.sample_async and cfg.sample_prompts and cfg.sample_every > 0)
+        maps = bool(cfg.maps_async and getattr(self, "maps", None) is not None)
+        sweeps = bool(cfg.sweep_async and getattr(self, "sweep", None) is not None)
+        return probes, samples, maps, sweeps
+
+    def _probe_async_device(self) -> str:
+        """The GPU of the second process (probes and/or the sweeps and maps) while training goes on, or "" (the reason
+        logged) when it cannot run here."""
+        cfg = self.cfg
+        wants = self._worker_wants()
+        if not any(wants):
             return ""
         from .probeworker import pick_device
 
@@ -5515,37 +5569,94 @@ class Trainer(RaceParallelMixin):
             dev, why = pick_device(cfg.probe_device, cfg.devices, self.device,
                                    torch.cuda.device_count() if torch.cuda.is_available() else 0)
         if why:
-            log.info("Probes render on the training GPU between steps (probe_async not used: %s)", why)
+            names = [n for n, on in zip(("probe_async", "sample_async", "maps_async", "sweep_async"), wants) if on]
+            log.info("Probes, samples, maps and sweeps stay on the training GPU between steps (%s not used: %s)",
+                     ", ".join(names), why)
         return dev
 
     def _setup_probe_worker(self) -> None:
-        """probe_async: start the probe process, which loads a copy of the sampling model (sample_model_path, else the
-        training base) with the same LoRA slots and the sampling LoRAs on the probe GPU."""
+        """probe_async / sample_async / maps_async / sweep_async: start the second GPU's process. For probes it loads a copy of the sampling
+        model (sample_model_path, else the training base) with the same LoRA slots and the sampling LoRAs; for sweeps
+        and maps the model the run trains (see probeworker.Renderer), with the pictures they read."""
         from .probeworker import ProbeProcess, ProbeProcessError
 
         dev = self._probe_async_device()
         if not dev:
             return
-        self.status.update(stage=f"loading the probe model on {dev}")
+        probes, samples, maps, sweeps = self._worker_wants()
+        render, analysis = probes or samples, maps or sweeps
+        what = "sampling and training models" if render and analysis else "sampling model" if render else "training model"
+        self.status.update(stage=f"loading the {what} on {dev}")
         t0 = time.time()
         try:
-            w = ProbeProcess(self.cfg.to_dict(), self.model_dir, dev, self.job_dir / "probe_worker.log")
+            w = ProbeProcess(self.cfg.to_dict(), self.model_dir, dev, self.job_dir / "probe_worker.log", probes=render,
+                             analysis=self._analysis_data(maps, sweeps) if analysis else None)
         except ProbeProcessError as e:
-            log.warning("probe_async: the probe process on %s failed to start, so probes render on the training GPU "
+            log.warning("The second GPU's process on %s failed to start, so everything runs on the training GPU "
                         "between steps: %s", dev, str(e).strip().splitlines()[-1])
             return
-        self.probe_worker = w
-        log.info("Probes render on %s in a separate process while training goes on (probe_async; started in %.0fs, "
-                 "its model loads while training starts): each probe is acted on once it is scored, up to "
-                 "probe_every steps later; the final one renders here", dev, time.time() - t0)
+        self.probe_worker = w if probes else None
+        self.sample_worker = w if samples else None
+        self.analysis_worker = w if analysis else None
+        if samples:
+            log.info("Samples render on %s in a separate process while training goes on (sample_async): each round "
+                     "is queued with the LoRA as it stands (the weight average) and its pictures are written under "
+                     "that step's name when it is done; one round is out at a time; the samples before training and "
+                     "the final ones render here", dev)
+        if probes:
+            log.info("Probes render on %s in a separate process while training goes on (probe_async; started in "
+                     "%.0fs, its model loads while training starts): each probe is acted on once it is scored, up to "
+                     "probe_every steps later; the final one renders here", dev, time.time() - t0)
+        if analysis:
+            log.info("Region sweeps and training maps run on %s in %s while training goes on (maps_async / sweep_async%s): "
+                     "each is queued with the LoRA as it stands (the weight average) and recorded when it comes back, "
+                     "up to one interval later, with a held-out best saved from exactly the weights it read; the "
+                     "final one runs there too, and training ends once it is in. Never run on real GPUs yet",
+                     dev, "the same process" if probes else "a separate process",
+                     "" if not self.cfg.sample_model_path else
+                     ", with a second model beside the sampling one: if it does not fit they run here")
+
+    @staticmethod
+    def _cpu(t):
+        return None if t is None else t.detach().to("cpu").clone()
+
+    def _analysis_data(self, maps_on: bool = True, sweeps_on: bool = True) -> dict:
+        """What the second GPU's process needs to read the sweeps and the maps, as plain data (sent once, with its
+        setup): the sweep's pictures (paths and parts maps; it loads the latents and texts itself) and the maps' probe
+        tensors."""
+        sweep = maps = None
+        if self.sweep is not None and sweeps_on:
+            sweep = [{"key": p["key"], "held": p["held"], "latent_path": p["latent_path"],
+                      "text_path": p["text_path"], "parts": self._cpu(p["parts"])} for p in self.sweep.probes]
+        if self.maps is not None and maps_on:
+            def off(o):  # the trigger-off caption's texts
+                return None if o is None else {"embeds": self._cpu(o["embeds"]), "mask": self._cpu(o["mask"])}
+
+            maps = {"probes": [{"id": pr["id"], "latents": self._cpu(pr["latents"]), "embeds": self._cpu(pr["embeds"]),
+                                "mask": self._cpu(pr["mask"]), "trigger": dict(pr.get("trigger") or {}),
+                                "off": off(pr.get("off"))} for pr in self.maps.probes],
+                    "sigmas": list(self.maps.sigmas), "seed": self.maps.seed}
+        return {"sweep": sweep, "maps": maps}
 
     @torch.no_grad()
-    def _probe_async_start(self, step: int, injected) -> None:
-        """Send the LoRA (the weight average with lora_ema) to the probe process and queue its probe there."""
+    def _probe_async_start(self, step: int, injected) -> bool:
+        """Send the LoRA (the weight average with lora_ema) to the probe process and queue its probe there. True when
+        queued; False when the process is gone (closed, the samples, maps and sweeps it had out redone): the caller
+        renders this probe on the training GPU."""
+        from .probeworker import ProbeProcessError
+
+        w = self.probe_worker
         with self._averaged():
             state = lora_mod.lora_state(injected)
-        self.probe_worker.submit(step, self._probe_jobs(step), state)
-        self.status.update(stage=f"training; probe of step {step} rendering on {self.probe_worker.device}")
+        try:
+            w.submit(step, self._probe_jobs(step), state)
+        except ProbeProcessError as e:
+            log.warning("probe_async: sending the probe of step %d to %s failed, so everything runs on the training "
+                        "GPU from here: %s", step, w.device, str(e).strip().splitlines()[-1])
+            self._close_probe_worker(redo=True)
+            return False
+        self.status.update(stage=f"training; probe of step {step} rendering on {w.device}")
+        return True
 
     def _probe_async_take(self, now: int, optimizer, scheduler, wait: bool = False) -> bool:
         """Score and act on the probe the probe process has rendered, if any (wait: until it is in). True to stop.
@@ -5553,15 +5664,15 @@ class Trainer(RaceParallelMixin):
         from .probeworker import ProbeProcessError
 
         w = self.probe_worker
-        if wait and w.pending is not None and not w.ready():
-            self.status.update(stage=f"waiting for the probe of step {w.pending.step} on {w.device}")
         lost = w.pending.step if w.pending is not None else None
         try:
+            if wait and w.pending is not None and not w.ready():
+                self.status.update(stage=f"waiting for the probe of step {w.pending.step} on {w.device}")
             got = w.take(wait)
         except ProbeProcessError as e:
             log.warning("probe_async: the probe process on %s failed (the probe of step %s is lost), so probes render "
                         "on the training GPU from here: %s", w.device, lost, str(e).strip().splitlines()[-1])
-            self._close_probe_worker()
+            self._close_probe_worker(redo=True)
             return False
         if got is None:
             return False
@@ -5585,15 +5696,176 @@ class Trainer(RaceParallelMixin):
         self._keel_probe(optimizer, scored=state)  # the lookahead anchors the weights that scored, pulls the live ones
         return stop
 
-    def _close_probe_worker(self) -> None:
-        """Stop the probe process (also after an error), freeing the probe GPU."""
-        w, self.probe_worker = self.probe_worker, None
+    def _close_probe_worker(self, redo: bool = False) -> None:
+        """Stop the second GPU's process (also after an error), freeing the GPU. redo (the process failed): the sweeps
+        and maps it had not finished are taken as they are when answered, else read again here from the LoRA state they
+        were queued with."""
+        w = next((x for x in (self.probe_worker, self.sample_worker, self.analysis_worker) if x is not None), None)
+        self.probe_worker = self.sample_worker = self.analysis_worker = None
         if w is None:
             return
+        lost = list(w.outstanding()) if redo and hasattr(w, "outstanding") else []
+        for p in getattr(w, "queue", []):
+            if p.kind == "probe":
+                log.warning("probe_async: the probe of step %s was still out on %s and is lost", p.step, w.device)
         if w.count:
             log.info("probe_async: %d probes rendered on %s in %.0fs; training waited %.0fs for them", w.count,
                      w.device, w.rendered, w.waited)
+        if getattr(w, "analysis_count", 0):
+            log.info("%d sweeps / maps read on %s in %.0fs", w.analysis_count, w.device, w.analysed)
         w.close()
+        for p in lost:
+            self._side_job(f"The {p.kind} of step {p.step}", lambda p=p: self._analysis_finish_lost(p))
+
+    # ------------------------------------------------------------ sweeps and maps on a second GPU (maps_async / sweep_async)
+    def _analysis_label(self, kind: str) -> str:
+        return "region sweep" if kind == "sweep" else "training maps"
+
+    def _analysis_start(self, kind: str, step: int, injected) -> bool:
+        """maps_async / sweep_async: queue the sweep / maps of `step` on the second GPU with the LoRA as it stands (the weight
+        average), and move the schedule on so it is not due again while it is out. True when queued; False to run it
+        here (not using the second GPU, it failed, or the analysis model did not load). One job of each kind is out at
+        a time: when the next is due before the last is in, training waits for it."""
+        from .probeworker import ProbeProcessError
+
+        w = self.analysis_worker
+        if w is None or not getattr(self.cfg, "sweep_async" if kind == "sweep" else "maps_async"):
+            return False
+        try:
+            if w.memory is None:  # the models load while training starts; the first job waits for them
+                self.status.update(stage=f"waiting for the analysis model on {w.device}")
+                w.wait_ready()
+            if not w.analysis_ok:
+                self._analysis_unavailable(w)
+                return False
+        except ProbeProcessError as e:
+            log.warning("maps_async / sweep_async: the process on %s failed to start its models, so everything runs on the "
+                        "training GPU from here: %s", w.device, str(e).strip().splitlines()[-1])
+            self._close_probe_worker(redo=True)
+            return False
+        if w.pending_of(kind) is not None:
+            self._analysis_take(kind, step, wait=True)
+            if self.analysis_worker is None:  # it failed while this one waited
+                return False
+            w = self.analysis_worker
+            if (self.sweep if kind == "sweep" else self.maps).failed:
+                return True  # that result turned this analysis off: nothing to run, here or there
+        with self._averaged():
+            state = lora_mod.lora_state(injected)
+        epoch = step / self._maps_epoch_steps()[0]
+        target = self.sweep if kind == "sweep" else self.maps
+        schedule = (target.last_step, target.next_step, getattr(target, "cursor", None))
+        try:
+            if kind == "sweep":
+                w.submit_analysis("sweep", step, state, keys=[p["key"] for p in self.sweep.begin(step)],
+                                  extra={"epoch": epoch})
+            else:
+                w.submit_analysis("maps", step, state, extra={"epoch": epoch, "effect": self.maps.begin(step)})
+        except ProbeProcessError as e:  # the schedule goes back (begin ran), so the local run is the same job
+            target.last_step, target.next_step = schedule[0], schedule[1]
+            if schedule[2] is not None:
+                target.cursor = schedule[2]
+            log.warning("maps_async / sweep_async: sending the %s of step %d to %s failed, so everything runs on the training "
+                        "GPU from here: %s", self._analysis_label(kind), step, w.device,
+                        str(e).strip().splitlines()[-1])
+            self._close_probe_worker(redo=True)
+            return False
+        self.status.update(stage=f"training; {self._analysis_label(kind)} of step {step} on {w.device}")
+        return True
+
+    def _analysis_unavailable(self, w) -> None:
+        """The second GPU's analysis model did not load: one log line, and the sweeps and maps run on the training GPU
+        from here (the probes, if the process renders them, go on there)."""
+        log.warning("The model the run trains did not load on %s (%s), so the region sweeps and training maps run on "
+                    "the training GPU between steps%s", w.device,
+                    str(w.analysis_error or "").strip().splitlines()[-1] if w.analysis_error else "unknown error",
+                    "; probes and samples keep rendering there" if self.probe_worker or self.sample_worker else "")
+        self.analysis_worker = None
+        if self.probe_worker is None and self.sample_worker is None:  # nothing else for it to do
+            w.close()
+
+    def _analysis_take_all(self, now: int, wait: bool = False) -> None:
+        """Record every sweep and maps capture the second GPU has finished (with wait: all of them, blocking)."""
+        for kind in ("sweep", "maps"):
+            if self.analysis_worker is not None:
+                self._analysis_take(kind, now, wait)
+
+    def _analysis_take(self, kind: str, now: int, wait: bool = False) -> None:
+        """Record and act on the sweep / maps of the second GPU if it is in (with wait: until it is). A process that
+        failed is closed, with everything it had out redone here and the sweeps and maps from then on run here."""
+        from .probeworker import ProbeProcessError
+
+        w = self.analysis_worker
+        p = w.pending_of(kind)
+        if p is None:
+            return
+        try:
+            if wait and not w.ready_analysis(kind):
+                self.status.update(stage=f"waiting for the {self._analysis_label(kind)} of step {p.step} on "
+                                         f"{w.device}")
+            got = w.take_analysis(kind, wait)
+        except ProbeProcessError as e:
+            log.warning("maps_async / sweep_async: the process on %s failed (the %s of step %s is read again here), so "
+                        "everything runs on the training GPU from here: %s", w.device, self._analysis_label(kind),
+                        p.step, str(e).strip().splitlines()[-1])
+            self._close_probe_worker(redo=True)
+            return
+        if got is None:
+            return
+        p, result, why = got
+        if why:  # its computation failed, as the same code would here: that analysis is off for the run
+            (self.sweep if kind == "sweep" else self.maps).fail(p.step, RuntimeError(why))
+            self.status.update(stage="training")
+            return
+        self._analysis_act(p, result, p.reply[2], f" (read on {w.device}"
+                           + (f", in at step {now})" if now != p.step else ")"))
+
+    def _analysis_act(self, p, result, seconds: float, where: str) -> None:
+        """Record a sweep / maps capture that was read away from training and follow it up. A sweep's best checkpoint
+        saves its own LoRA state (p.state), the stop and the region watch act now."""
+        if p.kind == "sweep":
+            row = self.sweep.record(p.step, p.extra["epoch"], p.jobs, result, seconds)
+            self._sweep_after(row, self.injected, p.step, state=p.state, where=where)
+        else:
+            self.maps.record(p.step, p.extra["epoch"], result, seconds)
+            log.info("Training maps of step %d%s", p.step, where)
+            self.status.update(training_maps=p.step, training_maps_bleed=self.maps.last_bleed)
+        self.status.update(stage="training")
+
+    @torch.no_grad()
+    def _analysis_finish_lost(self, p) -> None:
+        """A sweep / maps the second GPU did not finish: its answer if it came, else read here from the LoRA state it was
+        queued with (swapped in for the moment). The readings of the run's later sweeps then come from another GPU."""
+        if p.kind == "sample":  # the pictures, if they came; else rendered here from the state it was queued with
+            paths = p.reply[1] if p.reply is not None and p.reply[0] == "done" else self._render_from_state(
+                self.replicas[0][0], p.step, p.state, p.jobs, "sample")
+            self._sample_finish(paths, p.step)
+            return
+        if p.reply is not None and p.reply[0] == f"{p.kind}_done":
+            self._analysis_act(p, p.reply[1], p.reply[2], " (read on the second GPU)")
+            return
+        model, injected = self.replicas[0][0], self.injected
+        dev = norm_device(self.replicas[0][2])
+        live = lora_mod.lora_state(injected)
+        lora_mod.mirror_lora(lora_mod.lora_snapshots(p.state), injected)
+        t0 = time.time()
+        self.status.update(stage=f"{self._analysis_label(p.kind)} of step {p.step} (read again here)")
+        self._free_for_rendering()
+        try:
+            if p.kind == "sweep":
+                by = {pr["key"]: pr for pr in self.sweep.probes}
+                result = self.sweep._forward(model, dev, [by[k] for k in p.jobs], None)
+            else:
+                result = self.maps._run(model, injected, dev, None, bool(p.extra.get("effect")))
+        except Exception as e:  # noqa: BLE001
+            (self.sweep if p.kind == "sweep" else self.maps).fail(p.step, e)
+            return
+        finally:
+            lora_mod.mirror_lora(lora_mod.lora_snapshots(live), injected)
+            free_cuda()
+            self.status.update(stage="training")
+        self._analysis_act(p, result, time.time() - t0, " (read again here after the second GPU failed: this one's "
+                                                        "readings come from the training GPU)")
 
     # ------------------------------------------------------------ remote render (remoterender.py; a helper on the user's PC)
     def _remote_note(self, kind: str, seconds: float, jobs: int) -> None:
@@ -5866,6 +6138,11 @@ class Trainer(RaceParallelMixin):
         on; they are finished when they come in), else here as before."""
         from . import remoterender as RR
 
+        started = self._sample_start(step)
+        if started:  # sample_async: on the second GPU (it takes precedence over a remote helper)
+            return
+        if started is None:  # the second GPU's process failed: render here, as the log line says (no remote helper)
+            return self.sample_images(model, step)
         rr = self.remote
         if rr is None:
             return self.sample_images(model, step)
@@ -5883,6 +6160,62 @@ class Trainer(RaceParallelMixin):
         self.remote_samples.append(r)
         log.info("Remote render: the samples of step %d went to %s (training goes on; %d out)", step, rr.label,
                  len(self.remote_samples))
+
+    def _sample_start(self, step: int) -> bool | None:
+        """sample_async: queue the samples of `step` on the second GPU with the LoRA as it stands (the weight average).
+        One round is out at a time: if the last is not in, training waits for it. True when queued; False when the
+        second GPU is not used for samples (the usual routes apply); None when its process failed (sending, or the
+        last round while it was waited on): the caller renders on the training GPU, not through a remote helper."""
+        from .probeworker import ProbeProcessError
+
+        w = self.sample_worker
+        if w is None:
+            return False
+        if w.pending_of("sample") is not None:
+            self._sample_take(step, wait=True)
+            w = self.sample_worker
+            if w is None:  # it failed while this one waited
+                return None
+        with self._averaged():
+            state = lora_mod.lora_state(self.injected)
+        try:
+            w.submit(step, self._sample_jobs(step), state, kind="sample")
+        except ProbeProcessError as e:
+            log.warning("sample_async: sending the samples of step %d to %s failed, so everything runs on the "
+                        "training GPU from here: %s", step, w.device, str(e).strip().splitlines()[-1])
+            self._close_probe_worker(redo=True)
+            return None
+        self.status.update(stage=f"training; samples of step {step} rendering on {w.device}")
+        return True
+
+    def _sample_take(self, now: int, wait: bool = False) -> None:
+        """Finish the sample round the second GPU has rendered, if it is in (with wait: until it is): the log lines and
+        _sample_finish, as for a remote round. A process that failed is closed; the round it had out is rendered again
+        here from its own weights."""
+        from .probeworker import ProbeProcessError
+
+        w = self.sample_worker
+        p = w.pending_of("sample")
+        if p is None:
+            return
+        try:
+            if wait and not w.ready_analysis("sample"):
+                self.status.update(stage=f"waiting for the samples of step {p.step} on {w.device}")
+            got = w.take_sample(wait)
+        except ProbeProcessError as e:
+            log.warning("sample_async: the process on %s failed (the samples of step %s are rendered again here), so "
+                        "everything runs on the training GPU from here: %s", w.device, p.step,
+                        str(e).strip().splitlines()[-1])
+            self._close_probe_worker(redo=True)
+            return
+        if got is None:
+            return
+        p, paths = got
+        for path in paths:
+            log.info("Sample saved %s", path)
+        log.info("The samples of step %d rendered on %s%s", p.step, w.device,
+                 f" (in at step {now})" if now != p.step else "")
+        self._sample_finish(paths, p.step)
 
     def _remote_sample_take(self, model, r, wait: bool) -> None:
         """Finish a sample round that is in (or lost: render it here from its own weights, wait: until it is one):
