@@ -57,7 +57,7 @@ from torch import nn
 # what a race configuration may change, by group (the WebUI lists them); everything else is shared by the race
 RACE_KEYS: dict[str, tuple[str, ...]] = {
     "LR & optimizer": (
-        "learning_rate", "optimizer", "weight_decay", "lr_scheduler", "warmup_steps",
+        "learning_rate", "optimizer", "weight_decay", "lr_alpha_scale", "lr_scheduler", "warmup_steps",
         "warmup_fraction", "lr_min_factor", "lr_cycles", "adam_beta1",
         "adam_beta2", "adam_eps", "max_grad_norm", "lora_plus_ratio", "lora_ema", "automagic_min_lr",
         "automagic_max_lr", "automagic_polarity_history",
