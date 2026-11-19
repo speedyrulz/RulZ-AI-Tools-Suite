@@ -93,6 +93,21 @@ def test_files_and_listing(bridge, tmp_path):
     assert not list((tmp_path / "output/job/remote_render/rounds/000001_probe_1").glob("*.tmp"))
 
 
+def test_size_and_ranges(bridge, tmp_path):
+    job = start_job(tmp_path)
+    (job / "remote_render/data").write_bytes(b"0123456789")
+    path = BASE + "data"
+    assert bridge("size", path=path)[0]["size"] == 10
+    assert bridge("get", path=path, offset=3, length=4)[1] == b"3456"
+    assert bridge("get", path=path, offset=10, length=0)[1] == b""
+    for offset, length in [(9, 2), (-1, 1), (0, -1), (True, 1)]:
+        assert not bridge("get", path=path, offset=offset, length=length)[0]["ok"]
+    for op in ("size", "get"):
+        assert not bridge(op, path="job/remote_render/../secret", offset=0, length=1)[0]["ok"]
+    (job / "remote_render/folder").mkdir()
+    assert not bridge("size", path=BASE + "folder")[0]["ok"]  # a folder has no size to fetch
+
+
 def test_runs_reports_only_the_running_job_with_run_json(bridge, tmp_path):
     assert bridge("runs")[0]["runs"] == []  # no .webui_job.json
     job = start_job(tmp_path, run=False)

@@ -89,6 +89,11 @@ base:
     why: "RulZ AI Trainer's name for the sigmoid that beat shift in two matched A/Bs; 'reference' is the shifted curve and should not be used for a person here."
     confidence: CONF
     sources: [qa_timestep_2026_09]
+  resolution_shift:
+    value: true
+    why: "Shifts the noise levels by image size with Qwen's own sampler mu (x1.7 at 512 px, x2.0 at 1024 px); OneTrainer's community finds 1024 px learns slowly without a higher shift. Not raced here: race it against off."
+    confidence: CONF
+    sources: [ot_resshift_2026_11]
   batch_size:
     value: 1
     why: "Batch 1 is the wizard's value and our reference; one user needed batch 2 with automagic to train 'the way he wanted' and AI Toolkit does not scale the LR with batch."

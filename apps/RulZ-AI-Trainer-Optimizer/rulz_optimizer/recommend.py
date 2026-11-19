@@ -162,6 +162,8 @@ def recommend(k: Knowledge, model_id: str, scan: DatasetScan | None, goals: Goal
     wizard('lora_ema', 0.98, 'Weight averaging improves likeness and reduces checkpoint swings.')
     if model_id in ('minimax_h3', 'minimax_h3_image', 'p_h3_image', 'sdxl', 'flux2_klein', 'flux2_klein4b', 'zimage'):
         wizard('timestep_sampling', 'reference', 'Uses the model reference timestep schedule.')
+    if model_id in ('krea2', 'qwen_image21', 'flux3_klein', 'moss_image', 'ideogram4', 'fibo2'):
+        wizard('resolution_shift', True, 'Shifts the noise levels by image size, as the sampler does; 1024 px learns slowly without it.')
     if model_id in ('minimax_h3', 'minimax_h3_image', 'p_h3_image', 'qwen_image21'):
         wizard('training_adapter', 'auto', 'Use the model training adapter to prevent drift.')
     if model_id == 'flux3_klein':
@@ -250,6 +252,9 @@ def recommend(k: Knowledge, model_id: str, scan: DatasetScan | None, goals: Goal
             wizard('isolation', False, 'Krea OFT does not use isolation.')
     if str(choices['optimizer'].value).lower().startswith(('automagic', 'keel3')):
         choices.pop('learning_rate', None)
+    if 'resolution_shift' in choices and choices['resolution_shift'].value and 'timestep_sampling' in choices \
+            and str(choices['timestep_sampling'].value) == 'reference':
+        wizard('resolution_shift', False, 'The reference noise levels already carry the model shift; this setting has no effect with them.')
     unknown = sorted(key for key in choices if key not in KEYS)
     if unknown:
         warnings.append('Not exported, RulZ AI Trainer has no such setting: ' + ', '.join(unknown) + '.')

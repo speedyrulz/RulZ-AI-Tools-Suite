@@ -514,6 +514,19 @@ section) and samples with its own turbo LoRA by default where it has one ([Turbo
   the log signal-to-noise ratio is drawn from N(`logsnr_mean`, `logsnr_std`), -6 and 2 as the paper recommends, so
   most steps are very noisy (median sigma about 0.95), where a style's colours and strokes are learned. It is meant for
   style LoRAs; RulZ AI Trainer's `style` mode tilts the same way more gently.
+- **Resolution shift** (`resolution_shift`, off by default). The way FLUX-style samplers shift their noise levels by
+  image size ("dynamic shifting"), for training: every mode but `reference` draws as it always did, then its sigmas
+  go through `s' = e^mu * s / (1 + (e^mu - 1) * s)`, where mu grows with the image's token count (one token is a
+  16 px cell). A larger picture is noisier at the same sigma, so it needs more of its steps at high noise; community
+  reports (OneTrainer's Discord) say 1024 px barely learns without a higher shift. The default mu is FLUX / SD3's line,
+  0.5 at 256 tokens (256 px a side) to 1.15 at 4096 (1024 px), a shift of x1.9 at 512 px and x3.2 at 1024 px; Krea 2, Qwen-Image 2.1 and FIBO use
+  their sampler's own mu (Qwen's is 0.5 to 0.9 at 8192 tokens), FLUX.2 Klein its `flux2_shift`, Ideogram 4 its
+  pipeline's `0.5 + 0.5 ln(pixels / 512^2)`. It multiplies with `timestep_shift` (order: mode, `timestep_shift`,
+  resolution shift, then `sigma_min` / `sigma_max`), and the logit mean / std, `timestep_buckets` and the likeness
+  curriculum keep working. `clean_share` counts its steps after the shift, at each batch's size. `reference` already
+  carries the model family's own shift, so it ignores the setting (the run warns); SDXL and MiniMax-H3-Image, which
+  train on the model's own noise levels, ignore it too. The Training wizard turns it on for Krea 2, Qwen-Image 2.1,
+  FLUX.3 Klein, MOSS-Image, Ideogram 4 and FIBO 2. Unmeasured here: race it against off on your own data.
 - **Timestep buckets** (`timestep_buckets`, 0 = off; after musubi-tuner's `num_timestep_buckets`). Free draws land
   on the sampling curve by luck: 10 of them cover only about 6.5 of its 10 tenths on average, so a short run or a
   small dataset can train some noise levels twice and miss others. With `timestep_buckets: N` the curve is cut into N
@@ -532,7 +545,8 @@ section) and samples with its own turbo LoRA by default where it has one ([Turbo
   - **Where the curve starts.** RulZ AI Trainer's default logit-normal puts 50% of steps there, MOSS's own pretraining
     curve (`timestep_sampling: reference`) about 11%.
   - **How it hits the target.** The sampled curve is moved along the logit axis until the share is hit after
-    `timestep_shift`, `sigma_min` / `sigma_max` and the 1000-step grid; its shape stays. The run logs each change.
+    `timestep_shift`, `resolution_shift`, `sigma_min` / `sigma_max` and the 1000-step grid; its shape stays. The run
+    logs each change.
   - **Notation** (Fizgig's; percentages, and 1-based epochs of the run's image queue, or rotations of a full
     fine-tune):
 

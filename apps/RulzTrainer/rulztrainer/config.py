@@ -881,6 +881,9 @@ class TrainConfig:
     logsnr_mean: float = -6.0  # logsnr mode (style-friendly, arXiv 2411.14793): log-SNR ~ N(mean, std), very noisy
     logsnr_std: float = 2.0  #   steps where style is learned; the paper recommends -6 and 2 or 3
     timestep_shift: float = 1.0  # sigma shift applied to sampled sigmas (training_shift is 1.0 upstream)
+    resolution_shift: bool = False  # off: the draws are as they are. on: every mode but reference shifts its noise
+    #                                 levels by the family's own image-size shift (exp(mu), as its sampler: more noise
+    #                                 for larger pictures), on top of timestep_shift
     timestep_buckets: int = 0  # 0 = off; N (2+): every N sigma draws take one from each of N equal slices of the
     #                            sampling curve (shape unchanged), so small runs cover it evenly (musubi-tuner)
     clean_share: str = ""  # share of steps below sigma 0.5 by epoch (clean_share.py): "" = the sampler's own,
@@ -1757,6 +1760,9 @@ class TrainConfig:
             log.warning("timestep_shift %g on Z-Image: its reference noise levels already carry the static shift 3 "
                         "(timestep_sampling: reference), and the shift here is applied on top of whatever "
                         "timestep_sampling draws; leave it at 1 unless you mean it", self.timestep_shift)
+        if self.resolution_shift and self.timestep_sampling != "reference":
+            log.info("resolution_shift on Z-Image: the image-size shift stands in for the static shift 3 of the "
+                     "reference recipe, which is a different curve (timestep_sampling: reference is the Z-Image recipe)")
         if self.timestep_sampling != "reference":
             log.warning("timestep_sampling %s on Z-Image draws without the static shift 3 that Fizgig, ai-toolkit and "
                         "Tongyi train with; timestep_sampling: reference is the Z-Image recipe (logit-normal, then "

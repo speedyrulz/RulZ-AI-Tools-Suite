@@ -29,6 +29,7 @@ PACKAGE = Path(__file__).resolve().parent
 FRESH_SECONDS = 30.0  # a heartbeat (helper.json, the instance's own clock) this recent counts as a helper that is there
 MIN_DEADLINE = 90.0  # seconds a round gets at least
 DEADLINE_FACTOR = 3.0  # times the instance's own measured render time
+PROBE_INTERVAL_FACTOR = 1.5  # a probe round gets this times the wall seconds between the last two probe steps
 MISS_LIMIT = 2  # deadline misses / errors in a row that end delegation for the run
 MAX_SAMPLE_ROUNDS = 2  # sample rounds out at once; a third renders on the instance
 POLL_SECONDS = 0.5  # while training waits for a round
@@ -249,6 +250,7 @@ class RemoteRenderer:
         self.probes_off = ""  # why probes (only) stay on the instance: the shadow round disagreed
         self.shadow_done = False  # the shadow round was compared
         self.first_round = True  # the next round after the helper became ready gets the doubled deadline
+        self.probe_times: list[float] = []  # wall clock at the last two probe steps reached (note_probe_step)
         self.last_label = "instance"  # where the probes last rendered
         self.stats = {"rounds": 0, "helper_seconds": 0.0, "taken_back": 0, "waited": 0.0}
 
@@ -367,6 +369,25 @@ class RemoteRenderer:
         base = max(MIN_DEADLINE, DEADLINE_FACTOR * self.per_job.get(kind, 0.0) * max(1, jobs))
         return base * (2 if self.first_round else 1)
 
+    def note_probe_step(self) -> None:
+        """A probe step was reached now: remember the wall clock (the last two) so the interval between probes is known.
+        The first one is step 0, so the first interval runs from step 0 to the first probe that may be delegated."""
+        self.probe_times = (self.probe_times + [self.clock()])[-2:]
+
+    def probe_interval(self) -> float:
+        """Wall seconds the trainer took between its two most recent probe steps; 0.0 when fewer than two are known."""
+        return self.probe_times[1] - self.probe_times[0] if len(self.probe_times) == 2 else 0.0
+
+    def probe_deadline(self, jobs: int) -> tuple[float, str]:
+        """(seconds, why) a probe round handed to the helper gets: the larger of the old rule (deadline_for) and
+        PROBE_INTERVAL_FACTOR x the probe interval, so it has until about the next probe is due. With no interval known
+        yet it is the old rule alone. (Sample rounds always use the old rule.)"""
+        old = self.deadline_for("probe", jobs)
+        wanted = PROBE_INTERVAL_FACTOR * self.probe_interval()
+        if wanted > old:
+            return wanted, f"until the next probe, about {wanted:.0f}s ({self.probe_interval():.0f}s between probes)"
+        return old, f"3 x the instance's own render time, at least {MIN_DEADLINE:.0f}s"
+
     def switch(self, label: str) -> None:
         """Probes now render on `label`: a line in the log when that changed."""
         if label != self.last_label:
@@ -375,12 +396,15 @@ class RemoteRenderer:
 
     # -------------------------------------------------------- rounds
     def submit(self, kind: str, step: int, jobs: list, state: dict, negative_kind: str | None = None,
-               shadow: bool = False) -> Round:
+               shadow: bool = False, deadline_s: float | None = None) -> Round:
         """Hand the helper a round: round.json and the LoRA state written under rounds/.tmp-<seq>, then renamed to
-        rounds/<seq>_<kind>_<step> (a helper never sees half a round)."""
+        rounds/<seq>_<kind>_<step> (a helper never sees half a round). deadline_s: the seconds the round gets, when the
+        caller worked them out (probe_deadline); None is the old rule (deadline_for). The first-round doubling is part
+        of the old rule only, and probe_deadline already includes it where it applies."""
         self.seq += 1
         name = round_name(self.seq, kind, step)
-        deadline_s = self.deadline_for(kind, len(jobs))
+        if deadline_s is None:
+            deadline_s = self.deadline_for(kind, len(jobs))
         negative_kind = negative_kind or kind
         tmp = self.root / "rounds" / f".tmp-{self.seq}"
         tmp.mkdir(parents=True, exist_ok=True)
@@ -465,13 +489,21 @@ class RemoteRenderer:
         return Taken([str(j.out_path) for j in r.jobs], float(info.get("seconds") or 0.0),
                      str(info.get("host") or ""), str(info.get("gpu") or ""))
 
-    def collect(self, r: Round, wait: bool = False):
+    def collect(self, r: Round, wait: bool = False, give_up: str = "", max_wait: float | None = None):
         """(Taken, "") when the round's pictures are in and moved; (None, "open") while it waits (wait: blocks, polling,
         until it is not open: done, failed, or late); (None, why) when the round is lost and the caller must render
-        it itself (the round is then abandoned and a miss counted)."""
+        it itself (the round is then abandoned and a miss counted). give_up: a round still open is not waited for but
+        taken back at once, with this text as the reason (a probe still out when the next one is due). max_wait: with
+        wait, the longest the wait lasts (seconds on this renderer's clock); then the round is taken back."""
         t0 = time.time()
+        c0 = self.clock()
         state = self.check(r)
+        if state == "open" and give_up:
+            r.why, r.uncounted, state = give_up, False, "late"
         while wait and state == "open":
+            if max_wait is not None and self.clock() - c0 >= max_wait:
+                r.why, r.uncounted, state = f"no pictures within {max_wait:.0f}s of waiting for them", False, "late"
+                break
             self.sleep(POLL_SECONDS)
             state = self.check(r)
         if wait:
