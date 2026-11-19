@@ -400,6 +400,128 @@ def test_a_run_can_be_forgotten_but_not_while_it_goes(world):
     assert world.fleet.runs() == []
 
 
+def _finished_run_with_files(world, job="a"):
+    """A finished run whose downloaded folder (two files) lies in the fleet's downloads root; its record key."""
+    world.machines["1"].run(job)
+    world.tick()
+    world.machines["1"].finish()
+    world.tick()
+    rec = world.fleet.find_run(job)
+    folder = world.fleet.pulls / str(rec["instance"]) / job
+    (folder / "probes").mkdir(parents=True)
+    (folder / "log.txt").write_bytes(b"x" * 1000)
+    (folder / "probes" / "p.png").write_bytes(b"y" * 500)
+    world.fleet.update_run(rec["key"], lambda r: r.update(folder=str(folder)))
+    return rec["key"], folder
+
+
+@pytest.fixture
+def bin_calls(monkeypatch):
+    calls = []
+
+    def fake_bin(path):
+        calls.append(Path(path))
+        import shutil
+
+        shutil.rmtree(path)
+        return True
+
+    monkeypatch.setattr(fleet_module, "move_to_recycle_bin", fake_bin)
+    return calls
+
+
+def test_delete_run_bins_the_folder_and_drops_the_record(world, bin_calls):
+    key, folder = _finished_run_with_files(world)
+    result = world.fleet.delete_run(key)
+    assert bin_calls == [folder.resolve()]
+    assert (result["job"], result["binned"], result["folder"]) == ("a", True, str(folder.resolve()))
+    assert result["mb"] == 0.0 and not folder.exists()  # 1500 bytes round to 0.0 MB
+    assert world.fleet.runs() == []
+    assert not world.fleet.pulls.joinpath("1").exists()  # the emptied instance folder goes too
+    assert world.fleet.pulls.is_dir() or not world.fleet.pulls.exists()
+
+
+def test_delete_run_keeps_an_instance_folder_that_still_holds_other_runs(world, bin_calls):
+    key, folder = _finished_run_with_files(world)
+    (folder.parent / "other").mkdir()
+    world.fleet.delete_run(key)
+    assert folder.parent.is_dir() and (folder.parent / "other").is_dir()
+
+
+def test_delete_run_measures_megabytes(world, bin_calls):
+    key, folder = _finished_run_with_files(world)
+    (folder / "big.bin").write_bytes(b"z" * 2_500_000)
+    assert world.fleet.delete_run(key)["mb"] == 2.5
+
+
+def test_delete_run_refuses_a_running_run(world, bin_calls):
+    world.machines["1"].run("a")
+    world.tick()
+    with pytest.raises(Refused, match="still going"):
+        world.fleet.delete_run("a")
+    assert bin_calls == [] and len(world.fleet.runs()) == 1
+
+
+def test_delete_run_refuses_while_a_download_goes(world, bin_calls):
+    key, folder = _finished_run_with_files(world)
+    world.fleet._download_write({"run": key, "state": "going", "updated": world.clock(), "pid": 1})
+    with pytest.raises(Refused, match="download"):
+        world.fleet.delete_run(key)
+    world.fleet._write_json(world.fleet.downloads_file, {})
+    world.fleet.busy.add(("pull", key))  # a download started by this program
+    with pytest.raises(Refused, match="download"):
+        world.fleet.delete_run(key)
+    assert bin_calls == [] and folder.exists() and len(world.fleet.runs()) == 1
+
+
+def test_delete_run_never_touches_a_folder_outside_the_downloads_root(world, bin_calls, tmp_path):
+    key, _ = _finished_run_with_files(world)
+    outside = tmp_path / "precious"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("keep")
+    world.fleet.update_run(key, lambda r: r.update(folder=str(outside)))
+    result = world.fleet.delete_run(key)  # the record goes, the foreign folder stays
+    assert result["folder"] is None and not result["binned"] and bin_calls == []
+    assert (outside / "keep.txt").read_text() == "keep" and world.fleet.runs() == []
+
+
+def test_delete_run_leaves_the_downloads_root_itself_alone(world, bin_calls):
+    key, _ = _finished_run_with_files(world)
+    world.fleet.update_run(key, lambda r: r.update(folder=str(world.fleet.pulls)))
+    (world.fleet.pulls / "mine.txt").write_text("keep")
+    world.fleet.delete_run(key)
+    assert bin_calls == [] and (world.fleet.pulls / "mine.txt").exists() and world.fleet.runs() == []
+
+
+def test_delete_run_with_a_missing_folder_just_drops_the_record(world, bin_calls):
+    key, folder = _finished_run_with_files(world)
+    import shutil
+
+    shutil.rmtree(folder)
+    result = world.fleet.delete_run(key)
+    assert result["folder"] is None and bin_calls == [] and world.fleet.runs() == []
+
+
+def test_delete_run_keeps_the_record_when_the_bin_fails(world, monkeypatch):
+    key, folder = _finished_run_with_files(world)
+
+    def broken(path):
+        raise OSError("bin is full")
+
+    monkeypatch.setattr(fleet_module, "move_to_recycle_bin", broken)
+    with pytest.raises(Refused, match="bin is full"):
+        world.fleet.delete_run(key)
+    assert folder.exists() and len(world.fleet.runs()) == 1
+
+
+def test_move_to_recycle_bin_without_a_bin_removes_the_folder(tmp_path, monkeypatch):
+    monkeypatch.setattr(fleet_module, "WINDOWS", False)
+    folder = tmp_path / "gone"
+    folder.mkdir()
+    (folder / "f").write_text("x")
+    assert fleet_module.move_to_recycle_bin(folder) is False and not folder.exists()
+
+
 # ---------------------------------------------------------------- the queue
 
 
