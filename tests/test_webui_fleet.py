@@ -285,3 +285,21 @@ def test_a_chart_added_after_the_page_was_drawn_takes_the_pages_look():
     assert dark.options["series"][0]["itemStyle"]["color"] == "#F4F4F5"
     charts.discard([light])
     assert list(charts) == [dark]
+
+
+def test_a_chart_in_an_instance_card_makes_room_for_its_legends_second_row():
+    class Chart:
+        def __init__(self):
+            self.options = webui.chart_options(webui._axis("step"), webui._axis("training minus held-out (points)"),
+                                               [], ["face", "hair", "skin", "clothes", "background", "subject"])
+            self.classes, self._rz_width = ["w-full", "h-72"], 1280
+
+        def style(self, replace=""):
+            self.height = replace
+
+    wide, card = Chart(), Chart()
+    card._rz_box = webui.FLEET_CARD_PLOT
+    webui.fit_chart(wide)
+    webui.fit_chart(card)
+    assert wide.options["grid"]["top"] == 25 + 34  # one legend row across the page
+    assert card.options["grid"]["top"] == 2 * 25 + 34 and card.height == "height: 313px"  # two rows in a card
