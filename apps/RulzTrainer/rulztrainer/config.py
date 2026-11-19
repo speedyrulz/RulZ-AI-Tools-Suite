@@ -1163,6 +1163,12 @@ class TrainConfig:
     probe_ema: float = 0.5  # smoothing of probe scores (weight on the previous value)
     probe_async: bool = False  # render probes on a second GPU while training goes on (multi_gpu off, no race)
     probe_device: str = ""  # probe_async's GPU; empty = the first of devices that is not the training GPU
+    # more of the run's side jobs on that same second GPU while training goes on, each on its own switch, in any
+    # combination (same exclusions as probe_async: multi_gpu off, no race, no fine-tune; results act up to one interval
+    # late, on the weights they were taken from)
+    sample_async: bool = False  # the in-loop sample rounds
+    maps_async: bool = False  # the training maps
+    sweep_async: bool = False  # the region sweeps (and the held-out photos)
     remote_render: str = "auto"  # auto | off: hand samples and probes to a render helper on the user's PC when one is
     #                              connected (remoterender.py; nothing happens without a helper; not in a race, a
     #                              fine-tune or with multi_gpu)

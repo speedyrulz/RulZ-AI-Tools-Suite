@@ -313,29 +313,50 @@ class TrainingMaps:
             return False
         return step >= self.next_step or last
 
+    def effect_due(self, step: int) -> bool:
+        """Whether this capture has a LoRA effect to read: not the baseline of a fresh run (the LoRA starts at zero)."""
+        return step > 0 or self.last_step is not None
+
     def capture(self, step: int, epoch: float, model, injected: dict, device, *, averaged=None) -> None:
         """This step's maps appended to maps.jsonl; never fatal."""
         if self.failed or not self.probes:
             return
         t0 = time.time()
         try:
-            out = self._run(model, injected, device, averaged, effect=step > 0 or self.last_step is not None)
+            out = self._run(model, injected, device, averaged, effect=self.effect_due(step))
         except Exception as e:  # noqa: BLE001
-            self.failed = True
-            log.warning("Training maps failed at step %d, so they are off for the rest of this run; training goes "
-                        "on (%s: %s)", step, type(e).__name__, str(e)[:200])
-            log.debug("training maps error", exc_info=True)
+            self.fail(step, e)
             return
         finally:
             self.last_step = step
             self.next_step = step + self.every
+        self.record(step, epoch, out, time.time() - t0)
+
+    def begin(self, step: int) -> bool:
+        """A capture of `step` that is computed elsewhere (probe_async's second GPU): whether it reads the LoRA's
+        effect, with the schedule moved on now, so due() does not fire again while it is out. record() takes the
+        maps when they are in."""
+        effect = self.effect_due(step)
+        self.last_step = step
+        self.next_step = step + self.every
+        return effect
+
+    def fail(self, step: int, e) -> None:
+        """A capture failed: the maps are off for the rest of the run, training goes on."""
+        self.failed = True
+        log.warning("Training maps failed at step %d, so they are off for the rest of this run; training goes "
+                    "on (%s: %s)", step, type(e).__name__, str(e)[:200])
+        log.debug("training maps error", exc_info=True)
+
+    def record(self, step: int, epoch: float, out: dict, seconds: float) -> None:
+        """A capture's maps (computed here or elsewhere): its bleed, the maps.jsonl row and the log line."""
         row = {"step": int(step), "epoch": round(float(epoch), 3), "maps": out}
         self.last_bleed = bleed(out)
         if self.last_bleed is not None:
             row["bleed"] = self.last_bleed
         with open(self.dir / "maps.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
-        log.info("Training maps at step %d: %d picture(s), %.1fs%s", step, len(self.probes), time.time() - t0,
+        log.info("Training maps at step %d: %d picture(s), %.1fs%s", step, len(self.probes), seconds,
                  "" if self.last_bleed is None else
                  f"; without the trigger word the LoRA acts x{self.last_bleed:.2f} as much")
 
