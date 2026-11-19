@@ -138,12 +138,46 @@ It holds these shared pieces (used by both sides, so their names and behaviour a
   "connecting"|"preparing"|"ready"|"rendering"|"not_ready"|"idle"|"stopped"|"error", instance, job, gpu,
   message, rounds_done, last_round, last_seconds, behind, time, pid}`.
 - Stops cleanly on SIGTERM / Ctrl+Break / stdin close; the WebUI kills it with terminate().
+- **Several GPUs** (`--device cuda:1,cuda:3`; one value is unchanged and renders in the helper's own process; the hidden
+  `--workers process` forces the pool even for one GPU) - `rulztrainer/renderpool.py`:
+  - One worker process per GPU (the trainer's probeworker, so the pictures are the same code's), each loading the model
+    once, **one after another**. A GPU that fails to load is named in the status and left out; `ready.json` is written
+    when at least one loaded (`gpu` = the loaded GPUs' names joined with " + ", `vram_gb` = the smallest, plus
+    `gpus: [{device, name, vram_gb}]`; the instance reads `ready.json` field by field and ignores unknown ones);
+    `not_ready` only when none loaded.
+  - A round's LoRA is fetched once. **Sample rounds**: contiguous chunks of the job list, sized by each GPU's measured
+    seconds per unit cost (steps x width x height x frames; EWMA per kind; a worker's first render is a warm-up and not
+    timed; an unmeasured GPU is taken as the mean of the measured ones; equal split until any is measured; with fewer
+    pictures than GPUs the fastest take one each). **Probe rounds** use a fixed map: equal contiguous chunks over the live
+    GPUs in device order, because pictures differ slightly between card kinds. The LoRA bytes go to the workers one
+    after another. Pictures are uploaded in job order; `done.json` `seconds` is the round's wall render time.
+  - A worker that errors, exits, or does not answer within its cap (about 3x the expected seconds, at least 120 s, at
+    most the round's `deadline_s`; unmeasured: `deadline_s`; never later than the round's end) is killed and dropped for
+    the rest of the run. The deadline runs **from the claim** (the LoRA fetch counts). Its chunk is dealt again,
+    **once**, over the others after they answered their own, only if it can be shown to fit: time left > 0, and either
+    every re-dealt chunk's predicted seconds fit in it, or (a prediction missing) at least 120 s are left. Otherwise, or
+    when a re-dealt chunk fails again (at once; the other re-dealt chunks are not waited for and their workers are
+    killed), the round fails (`error.json`, `failed/`). Every worker has answered or been killed before the round's
+    folder is removed. With at least as many pictures as GPUs every GPU gets at least one, so its speed stays measured.
+    A worker process that does not connect back within 120 s is killed (it is in the Job Object from the start).
+    A stop during a round leaves the claimed round to the instance's deadline (no `error.json`).
+  - Never run for real (no GPU here): the LoRA is sent with a blocking `Connection.send` (the worker always has a
+    reader thread, and a dead process makes the send fail), and the pool has only been run against fake workers.
+  - When every GPU is dropped the round fails, the helper loads all its GPUs again at once (dropped ones included) and
+    sends **no heartbeat** until a GPU is back, so the instance sees a stale helper and stops delegating instead of
+    counting misses.
+  - Workers are processes in a kill-on-close Job Object on Windows (none outlives the helper); stopping closes them with
+    a 5 s deadline, then kills.
+  - Status file: `gpus: [{device, name, state, sec_per_unit}]` (`state`: loading, ready, rendering, dropped,
+    load_failed; `[]` for one GPU in-process), and `message` names a GPU that did not load or was dropped and why.
 
 ## 6. WebUI Fleet tab (webui.py)
-- Per instance card: "Render on this PC" switch, GPU select (from `--list-gpus`), optional sampling model path +
+- Per instance card: "Render on this PC" switch, GPU multi-select (from `--list-gpus`; the pictures of each round are
+  split between the chosen GPUs; none picked: "Pick the GPU(s) to render on first"; the saved choice moved from `gpu` to a
+  `gpus` list), optional sampling model path +
   quant ("samples only" stated), a status line from the status file (state, job, rounds done, last render seconds,
-  behind, message). The switch starts/stops the helper subprocess (one per instance; refuse a GPU another helper
-  uses); turning it on is the user's consent to use that GPU. Helpers stop when the WebUI exits.
+  behind, message). The switch starts/stops the helper subprocess (one per instance; refuse any GPU another helper
+  uses, by set intersection); turning it on is the user's consent to use that GPU. Helpers stop when the WebUI exits.
 - RulZ design rules: Quasar theme is already set up; sentence case, short status words, no emoji, one primary
   button per view (the switch is not a primary button), status carries a word + icon.
 

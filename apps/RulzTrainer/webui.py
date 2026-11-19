@@ -10337,7 +10337,11 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
 
     # ------------------------------------------- "Render on this PC" (the helper: rulztrainer.renderhelper)
     def render_pref(iid) -> dict:
-        return state.setdefault("render_pref", {}).setdefault(iid, {"gpu": None, "model": "", "quant": "auto"})
+        pref = state.setdefault("render_pref", {}).setdefault(iid, {"gpus": [], "model": "", "quant": "auto"})
+        if "gpu" in pref:  # an older pref held one GPU index (or None): it is the list's first entry
+            old = pref.pop("gpu")
+            pref.setdefault("gpus", [] if old is None else [old])
+        return pref
 
     def make_render_controls(iid: int, w: dict) -> None:
         pref = render_pref(iid)
@@ -10347,11 +10351,14 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
             with ui.row().classes("w-full items-center gap-2"):
                 w["render"] = ui.switch("Render on this PC", value=helpers.running(iid),
                                         on_change=lambda e, i=iid: toggle_render(i, bool(e.value))) \
-                    .tooltip("Renders this run's samples and likeness probes on one of this PC's GPUs. Turning it on "
-                             "lets the helper use that GPU until you turn it off or close this WebUI.")
-                w["render_gpu"] = ui.select({g["index"]: render_gpu_label(g) for g in gpus}, value=pref["gpu"],
-                                            label="GPU", on_change=lambda e, p=pref: p.update(gpu=e.value)) \
-                    .props("dense outlined options-dense").classes("w-64")
+                    .tooltip("Renders this run's samples and likeness probes on this PC's GPUs. Turning it on lets the "
+                             "helper use the GPUs you picked until you turn it off or close this WebUI.")
+                w["render_gpu"] = ui.select({g["index"]: render_gpu_label(g) for g in gpus}, value=pref["gpus"],
+                                            multiple=True, label="GPUs",
+                                            on_change=lambda e, p=pref: p.update(gpus=list(e.value or []))) \
+                    .props("dense outlined options-dense multiple use-chips").classes("w-72") \
+                    .tooltip("One or several GPUs. With several, the pictures of each round are split between them "
+                             "(faster GPUs get more), and a GPU that fails is left out while the others go on.")
                 ui.button(icon="refresh", color=None, on_click=lambda _, i=iid: list_gpus(i)).props("flat dense round") \
                     .tooltip("List this PC's GPUs again")
             with ui.row().classes("w-full items-center gap-2 rz-tips"):
@@ -10402,19 +10409,19 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
         gpus, err = await run.io_bound(helpers.list_gpus)
         if "render_gpu" in w:
             w["render_gpu"].set_options({g["index"]: render_gpu_label(g) for g in gpus})
-        gpu = next((g for g in gpus if g["index"] == pref["gpu"]), None)
-        if gpu is None:
-            ui.notify(err or "Pick the GPU to render on first, then turn this on.", type="warning", multi_line=True)
+        picked = [g for g in gpus if g["index"] in pref["gpus"]]
+        if not picked:
+            ui.notify(err or "Pick the GPU(s) to render on first, then turn this on.", type="warning", multi_line=True)
             w["render"].value = False
             return
         try:
-            await run.io_bound(helpers.start, iid, gpu, pref["model"], pref["quant"])
+            await run.io_bound(helpers.start, iid, picked, pref["model"], pref["quant"])
         except rulz_renderctl.Refused as e:
             ui.notify(str(e), type="warning", multi_line=True)
             w["render"].value = False
             return
-        ui.notify(f"Instance {iid}: rendering on {gpu['name']} (GPU {gpu['index']}) while this WebUI runs.",
-                  type="positive", multi_line=True)
+        where = " and ".join(f"{g['name']} (GPU {g['index']})" for g in picked)
+        ui.notify(f"Instance {iid}: rendering on {where} while this WebUI runs.", type="positive", multi_line=True)
 
     def fill_render(w: dict, iid: int) -> None:
         if "render" not in w:

@@ -89,7 +89,7 @@ def test_command_line(tmp_path):
 
 def test_start_refuses_a_gpu_another_helper_uses_and_stop_ends_it(helpers):
     helpers.start(1, GPUS[0])
-    assert helpers.running(1) and helpers.gpu_of(1) == 0
+    assert helpers.running(1) and helpers.gpu_of(1) == [0]
     with pytest.raises(ctl.Refused, match="already rendering for instance 1"):
         helpers.start(2, GPUS[0])
     with pytest.raises(ctl.Refused, match="already running"):
@@ -214,3 +214,76 @@ def test_view_names_the_gpu(helpers):
     assert helpers.view(5)["word"] == "Ready"
     helpers.stop(5)
     assert helpers.view(5)["word"] == "Stopped" and not helpers.view(5)["running"]
+
+
+GPUS3 = GPUS + [{"index": 3, "name": "RTX 4060 Ti", "total_gb": 16.0, "free_gb": 15.0}]
+
+
+def test_command_line_with_several_gpus(tmp_path):
+    cmd = ctl.helper_command(7, [1, 3], tmp_path / "7.json")
+    assert cmd[cmd.index("--device") + 1] == "cuda:1,cuda:3"
+    assert ctl.helper_command(7, 2, tmp_path / "7.json")[cmd.index("--device") + 1] == "cuda:2"  # a single value as before
+
+
+def test_start_on_several_gpus_and_the_conflict_check_is_a_set_intersection(helpers):
+    cmd = helpers.start(1, [GPUS3[0], GPUS3[2]])
+    assert cmd[cmd.index("--device") + 1] == "cuda:0,cuda:3"
+    assert helpers.gpu_of(1) == [0, 3] and helpers.gpu_user(3) == "1" and helpers.gpu_user(1) is None
+    with pytest.raises(ctl.Refused, match=r"GPU 3 \(RTX 4060 Ti\) is already rendering for instance 1"):
+        helpers.start(2, [GPUS3[1], GPUS3[2]])  # one shared GPU refuses the whole start
+    assert len(helpers.made) == 1
+    helpers.start(2, [GPUS3[1]])  # a disjoint set is fine
+    assert helpers.gpu_of(2) == [1]
+    with pytest.raises(ctl.Refused, match="Pick a GPU"):
+        helpers.start(3, [])
+    helpers.stop(1, wait=0.01)
+    assert helpers.gpu_of(1) is None
+    helpers.start(3, [GPUS3[0], GPUS3[2]])  # both are free again
+
+
+def test_view_joins_the_gpu_names_and_carries_the_pool(helpers):
+    helpers.start(5, [GPUS[0], GPUS[1]])
+    assert helpers.view(5)["gpu_name"] == "RTX 5090 + RTX 5060 Ti"
+    helpers.status_file(5).write_text(json.dumps({"state": "ready", "time": 9e12, "gpus": [
+        {"device": "cuda:0", "name": "RTX 5090", "state": "ready"},
+        {"device": "cuda:1", "name": "RTX 5060 Ti", "state": "dropped"}]}), encoding="utf-8")
+    v = helpers.view(5)
+    assert [g["word"] for g in v["gpus"]] == ["Ready", "Dropped"] and "1 of 2 GPUs" in v["text"]
+
+
+def test_starts_at_once_do_not_both_pass_the_checks(tmp_path):
+    import threading
+    import time
+
+    made = []
+
+    def slow_popen(cmd, **kw):
+        time.sleep(0.3)  # Popen taking a moment while the other start arrives
+        p = FakeProc(cmd, **kw)
+        made.append(p)
+        return p
+
+    def race(h, calls):
+        out = []
+
+        def go(args):
+            try:
+                h.start(*args)
+                out.append("started")
+            except ctl.Refused as e:
+                out.append(str(e))
+
+        threads = [threading.Thread(target=go, args=(a,)) for a in calls]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        return out
+
+    out = race(ctl.RenderHelpers(tmp_path / "a", popen=slow_popen), [(1, GPUS[0]), (1, GPUS[1])])  # one instance twice
+    assert len(made) == 1 and sorted(o == "started" for o in out) == [False, True]
+    assert any("already running" in o for o in out)
+    made.clear()
+    out = race(ctl.RenderHelpers(tmp_path / "b", popen=slow_popen), [(1, GPUS[0]), (2, GPUS[0])])  # one GPU, two instances
+    assert len(made) == 1 and sorted(o == "started" for o in out) == [False, True]
+    assert any("already rendering" in o for o in out)
