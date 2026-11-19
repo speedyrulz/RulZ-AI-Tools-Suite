@@ -3506,12 +3506,16 @@ def chart_options(x: dict, y, series: list, legend: list[str]) -> dict:
             "grid": {"left": 52, "right": 24, "top": 40, "bottom": 44}}
 
 
+FLEET_CARD_PLOT = 330  # px of plot in the narrowest instance card (.rz-fleet-grid's 400 px less padding and axes)
+
+
 def fit_chart(chart) -> None:
     """Fit a chart_options() chart to its browser's width (chart._rz_width, the window's): the legend's rows are
     counted the way ECharts wraps them and the plot starts below them, with smaller text and margins on a phone."""
     width = getattr(chart, "_rz_width", 1280)
     narrow = width < 600
     plot = min(width, 1440) - (100 if narrow else 160)  # less the page's and the card's padding (a 375 px phone: 282)
+    plot = min(plot, getattr(chart, "_rz_box", plot))  # a chart in a narrow box (an instance card) wraps sooner
     legend = chart.options.get("legend") or {}
     names = [n["name"] if isinstance(n, dict) else str(n) for n in legend.get("data") or []]
     font, icon, gap = (11, 16, 8) if narrow else (12, 25, 12)
@@ -9200,8 +9204,10 @@ class RegionBlock:
     widgets into `parent` the first time there is something to show, and reads the folder's files again only when
     one of them changed."""
 
-    def __init__(self, parent, charts: list | None = None):
-        self.parent, self.charts = parent, charts if charts is not None else []
+    def __init__(self, parent, charts: list | None = None, box: int | None = None):
+        """box: the plot width in px when the block sits in a narrow place (an instance card), so the charts' legends
+        wrap the way they are drawn there, and the region charts go two to a row instead of by the window's width."""
+        self.parent, self.charts, self.box = parent, charts if charts is not None else [], box
         self.own: list = []  # this block's charts, for the page to drop when the block's card is rebuilt
         self.built, self.shown, self.sig = False, False, None
 
@@ -9242,12 +9248,15 @@ class RegionBlock:
                     self.gap_chart = RzChart(chart_options(
                         _axis("step", min="dataMin"), _axis("training minus held-out (points)", scale=True), [], [])) \
                         .classes("w-full h-72")
+                    if self.box:
+                        self.gap_chart._rz_box = self.box
                     self.charts.append(self.gap_chart)
                     self.own.append(self.gap_chart)
                 hint("Each region on its own: how much of its starting error is gone (0% = as at the first sweep), "
                      "on the training pictures and on the held-out photos (grey, dashed).")
                 self.regions: dict = {}
-                with ui.element("div").classes("w-full grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3"):
+                cols = "grid-cols-2" if self.box else "grid-cols-1 md:grid-cols-2 xl:grid-cols-3"
+                with ui.element("div").classes(f"w-full grid {cols} gap-3"):
                     for region in SWEEP_COLORS:
                         with ui.column().classes("w-full gap-0 min-w-0") as cell:
                             ui.label(region.capitalize() + (" (face, hair and skin)" if region == "subject"
@@ -9706,7 +9715,8 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
                          open_=False) as w["region_exp"]:
                 w["region_box"] = ui.column().classes("w-full gap-1")
             w["region_exp"].visible = False
-            w["region"] = RegionBlock(w["region_box"], charts)  # builds itself once the run has region files
+            # builds itself once the run has region files; its charts wrap their legends for a card's width
+            w["region"] = RegionBlock(w["region_box"], charts, box=FLEET_CARD_PLOT)
             w["machine"] = hint("")
             w["version"] = hint("")
             w["theirs"] = hint("")
