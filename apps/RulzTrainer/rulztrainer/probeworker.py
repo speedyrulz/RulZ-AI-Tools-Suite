@@ -54,6 +54,25 @@ def pick_device(probe_device: str, devices: str, train_device, n_gpus: int) -> t
     return "", f"no GPU besides {train} in devices ({devices})"
 
 
+def pack_tensors(data):
+    """Data holding tensors, as bytes to send to the probe process (None stays None). A tensor sent as itself over the
+    connection is not copied: torch's pickler sends a handle to shared memory that the other side fetches from this
+    process's resource sharer, which checks the multiprocessing authkey. The probe process is a program of its own with
+    another authkey, so the fetch is refused ("digest sent was rejected") and the process dies before loading."""
+    if data is None:
+        return None
+    buf = io.BytesIO()
+    torch.save(data, buf)
+    return buf.getvalue()
+
+
+def unpack_tensors(data):
+    """pack_tensors' bytes back as the data (anything else is returned as it is)."""
+    if isinstance(data, (bytes, bytearray)):
+        return torch.load(io.BytesIO(data), weights_only=True)
+    return data
+
+
 class ProbeProcessError(RuntimeError):
     """The probe process failed (its traceback in the message)."""
 
@@ -117,7 +136,7 @@ class ProbeProcess:
         self.conn = accepted[0]
         try:
             self._send(("setup", cfg, str(model_dir) if model_dir else None, device,
-                        {"probes": probes, "analysis": analysis}))
+                        {"probes": probes, "analysis": pack_tensors(analysis)}))
         except ProbeProcessError:
             self.proc.kill()
             for f in (self.conn.close, self.log_file.close):
@@ -502,7 +521,8 @@ def main() -> None:
     _, cfg, model_dir, device, *rest = conn.recv()
     opts = rest[0] if rest else {}
     try:
-        r = Renderer(cfg, model_dir, device, probes=opts.get("probes", True), analysis=opts.get("analysis"))
+        r = Renderer(cfg, model_dir, device, probes=opts.get("probes", True),
+                     analysis=unpack_tensors(opts.get("analysis")))
     except BaseException:  # noqa: BLE001
         conn.send(("error", traceback.format_exc()))
         return
