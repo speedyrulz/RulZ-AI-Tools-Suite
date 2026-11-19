@@ -1241,6 +1241,9 @@ class TrainConfig:
     sample_async: bool = False  # the in-loop sample rounds
     maps_async: bool = False  # the training maps
     sweep_async: bool = False  # the region sweeps (and the held-out photos)
+    sweep_split: bool = False  # with sweep_async: each sweep's pictures are divided between the second GPU (as many as
+    #                            fit before the next sweep is due, the held-out ones always) and the training GPU (the
+    #                            rest, read at once between steps), so training waits less on a big dataset
     remote_render: str = "auto"  # auto | off: hand samples and probes to a render helper on the user's PC when one is
     #                              connected (remoterender.py; nothing happens without a helper; not in a race, a
     #                              fine-tune or with multi_gpu)
@@ -1647,6 +1650,9 @@ class TrainConfig:
                 raise ValueError("LoRA Isolation builds side-by-side pictures from the dataset's photos: it does not "
                                  "take video clips (set train_frames to 1, or turn isolation off)")
         self.validate_still_masking()
+        if self.sweep_split and not self.sweep_async:
+            raise ValueError("sweep_split divides each region sweep between the training GPU and the second GPU: "
+                             "turn sweep_async on as well")
         if self.sdxl_prediction not in SDXL_PREDICTIONS:
             raise ValueError(f"sdxl_prediction must be one of {', '.join(SDXL_PREDICTIONS)}, got "
                              f"{self.sdxl_prediction!r}")

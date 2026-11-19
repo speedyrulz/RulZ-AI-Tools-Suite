@@ -2321,7 +2321,7 @@ class Form:
             probe_floor_seeds=int(v("probe_floor_seeds") or 4),
             probe_async=bool(v("probe_async")), probe_device=s("probe_device"),
             sample_async=bool(v("sample_async")), maps_async=bool(v("maps_async")),
-            sweep_async=bool(v("sweep_async")),
+            sweep_async=bool(v("sweep_async")), sweep_split=bool(v("sweep_split")) and bool(v("sweep_async")),
             probe_steps=int(v("probe_steps")), probe_cfg=float(v("probe_cfg")), probe_ema=float(v("probe_ema")),
             likeness_noise_band=float(v("likeness_noise_band")), likeness_track_best=bool(v("likeness_track_best")),
             likeness_track_best_face=bool(v("likeness_track_best_face")),
@@ -13561,6 +13561,17 @@ def build_page(local: bool = True):
                                          "interval later. Best held-out checkpoint saves exactly the weights that "
                                          "were swept; held-out patience and region steering act then. Same model "
                                          "copy and fallback as the maps.")
+                            w["sweep_split"] = ui.switch("Split the region sweeps with the training GPU",
+                                                         value=d.sweep_split) \
+                                .tooltip("Experimental, never run on a real GPU yet. Needs Region sweeps on the second "
+                                         "GPU. Each sweep's pictures are divided between the two GPUs: the second GPU "
+                                         "reads as many as it finishes before the next sweep is due (measured from the "
+                                         "run's own sweeps and step time; the held-out pictures always go there), and "
+                                         "training reads the rest at once between steps with the same weight average, "
+                                         "so training waits less when the sweep is long. The two parts are merged "
+                                         "into one sweep. The first and the last sweep are split by the two GPUs' "
+                                         "speed.") \
+                                .bind_enabled_from(w["sweep_async"], "value")
                         w["probe_face_prompt"] = ui.input("Face probe prompt (headshot; empty = none)") \
                             .classes("w-full")
                         w["probe_body_prompt"] = ui.input("Body probe prompt (full body, upright; empty = none)") \

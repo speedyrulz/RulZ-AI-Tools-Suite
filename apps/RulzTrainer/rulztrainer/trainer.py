@@ -1745,6 +1745,7 @@ class Trainer(RaceParallelMixin):
         self.run_start_step = step  # what pruning counts as the run this one carries on (0: a fresh run)
         compute_done = 0  # optimizer steps of every configuration (a race trains several)
         step_times: list[float] = []  # seconds per optimizer step, training only (no saves, samples or probes)
+        self.recent_step_times = step_times  # (sweep_split sizes a sweep from them)
         profile_at = profiling.requested_step()
         snapshot_at = profiling.requested_step("RULZ_MEMORY_SNAPSHOT_STEP")
         peak_ram = profiling.PeakRam().start()
@@ -3887,7 +3888,7 @@ class Trainer(RaceParallelMixin):
         sweep_async it is queued on the second GPU instead and followed when its readings are in."""
         if self.sweep is None:
             return
-        if self._analysis_start("sweep", step, injected):
+        if self._analysis_start("sweep", step, injected, model=model):
             return
         self.status.update(stage=f"region sweep (step {step})")
         self._free_for_rendering()
@@ -3901,12 +3902,15 @@ class Trainer(RaceParallelMixin):
             return
         self._sweep_after(row, injected, step)
 
-    def _sweep_after(self, row: dict, injected, step: int, state: dict | None = None, where: str = "") -> None:
+    def _sweep_after(self, row: dict, injected, step: int, state: dict | None = None, where: str = "",
+                     split: dict | None = None) -> None:
         """What follows a recorded sweep (here, or read on the second GPU: `state` is then the LoRA it read, `where`
-        says so in the log): the log line, the Monitor, the region watch, the held-out best file, the stop."""
+        says so in the log): the log line, the Monitor, the region watch, the held-out best file, the stop. split
+        (sweep_split): how its pictures were divided, for the Monitor."""
         cfg = self.cfg
         log.info("Region sweep at step %d%s: %s", step, where, regionsweep.describe(row))
         self.status.update(region_sweep={**row, "line": regionsweep.describe(row),
+                                         **({"split": split} if split else {}),
                                          "history": [{k: r[k] for k in ("step", "train", "held")}
                                                      for r in self.sweep.history[-200:]]})
         if self.region_watch is not None:
@@ -5764,11 +5768,12 @@ class Trainer(RaceParallelMixin):
     def _analysis_label(self, kind: str) -> str:
         return "region sweep" if kind == "sweep" else "training maps"
 
-    def _analysis_start(self, kind: str, step: int, injected) -> bool:
+    def _analysis_start(self, kind: str, step: int, injected, model=None) -> bool:
         """maps_async / sweep_async: queue the sweep / maps of `step` on the second GPU with the LoRA as it stands (the weight
         average), and move the schedule on so it is not due again while it is out. True when queued; False to run it
         here (not using the second GPU, it failed, or the analysis model did not load). One job of each kind is out at
-        a time: when the next is due before the last is in, training waits for it."""
+        a time: when the next is due before the last is in, training waits for it. With sweep_split a sweep's pictures
+        are divided between the second GPU and this one (`model`: the training model, for the part read here)."""
         from .probeworker import ProbeProcessError
 
         w = self.analysis_worker
@@ -5786,19 +5791,28 @@ class Trainer(RaceParallelMixin):
                         "training GPU from here: %s", w.device, str(e).strip().splitlines()[-1])
             self._close_probe_worker(redo=True)
             return False
+        split = kind == "sweep" and bool(getattr(self.cfg, "sweep_split", False))
+        waited = 0.0
         if w.pending_of(kind) is not None:
+            t_wait = time.time()
             self._analysis_take(kind, step, wait=True)
+            waited = time.time() - t_wait
             if self.analysis_worker is None:  # it failed while this one waited
                 return False
             w = self.analysis_worker
             if (self.sweep if kind == "sweep" else self.maps).failed:
                 return True  # that result turned this analysis off: nothing to run, here or there
+        if split:
+            seconds = self._step_seconds()
+            self._sweep_sizer().note_wait(waited, self.sweep.every * seconds if seconds else None)
         with self._averaged():
             state = lora_mod.lora_state(injected)
         epoch = step / self._maps_epoch_steps()[0]
         target = self.sweep if kind == "sweep" else self.maps
         schedule = (target.last_step, target.next_step, getattr(target, "cursor", None))
         try:
+            if split:
+                return self._sweep_split_start(w, step, state, epoch, injected, model)
             if kind == "sweep":
                 w.submit_analysis("sweep", step, state, keys=[p["key"] for p in self.sweep.begin(step)],
                                   extra={"epoch": epoch})
@@ -5814,6 +5828,83 @@ class Trainer(RaceParallelMixin):
             self._close_probe_worker(redo=True)
             return False
         self.status.update(stage=f"training; {self._analysis_label(kind)} of step {step} on {w.device}")
+        return True
+
+    def _sweep_sizer(self):
+        """sweep_split's sizing (regionsweep.SplitSizer): what it has learned of each side's speed in this run."""
+        if getattr(self, "split_sizer", None) is None:
+            self.split_sizer = regionsweep.SplitSizer()
+        return self.split_sizer
+
+    def _step_seconds(self) -> float | None:
+        """Seconds per training step lately (the median of the last 20; side jobs are not in them), or None before
+        there are a few."""
+        times = sorted(list(getattr(self, "recent_step_times", None) or [])[-20:])
+        return times[len(times) // 2] if len(times) >= 3 else None
+
+    def _sweep_split_start(self, w, step: int, state: dict, epoch: float, injected, model) -> bool:
+        """sweep_split: this sweep's pictures are divided between the second GPU and this one. The second GPU's part
+        is queued first; this one's is read here at once with the same weight average that was sent, and the two are
+        merged into one sweep when the second GPU's readings are in. True once it is queued or recorded; False when the
+        queueing failed (the schedule goes back and the sweep runs here as a whole)."""
+        from .probeworker import ProbeProcessError
+
+        sizer = self._sweep_sizer()
+        schedule = (self.sweep.last_step, self.sweep.next_step, getattr(self.sweep, "cursor", None))
+        chosen = self.sweep.begin(step)
+        keys = [pr["key"] for pr in chosen]
+        busy = float(getattr(w, "rendered", 0.0) or 0.0) + float(getattr(w, "analysed", 0.0) or 0.0)
+        count = sizer.remote_count(len(chosen), sum(1 for pr in chosen if pr["held"]), self.sweep.every,
+                                   self._step_seconds(), sizer.other_work(busy), last=step >= self.cfg.steps)
+        remote, local = chosen[:count], chosen[count:]  # (the held-out pictures come first: they always go remote)
+        split = {"remote": len(remote), "local": len(local), "device": w.device,
+                 "held": sum(1 for pr in remote if pr["held"])}
+        pending = None
+        if remote:
+            try:
+                w.submit_analysis("sweep", step, state, keys=[pr["key"] for pr in remote],
+                                  extra={"epoch": epoch, "all_keys": keys, "local": {}, "local_seconds": 0.0,
+                                         "split": split})
+            except ProbeProcessError as e:  # the schedule goes back (begin ran), so the local run is the same job
+                self.sweep.last_step, self.sweep.next_step = schedule[0], schedule[1]
+                if schedule[2] is not None:
+                    self.sweep.cursor = schedule[2]
+                log.warning("maps_async / sweep_async: sending the region sweep of step %d to %s failed, so everything "
+                            "runs on the training GPU from here: %s", step, w.device, str(e).strip().splitlines()[-1])
+                self._close_probe_worker(redo=True)
+                return False
+            pending = w.pending_of("sweep")
+        readings, took = {}, 0.0
+        if local:
+            if hasattr(w, "refresh"):
+                w.refresh()  # (the replies that are in are drained before this one pauses training)
+            model = model if model is not None else self.replicas[0][0]
+            t0 = time.time()
+            self.status.update(stage=f"region sweep (step {step}, {len(local)} of {len(chosen)} pictures here)")
+            self._free_for_rendering()
+            try:
+                readings = self.sweep._forward(model, norm_device(self.replicas[0][2]), local,
+                                               averaged=self._averaged)
+            except Exception as e:  # noqa: BLE001
+                self.sweep.fail(step, e)  # as a sweep read here failing: the sweeps are off, training goes on
+                if pending is not None:  # its answer is taken and thrown away (record would miss the local keys)
+                    pending.extra["abandoned"] = True
+                return True
+            finally:
+                free_cuda()
+                self.status.update(stage="training")
+            took = time.time() - t0
+            sizer.note_local(took, len(local))
+        split["local_seconds"] = round(took, 2)
+        if pending is not None:
+            pending.extra["local"], pending.extra["local_seconds"] = readings, took
+            self.status.update(stage=f"training; region sweep of step {step}: {len(remote)} pictures on {w.device}, "
+                                     f"{len(local)} read here in {took:.1f}s")
+            return True
+        row = self.sweep.record(step, epoch, keys, readings, took)  # nothing went to the second GPU
+        self._sweep_after(row, injected, step, where=f" (all {len(local)} pictures here: none fit on {w.device} "
+                                                     f"before the next sweep)", split=split)
+        self.status.update(stage="training")
         return True
 
     def _analysis_unavailable(self, w) -> None:
@@ -5859,19 +5950,32 @@ class Trainer(RaceParallelMixin):
         if got is None:
             return
         p, result, why = got
+        if p.extra.get("abandoned"):  # a split sweep whose local part failed: the sweeps are off, this is dropped
+            self.status.update(stage="training")
+            return
         if why:  # its computation failed, as the same code would here: that analysis is off for the run
             (self.sweep if kind == "sweep" else self.maps).fail(p.step, RuntimeError(why))
             self.status.update(stage="training")
             return
-        self._analysis_act(p, result, p.reply[2], f" (read on {w.device}"
-                           + (f", in at step {now})" if now != p.step else ")"))
+        late = f", in at step {now}" if now != p.step else ""
+        self._analysis_act(p, result, p.reply[2], f" (read on {w.device}{late})", late=late)
 
-    def _analysis_act(self, p, result, seconds: float, where: str) -> None:
+    def _analysis_act(self, p, result, seconds: float, where: str, late: str = "") -> None:
         """Record a sweep / maps capture that was read away from training and follow it up. A sweep's best checkpoint
-        saves its own LoRA state (p.state), the stop and the region watch act now."""
+        saves its own LoRA state (p.state), the stop and the region watch act now. A split sweep (sweep_split) is
+        merged here: `result` is the second GPU's part, the part read here was kept on the job."""
         if p.kind == "sweep":
-            row = self.sweep.record(p.step, p.extra["epoch"], p.jobs, result, seconds)
-            self._sweep_after(row, self.injected, p.step, state=p.state, where=where)
+            split = p.extra.get("split")
+            keys, merged, total = p.jobs, result, seconds
+            if p.extra.get("all_keys"):
+                local_s = float(p.extra.get("local_seconds") or 0.0)
+                keys, merged, total = p.extra["all_keys"], {**p.extra.get("local", {}), **result}, seconds + local_s
+                if where.startswith(" (read on"):  # (not one the second GPU lost: that is its own line)
+                    self._sweep_sizer().note_remote(seconds, len(p.jobs))
+                    where = (f" ({split['remote']} on {split['device']} in {seconds:.1f}s, {split['local']} here in "
+                             f"{local_s:.1f}s{late})")
+            row = self.sweep.record(p.step, p.extra["epoch"], keys, merged, total)
+            self._sweep_after(row, self.injected, p.step, state=p.state, where=where, split=split)
         else:
             self.maps.record(p.step, p.extra["epoch"], result, seconds)
             log.info("Training maps of step %d%s", p.step, where)
@@ -5886,6 +5990,8 @@ class Trainer(RaceParallelMixin):
             paths = p.reply[1] if p.reply is not None and p.reply[0] == "done" else self._render_from_state(
                 self.replicas[0][0], p.step, p.state, p.jobs, "sample")
             self._sample_finish(paths, p.step)
+            return
+        if p.extra.get("abandoned"):  # a split sweep whose local part failed: the sweeps are off
             return
         if p.reply is not None and p.reply[0] == f"{p.kind}_done":
             self._analysis_act(p, p.reply[1], p.reply[2], " (read on the second GPU)")
