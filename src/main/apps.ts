@@ -487,8 +487,25 @@ export class AppManager {
       )
       await this.saveLatestCache()
     }
+    await this.relabelInstalled()
     await catalog
     this.changed()
+  }
+
+  /**
+   * A source install keeps the label its commit had when it was installed. Installed between a merge and its version
+   * tag, that is "v3.42.0 + 1 commit" while the same commit is now "v3.43.0": the app page then shows an older
+   * installed version next to the latest and no Update button (rightly: it is the same commit). Takes the newer label.
+   */
+  private async relabelInstalled(): Promise<void> {
+    for (const app of CATALOG) {
+      if (app.install.kind !== 'source') continue
+      const installed = this.o.store.getInstalled(app.id)
+      const info = this.latest.get(app.id)?.info
+      if (!installed?.managed || !installed.version || !info || info.version !== installed.version) continue
+      if (installed.versionLabel === info.label || info.label === info.version) continue
+      await this.o.store.setInstalled(app.id, { ...installed, versionLabel: info.label }).catch(() => undefined)
+    }
   }
 
   /** After a settings change: turning the GitHub README setting on or off changes which files are shown. */
