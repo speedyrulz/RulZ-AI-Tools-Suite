@@ -994,3 +994,38 @@ def test_a_poll_error_and_a_failed_setup_send_are_process_errors(tmp_path, monke
     with pytest.raises(PW.ProbeProcessError, match="closed its connection"):
         PW.ProbeProcess({}, None, "cuda:1", tmp_path / "probe.log")
     assert killed == [True]
+
+
+def test_the_setup_reaches_a_separate_process_with_its_tensors(tmp_path):
+    """The probe process is a program of its own (another multiprocessing authkey). Tensors in its setup used to go as
+    shared-memory handles it had to fetch from the trainer, which refused it ("digest sent was rejected" on Linux), so
+    maps_async and sweep_async never started. Packed as bytes they arrive in a real separate process."""
+    import secrets
+    import subprocess
+    from multiprocessing.connection import Listener
+
+    analysis = {"maps": {"probes": [{"latents": torch.arange(6.0).reshape(2, 3), "trigger": {}}], "sigmas": [0.5]},
+                "sweep": None}
+    packed = PW.pack_tensors(analysis)
+    assert isinstance(packed, bytes) and PW.pack_tensors(None) is None
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {str(Path(PW.__file__).parents[1])!r})\n"
+        "from multiprocessing.connection import Client\n"
+        "from rulztrainer.probeworker import unpack_tensors\n"
+        "key = bytes.fromhex(sys.stdin.readline().strip())\n"
+        "conn = Client(('127.0.0.1', int(sys.argv[1])), authkey=key)\n"
+        "_, opts = conn.recv()\n"
+        "a = unpack_tensors(opts['analysis'])\n"
+        "conn.send(float(a['maps']['probes'][0]['latents'].sum()))\n", encoding="utf-8")
+    key = secrets.token_bytes(32)
+    with Listener(("127.0.0.1", 0), authkey=key) as listener:
+        proc = subprocess.Popen([sys.executable, str(child), str(listener.address[1])], stdin=subprocess.PIPE, text=True)
+        proc.stdin.write(key.hex() + "\n")
+        proc.stdin.flush()
+        with listener.accept() as conn:
+            conn.send(("setup", {"probes": False, "analysis": packed}))
+            assert conn.poll(60)
+            assert conn.recv() == 15.0
+    assert proc.wait(60) == 0
