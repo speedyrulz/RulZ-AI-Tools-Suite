@@ -3882,11 +3882,16 @@ class JobFiles:
 def history_job_dir(rec: dict, runs: list[dict]) -> Path | None:
     """The job folder of a Previous Runs record while it still holds that run's files: its status.json names the run
     (runs since v2.29.0), or for older runs no later run of the same job name was saved."""
+    vast = (rec.get("source") or {}).get("kind") == "vast"
+    if vast and not rec.get("job_dir"):
+        return None  # a vast.ai run that was not downloaded has no folder here
     d = Path(rec.get("job_dir") or ROOT / "output" / (rec.get("job") or ""))
     try:
         status = json.loads((d / "status.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    if vast:
+        return d  # its own download folder, named by the Fleet
     if status.get("run_id"):
         return d if status["run_id"] == rec["id"] else None
     later = any(r.get("job") == rec.get("job") and (r.get("started") or 0) > (rec.get("started") or 0) for r in runs)
@@ -8269,6 +8274,7 @@ HISTORY_COLORS = ["#FF3B30", "#60A5FA", "#34D399", "#F59E0B", "#C084FC", "#22D3E
 _WIDE = {"classes": "rz-wide-col", "headerClasses": "rz-wide-col"}  # hidden on a phone (the run's name has its date)
 HISTORY_COLUMNS = [
     {"name": "run", "label": "Run", "field": "run", "align": "left", "sortable": True},
+    {"name": "where", "label": "Where", "field": "where", "align": "left", "sortable": True, **_WIDE},
     {"name": "started", "label": "Started", "field": "started", "align": "left", "sortable": True, **_WIDE},
     {"name": "state", "label": "State", "field": "state", "align": "left", "sortable": True, **_WIDE},
     {"name": "steps", "label": "Steps", "field": "steps", "align": "right"},
@@ -8308,7 +8314,9 @@ def history_rows(runs: list[dict]) -> list[dict]:
                    if cfg.get("network_type") == "lokr" else f"LoRA r{cfg.get('lora_rank', '?')}") \
             + (" + DoRA" if cfg.get("dora") else "")
         comb = probes.get("combined") or []
-        rows.append({"id": r["id"], "run": history_label(r),
+        src = r.get("source") or {}
+        where = ("vast.ai" + (f" · {src['gpu']}" if src.get("gpu") else "")) if src.get("kind") == "vast" else "This PC"
+        rows.append({"id": r["id"], "run": history_label(r), "where": where,
                      "started": datetime.fromtimestamp(r.get("started") or 0).strftime("%Y-%m-%d %H:%M"),
                      "state": r.get("state", ""), "steps": f"{r.get('step', 0):,} / {r.get('total', 0):,}",
                      "adapter": adapter, "lr": f"{cfg['learning_rate']:.1e}" if cfg.get("learning_rate") else "-",
@@ -8471,7 +8479,8 @@ def probe_compare(groups, step: int, kind: str) -> tuple[list[str], list[tuple[s
 def build_history_tab(charts: list):
     """Previous Runs: the saved likeness history of every run (output/_history), any number of them ticked to overlay
     their charts."""
-    state = {"runs": [], "view": [], "own": [], "sig": None, "picks": [], "captions": [], "shown": None}
+    state = {"runs": [], "view": [], "own": [], "sig": None, "picks": [], "captions": [], "shown": None,
+             "fleet_sig": None}
 
     def selected_runs() -> list[dict]:
         ids = {row["id"] for row in table.selected}
@@ -8594,13 +8603,28 @@ def build_history_tab(charts: list):
         state["shown"] = None
         draw_probes()
 
+    def sync_fleet(force: bool = False) -> int:
+        """The Fleet's runs on vast.ai into the history, when the Fleet's records changed; a broken file never
+        breaks the tab."""
+        try:
+            fsig = history.fleet_signature()
+            if fsig == state["fleet_sig"] and not force:
+                return 0
+            state["fleet_sig"] = fsig
+            return history.import_fleet_runs()
+        except Exception:  # noqa: BLE001
+            return 0
+
     def reload(force: bool = False):
+        sync_fleet()
         sig = history.signature()
         if sig == state["sig"] and not force:
             return
         state["sig"] = sig
         state["runs"] = history.list_runs()
-        count.text = (f"{len(state['runs'])} saved run(s)" if state["runs"] else
+        n_vast = sum(1 for r in state["runs"] if (r.get("source") or {}).get("kind") == "vast")
+        count.text = (f"{len(state['runs'])} saved run(s)" + (f", {n_vast} from vast.ai" if n_vast else "")
+                      if state["runs"] else
                       "No saved runs yet. A run is saved while it trains once it has likeness scores.")
         apply_scale()
 
@@ -8622,8 +8646,11 @@ def build_history_tab(charts: list):
 
     def import_old():
         n = history.import_jobs()
-        ui.notify(f"Imported {n} earlier run(s) from the output folder" if n else
-                  "Nothing new to import: every job folder with scores already has a saved run", type="info")
+        v = sync_fleet(True)
+        ui.notify(f"Imported {n} earlier run(s) from the output folder" + (f" and {v} from vast.ai" if v else "")
+                  if n or v else
+                  "Nothing new to import: every job folder with scores already has a saved run, and so does every "
+                  "run of the Fleet tab", type="info")
         reload(True)
 
     async def rename():
@@ -8651,6 +8678,9 @@ def build_history_tab(charts: list):
         with ui.dialog() as dlg, ui.card():
             ui.label(f"Remove {len(picked)} run(s) from the history? The job folders and their files are not "
                      "touched.").classes("text-sm")
+            if any((r.get("source") or {}).get("kind") == "vast" for r in picked):
+                ui.label("Runs from vast.ai are removed from this list only: the Fleet tab's record of them and "
+                         "the files you downloaded stay.").classes("text-sm")
             with ui.row().classes("w-full justify-end gap-2"):
                 ui.button("Cancel", on_click=lambda: dlg.submit(False)).props("flat")
                 ui.button("Remove", on_click=lambda: dlg.submit(True)).props("unelevated color=negative")
@@ -8664,7 +8694,8 @@ def build_history_tab(charts: list):
                 ui.label("Previous runs").classes("rz-title")
                 hint("Every run with likeness scores is saved here while it trains. Tick runs to compare their "
                      "likeness charts and probe images, and see which setup learned the person faster or better "
-                     "(0 = a stranger, 100 = your references).")
+                     "(0 = a stranger, 100 = your references). Runs on the vast.ai instances the Fleet tab "
+                     "watches are listed too (Where: vast.ai), with probe images once you download their probes.")
             ui.button("Import old runs", icon="move_to_inbox", on_click=import_old).props("outline") \
                 .tooltip("Add the runs whose job folders are in the output folder but not in this list yet")
     with card():
@@ -8885,6 +8916,7 @@ def build_history_tab(charts: list):
         history.import_jobs()  # the runs from before the history existed, once
     except Exception:  # noqa: BLE001
         pass
+    sync_fleet(True)  # the Fleet's vast.ai runs, once; reload() then follows the Fleet's changes
     reload(True)
     ui.timer(4.0, while_connected(reload))
 

@@ -2748,6 +2748,14 @@ normalized scale: the **mean face and mean body** score of the sample images at 
 similarity), and the smoothed **face, body and combined** score at each probe (Likeness probes & controller). Runs
 from before the history existed are imported from their job folders when the tab first loads, or with *Import old runs*.
 
+**vast.ai runs** (since 3.46.0). The runs on the vast.ai instances the [Fleet tab](#several-instances-at-once-the-fleet)
+watches are listed too, with **Where** *vast.ai · RTX 5090* (local runs: *This PC*). Their charts come from the
+`status.json` the Fleet downloaded, or, without a download, from the scores the Fleet recorded while it watched; their
+probe images and the *Saved files* downloads appear once that run's probes or files are downloaded. A run still
+training is brought up to date whenever the Fleet records it. *Remove from history* hides a vast.ai run from this list
+only (it is not brought back); the Fleet's record and the downloaded files stay. Runs the Fleet never watched, or
+from before it existed, are not listed.
+
 Tick any number of runs in the table (name, start, state, steps, adapter, learning rate, last and best scores) to
 overlay them: one colour per run, solid lines for the face, dashed for the body and thick for the combined score. The
 legend has one entry per run (click it to hide all of that run's lines) and the tooltip names each line (`<run> ·

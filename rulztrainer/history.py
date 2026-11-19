@@ -102,15 +102,20 @@ _PROBE_IMAGE = re.compile(r"step(?P<step>\d{6})_(?P<kind>face|body)_(?P<seed>\d+
 PROBE_THUMB_PX = 768  # the copies' longest side (probes render at probe_size, 512 by default)
 
 
-def _source(path: str) -> Path:
+def _source(path: str, base: Path | None = None) -> Path:
+    """Where a probe image is: the trainer's folder for a local run; with base (a downloaded vast.ai run's folder)
+    its probes/ folder, by file name, since the status.json paths are the instance's."""
+    if base is not None:
+        return base / "probes" / Path(path).name
     p = Path(path)
     return p if p.is_absolute() else ROOT / p
 
 
-def keep_probe_images(run_id: str, status: dict, root: Path = HISTORY_DIR) -> list[dict]:
+def keep_probe_images(run_id: str, status: dict, root: Path = HISTORY_DIR, base: Path | None = None) -> list[dict]:
     """Copy the run's probe images into root/<run id>/ (JPEG, at most PROBE_THUMB_PX; already copied ones are kept)
     and return their entries: {"step", "kind", "seed", "racer", "file" (relative to root), "face", "body",
-    "combined"} with that probe's scores (normalized where the run had them)."""
+    "combined"} with that probe's scores (normalized where the run had them). base: the folder a vast.ai run was
+    downloaded to (its images are looked for in base/probes/)."""
     names = race_names(status)
     out = []
     for rec in status.get("probes") or []:
@@ -125,7 +130,7 @@ def keep_probe_images(run_id: str, status: dict, root: Path = HISTORY_DIR) -> li
             name = f"{racer + '_' if racer else ''}step{int(m['step']):06d}_{m['kind']}_{m['seed']}.jpg"
             dest = root / run_id / name
             if not dest.is_file():
-                src = _source(img)
+                src = _source(img, base)
                 if not src.is_file():
                     continue
                 try:
@@ -249,6 +254,12 @@ def has_data(record: dict) -> bool:
         record["probes"].get(k) for k in ("face", "body", "combined"))
 
 
+VAST_PREFIX = "vast-"
+HIDDEN_VAST = "_hidden_vast.json"
+FLEET_RUNS_DIR = Path(os.environ.get("RULZ_VAST_HOME") or Path.home() / ".rulz_vast") / "fleet" / "runs"
+# the Fleet's run state -> the history's
+VAST_STATES = {"done": "finished", "error": "error", "ended": "stopped", "running": "running"}
+
 REPLACE_TRIES = 6  # on Windows a reader (the Previous Runs poll, a scan) can briefly hold the target open
 
 
@@ -265,7 +276,7 @@ def _replace(tmp: Path, path: Path) -> None:
             time.sleep(0.05 * (attempt + 1))
 
 
-def _write(path: Path, record: dict) -> None:
+def _write(path: Path, record) -> None:
     """A history file written whole: into a temporary file beside it, which then takes its place. The trainer
     (save_run) and the WebUI (set_label) write the same file from two processes, so each write has a temporary name
     of its own: with one shared <id>.tmp a writer could move the other's half-written file into place, or find its
@@ -303,6 +314,8 @@ def list_runs(root: Path = HISTORY_DIR) -> list[dict]:
     """Every saved run, newest first."""
     runs = []
     for p in sorted(root.glob("*.json")) if root.is_dir() else []:
+        if p.name.startswith("_"):  # _hidden_vast.json and the like: not a run
+            continue
         try:
             rec = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(rec, dict) and rec.get("id") and "identity" in rec and "probes" in rec:
@@ -317,7 +330,8 @@ def signature(root: Path = HISTORY_DIR) -> tuple:
     writes can share a time stamp where the clock is coarse (Windows)."""
     if not root.is_dir():
         return ()
-    return tuple((p.name, st.st_mtime_ns, st.st_size) for p, st in ((p, p.stat()) for p in sorted(root.glob("*.json"))))
+    return tuple((p.name, st.st_mtime_ns, st.st_size) for p, st in ((p, p.stat()) for p in sorted(root.glob("*.json"))
+                                                  if not p.name.startswith("_")))
 
 
 def set_label(run_id: str, label: str, root: Path = HISTORY_DIR) -> bool:
@@ -331,8 +345,23 @@ def set_label(run_id: str, label: str, root: Path = HISTORY_DIR) -> bool:
     return True
 
 
+def hidden_vast(root: Path = HISTORY_DIR) -> set[str]:
+    """The vast.ai runs the user removed from the list (the import does not bring them back)."""
+    try:
+        data = json.loads((root / HIDDEN_VAST).read_text(encoding="utf-8"))
+        return {str(x) for x in data} if isinstance(data, list) else set()
+    except (OSError, ValueError):
+        return set()
+
+
 def delete_runs(run_ids: list[str], root: Path = HISTORY_DIR) -> int:
+    """Remove runs from the history (the record and the probe thumbnails). A vast.ai run's id is also put on the
+    hidden list, so the next import of the Fleet's records leaves it out; the Fleet's record and the downloaded files
+    are never touched."""
     n = 0
+    vast = [r for r in run_ids if str(r).startswith(VAST_PREFIX)]
+    if vast:
+        _write(root / HIDDEN_VAST, sorted(hidden_vast(root) | set(vast)))
     for rid in run_ids:
         p = root / f"{rid}.json"
         if p.is_file() and p.parent == root:
@@ -417,4 +446,100 @@ def import_jobs(output: Path | None = None, root: Path = HISTORY_DIR) -> int:
             _write(root / f"{record['id']}.json", record)
             have.add(job)
             added += 1
+    return added
+
+
+def fleet_signature(fleet_dir: Path = FLEET_RUNS_DIR) -> tuple:
+    """Changes whenever a Fleet run record is added, changed or removed (the page's cheap poll); () without a Fleet."""
+    try:
+        return tuple((p.name, st.st_mtime_ns, st.st_size)
+                     for p, st in ((p, p.stat()) for p in sorted(fleet_dir.glob("*.json"))))
+    except OSError:
+        return ()
+
+
+def _mtime(path: Path) -> int:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def import_fleet_runs(fleet_dir: Path = FLEET_RUNS_DIR, root: Path = HISTORY_DIR) -> int:
+    """History for the training runs the Fleet tracked on vast.ai instances (one JSON per run in the Fleet's runs
+    folder): id "vast-<key>", the likeness data from the run's downloaded status.json where there is one, else from
+    the Fleet's own record; probe images from the download's probes/ folder. A run is rewritten only when its Fleet
+    data changed; a label the user gave it is kept; runs the user removed (delete_runs) are not brought back.
+    Returns how many runs were added or updated."""
+    if not fleet_dir.is_dir():
+        return 0
+    hidden = hidden_vast(root)
+    added = 0
+    for path in sorted(fleet_dir.glob("*.json")):
+        try:
+            fr = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(fr, dict) or not fr.get("key"):
+            continue
+        run_id = VAST_PREFIX + re.sub(r"[^A-Za-z0-9._-]+", "_", str(fr["key"]))
+        if run_id in hidden:
+            continue
+        folder = Path(fr["folder"]) if fr.get("folder") else None
+        if folder is not None and not folder.is_dir():
+            folder = None
+        status_path = folder / "status.json" if folder else None
+        stamp = [fr.get("modified"), fr.get("step"), fr.get("state"), fr.get("ended"),
+                 _mtime(status_path) if status_path else 0, sorted(fr.get("downloaded") or [])]
+        out_path = root / f"{run_id}.json"
+        old: dict = {}
+        try:
+            old = json.loads(out_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        if not isinstance(old, dict):
+            old = {}
+        if (old.get("source") or {}).get("stamp") == stamp:
+            continue
+        status, cfg = None, None
+        if status_path and status_path.is_file():
+            try:
+                st = json.loads(status_path.read_text(encoding="utf-8"))
+                if isinstance(st, dict) and st.get("probes"):
+                    status = st
+            except (OSError, ValueError):
+                pass
+            if status is not None:
+                try:
+                    import yaml
+
+                    cfg = yaml.safe_load((folder / "config.yaml").read_text(encoding="utf-8"))
+                except Exception:  # noqa: BLE001 - missing or unreadable: the Fleet record's copy
+                    cfg = None
+        if status is None:
+            status = {"probes": fr.get("probes") or [], "step": fr.get("step"), "total": fr.get("total")}
+        if not isinstance(cfg, dict) or not cfg:
+            cfg = fr.get("config") if isinstance(fr.get("config"), dict) else {}
+        cfg = {**cfg, "job_name": cfg.get("job_name") or fr.get("job") or ""}
+        try:
+            from .config import TrainConfig
+
+            arch = TrainConfig.from_dict(cfg).arch_name()
+        except Exception:  # noqa: BLE001 - a config the current code cannot read
+            arch = ""
+        started = fr.get("started") or fr.get("first_seen") or 0
+        record = build_record(cfg, arch, run_id, started, status, VAST_STATES.get(fr.get("state"), "stopped"),
+                              fr.get("ended") or fr.get("modified") or started)
+        if not has_data(record):
+            continue
+        record["job_dir"] = str(folder) if folder else ""
+        record["source"] = {"kind": "vast", "instance": fr.get("instance"), "gpu": fr.get("gpu"), "key": fr["key"],
+                            "stamp": stamp}
+        record["probe_images"] = keep_probe_images(run_id, status, root, folder) if folder else []
+        record["label"] = old.get("label", "")
+        try:
+            _write(out_path, record)
+        except OSError:
+            continue
+        added += 1
     return added
