@@ -89,6 +89,11 @@ base:
     why: "Both sides: stack A (sigmoid plus high-noise bias) says high noise 'changed the game' for details; stack B says a clean-end timestep helped; others say shift. 'reference' is MOSS's own training distribution, which is already heavily high-noise (median about 0.75); in RulZ AI Trainer it is the closest to stack A and has not been compared with it."
     confidence: DISP
     sources: [moss_stackA_2026_10, moss_stackB_2026_10, moss_shift_2026_10, doc_trainer_3_28]
+  resolution_shift:
+    value: true
+    why: "Shifts the noise levels by image size (the FLUX line, x1.9 at 512 px, x3.2 at 1024 px); OneTrainer's community finds 1024 px learns slowly without a higher shift. It only applies when timestep_sampling is not reference (the wizard drops it with reference, whose curve already carries MOSS's shift). Not raced here."
+    confidence: CONF
+    sources: [ot_resshift_2026_11]
   batch_size:
     value: 1
     why: "Batch 1 is the wizard's value; one user ran batch 2 with accumulation 2 and differential guidance, and AI Toolkit does not scale the LR with batch."

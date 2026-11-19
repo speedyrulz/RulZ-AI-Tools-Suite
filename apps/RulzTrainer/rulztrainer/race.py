@@ -69,8 +69,8 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
         "hull_factor_cap", "hull_safety_cap", "hull_gain_max", "hull_ns_iters", "hull_damping", "hull_regions",
         "hull_gain_body", "hull_gain_background", "hull_ring_cells", "hull_face_safe", "hull_retreat"),
     "Timesteps & loss": (
-        "timestep_sampling", "logit_mean", "logit_std", "sigmoid_scale", "timestep_shift", "clean_share", "logsnr_mean",
-        "logsnr_std", "timestep_buckets",
+        "timestep_sampling", "logit_mean", "logit_std", "sigmoid_scale", "timestep_shift", "resolution_shift", "clean_share",
+        "logsnr_mean", "logsnr_std", "timestep_buckets",
         "loss_weighting", "loss_type",
         "sigma_min", "sigma_max", "content_power", "region_weights", "face_loss_weight", "body_loss_weight",
         "background_loss_weight", "face_margin", "region_feather_cells", "region_prior_weight", "id_loss_weight",

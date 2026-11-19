@@ -34,6 +34,7 @@ lr_scheduler: constant
 warmup_steps: 50
 timestep_sampling: logit_normal
 timestep_shift: 1.0
+resolution_shift: false  # true: shift the noise levels by the image size, as the model's sampler does (not with reference)
 
 save_every: 250
 sample_every: 250

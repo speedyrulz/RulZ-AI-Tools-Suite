@@ -3,8 +3,8 @@
 The clean end is a noise level (sigma) below 0.5: nearly clean images, where faces and fine detail are refined. The
 noisy half shapes composition. Every timestep_sampling mode puts some share of its steps there: MOSS-Image's own
 pretraining curve (timestep_sampling: reference) about 11-13%, RulzTrainer's default logit-normal (mean 0) 50%. With
-clean_share set, the sampled curve is moved along the logit axis until that share of its steps (after timestep_shift,
-the sigma range and the 1000-step grid) lands below 0.5; its shape stays.
+clean_share set, the sampled curve is moved along the logit axis until that share of its steps (after timestep_shift
+and resolution_shift, at the batch's image size, the sigma range and the 1000-step grid) lands below 0.5; its shape stays.
 
 clean_share takes Fizgig's notation, percentages and 1-based epochs of the run's own image queue:
   "40"              40% for the whole run

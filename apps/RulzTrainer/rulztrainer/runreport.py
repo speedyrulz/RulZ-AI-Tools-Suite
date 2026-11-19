@@ -51,7 +51,7 @@ SWITCHES = (  # settings worth naming on the summary when they are on
     ("likeness_lr_control", "likeness lr control"), ("likeness_track_best", "best checkpoint kept"),
     ("region_weights", "region-weighted loss"), ("loss_watch", "loss watch"), ("per_image_lr", "per-image lr"),
     ("isolation", "LoRA Isolation"), ("finetune", "full fine-tune"), ("dora", "DoRA"),
-    ("block_audit_every", "block audit"),
+    ("block_audit_every", "block audit"), ("resolution_shift", "resolution shift"),
 )
 
 

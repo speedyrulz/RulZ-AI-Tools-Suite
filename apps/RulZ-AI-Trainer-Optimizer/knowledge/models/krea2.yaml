@@ -86,6 +86,11 @@ base:
     why: "The same bell curve as the sigmoid that users prefer for likeness (linear was clearly worse in a 15-setting test); it is what our reference runs used."
     confidence: CONF
     sources: [atk_timestep_2026_07, meas_krea_race_2026_11]
+  resolution_shift:
+    value: true
+    why: "Shifts the logit-normal noise levels by image size with the sampler's own mu (x1.8 at 512 px, x2.5 at 1024 px); OneTrainer's community finds 1024 px learns slowly without a higher shift. Not raced on Krea 2 here: race it against off."
+    confidence: CONF
+    sources: [ot_resshift_2026_11]
   batch_size:
     value: 1
     why: "Batch 1; AI Toolkit does not scale the LR with batch, so a bigger batch needs 1.5-2.5x the steps and dulls likeness for characters."

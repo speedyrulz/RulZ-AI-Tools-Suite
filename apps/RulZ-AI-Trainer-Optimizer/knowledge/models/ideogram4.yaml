@@ -87,6 +87,11 @@ base:
     why: "Ideogram's documented time distribution (logit-normal, resolution-aware mean), which is high-noise like the one user's 'shift only'; the earlier community config used 'weighted' and a style recipe 'linear'. Not compared."
     confidence: DISP
     sources: [id_firstcfg_2026_06, id_shift_2026_10, web_estylon_2026_06, doc_trainer_3_28]
+  resolution_shift:
+    value: true
+    why: "Shifts the noise levels by image size with the pipeline's own resolution-aware mean (x1.7 at 512 px, x3.3 at 1024 px); OneTrainer's community finds 1024 px learns slowly without a higher shift. It only applies when timestep_sampling is not reference (the wizard drops it with reference, which already has this mean). Not raced here."
+    confidence: CONF
+    sources: [ot_resshift_2026_11]
   batch_size:
     value: 1
     why: "Batch 1 in every recipe."
