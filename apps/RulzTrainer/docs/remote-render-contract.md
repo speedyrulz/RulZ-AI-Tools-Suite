@@ -68,6 +68,12 @@ It holds these shared pieces (used by both sides, so their names and behaviour a
 - Delegation is allowed only while ready.json matches and helper.json is fresh. Deadline per round:
   `max(90, 3 x instance's own measured render seconds per picture of that kind x the round's picture count)`, so a
   round with more pictures gets proportionally longer; first round after ready gets 2x that.
+  Probe rounds (delegated and shadow) get until about the next probe instead (3.39.1,
+  `RemoteRenderer.probe_deadline`): the larger of that rule (doubling included) and 1.5 x the wall seconds between the
+  two most recent probe steps (`note_probe_step`, called at every probe step from step 0). At the next probe step a
+  delegated probe still out is not waited for: it is taken back at once and rendered on the instance from the same
+  weights, a counted miss. The end-of-training take waits at most the old rule's seconds. Sample rounds keep the old
+  rule. (A PC GPU ~4x slower than the instance behind a slow link needed ~4 min for a round the old rule gave 117 s.)
   2 consecutive deadline misses or errors -> stop delegating for the rest of the run (log it).
 - A kind is delegated only after the instance has timed one render of it (`note_own`): until then there is no
   deadline to give, so that round renders on the instance. In practice step 0 supplies the timing.
@@ -95,11 +101,17 @@ It holds these shared pieces (used by both sides, so their names and behaviour a
   length + body bytes. Bad magic -> exit. Exit on stdin EOF.
 - Ops (header `op`, reply `{ok, ...}` or `{ok:false, error}`): `hello {protocol}` -> `{protocol, output_root,
   time}`; `runs` -> running jobs that have `remote_render/run.json` with run.json, prepare status, open round
-  names; `get {path}` -> body = file bytes; `put {path}` + body; `write_json {path, data}`; `rename {src, dst}` ->
+  names; `get {path}` -> body = file bytes, or with `{offset, length}` (non-negative ints, inside the file) that byte
+  range; `size {path}` -> `{size}`; `put {path}` + body; `write_json {path, data}`; `rename {src, dst}` ->
   `{ok, renamed: bool}`; `list {path}`; `heartbeat {job, run_token, host, gpu}` (writes helper.json with the
   instance clock). Every path is relative to the output root and must resolve inside
   `<output_root>/<job>/remote_render/` (reject `..`, absolute paths, symlinks out).
 - Output root discovery: the same way `rulz_agent.py` finds the WebUI's output folder.
+
+- Transfer speed (3.39.1): one ssh stream from a vast host fell to ~0.8 MB/s (84 MB in 100 s); the worker fetches a
+  LoRA of 8 MiB or more in `LORA_STREAMS` (4) byte ranges over its own connection plus 3 more it keeps for the run
+  (8-19 s for 84 MB, measured), falling back to one get when a range fails. The helper's ssh prefers
+  `aes128-gcm@openssh.com` (`-c ^...`, the default list stays behind it).
 
 ## 5. The PC helper `rulztrainer/renderhelper.py` (runs on the user's PC)
 - CLI: `python -m rulztrainer.renderhelper --instance <id> --device cuda:N [--sample-model PATH]

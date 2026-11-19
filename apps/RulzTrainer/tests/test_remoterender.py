@@ -813,3 +813,142 @@ def test_modes_that_skip_remote_render_clear_an_old_runs_folder(tmp_path, monkey
     t4.job_dir = tr.job_dir
     t4._setup_remote_render()
     assert t4.remote is None and not folder.exists()
+
+
+# ------------------------------------------------------------ probe rounds: until the next probe
+def test_a_probe_round_gets_until_the_next_probe_and_samples_keep_the_old_rule(tmp_path):
+    rr, h, clock = _renderer(tmp_path)  # 1 s per picture: the old rule is max(90, 3 x 1 x 2) = 90 (x2 first round)
+    rr.first_round = False
+    h.beat()
+    seconds, why = rr.probe_deadline(2)
+    assert seconds == 90.0 and "3 x" in why  # no interval known: the old rule
+    rr.note_probe_step()
+    assert rr.probe_interval() == 0.0 and rr.probe_deadline(2)[0] == 90.0  # one step is no interval yet
+    clock.t += 600.0
+    rr.note_probe_step()
+    assert rr.probe_interval() == 600.0
+    seconds, why = rr.probe_deadline(2)
+    assert seconds == 900.0 and "until the next probe, about 900s" in why  # 1.5 x 600 s
+    clock.t += 20.0
+    rr.note_probe_step()  # only the last two count: 20 s now, so the old rule is the larger again
+    assert rr.probe_interval() == 20.0 and rr.probe_deadline(2)[0] == 90.0
+    clock.t += 600.0
+    rr.note_probe_step()
+    r = rr.submit("probe", 10, _jobs(rr.job_dir), _state(), deadline_s=rr.probe_deadline(2)[0])
+    assert r.deadline - r.submitted == 900.0 and r.cap - r.submitted == 1800.0
+    s = rr.submit("sample", 10, _jobs(rr.job_dir, kind="sample"), _state())  # samples: the old rule, unchanged
+    assert s.deadline - s.submitted == 90.0
+    got = json.loads((RR.round_path(rr.root, "rounds", r.name) / "round.json").read_text())
+    assert got["deadline_s"] == 900.0  # the helper is told the same number
+
+
+def test_the_first_round_doubling_stays_in_the_old_rule(tmp_path):
+    rr, h, clock = _renderer(tmp_path)
+    assert rr.first_round and rr.probe_deadline(2)[0] == 180.0  # no interval: the old rule, doubled
+    rr.note_probe_step()
+    clock.t += 100.0
+    rr.note_probe_step()
+    assert rr.probe_deadline(2)[0] == 180.0  # 1.5 x 100 = 150 < 180: the doubled old rule is the larger
+    h.beat()
+    r = rr.submit("probe", 10, _jobs(rr.job_dir), _state(), deadline_s=180.0)
+    assert rr.first_round is False and r.deadline - r.submitted == 180.0
+
+
+def test_a_round_still_out_is_taken_back_at_once_and_counts_as_a_miss(tmp_path):
+    rr, h, clock = _renderer(tmp_path)
+    h.beat()
+    r = rr.submit("probe", 10, _jobs(rr.job_dir), _state(), deadline_s=900.0)
+    h.claim(r)
+    t0 = clock.t
+    got, why = rr.collect(r, wait=False, give_up="it did not come in before the next probe")
+    assert got is None and why == "it did not come in before the next probe" and clock.t == t0  # no waiting
+    assert rr.misses == 1 and rr.stats["taken_back"] == 1 and r.name not in rr.rounds
+    r2 = rr.submit("probe", 20, _jobs(rr.job_dir), _state(), deadline_s=900.0)
+    assert rr.collect(r2, wait=False, give_up="late")[0] is None and rr.off_reason  # two in a row end delegation
+    rr.off_reason, rr.misses = "", 0
+    r3 = rr.submit("probe", 30, _jobs(rr.job_dir), _state(), deadline_s=900.0)
+    h.claim(r3)
+    h.finish(r3)  # a round that is in is taken, not given up on
+    got, why = rr.collect(r3, wait=False, give_up="late")
+    assert got is not None and why == "" and rr.misses == 0
+
+
+def test_waiting_for_a_round_can_be_capped(tmp_path):
+    rr, h, clock = _renderer(tmp_path)
+    h.beat()
+    r = rr.submit("probe", 10, _jobs(rr.job_dir), _state(), deadline_s=5000.0)
+    real_sleep = rr.sleep
+    rr.sleep = lambda s: (real_sleep(s), h.beat())  # the helper is alive but never finishes
+    t0 = clock.t
+    got, why = rr.collect(r, wait=True, max_wait=90.0)
+    assert got is None and "within 90s of waiting" in why and 90.0 <= clock.t - t0 < 92.0 and rr.misses == 1
+
+
+def test_the_next_probe_does_not_wait_for_the_one_out_but_renders_it_here(tmp_path, monkeypatch):
+    clock = Clock()
+    T, tr, status = _trainer(tmp_path)
+    rr, h = _open(tr, tmp_path, clock, monkeypatch)
+    seen, order = [], []
+    _fake_rendering(T, tr, monkeypatch, seen)
+    tr._averaged = contextlib.nullcontext
+    tr._probe_jobs = lambda step: _jobs(tr.job_dir, 2, step)
+    tr._score_probe = lambda jobs, images, step, check=True: (60.0, None, {"face": [60.0], "body": []})
+    tr._probe_finish = lambda step, face, body, images, seeds, took, o, s, inj, now=None: (
+        order.append((step, took)) or False)
+    tr._keel_probe = lambda *a, **k: None
+    tr.run_probe = lambda model, step, opt, sched, inj: order.append(("inline", step)) or False
+    tr.last_probe = None
+    safely = lambda job: tr._side_job("probe", job, False)  # noqa: E731
+    rr.shadow_done = True
+    rr.first_round = False
+    tr._remote_probe_round(None, 0, None, None, tr.injected, False, True, safely)  # step 0 (in_round: renders here)
+    clock.t += 600.0  # ten minutes of training between probes
+    h.beat()
+    tr._remote_probe_round(None, 10, None, None, tr.injected, False, False, safely)
+    first = tr.remote_probe
+    assert first is not None and first.deadline - first.submitted == 900.0  # 1.5 x the 600 s since step 0
+    clock.t += 600.0
+    h.beat()
+    h.claim(first)  # the helper is still rendering it when the next probe is due
+    t0 = clock.t
+    tr._remote_probe_round(None, 20, None, None, tr.injected, False, False, safely)
+    assert clock.t == t0  # nothing waited
+    acted = [o for o in order if o[0] != "inline"]
+    assert acted[0][0] == 10 and "after the helper's miss" in acted[0][1]  # taken back and rendered here
+    second = tr.remote_probe
+    assert second is not None and second.step == 20 and rr.misses == 1 and rr.stats["taken_back"] == 1
+    assert second.deadline - second.submitted == 900.0  # 1.5 x the 600 s between probes
+
+
+def test_the_end_of_training_waits_no_longer_than_the_old_rule(tmp_path, monkeypatch):
+    clock = Clock()
+    T, tr, status = _trainer(tmp_path)
+    rr, h = _open(tr, tmp_path, clock, monkeypatch)
+    seen = []
+    _fake_rendering(T, tr, monkeypatch, seen)
+    tr._averaged = contextlib.nullcontext
+    tr._probe_jobs = lambda step: _jobs(tr.job_dir, 2, step)
+    tr._score_probe = lambda jobs, images, step, check=True: (60.0, None, {"face": [60.0], "body": []})
+    tr._probe_finish = lambda *a, **k: False
+    tr._keel_probe = lambda *a, **k: None
+    rr.first_round = False
+    real_sleep = rr.sleep
+    rr.sleep = lambda s: (real_sleep(s), h.beat())
+    tr._remote_probe_submit(10, tr.injected, False)
+    r = tr.remote_probe
+    r.deadline = r.submitted + 5000.0  # (a long deadline from a long probe interval)
+    r.cap = r.submitted + 10000.0
+    t0 = clock.t
+    assert tr._remote_probe_take(None, 10, 10, None, None, wait=True, capped=True) is False
+    assert 90.0 <= clock.t - t0 < 92.0 and tr.remote_probe is None  # the old rule's 90 s, then rendered here
+    assert len(seen) == 1 and rr.misses == 1
+
+    # the cap counts from when the round was handed over: one out 60 s already waits only the 30 s left
+    tr._remote_probe_submit(20, tr.injected, False)
+    r = tr.remote_probe
+    r.deadline, r.cap = r.submitted + 5000.0, r.submitted + 10000.0
+    clock.t += 60.0
+    h.beat()
+    t0 = clock.t
+    assert tr._remote_probe_take(None, 20, 20, None, None, wait=True, capped=True) is False
+    assert 30.0 <= clock.t - t0 < 32.0 and tr.remote_probe is None

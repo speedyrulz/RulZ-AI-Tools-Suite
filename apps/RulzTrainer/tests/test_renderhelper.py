@@ -21,6 +21,63 @@ TOKEN = "tok123"
 EMBEDS = {"a portrait": "embeds/aaa.safetensors", "bad": "embeds/bbb.safetensors"}
 
 
+def test_parallel_lora_and_connection_reuse(world):
+    h = world.make()
+    payload = bytes(range(251)) * 34000
+    (world.base / "lora").write_bytes(payload)
+    worker = h._bridge()
+    try:
+        assert h._fetch_lora(worker, "job/remote_render/lora") == (payload, 4)
+        assert len(h.range_bridges) == 3
+        assert h._fetch_lora(worker, "job/remote_render/lora") == (payload, 4)
+        assert len(world.conns) == 4
+    finally:
+        h._drop_wb()
+
+
+def test_lora_fallback_and_small_file(world, monkeypatch):
+    h = world.make()
+    worker = h._bridge()
+    payload = b"x" * (8 * 1024 * 1024)
+    (world.base / "lora").write_bytes(payload)
+    original_connect = h.connect
+    def connect():
+        bridge = original_connect()
+        monkeypatch.setattr(bridge, "get", lambda *args: (_ for _ in ()).throw(rh.BridgeError("failed")))
+        return bridge
+    h.connect = connect
+    calls = []
+    original_get = worker.get
+    def get(*args):
+        calls.append(args)
+        return original_get(*args)
+    monkeypatch.setattr(worker, "get", get)
+    try:
+        assert h._fetch_lora(worker, "job/remote_render/lora") == (payload, 1)
+        assert calls[-1] == ("job/remote_render/lora",)
+        assert not h.range_bridges
+        calls.clear()
+        (world.base / "lora").write_bytes(b"small")
+        assert h._fetch_lora(worker, "job/remote_render/lora") == (b"small", 1)
+        assert calls == [("job/remote_render/lora",)]
+    finally:
+        h._drop_wb()
+
+
+def test_spawn_prefers_cipher(monkeypatch):
+    commands = []
+    class Proc:
+        stdin = SimpleNamespace(write=lambda data: None, flush=lambda: None)
+        stdout = None
+        stderr = None
+    monkeypatch.setattr(rh.subprocess, "Popen", lambda command, **kwargs: commands.append(command) or Proc())
+    monkeypatch.setattr(rh.Bridge, "call", lambda *args, **kwargs: ({}, b""))
+    connector = rh.SshConnector(None)
+    monkeypatch.setattr(connector.remote, "ssh_command", lambda conn, key: ["ssh", "host"])
+    connector._spawn({"host": "host", "port": 22})
+    assert commands[0][:4] == ["ssh", "-c", "^aes128-gcm@openssh.com", "host"]  # options before the host
+
+
 class FakeRenderer:
     def __init__(self):
         self.calls = []
@@ -364,6 +421,32 @@ def test_round_taken_back_before_the_claim_is_skipped(world):
     h.wb = w.connect()
     h._render(entry, "000009_probe_1")  # not there: the trainer took it
     assert not w.renderer.calls and not (w.base / "done").exists()
+
+
+def test_taken_back_while_the_lora_comes_is_no_error(world, monkeypatch):
+    """The trainer takes a round back at the next probe while the PC still fetches its LoRA: the files are gone from
+    claimed/, which is a round taken back, not a helper error."""
+    w = world
+    h = ready_state(w)
+    w.add_round("000001_probe_5", "probe", 5)
+
+    def fetch(bridge, path):
+        (w.base / "abandoned").mkdir(exist_ok=True)
+        os.rename(w.base / "claimed/000001_probe_5", w.base / "abandoned/000001_probe_5")
+        return bridge.get(path), 1
+
+    monkeypatch.setattr(h, "_fetch_lora", fetch)
+    entry = {"job": "job", "run": {"run_token": TOKEN}}
+    h.wb = w.connect()
+    h._render(entry, "000001_probe_5")
+    assert not w.renderer.calls and h.status.data["state"] == "ready" and "taken back" in h.status.data["message"]
+
+
+def test_a_read_on_a_closed_connection_is_a_disconnect(world):
+    b = world.connect()
+    b.close()
+    with pytest.raises(rh.Disconnected):
+        b._read(4)
 
 
 def test_late_done_after_abandon_is_dropped(world):

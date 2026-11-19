@@ -256,7 +256,23 @@ def dispatch(h, body):
     p = path(h.get("path"), root_ok=op == "list")
     anchor = anchor_of(h["path"]) if op in ("put", "write_json") else None
     if op == "get":
+        if "offset" in h or "length" in h:
+            offset, length = h.get("offset"), h.get("length")
+            if type(offset) is not int or type(length) is not int or offset < 0 or length < 0:
+                raise ValueError("offset and length must be nonnegative integers")
+            with p.open("rb") as f:
+                if offset + length > os.fstat(f.fileno()).st_size:
+                    raise ValueError("range exceeds file size")
+                f.seek(offset)
+                data = f.read(length)
+                if len(data) != length:
+                    raise ValueError("short range read")
+                return {}, data
         return {}, p.read_bytes()
+    if op == "size":
+        if not p.is_file():
+            raise FileNotFoundError("not a file: %s" % h["path"])
+        return {"size": p.stat().st_size}, b""
     if op == "put":
         write_file(p, body, anchor)
         return {}, b""
