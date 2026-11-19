@@ -133,7 +133,7 @@ a warning when that is more than 3x above or below the recommendation for its mo
 Automagic, Keel and Hull optimizers (which set their own rate) are skipped. Alpha-only-scales-the-rate is a community
 view (OneTrainer Discord, 2026-11), not something measured here.
 
-**Scale LR to alpha = rank (0.3.8).** RulZ AI Trainer 3.47.0 has an opt-in `lr_alpha_scale` setting that trains at the
+**Scale LR to alpha = rank (0.3.8).** RulZ AI Trainer 3.48.0 has an opt-in `lr_alpha_scale` setting that trains at the
 entered rate x rank / alpha, so the entered rate is the rate at alpha = rank. For a run with it on (and applying), the Runs
 tab treats the entered rate as the alpha = rank equivalent and says it was scaled and what it trained at. The key is in the
 trainer key list with default off. The Optimizer never turns it on in a recommendation.
