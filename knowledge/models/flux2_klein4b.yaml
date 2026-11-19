@@ -36,7 +36,7 @@ base:
   lora_rank: {value: 16, why: "Start with the 9B rank; its suitability for 4B is unmeasured.", confidence: GUESS, sources: []}
   lora_alpha: {value: 16.0, why: "Keep alpha equal to rank; unmeasured on 4B.", confidence: GUESS, sources: []}
   optimizer: {value: adamw8bit, why: "An 8-bit AdamW starting point carried over from 9B; unmeasured on 4B.", confidence: GUESS, sources: []}
-  learning_rate: {value: 5.0e-5, why: "Conservative 9B starting point; the vendor suggests lowering to this rate if training collapses. Unmeasured on 4B.", confidence: GUESS, sources: [web_bfl_f2_training_2026_01]}
+  learning_rate: {value: 5.0e-5, why: "Conservative 9B starting point; the vendor suggests lowering to this rate if training collapses. Unmeasured on 4B. Quoted at alpha equal to rank. OneTrainer's Klein presets once shipped a rate 10x too high (community report).", confidence: GUESS, sources: [web_bfl_f2_training_2026_01, ot_klein_lr_2026_11]}
   lr_scheduler: {value: constant, why: "Family starting point; unmeasured on 4B.", confidence: GUESS, sources: []}
   timestep_sampling: {value: reference, why: "The same family noise schedule as 9B; this setting is unmeasured on 4B.", confidence: GUESS, sources: []}
   batch_size: {value: 1, why: "Conservative memory starting point; unmeasured on 4B.", confidence: GUESS, sources: []}
