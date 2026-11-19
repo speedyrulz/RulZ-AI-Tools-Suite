@@ -227,7 +227,11 @@ def _network(c: dict) -> str:
         return f"OFT, block {c.get('oft_block_size')}"
     if kind == "lokr":
         return f"LoKr, factor {c.get('lokr_factor')}"
-    return f"{'DoRA' if c.get('dora') else 'LoRA'}, rank {c.get('lora_rank')} (alpha {_value(c.get('lora_alpha'))})"
+    from .config import alpha_equivalent_text
+
+    equal = alpha_equivalent_text(c)
+    return (f"{'DoRA' if c.get('dora') else 'LoRA'}, rank {c.get('lora_rank')} "
+            f"(alpha {_value(c.get('lora_alpha'))}{'; ' + equal if equal else ''})")
 
 
 def _resolution(c: dict) -> str:

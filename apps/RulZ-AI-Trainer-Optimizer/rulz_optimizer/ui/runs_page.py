@@ -124,6 +124,7 @@ def build(state: AppState) -> None:
         try:
             run = await common.io(runs.load_run, Path(path_text))
             findings = await common.io(diagnose.detect, run)
+            findings += await common.io(diagnose.alpha_findings, run, knowledge)
         except Exception as e:  # noqa: BLE001
             with detail_box:
                 common.banner(f"Could not read this run: {e}", "error", "info")

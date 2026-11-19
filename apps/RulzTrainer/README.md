@@ -1181,6 +1181,19 @@ transformers-format folder. SAM 3 is kept in system RAM and moved to `body_devic
 in bf16 (1.7 GB of weights instead of 3.4 GB, a 2.0 GB peak instead of 3.8 GB, person masks within IoU 0.9998 of fp32).
 An image that runs out of GPU memory is segmented on the CPU, and the next one tries the GPU again.
 
+## LoRA alpha and the learning rate (since 3.42.0)
+
+A LoRA's update is scaled by alpha / rank, so alpha only changes how big the steps are: it acts like a multiplier on
+the learning rate. RulZ AI Trainer's convention is alpha = rank (scale 1) with a learning rate of 1e-4. Other tools set
+alpha differently: OneTrainer's presets use rank 16, alpha 1 and 3e-4, which acts like 3e-4 x 1/16 = 1.9e-5 at
+alpha = rank, about five times lower than a copied "3e-4" looks. When alpha differs from rank on a LoRA (DoRA
+included), the wizard's Learning rate setting and the Train tab's optimization row show what the rate acts like at
+alpha = rank, in the warning colour when that is more than 3 times above or below the recommendation for the model; the
+run's start log, the run report's Network line and the review of the run say the same. The readout changes nothing:
+defaults, saved configs and training are as before. It is left out for a full fine-tune and for LoKr and OFT (they
+train at scale 1 whatever alpha says). Automagic, Keel and Hull set their own rate, so the learning rate field is not
+the rate their weights get: the note says so instead of giving a number (alpha still scales their updates).
+
 ## Per-image loss watch and per-image learning rate
 
 `loss_watch: true` records every image's loss normalised by the expected loss at its noise level (40 sigma

@@ -123,6 +123,16 @@ any problems found in the knowledge files when they were loaded.
 
 The knowledge changes with the models. The Knowledge tab shows exactly what the recommendation used.
 
+**Alpha and learning rate (0.3.6).** A plain LoRA's update is scaled by alpha / rank, so alpha only changes the
+effective learning rate. RulZ AI Trainer keeps alpha = rank (scale 1). OneTrainer's presets use rank 16, alpha 1 and
+3e-4, which acts like 3e-4 x 1/16 = 1.9e-5 at alpha = rank. A knowledge entry that quotes a rate from a source trained
+at another alpha and rank can say so with `source_alpha` and `source_rank` next to its `learning_rate` value; the
+loader converts it to alpha = rank (rate x alpha / rank) before it is used and the reason says so. Entries without them
+are used as written. On the Runs tab, a LoRA run whose alpha differs from its rank shows its rate at alpha = rank, with
+a warning when that is more than 3x above or below the recommendation for its model. Full fine-tunes, LoKr / OFT and the
+Automagic, Keel and Hull optimizers (which set their own rate) are skipped. Alpha-only-scales-the-rate is a community
+view (OneTrainer Discord, 2026-11), not something measured here.
+
 ## Limits
 
 - Never tested with a real training run. Nothing here has been checked against a finished LoRA you were happy with.

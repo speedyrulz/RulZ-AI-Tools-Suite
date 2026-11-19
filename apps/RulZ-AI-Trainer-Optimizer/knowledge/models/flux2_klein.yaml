@@ -64,9 +64,9 @@ base:
     sources: [f2_lowlr_2026_01, atk_klein_lr_2026_07, doc_trainer_3_28]
   learning_rate:
     value: 5.0e-5
-    why: "Both sides: 1e-5 to 2e-5 gave likeness at 1,000-1,500 steps and 3e-4 collapses, but the vendor says 8e-5 to 1e-4 for characters and the wizard uses 1e-4. 5e-5 is the vendor's own 'if training collapses' value, between the two."
+    why: "Both sides: 1e-5 to 2e-5 gave likeness at 1,000-1,500 steps and 3e-4 collapses, but the vendor says 8e-5 to 1e-4 for characters and the wizard uses 1e-4. 5e-5 is the vendor's own 'if training collapses' value, between the two. All of these are quoted at alpha equal to rank, so none needs converting. OneTrainer's Klein presets once shipped a rate 10x too high (community report); that is one more reason the high end is disputed."
     confidence: DISP
-    sources: [f2_lowlr_2026_01, atk_klein_lr_2026_07, web_bfl_f2_training_2026_01, doc_trainer_3_28]
+    sources: [f2_lowlr_2026_01, atk_klein_lr_2026_07, web_bfl_f2_training_2026_01, doc_trainer_3_28, ot_klein_lr_2026_11]
   lr_scheduler:
     value: constant
     why: "Constant, as the trainer's default and Fizgig's recipe."
