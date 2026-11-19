@@ -61,9 +61,9 @@ base:
     sources: [f3_adafactor_2026_10, web_bfl_f3_docs_2026_10]
   learning_rate:
     value: 1.0e-4
-    why: "The vendor's rate (for AdamW; not verified with Adafactor). Another source lowers to 5e-5 if training collapses."
+    why: "The vendor's rate (for AdamW; not verified with Adafactor), quoted at alpha equal to rank, so no conversion applies. Another source lowers to 5e-5 if training collapses. OneTrainer's Klein presets once shipped a rate 10x too high (community report), so be wary of Klein rates copied from presets with another alpha."
     confidence: DOC
-    sources: [web_bfl_f3_docs_2026_10, doc_trainer_3_28]
+    sources: [web_bfl_f3_docs_2026_10, doc_trainer_3_28, ot_klein_lr_2026_11, ot_alpha_2026_11]
   lr_scheduler:
     value: constant
     why: "The vendor recipe: constant after the warm-up."

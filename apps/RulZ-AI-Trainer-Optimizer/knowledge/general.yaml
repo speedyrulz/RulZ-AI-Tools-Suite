@@ -184,6 +184,9 @@ general_facts:
   - text: "Low rank or LoKr factor 4-8 is enough for one person. A big rank overfits small sets (rank 64 on 20 images never reached likeness in 8,000 steps on one model). Keep alpha equal to rank. A LoKr file of 1.4 GB means the factor was not set (full matrix)."
     confidence: CONF
     sources: [atk_rank_lokr_2026]
+  - text: "Alpha only scales the learning rate: a LoRA update is multiplied by alpha / rank, so the same run at alpha 1 and rank 16 with 3e-4 acts like 1.9e-5 at alpha = rank, not like 3e-4. OneTrainer's presets use rank 16, alpha 1, 3e-4. RulZ AI Trainer keeps alpha = rank, so a rate quoted from a preset with another alpha must be converted (rate x alpha / rank) before it is compared with the rates here. Community members also keep alpha at 1 or sqrt(rank) so one learning rate works across ranks. Community report, not measured here; the Optimizer's Runs tab shows the alpha = rank equivalent for runs where alpha differs from rank."
+    confidence: REP
+    sources: [ot_alpha_2026_11]
   - text: "Batch size and gradient accumulation do not scale the learning rate in AI Toolkit; a larger batch needs about 1.5-2.5x more steps. Batch 1 is the common choice for characters (an averaged gradient dulls likeness)."
     confidence: REP
     sources: [atk_lr_scaling_2026_11]
@@ -1135,3 +1138,17 @@ sources:
     people: null
     url: null
     note: "1024 px learns slowly without a higher shift; BFL confirms dynamic shifting (the noise shift grows with image size)."
+  ot_alpha_2026_11:
+    kind: community
+    where: "OneTrainer Discord training-discussion"
+    date: "2026-11"
+    people: null
+    url: null
+    note: "OneTrainer's presets use rank 16, alpha 1 and a learning rate of 3e-4; alpha only scales the learning rate (the update is scaled by alpha / rank), and keeping alpha at 1 or sqrt(rank) lets one rate work across ranks. Stated in discussion, not measured; the people count was not recorded."
+  ot_klein_lr_2026_11:
+    kind: community
+    where: "OneTrainer Discord training-discussion"
+    date: "2026-11"
+    people: null
+    url: null
+    note: "OneTrainer's Klein presets shipped a learning rate 10x too high for a while; the exact figures were not recorded here. A reminder to check a quoted Klein rate against its alpha and rank before trusting it."

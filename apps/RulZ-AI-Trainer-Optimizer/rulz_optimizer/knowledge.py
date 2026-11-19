@@ -18,6 +18,9 @@ class Setting:
     confidence: str
     sources: list[str]
     op: str | None = None
+    source_value: Any = None  # the rate as the source quoted it, when it was converted to alpha = rank
+    source_alpha: float | None = None
+    source_rank: float | None = None
 
 
 @dataclass
@@ -85,15 +88,51 @@ def default_dir() -> Path:
     return Path(__file__).resolve().parents[1] / 'knowledge'
 
 
+def to_alpha_rank(rate, alpha, rank):
+    """A LoRA update is scaled by alpha / rank, so a learning rate quoted at another alpha and rank acts like
+    rate x alpha / rank at alpha = rank (RulZ AI Trainer's convention, scale 1)."""
+    return rate * alpha / rank
+
+
+def _positive(key, name, value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
+        raise ValueError(f'{key}: {name} must be a positive number')
+    return float(value)
+
+
+def _setting(key, value, parent):
+    why = value.get('why', parent.get('why', ''))
+    amount, op = value['value'], value.get('op')
+    confidence = value.get('confidence', parent.get('confidence', ''))
+    sources = value.get('sources', parent.get('sources', []))
+    has_alpha, has_rank = 'source_alpha' in value, 'source_rank' in value
+    if not (has_alpha or has_rank):
+        return Setting(key, amount, why, confidence, sources, op)
+    # Optional: the alpha and rank the quoted learning rate was trained at. Converted here, so the recommender sees
+    # an alpha = rank rate and unannotated entries behave as before.
+    if not (has_alpha and has_rank):
+        raise ValueError(f'{key}: source_alpha and source_rank must be given together')
+    if key != 'learning_rate':
+        raise ValueError(f'{key}: source_alpha and source_rank apply to learning_rate only')
+    if op == 'mul':
+        raise ValueError(f'{key}: a multiplier is not a rate; source_alpha and source_rank cannot go with op mul')
+    alpha = _positive(key, 'source_alpha', value['source_alpha'])
+    rank = _positive(key, 'source_rank', value['source_rank'])
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        raise ValueError(f'{key}: a converted learning rate must be a number')
+    converted = to_alpha_rank(float(amount), alpha, rank)
+    if abs(alpha - rank) > 1e-9:
+        why = (why + ' ' if why else '') + (f'Quoted as {float(amount):.4g} at alpha {alpha:g} and rank {rank:g}; '
+                                            f'{converted:.4g} at alpha = rank.')
+    return Setting(key, converted, why, confidence, sources, op, amount, alpha, rank)
+
+
 def _settings(data, parent=None):
     parent = parent or {}
     for key, value in data.items():
         if not isinstance(value, dict) or 'value' not in value:
             raise ValueError(f'{key}: setting must be a mapping with a value')
-    return {key: Setting(key, value['value'], value.get('why', parent.get('why', '')),
-                         value.get('confidence', parent.get('confidence', '')),
-                         value.get('sources', parent.get('sources', [])), value.get('op'))
-            for key, value in data.items()}
+    return {key: _setting(key, value, parent) for key, value in data.items()}
 
 
 def _flaws(data):

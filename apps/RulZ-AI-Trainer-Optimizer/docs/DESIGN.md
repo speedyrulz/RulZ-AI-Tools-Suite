@@ -203,6 +203,8 @@ list), `median_mp_max`, `median_mp_min`.
 # knowledge.py
 class KnowledgeError(Exception): ...
 @dataclass class Setting: key: str; value: Any; why: str; confidence: str; sources: list[str]; op: str | None = None
+   # + source_value / source_alpha / source_rank: set when a learning_rate entry gave source_alpha and source_rank (the
+   #   alpha and rank the quoted rate was trained at); value is then already converted to alpha = rank (rate x alpha / rank)
 @dataclass class Fix: set: dict[str, Setting]; action: str | None; why: str; confidence: str; sources: list[str]
 @dataclass class Flaw: symptom: str; causes: list[str]; fixes: list[Fix]
 @dataclass class Rule: id: str; when: dict; set: dict[str, Setting]; note: str | None

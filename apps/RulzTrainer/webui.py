@@ -28,7 +28,7 @@ from fastapi import Request
 from nicegui import app, background_tasks, run, ui
 
 from rulztrainer.archs import get_arch
-from rulztrainer.config import (AUTOMAGIC, KEEL, LR_SCHEDULERS, KEEL_FB, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
+from rulztrainer.config import (AUTOMAGIC, KEEL, alpha_differs, alpha_lr_note, effective_optimizer, lr_at_alpha_rank, LR_SCHEDULERS, KEEL_FB, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
                                 MODEL_PRESETS, ARCH_SAMPLE_LORA, VIDEO_ARCHS, VIDEO_EXTS, VIDEO_DATA_PRESETS,
                                 STILL_FFN_TARGETS, detect_video_data_preset, video_data_preset,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
@@ -6381,6 +6381,10 @@ def extra_review_rows(cfg: TrainConfig) -> list[tuple[str, str]]:
         adapter = f"LoKr, factor {cfg.lokr_factor}" + (" + DoRA" if cfg.dora else "")
     else:
         adapter = f"LoRA, rank {cfg.lora_rank}, alpha {cfg.lora_alpha:g}" + (" + DoRA" if cfg.dora else "")
+        if alpha_differs(cfg):  # the rate this run acts like at alpha = rank, where the optimizer takes the rate as set
+            eq = lr_at_alpha_rank(cfg)
+            if eq is not None:
+                adapter += f" (lr {effective_optimizer(cfg)[1]:.1e} acts like {eq:.1e} at alpha = rank)"
     rows = [("Adapter", adapter),
             ("Memory", f"gradient checkpointing {'on' if cfg.gradient_checkpointing else 'off'}; "
                        + (f"block swap {cfg.block_swap} blocks" if cfg.block_swap else "no block swap"))]
@@ -7167,6 +7171,16 @@ class Wizard:
             icon.name = "check_circle" if same else "lightbulb"
             btn.visible = not same
         self.mark_extras()
+        if hasattr(self, "alpha_note"):
+            rec = self.recs.get("learning_rate")
+            note = alpha_lr_note(cfg, rec[0] if rec else None)
+            self.alpha_note.visible = note is not None
+            if note is not None:
+                self.alpha_note.text = note[0]
+                if note[1]:
+                    self.alpha_note.classes(add="rz-warn")
+                else:
+                    self.alpha_note.classes(remove="rz-warn")
         if hasattr(self, "refs_note"):
             n_face, n_body = len(cfg.face_refs) if self.has_face() else 0, len(cfg.body_refs) if self.has_body() else 0
             self.refs_note.text = ("Likeness references: your photos in " + ", ".join(
@@ -7586,6 +7600,8 @@ class Wizard:
                           "How big each update is. 1e-4 (0.0001) is the wizard's default. Too high gives burnt, noisy "
                           "samples; too low learns slowly."):
             self.bind(ui.number("Learning rate", format="%.1e", step=1e-5, min=0), "learning_rate").classes("w-full")
+            self.alpha_note = hint("")  # shown only while alpha differs from rank: what the rate acts like at alpha = rank
+            self.alpha_note.visible = False
         with self.setting(None, "LoRA rank",
                           "The size of the LoRA. 32 (the default) has room for a face's detail; higher mostly adds file "
                           "size and copies the photos more easily. Alpha follows the rank unless you set it under "
@@ -8172,7 +8188,9 @@ class Wizard:
              + (" (datasets with their own: those)" if any(sp.resolutions for sp in cfg.dataset_specs()) else "")),
             ("Training", f"{cfg.steps} steps, batch {cfg.batch_size}, lr {cfg.learning_rate:g}, {cfg.optimizer}"
                          + (f", LoRA rank {cfg.lora_rank} / alpha {cfg.lora_alpha:g}" if cfg.network_type == "lora"
-                            and not cfg.finetune else "")),
+                            and not cfg.finetune else "")
+                         + (f" (acts like lr {lr_at_alpha_rank(cfg):.1e} at alpha = rank)"
+                            if alpha_differs(cfg) and lr_at_alpha_rank(cfg) is not None else "")),
             ("Experimental", ", ".join(ex["title"] for ex in EXPERIMENTS if self.experiment_on(ex)) or "none"),
             ("Saving", f"every {cfg.save_every} steps; samples every {cfg.sample_every} steps "
                        f"({len(cfg.sample_prompts)} prompts)"),
@@ -11907,6 +11925,30 @@ def build_page(local: bool = True):
                                 .bind_visibility_from(w["lr_scheduler"], "value", lambda x: x == "cosine_restarts") \
                                 .tooltip("cosine_restarts: how many cosine falls the steps after the warm-up are "
                                          "split into; each starts again at the full rate.")
+                        alpha_note = hint("")  # only while a LoRA's alpha differs from its rank
+                        alpha_note.visible = False
+
+                        def show_alpha_note(_=None):
+                            try:
+                                cfg = f.to_config()
+                            except Exception:  # noqa: BLE001 - a field is mid-edit; the hint must never break the form
+                                return
+                            try:
+                                rec = wizard_recommendations(cfg, None, [], None).get("learning_rate")
+                            except Exception:  # noqa: BLE001 - the readout works without a recommendation
+                                rec = None
+                            note = alpha_lr_note(cfg, rec[0] if rec else None)
+                            alpha_note.visible = note is not None
+                            if note is not None:
+                                alpha_note.text = note[0]
+                                if note[1]:
+                                    alpha_note.classes(add="rz-warn")
+                                else:
+                                    alpha_note.classes(remove="rz-warn")
+
+                        for key in ("learning_rate", "optimizer", "lora_rank", "lora_alpha", "network_type",
+                                    "finetune"):
+                            w[key].on_value_change(show_alpha_note)
                         with fields().bind_visibility_from(w["optimizer"], "value",
                                                            lambda x: x in ("adamw", "adamw8bit")):
                             w["adam_beta1"] = ui.number("Adam beta 1", value=d.adam_beta1, min=0, max=0.9999,
@@ -12942,6 +12984,8 @@ def build_page(local: bool = True):
                                 .tooltip("Smaller subject datasets repeat so each trains about as often as the "
                                          "largest.")
                         iso_fields.bind_visibility_from(w["isolation"], "value")
+                        for key in ("isolation", "dop_weight"):  # (isolation trains Automagic / Keel with AdamW)
+                            w[key].on_value_change(show_alpha_note)
 
                     # ---- Regularisation dataset
                     with sections.section("Likeness", "Regularisation dataset",
