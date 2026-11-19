@@ -157,6 +157,42 @@ def test_fleet_run_without_a_download_has_no_sweeps_or_maps(tmp_path):
     assert run["sweeps"] == [] and "maps" not in run
 
 
+def test_fleet_import_brings_sweeps_to_a_run_imported_by_3_46(tmp_path):
+    """A finished vast.ai run imported under 3.46.0 (no sweeps, no maps, the old stamp) gets its sweeps and maps from
+    the downloaded folder the next time the import runs, though its Fleet record never changes again. The folder
+    holds the sweeps the way the Fleet page reads them: a status.json without a sweep history, plus
+    region_sweep.jsonl."""
+    folder = tmp_path / "dl"
+    folder.mkdir()
+    (folder / "status.json").write_text(json.dumps(status()), encoding="utf-8")
+    with open(folder / "region_sweep.jsonl", "w", encoding="utf-8") as f:
+        for row in (sweep_row(0, 0.0, 0.0), sweep_row(100, 0.4, 0.25), sweep_row(200, 0.6, 0.3)):
+            f.write(json.dumps(row) + "\n")
+    write_maps(folder)
+    fleet, root = fleet_record(tmp_path, folder), tmp_path / "h"
+    assert history.import_fleet_runs(fleet, root) == 1
+    # turn the record into what 3.46.0 wrote: no sweeps or maps field, no kept maps, the stamp without the version
+    path = root / "vast-9-job-1.json"
+    old = json.loads(path.read_text(encoding="utf-8"))
+    old.pop("sweeps")
+    old.pop("maps")
+    fr = json.loads((fleet / "9-job-1.json").read_text(encoding="utf-8"))
+    old["source"]["stamp"] = [fr["modified"], fr["step"], fr["state"], fr["ended"],
+                              (folder / "status.json").stat().st_mtime_ns, []]
+    old["label"] = "kept label"
+    path.write_text(json.dumps(old), encoding="utf-8")
+    import shutil
+
+    shutil.rmtree(root / "vast-9-job-1" / "maps")
+    assert history.import_fleet_runs(fleet, root) == 1
+    (run,) = history.list_runs(root)
+    assert [e["step"] for e in run["sweeps"]] == [0, 100, 200] and run["sweeps"][2]["held"]["face"] == 0.3
+    assert run["maps"] is True and (root / run["id"] / "maps" / "maps.jsonl").is_file()
+    assert run["label"] == "kept label"
+    # imported once more, then left alone again while the Fleet record stays the same
+    assert history.import_fleet_runs(fleet, root) == 0
+
+
 def test_import_jobs_adds_sweeps_and_maps_to_an_older_record(tmp_path):
     out, root = tmp_path / "out", tmp_path / "h"
     job = out / "old"
