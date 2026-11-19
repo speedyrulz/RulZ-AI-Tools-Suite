@@ -9408,14 +9408,31 @@ async def fleet_make_report(rec: dict, root, pull, make, notify, send, reload=No
         default = Path(root) / str(r.get("instance")) / str(r.get("job"))
         return fleet_folder(r, root) or (fleet_folder({"folder": str(default)}, root) if default.is_dir() else None)
 
+    async def pulled(kinds) -> str:
+        """Pull the kinds; the reason it failed ("" when it did). Whatever goes wrong here must not stop the report."""
+        notify(f"{name}: downloading {', '.join(kinds)} for the report...", "info")
+        try:
+            result = await pull(rec.get("key"), kinds)
+        except Exception as e:  # noqa: BLE001
+            return str(e) or type(e).__name__
+        if isinstance(result, dict):
+            return result.get("error") or ""
+        return "the download did not start"
+
     folder = folder_of(rec)
     kinds = fleet_report_kinds(folder, rec)
-    notify(f"{name}: downloading {', '.join(kinds)} for the report...", "info")
-    result = await pull(rec.get("key"), kinds)
-    why = (result or {}).get("error") if isinstance(result, dict) else "the download did not start"
+    why = await pulled(kinds)
     if reload is not None:
         rec = reload(rec.get("key")) or rec
     folder = folder_of(rec)
+    if not why and folder is not None and folder.is_dir():
+        # the downloaded settings can say what the first look could not (training maps): fetch those too, once
+        more = [k for k in fleet_report_missing(folder, rec) if k not in kinds]
+        if more:
+            why = await pulled(more)
+            if reload is not None:
+                rec = reload(rec.get("key")) or rec
+            folder = folder_of(rec)
     if folder is None or not folder.is_dir():
         notify(f"{name}: no downloaded folder and nothing could be downloaded ({why or 'no files came'}), so there "
                f"is nothing to make a report from.", "warning")
@@ -9434,8 +9451,15 @@ async def fleet_make_report(rec: dict, root, pull, make, notify, send, reload=No
         note = f"Made from what is there; missing: {', '.join(missing)}" + (f" ({why})" if why else "")
         notify(f"{name}: report written to {where}. {note}", "warning")
     else:
-        notify(f"{name}: report written to {where}", "positive")
+        if why:
+            notify(f"{name}: report written to {where}. Made from the files already here; the download failed: "
+                   f"{why}", "warning")
+        else:
+            notify(f"{name}: report written to {where}", "positive")
     return where
+
+
+_REPORT_BUSY: set = set()  # keys of the runs whose report is being made, for every browser page of this WebUI
 
 
 _STATUS_PROBES: dict = {}  # status.json path -> ((mtime, size), its probe records)
@@ -10723,7 +10747,10 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
         except (rulz_fleet.Refused, rulz_fleet.remote.Unreachable, SystemExit, OSError) as e:
             return {"error": str(e) or "The download did not work."}
         finally:
-            refresh(force=True)
+            try:
+                refresh(force=True)
+            except Exception:  # noqa: BLE001  (a redraw problem must not cost the report)
+                pass
 
     async def report_make(folder):
         from rulztrainer import runreport
@@ -10735,7 +10762,7 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
         if not keys:
             ui.notify("Tick a run first.", type="warning")
             return
-        busy = state.setdefault("report_busy", set())
+        busy = _REPORT_BUSY
         for key in keys:
             rec = fl.load_run(key)
             if rec is None:

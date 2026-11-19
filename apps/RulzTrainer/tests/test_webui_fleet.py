@@ -308,15 +308,15 @@ def test_a_chart_in_an_instance_card_makes_room_for_its_legends_second_row():
 
 def _report_folder(root, logs=False, probes=False, maps=False):
     folder = root / "7" / "job"
-    folder.mkdir(parents=True)
+    folder.mkdir(parents=True, exist_ok=True)
     if logs:
         (folder / "config.yaml").write_text("training_maps: true\n", encoding="utf-8")
         (folder / "status.json").write_text("{}", encoding="utf-8")
     if probes:
-        (folder / "probes").mkdir()
+        (folder / "probes").mkdir(exist_ok=True)
         (folder / "probes" / "step000100_face_1.png").write_bytes(b"x")
     if maps:
-        (folder / "training_maps").mkdir()
+        (folder / "training_maps").mkdir(exist_ok=True)
         (folder / "training_maps" / "maps.jsonl").write_text("{}\n", encoding="utf-8")
     return folder
 
@@ -374,7 +374,8 @@ def test_a_report_downloads_then_makes_the_files_and_sends_them(tmp_path):
     page = _ReportPage({"fetched": 3, "mb": 1.0}, fill=lambda: _report_folder(root, logs=True, probes=True))
     rec = {"key": "7/job", "instance": 7, "job": "job"}
     where = page.run(rec, root)
-    assert page.pulls == [("7/job", ["logs", "probes"])]  # the folder did not exist yet
+    # the folder did not exist yet; the downloaded config.yaml then said training maps, so they are fetched too
+    assert page.pulls == [("7/job", ["logs", "probes"]), ("7/job", ["maps"])]
     assert page.made == [folder.resolve()] and where == folder.resolve() / "report"
     assert [p.name for p in page.sent] == ["report.png", "report.pdf"]
     kind, text = page.notes[-1]
@@ -411,3 +412,34 @@ def test_a_report_that_cannot_be_made_is_a_notice_not_a_crash(tmp_path):
     page = _ReportPage({"fetched": 0, "mb": 0}, fail=RuntimeError("matplotlib missing"))
     assert page.run({"key": "7/job", "instance": 7, "job": "job"}, root) is None
     assert page.sent == [] and page.notes[-1][0] == "negative" and "matplotlib missing" in page.notes[-1][1]
+
+
+def test_a_failed_download_of_a_complete_folder_is_a_warning_with_the_reason(tmp_path):
+    root = tmp_path / "pulls"
+    _report_folder(root, logs=True, probes=True, maps=True)
+    page = _ReportPage({"error": "Instance 7 is gone: its files can no longer be downloaded."})
+    assert page.run({"key": "7/job", "instance": 7, "job": "job"}, root) is not None
+    kind, text = page.notes[-1]
+    assert kind == "warning" and "download failed" in text and "is gone" in text and "missing" not in text
+
+
+def test_a_download_that_raises_still_gets_the_report_from_what_is_there(tmp_path):
+    root = tmp_path / "pulls"
+    _report_folder(root, logs=True, probes=True, maps=True)
+    page = _ReportPage(None)
+
+    async def boom(key, kinds):
+        raise ValueError("odd failure")
+
+    page.pull = boom
+    assert page.run({"key": "7/job", "instance": 7, "job": "job"}, root) is not None
+    assert len(page.made) == 1 and len(page.sent) == 2
+    kind, text = page.notes[-1]
+    assert kind == "warning" and "odd failure" in text
+
+
+def test_the_report_guard_is_shared_by_every_page():
+    assert isinstance(webui._REPORT_BUSY, set)  # module level: two browser pages see the same set
+    import inspect
+
+    assert "_REPORT_BUSY" in inspect.getsource(webui.build_fleet_tab) and "report_busy" not in         inspect.getsource(webui.build_fleet_tab)

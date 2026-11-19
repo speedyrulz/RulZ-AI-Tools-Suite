@@ -352,16 +352,27 @@ def sweep_series(rows: list, region: str, key: str) -> list[tuple[int, float]]:
     points = []
     for row in rows:
         try:
-            value = (row.get(key) or {}).get(region)
+            part = row.get(key)
+            value = part.get(region) if isinstance(part, dict) else None
             step = int(row["step"])
             if value is not None and math.isfinite(float(value)):
                 points.append((step, 100 * float(value)))
-        except (KeyError, TypeError, ValueError, OverflowError):
+        except (KeyError, TypeError, ValueError, OverflowError, AttributeError):
             continue
     return points
 
 
+def since_baseline(rows: list) -> list:
+    """The rows measured against one baseline. After a resume without a saved state the sweep took its baseline from
+    an already trained model and marks its rows "late"; the rows before that block count against the old baseline."""
+    start = len(rows)
+    while start > 0 and isinstance(rows[start - 1], dict) and rows[start - 1].get("late"):
+        start -= 1
+    return rows[start:] if 0 < start < len(rows) else rows
+
+
 def sweep_gaps(rows: list) -> dict:
+    rows = since_baseline(rows)
     result = {}
     for region in SWEEP_COLORS:
         points = []
@@ -386,31 +397,76 @@ def growing_gap(rows: list) -> tuple | None:
 
 
 def watch_data(job_dir: Path) -> dict:
-    """Read the watch summary and per-picture contrasts from the saved states."""
-    state = regionwatch.read(job_dir)
-    if not isinstance(state, dict):
+    """Read the watch summary and per-picture contrasts from the saved states. {} (no page) when there is nothing
+    to show or the files are odd: a report must never fail on them."""
+    try:
+        state = regionwatch.read(job_dir)
+        if not isinstance(state, dict):
+            return {}
+        history = state.get("history")
+        history = history if isinstance(history, list) else []
+        last = history[-1] if history and isinstance(history[-1], dict) else {}
+        summary = {**last, "epoch": state.get("epoch"), "frozen": state.get("frozen"), "late": state.get("late")}
+        sweep = regionsweep.read(job_dir)
+        latest = sweep.get("latest") if isinstance(sweep, dict) else None
+        latest = latest if isinstance(latest, dict) else {}
+        pictures = state.get("pictures")
+        pictures = pictures if isinstance(pictures, dict) else {}
+        rows = []
+        for key, rec in pictures.items():
+            if not isinstance(rec, dict) or not rec.get("seen"):
+                continue
+            logs = rec.get("contrast_log")
+            logs = logs if isinstance(logs, dict) else {}
+            entry = latest.get(key)
+            swept = entry.get("contrast") if isinstance(entry, dict) else None
+            swept = swept if isinstance(swept, dict) else {}
+            row = {"image": Path(str(key)).name}
+            for region in regionwatch.PROTECTED:
+                try:
+                    row[region] = math.exp(float(logs[region])) if region in logs else None
+                except (ValueError, TypeError, OverflowError):
+                    row[region] = None
+                row["sweep_" + region] = swept.get(region)
+            rows.append(row)
+        if not rows and not last:
+            return {}
+        rows.sort(key=lambda r: (r["background"] is None, r["background"] or 0))
+        return {"summary": summary, "rows": rows}
+    except Exception:  # noqa: BLE001 - odd saved files must not stop the report
         return {}
-    history = state.get("history") or []
-    last = history[-1] if history and isinstance(history[-1], dict) else {}
-    summary = {**last, "epoch": state.get("epoch"), "frozen": state.get("frozen"), "late": state.get("late")}
-    sweep = regionsweep.read(job_dir) or {}
-    latest = sweep.get("latest") or {}
-    rows = []
-    for key, rec in (state.get("pictures") or {}).items():
-        if not isinstance(rec, dict) or not rec.get("seen"):
-            continue
-        logs = rec.get("contrast_log") or {}
-        swept = (latest.get(key) or {}).get("contrast") or {}
-        row = {"image": Path(key).name}
-        for region in regionwatch.PROTECTED:
-            try:
-                row[region] = math.exp(float(logs[region])) if region in logs else None
-            except (ValueError, TypeError, OverflowError):
-                row[region] = None
-            row["sweep_" + region] = swept.get(region)
-        rows.append(row)
-    rows.sort(key=lambda r: (r["background"] is None, r["background"] or 0))
-    return {"summary": summary, "rows": rows}
+
+
+def sweep_notes(run: Run) -> list[tuple[str, str]]:
+    """The region sweeps' plain findings (kind, text): shown in the summary and on the sweeps page."""
+    out = []
+    if not run.sweeps:
+        return out
+    points = sweep_series(run.sweeps, "subject", "held")
+    if points:
+        step, value = max(points, key=lambda p: p[1])
+        out.append(("note", f"Held-out photos peaked at step {step} ({value:.1f}% of the subject learned)."))
+    gap = growing_gap(run.sweeps)
+    if gap:
+        region, rise, value = gap
+        out.append(("warn", f"{region.capitalize()} may be memorised: the training / held-out gap grew "
+                            f"{rise:.1f} points to {value:.1f} points."))
+    return out
+
+
+def sweeps_text(run: Run, width: int = 120, lines: int = 5) -> str:
+    """The sweeps page's heading text: the findings first (so the memorising warning is never cut), then the latest
+    sweep's line."""
+    try:
+        line = regionsweep.describe(run.sweeps[-1])
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError):
+        line = ""
+    out = []
+    for _, note in sweep_notes(run):
+        out += _wrap(note, width)
+    if line:
+        out += _wrap(f"Sweep at step {run.sweeps[-1].get('step')}: {line}", width)
+    return "\n".join(out[:lines])
 
 
 def verdict(run: Run) -> list[tuple[str, str]]:
@@ -437,16 +493,7 @@ def verdict(run: Run) -> list[tuple[str, str]]:
     dup = (run.status.get("near_duplicates") or {}).get("count")
     if dup:
         out.append(("note", f"{dup} near-duplicate pair(s) of training photos."))
-    if run.sweeps:
-        points = sweep_series(run.sweeps, "subject", "held")
-        if points:
-            step, value = max(points, key=lambda p: p[1])
-            out.append(("note", f"Held-out photos peaked at step {step} ({value:.1f}% of the subject learned)."))
-        gap = growing_gap(run.sweeps)
-        if gap:
-            region, rise, value = gap
-            out.append(("warn", f"{region.capitalize()} may be memorised: the training / held-out gap grew "
-                                f"{rise:.1f} points to {value:.1f} points."))
+    out += sweep_notes(run)
     if race_winner(run):
         out.append(("good", f"Race won by {race_winner(run)}."))
     if run.status.get("error"):
@@ -1046,13 +1093,7 @@ def pdf(run: Run, path: Path) -> Path:
         # 4: sweeps
         if run.sweeps:
             page = new("Region sweeps")
-            try:
-                line = regionsweep.describe(run.sweeps[-1])
-            except (KeyError, TypeError, ValueError, AttributeError):
-                line = ""
-            notes = [t for _, t in verdict(run) if t.startswith(("Held-out photos peaked", "Face may be memorised", "Hair may be memorised", "Skin may be memorised", "Clothes may be memorised", "Background may be memorised", "Subject may be memorised"))]
-            text = f"Sweep at step {run.sweeps[-1].get('step')}: {line}" if line else ""
-            page.text(0.55, 0.85, "\n".join(_wrap("  ".join([text] + notes).strip(), 120)[:4]), size=7.5, color=MUTED)
+            page.text(0.55, 0.85, sweeps_text(run), size=7.5, color=MUTED)
             x, y, w, h = page.card(0.5, 1.75, W - 1.0, 3.1, "Training minus held-out gap (points)" if sweep_gaps(run.sweeps) else "Training error removed (%)")
             sweep_chart(page.axes(x + 0.55, y + 0.05, w - 0.7, h - 0.48), run)
             page.text(0.55, 5.05, "ERROR REMOVED (%): TRAINING SOLID, HELD-OUT DASHED", size=7.5, color=MUTED, weight="bold")
