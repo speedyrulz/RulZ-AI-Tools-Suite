@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -146,6 +146,40 @@ describe.runIf(process.platform === 'win32')('jobs', () => {
     await store.setInstalled('image-grid', { ...managed(join(organizer, 'Grid')), launchPath: join(organizer, 'Grid', 'g.exe') })
     await m.update('image-organizer')
     expect((await ended(jobs, 'image-organizer')).action).toBe('update')
+  }, 30_000)
+})
+
+describe('installed labels', () => {
+  it('takes the tag label of an installed commit that was tagged after the install', async () => {
+    const { m, store } = await manager()
+    const trainer = join(dir, 'RulzTrainer')
+    await mkdir(trainer)
+    await writeFile(join(trainer, 'run_webui.bat'), '')
+    await store.saveCache('latest-cache.json', {
+      entries: { 'rulz-trainer': { info: { version: 'abc123', label: 'v3.43.0', date: null, downloadSize: null, url: '' }, at: Date.now() } }
+    })
+    const info = { ...managed(trainer), launchPath: join(trainer, 'run_webui.bat'), version: 'abc123', method: 'archive' as const }
+    await store.setInstalled('rulz-trainer', { ...info, versionLabel: 'v3.42.0 + 1 commit' })
+    await m.init()
+    await m.refreshLatest(false)
+    expect(store.getInstalled('rulz-trainer')?.versionLabel).toBe('v3.43.0')
+    expect(m.views().find((v) => v.app.id === 'rulz-trainer')?.updateAvailable).toBe(false)
+  }, 30_000)
+
+  it('leaves the label of an older installed commit alone', async () => {
+    const { m, store } = await manager()
+    const trainer = join(dir, 'RulzTrainer')
+    await mkdir(trainer)
+    await writeFile(join(trainer, 'run_webui.bat'), '')
+    await store.saveCache('latest-cache.json', {
+      entries: { 'rulz-trainer': { info: { version: 'new456', label: 'v3.43.0', date: null, downloadSize: null, url: '' }, at: Date.now() } }
+    })
+    const info = { ...managed(trainer), launchPath: join(trainer, 'run_webui.bat'), version: 'abc123', method: 'archive' as const }
+    await store.setInstalled('rulz-trainer', { ...info, versionLabel: 'v3.42.0' })
+    await m.init()
+    await m.refreshLatest(false)
+    expect(store.getInstalled('rulz-trainer')?.versionLabel).toBe('v3.42.0')
+    expect(m.views().find((v) => v.app.id === 'rulz-trainer')?.updateAvailable).toBe(true)
   }, 30_000)
 })
 
