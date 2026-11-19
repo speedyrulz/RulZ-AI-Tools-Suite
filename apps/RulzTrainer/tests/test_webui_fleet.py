@@ -303,3 +303,111 @@ def test_a_chart_in_an_instance_card_makes_room_for_its_legends_second_row():
     webui.fit_chart(card)
     assert wide.options["grid"]["top"] == 25 + 34  # one legend row across the page
     assert card.options["grid"]["top"] == 2 * 25 + 34 and card.height == "height: 313px"  # two rows in a card
+
+
+
+def _report_folder(root, logs=False, probes=False, maps=False):
+    folder = root / "7" / "job"
+    folder.mkdir(parents=True)
+    if logs:
+        (folder / "config.yaml").write_text("training_maps: true\n", encoding="utf-8")
+        (folder / "status.json").write_text("{}", encoding="utf-8")
+    if probes:
+        (folder / "probes").mkdir()
+        (folder / "probes" / "step000100_face_1.png").write_bytes(b"x")
+    if maps:
+        (folder / "training_maps").mkdir()
+        (folder / "training_maps" / "maps.jsonl").write_text("{}\n", encoding="utf-8")
+    return folder
+
+
+def test_a_report_downloads_only_the_kinds_the_folder_lacks(tmp_path):
+    assert webui.fleet_report_kinds(None) == ["logs", "probes"]
+    assert webui.fleet_report_kinds(tmp_path / "nope", {"config": {"training_maps": True}}) == \
+        ["logs", "probes", "maps"]
+    empty = _report_folder(tmp_path / "a")
+    assert webui.fleet_report_kinds(empty) == ["logs", "probes"]
+    logs_only = _report_folder(tmp_path / "b", logs=True)  # its config.yaml says the run had training maps
+    assert webui.fleet_report_kinds(logs_only) == ["logs", "probes", "maps"]
+    assert webui.fleet_report_missing(logs_only) == ["probes", "maps"]
+    both = _report_folder(tmp_path / "c", logs=True, probes=True)
+    assert webui.fleet_report_kinds(both) == ["logs", "maps"]
+    plain = _report_folder(tmp_path / "d", probes=True)
+    (plain / "config.yaml").write_text("training_maps: false\n", encoding="utf-8")
+    (plain / "status.json").write_text("{}", encoding="utf-8")
+    assert webui.fleet_report_kinds(plain) == ["logs"]  # logs always; nothing else is lacking
+    assert webui.fleet_report_missing(plain) == []
+    full = _report_folder(tmp_path / "e", logs=True, probes=True, maps=True)
+    assert webui.fleet_report_missing(full) == []
+
+
+class _ReportPage:
+    """The page side of fleet_make_report: what it was told, downloaded and sent."""
+
+    def __init__(self, pull_result, files=("report.png", "report.pdf"), fail=None, fill=None):
+        self.pulls, self.notes, self.sent, self.made = [], [], [], []
+        self.pull_result, self.files, self.fail, self.fill = pull_result, files, fail, fill
+
+    async def pull(self, key, kinds):
+        self.pulls.append((key, list(kinds)))
+        if self.fill:
+            self.fill()
+        return self.pull_result
+
+    async def make(self, folder):
+        self.made.append(folder)
+        if self.fail:
+            raise self.fail
+        return {p.split(".")[-1]: folder / "report" / p for p in self.files}
+
+    def run(self, rec, root):
+        import asyncio
+
+        return asyncio.run(webui.fleet_make_report(rec, root, self.pull, self.make,
+                                                   lambda text, kind: self.notes.append((kind, text)),
+                                                   self.sent.append))
+
+
+def test_a_report_downloads_then_makes_the_files_and_sends_them(tmp_path):
+    root = tmp_path / "pulls"
+    folder = root / "7" / "job"
+    page = _ReportPage({"fetched": 3, "mb": 1.0}, fill=lambda: _report_folder(root, logs=True, probes=True))
+    rec = {"key": "7/job", "instance": 7, "job": "job"}
+    where = page.run(rec, root)
+    assert page.pulls == [("7/job", ["logs", "probes"])]  # the folder did not exist yet
+    assert page.made == [folder.resolve()] and where == folder.resolve() / "report"
+    assert [p.name for p in page.sent] == ["report.png", "report.pdf"]
+    kind, text = page.notes[-1]
+    assert kind == "warning" and "missing: maps" in text  # its config.yaml says training maps, none came
+    done = _ReportPage({"fetched": 0, "mb": 0})
+    _report_folder(tmp_path / "x", logs=True, probes=True, maps=True)
+    done.run({"key": "7/job", "instance": 7, "job": "job", "folder": str(tmp_path / "x" / "7" / "job")},
+             tmp_path / "x")
+    assert done.notes[-1][0] == "positive" and done.pulls[0][1] == ["logs"]
+
+
+def test_a_report_of_a_gone_instance_is_made_from_what_is_there(tmp_path):
+    root = tmp_path / "pulls"
+    _report_folder(root, logs=True)
+    page = _ReportPage({"error": "Instance 7 is gone: its files can no longer be downloaded."})
+    rec = {"key": "7/job", "instance": 7, "job": "job", "config": {"training_maps": True}}
+    assert page.run(rec, root) is not None
+    assert len(page.made) == 1 and len(page.sent) == 2
+    kind, text = page.notes[-1]
+    assert kind == "warning" and "missing: probes, maps" in text and "is gone" in text
+
+
+def test_a_report_without_any_folder_says_so_and_makes_nothing(tmp_path):
+    page = _ReportPage({"error": "Instance 7 is gone: its files can no longer be downloaded."})
+    assert page.run({"key": "7/job", "instance": 7, "job": "job"}, tmp_path / "pulls") is None
+    assert page.made == [] and page.sent == []
+    kind, text = page.notes[-1]
+    assert kind == "warning" and "no downloaded folder" in text and "is gone" in text
+
+
+def test_a_report_that_cannot_be_made_is_a_notice_not_a_crash(tmp_path):
+    root = tmp_path / "pulls"
+    _report_folder(root, logs=True, probes=True, maps=True)
+    page = _ReportPage({"fetched": 0, "mb": 0}, fail=RuntimeError("matplotlib missing"))
+    assert page.run({"key": "7/job", "instance": 7, "job": "job"}, root) is None
+    assert page.sent == [] and page.notes[-1][0] == "negative" and "matplotlib missing" in page.notes[-1][1]

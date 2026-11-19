@@ -9334,6 +9334,102 @@ def fleet_folder(rec: dict | None, root) -> Path | None:
         return None
 
 
+_REPORT_IMAGES = {".png", ".jpg", ".jpeg", ".webp"}
+
+
+def _fleet_report_maps_expected(folder, rec: dict | None) -> bool:
+    """Whether the run was set to make training maps: its record's config, else the downloaded config.yaml or
+    status.json says so."""
+    cfg = (rec or {}).get("config")
+    if isinstance(cfg, dict) and cfg.get("training_maps"):
+        return True
+    if folder:
+        try:
+            import yaml
+
+            data = yaml.safe_load((Path(folder) / "config.yaml").read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("training_maps"):
+                return True
+        except Exception:  # noqa: BLE001  (no config.yaml, no PyYAML, or an unreadable file: it says nothing)
+            pass
+        try:
+            data = json.loads((Path(folder) / "status.json").read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("training_maps"):
+                return True
+        except (OSError, ValueError):
+            pass
+    return False
+
+
+def fleet_report_missing(folder, rec: dict | None = None) -> list[str]:
+    """What a run's report needs that its downloaded folder does not hold yet, as download kinds: "logs" (settings,
+    status, likeness, sweeps, train.log) when config.yaml or status.json is absent, "probes" when probes/ has no
+    image, "maps" when the run had training maps and training_maps/ has no maps.jsonl. Everything for no folder."""
+    path = Path(folder) if folder else None
+    if path is None or not path.is_dir():
+        return ["logs", "probes"] + (["maps"] if _fleet_report_maps_expected(None, rec) else [])
+    out = []
+    if not (path / "config.yaml").is_file() or not (path / "status.json").is_file():
+        out.append("logs")
+    try:
+        has_probes = any(p.suffix.lower() in _REPORT_IMAGES for p in (path / "probes").iterdir())
+    except OSError:
+        has_probes = False
+    if not has_probes:
+        out.append("probes")
+    if _fleet_report_maps_expected(path, rec) and not (path / "training_maps" / "maps.jsonl").is_file():
+        out.append("maps")
+    return out
+
+
+def fleet_report_kinds(folder, rec: dict | None = None) -> list[str]:
+    """The kinds to download before a report: "logs" always (a run still going has newer logs; only changed files
+    are fetched), plus whatever else fleet_report_missing says is absent."""
+    return ["logs"] + [k for k in fleet_report_missing(folder, rec) if k != "logs"]
+
+
+async def fleet_make_report(rec: dict, root, pull, make, notify, send, reload=None) -> Path | None:
+    """One run's report from the Fleet tab: download what its folder lacks, then make the report from the folder.
+    `pull(key, kinds)` (awaited) returns {"fetched", "mb"} or {"error": text}; `make(folder)` (awaited) returns
+    {kind: Path}; `notify(text, kind)` and `send(path)` talk to the page. A gone instance or a failed download does
+    not stop the report: it is made from what is there and the notice says what was missing. Returns the report
+    folder, or None when nothing was made."""
+    name = f"{rec.get('job')} (instance {rec.get('instance')})"
+
+    def folder_of(r):
+        default = Path(root) / str(r.get("instance")) / str(r.get("job"))
+        return fleet_folder(r, root) or (fleet_folder({"folder": str(default)}, root) if default.is_dir() else None)
+
+    folder = folder_of(rec)
+    kinds = fleet_report_kinds(folder, rec)
+    notify(f"{name}: downloading {', '.join(kinds)} for the report...", "info")
+    result = await pull(rec.get("key"), kinds)
+    why = (result or {}).get("error") if isinstance(result, dict) else "the download did not start"
+    if reload is not None:
+        rec = reload(rec.get("key")) or rec
+    folder = folder_of(rec)
+    if folder is None or not folder.is_dir():
+        notify(f"{name}: no downloaded folder and nothing could be downloaded ({why or 'no files came'}), so there "
+               f"is nothing to make a report from.", "warning")
+        return None
+    missing = fleet_report_missing(folder, rec)
+    notify(f"{name}: making the report...", "info")
+    try:
+        done = await make(folder)
+    except Exception as e:  # noqa: BLE001  (a ReportError or anything else: the notice says why)
+        notify(f"{name}: no report ({e})" + (f". {why}" if why else ""), "negative")
+        return None
+    for path in done.values():
+        send(path)
+    where = next(iter(done.values())).parent
+    if missing:
+        note = f"Made from what is there; missing: {', '.join(missing)}" + (f" ({why})" if why else "")
+        notify(f"{name}: report written to {where}. {note}", "warning")
+    else:
+        notify(f"{name}: report written to {where}", "positive")
+    return where
+
+
 _STATUS_PROBES: dict = {}  # status.json path -> ((mtime, size), its probe records)
 
 
@@ -9728,6 +9824,10 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
                 w["download"] = ui.button("Download files", icon="cloud_download", color=None) \
                     .props("outline dense no-caps").tooltip("Choose which files of this instance's run to download "
                                                             "to this computer now")
+                w["report"] = ui.button("Run report", icon="summarize", color=None) \
+                    .props("outline dense no-caps").tooltip("A summary picture and a PDF of this instance's run (the "
+                                                            "run so far while it trains). Downloads what its folder "
+                                                            "lacks first.")
                 w["accept"] = ui.switch("Takes queued runs", value=inst.get("accept", True),
                                         on_change=lambda e, i=iid: act(fl.set_instance, i, accept=bool(e.value))
                                         if e.value != state["accept"].get(i, True) else None)
@@ -9875,6 +9975,7 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
         mine = fleet_card_run(state.get("runs") or [], iid)
         w["download_key"] = mine["key"] if mine else None
         w["download"].visible = mine is not None
+        w["report"].visible = mine is not None
         w["version"].text = fleet_version_line(inst)
         w["version"].visible = bool(w["version"].text)
         usable = inst["state"] != "gone"
@@ -9904,6 +10005,8 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
                     w = state["cards"][inst["id"]] = make_card(inst)
                     w["stop"].on_click(lambda _, w=w: stop_run(*w["stop_target"]))
                     w["download"].on_click(lambda _, w=w: ask_download(w.get("download_key")))
+                    w["report"].on_click(lambda _, w=w: report_runs([w["download_key"]] if w.get("download_key")
+                                                                    else []))
                     w["open"].on("click", lambda _, i=inst["id"]: open_webui(i), js_handler=fleet_open_tab_js(inst["id"]))
                     w["update_item"].on_click(lambda _, i=inst["id"]: update_trainer(i))
                     w["reboot_item"].on_click(lambda _, w=w: reboot_instance(*w["reboot_target"]))
@@ -10201,6 +10304,11 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
             cmp_hint = hint("")
             cmp_btn = ui.button("Compare", icon="compare", color=None).props("outline dense no-caps")
             cmp_btn.disable()
+            report_btn = ui.button("Run report", icon="summarize", color=None).props("outline dense no-caps") \
+                .tooltip("A summary picture and a PDF of each ticked run, one after another. Downloads what the "
+                         "run's folder lacks first (logs, probe images, training maps) while its instance is "
+                         "there, then writes them into the run's folder under report/ and downloads them here.")
+            report_btn.disable()
         run_table = ui.table(columns=FLEET_RUN_COLUMNS, rows=[], row_key="key", selection="multiple",
                              pagination={"rowsPerPage": 12, "sortBy": "ended", "descending": True},
                              on_select=lambda _: pick_changed()).props("flat dense").classes("w-full")
@@ -10216,7 +10324,8 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
         hint("Kept on this computer, so a run stays here after its instance is destroyed. Runs that were already "
              "on an instance when it joined are listed too, and their files are downloaded by the download rules. "
              "Tick a run for its numbers, charts and files, or two or more and click Compare to chart them "
-             "together; the cloud icon on a row downloads that run's files now.")
+             "together; the cloud icon on a row downloads that run's files now. Run report makes a summary picture "
+             "and a PDF of each ticked run (downloading first what its folder lacks).")
         run_multi = hint("")
         with ui.column().classes("w-full gap-3") as run_detail:
             run_title = ui.label("").classes("text-base font-medium")
@@ -10244,6 +10353,9 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
                     run_open = ui.button("Open folder", icon="folder_open", color=None) \
                         .props("outline dense no-caps")
                     run_open_tip = ui.tooltip("")
+                run_report = ui.button("Run report", icon="summarize", color=None).props("outline dense no-caps") \
+                    .tooltip("A summary picture and a PDF of this run. Downloads what its folder lacks first, then "
+                             "writes them under report/ in the run's folder and downloads them here.")
                 ui.space()
                 run_forget = ui.button("Forget this run", icon="delete_outline", color=None) \
                     .props("flat dense no-caps").tooltip("Drop it from this list. Downloaded files stay.")
@@ -10346,6 +10458,7 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
     def pick_changed() -> None:
         n = len(picked_keys())
         cmp_btn.set_enabled(n >= 2)
+        report_btn.set_enabled(n >= 1)
         cmp_hint.text = "Tick a second run to compare" if n == 1 else ""
         if n < 2:
             cmp["open"] = False
@@ -10595,6 +10708,47 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
             run_table.selected = []
             pick_changed()
 
+    async def report_pull(key, kinds):
+        """pull_now for a report: a refusal (instance gone, a download already going) comes back as text."""
+        try:
+            return await run.io_bound(fl.pull_now, key, list(kinds))
+        except (rulz_fleet.Refused, rulz_fleet.remote.Unreachable, SystemExit, OSError) as e:
+            return {"error": str(e) or "The download did not work."}
+        finally:
+            refresh(force=True)
+
+    async def report_make(folder):
+        from rulztrainer import runreport
+
+        return await run.io_bound(runreport.generate, folder)
+
+    async def report_runs(keys: list[str]):
+        """The run report of each given run, one after another; a run already being reported is skipped."""
+        if not keys:
+            ui.notify("Tick a run first.", type="warning")
+            return
+        busy = state.setdefault("report_busy", set())
+        for key in keys:
+            rec = fl.load_run(key)
+            if rec is None:
+                ui.notify("That run is not on record any more.", type="warning")
+                continue
+            if key in busy:
+                ui.notify(f"{rec.get('job')}: its report is already being made.", type="info")
+                continue
+            busy.add(key)
+            try:
+                await fleet_make_report(rec, fl.pulls, report_pull, report_make,
+                                        lambda text, kind: ui.notify(text, type=kind, multi_line=True),
+                                        ui.download, fl.load_run)
+            finally:
+                busy.discard(key)
+        picked = picked_run()
+        if picked is not None and picked["key"] in keys:
+            show_run()
+
+    report_btn.on_click(lambda: report_runs(picked_keys()))
+    run_report.on_click(lambda: report_runs([r["key"]] if (r := picked_run()) else []))
     run_pull.on_click(pull_run)
     run_forget.on_click(forget_run)
 
@@ -14752,6 +14906,13 @@ the cloud icon on a row of Past runs, pick the kinds, and click **Download**; on
 are fetched. The **Downloads** strip under the header shows each download as it goes (files, megabytes, speed, time
 left) and for a few seconds after it ends. **Open downloads folder** shows the folder the files go to, and **Open
 folder** in a run's details shows that run's own folder; both open on the computer that runs this WebUI.
+
+**Run report**: click **Run report** on an instance's card (its running run, else its newest), in one run's details,
+or under Past runs for every ticked run (the details button reports only the run shown). For each run the
+page first downloads what its folder lacks (logs and settings always, probe images when there are none, training
+maps when the run had them), then writes a summary picture and a PDF into the run's folder under `report/` and
+downloads them to this browser. A run whose instance is gone gets a report from the files already on this computer,
+and the notice says what was missing. Several ticked runs are done one after another.
 
 **Region watch**: for a run whose logs are downloaded, the run's details (under Past runs) and a running instance's
 card (a collapsible Region watch) show the same region watch, sweep and block audit lines and charts as the Monitor.

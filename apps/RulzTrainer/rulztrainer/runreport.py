@@ -30,11 +30,14 @@ from pathlib import Path
 
 from .caption_text import read_caption_text
 from .history import probe_racer as _probe_racer
+from . import regionsweep, regionwatch
 
 INK, MUTED, FAINT, GRID, SURFACE, CARD = "#1a1a19", "#6b6a63", "#9b9a92", "#e4e3dd", "#f4f3ef", "#ffffff"
 BAND, BAND_INK, BAND_MUTED = "#1f2937", "#ffffff", "#b6c0cf"
 BLUE, ORANGE, AQUA, YELLOW, GOLD, RED = "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#c98500", "#c9413f"
 IMAGE_TYPES = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+SWEEP_COLORS = {"face": "#FF3B30", "hair": "#b87400", "skin": "#d64570", "clothes": "#357ac2",
+                "background": "#16865d", "subject": INK}
 PROBE_RE = re.compile(r"^(?:(?P<racer>.+)_)?step(?P<step>\d{6})_(?P<kind>face|body|check-[^_]+)_(?P<seed>\d+)\.(?:png|jpg|jpeg|webp)$")
 # the settings the summary lists, in this order: (label, config key or a function of the config)
 SUMMARY_KEYS = (
@@ -68,6 +71,7 @@ class Run:
     probes: list = field(default_factory=list)  # likeness.jsonl's records, oldest first
     images: dict = field(default_factory=dict)  # (racer, step, kind) -> {seed: Path}
     sweeps: list = field(default_factory=list)
+    watch: dict = field(default_factory=dict)
     audits: list = field(default_factory=list)  # block_audit.jsonl's rows, oldest first (blockaudit.py)
     maps: dict = field(default_factory=dict)  # {"pictures": [...], "rows": [...], "dir": Path}
     dataset: list = field(default_factory=list)  # image paths
@@ -151,7 +155,8 @@ def load(job_dir, root=None) -> Run:
     run.status = _json(job_dir / "status.json", {})
     run.probes = _jsonl(job_dir / "likeness.jsonl") or list(run.status.get("probes") or [])
     run.images = probe_images(job_dir / "probes")
-    run.sweeps = [r for r in _jsonl(job_dir / "region_sweep.jsonl") if not r.get("first")]
+    run.sweeps = [r for r in _jsonl(job_dir / "region_sweep.jsonl") if isinstance(r, dict) and not r.get("first")]
+    run.watch = watch_data(job_dir)
     run.audits = [r for r in _jsonl(job_dir / "block_audit.jsonl") if isinstance(r, dict) and r.get("groups")]
     maps_dir = job_dir / "training_maps"
     pictures = (_json(maps_dir / "probes.json", {}) or {}).get("probes") or []
@@ -342,6 +347,72 @@ def racers(run: Run) -> list[str]:
     return sorted({r for (r, _s, _k) in run.images if r})
 
 
+def sweep_series(rows: list, region: str, key: str) -> list[tuple[int, float]]:
+    """Sweep points in percent; omit missing or invalid readings."""
+    points = []
+    for row in rows:
+        try:
+            value = (row.get(key) or {}).get(region)
+            step = int(row["step"])
+            if value is not None and math.isfinite(float(value)):
+                points.append((step, 100 * float(value)))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    return points
+
+
+def sweep_gaps(rows: list) -> dict:
+    result = {}
+    for region in SWEEP_COLORS:
+        points = []
+        for row in rows:
+            train = sweep_series([row], region, "train")
+            held = sweep_series([row], region, "held")
+            if train and held:
+                points.append((train[0][0], train[0][1] - held[0][1]))
+        if points:
+            result[region] = points
+    return result
+
+
+def growing_gap(rows: list) -> tuple | None:
+    """Largest growing gap of at least 15 points, the Monitor's example holdout threshold."""
+    candidates = [(points[-1][1] - points[0][1], region, points[-1][1])
+                  for region, points in sweep_gaps(rows).items() if len(points) >= 2]
+    if not candidates:
+        return None
+    rise, region, gap = max(candidates)
+    return (region, rise, gap) if rise >= 15 and gap >= 15 else None
+
+
+def watch_data(job_dir: Path) -> dict:
+    """Read the watch summary and per-picture contrasts from the saved states."""
+    state = regionwatch.read(job_dir)
+    if not isinstance(state, dict):
+        return {}
+    history = state.get("history") or []
+    last = history[-1] if history and isinstance(history[-1], dict) else {}
+    summary = {**last, "epoch": state.get("epoch"), "frozen": state.get("frozen"), "late": state.get("late")}
+    sweep = regionsweep.read(job_dir) or {}
+    latest = sweep.get("latest") or {}
+    rows = []
+    for key, rec in (state.get("pictures") or {}).items():
+        if not isinstance(rec, dict) or not rec.get("seen"):
+            continue
+        logs = rec.get("contrast_log") or {}
+        swept = (latest.get(key) or {}).get("contrast") or {}
+        row = {"image": Path(key).name}
+        for region in regionwatch.PROTECTED:
+            try:
+                row[region] = math.exp(float(logs[region])) if region in logs else None
+            except (ValueError, TypeError, OverflowError):
+                row[region] = None
+            row["sweep_" + region] = swept.get(region)
+        rows.append(row)
+    rows.sort(key=lambda r: (r["background"] is None, r["background"] or 0))
+    return {"summary": summary, "rows": rows}
+
+
 def verdict(run: Run) -> list[tuple[str, str]]:
     """Short plain findings for the summary: (kind, text), kind good / note / warn."""
     out = []
@@ -367,10 +438,15 @@ def verdict(run: Run) -> list[tuple[str, str]]:
     if dup:
         out.append(("note", f"{dup} near-duplicate pair(s) of training photos."))
     if run.sweeps:
-        peak = max(run.sweeps, key=lambda s: (s.get("held") or {}).get("subject") or -1)
-        if (peak.get("held") or {}).get("subject") is not None:
-            out.append(("note", f"Held-out photos peaked at step {peak['step']} "
-                                f"({100 * peak['held']['subject']:.1f}% of the subject learned)."))
+        points = sweep_series(run.sweeps, "subject", "held")
+        if points:
+            step, value = max(points, key=lambda p: p[1])
+            out.append(("note", f"Held-out photos peaked at step {step} ({value:.1f}% of the subject learned)."))
+        gap = growing_gap(run.sweeps)
+        if gap:
+            region, rise, value = gap
+            out.append(("warn", f"{region.capitalize()} may be memorised: the training / held-out gap grew "
+                                f"{rise:.1f} points to {value:.1f} points."))
     if race_winner(run):
         out.append(("good", f"Race won by {race_winner(run)}."))
     if run.status.get("error"):
@@ -561,16 +637,27 @@ def loss_chart(ax, run: Run):
 
 
 def sweep_chart(ax, run: Run):
-    steps = [s["step"] for s in run.sweeps]
-    for label, key, color, marker in (("Training photos", "train", BLUE, "o"), ("Held-out photos", "held", ORANGE, "s")):
-        ys = [(s.get(key) or {}).get("subject") for s in run.sweeps]
-        pts = [(a, 100 * b) for a, b in zip(steps, ys) if b is not None]
+    gaps = sweep_gaps(run.sweeps)
+    for region, color in SWEEP_COLORS.items():
+        pts = gaps.get(region) or ([] if gaps else sweep_series(run.sweeps, region, "train"))
         if pts:
-            ax.plot(*zip(*pts), color=color, lw=1.6, marker=marker, ms=3.5, label=label)
-    ax.set_ylim(bottom=0)
+            ax.plot(*zip(*pts), color=color, lw=2.2 if region == "subject" else 1.2, marker="o", ms=3, label=region)
+    if gaps:
+        ax.axhline(0, color=FAINT, lw=0.7)
     ax.set_xlabel("training step", fontsize=7.5)
-    ax.set_ylabel("% of the subject's error removed", fontsize=7.5)
-    ax.legend(frameon=False, fontsize=7.5, loc="upper left")
+    ax.set_ylabel("train - held (points)" if gaps else "training error removed (%)", fontsize=7.5)
+    if ax.lines:
+        ax.legend(frameon=False, fontsize=7, loc="best", ncol=3)
+
+
+def sweep_region_chart(ax, run: Run, region: str):
+    for key, label, color, style in (("train", "training", SWEEP_COLORS[region], "-"),
+                                      ("held", "held-out", FAINT, "--")):
+        points = sweep_series(run.sweeps, region, key)
+        if points:
+            ax.plot(*zip(*points), color=color, ls=style, lw=1.4, marker="o", ms=2.5, label=label)
+    ax.set_title(region, fontsize=8, color=INK)
+    ax.tick_params(labelsize=6)
 
 
 def audit_credits(rows: list, kind: str):
@@ -804,7 +891,7 @@ def summary(run: Run, path: Path, dpi: int = 150) -> Path:
                     page.text(sx + (j + 1) * (cw + 0.06) + cw / 2, drawn[1] + drawn[3] + 0.06, label, size=6.8,
                               color=MUTED, ha="center")
     elif run.sweeps:
-        x, y, w, h = page.card(8.1, y0, 7.3, 3.5, "What was learned: training photos against held-out photos")
+        x, y, w, h = page.card(8.1, y0, 7.3, 3.5, "What was learned: training minus held-out, per region (points)" if sweep_gaps(run.sweeps) else "What was learned: training photos, per region")
         sweep_chart(page.axes(x + 0.45, y, w - 0.5, h - 0.4), run)
     else:
         x, y, w, h = page.card(8.1, y0, 7.3, 3.5, "Loss")
@@ -812,7 +899,7 @@ def summary(run: Run, path: Path, dpi: int = 150) -> Path:
     # loss (or sweeps) | result
     y1 = y0 + 3.8
     if run.maps and run.sweeps:
-        x, y, w, h = page.card(0.6, y1, 7.3, 2.6, "What was learned: training photos against held-out photos")
+        x, y, w, h = page.card(0.6, y1, 7.3, 2.6, "What was learned: training minus held-out, per region (points)" if sweep_gaps(run.sweeps) else "What was learned: training photos, per region")
         sweep_chart(page.axes(x + 0.45, y, w - 0.5, h - 0.38), run)
     else:
         x, y, w, h = page.card(0.6, y1, 7.3, 2.6, "Loss")
@@ -958,22 +1045,59 @@ def pdf(run: Run, path: Path) -> Path:
 
         # 4: sweeps
         if run.sweeps:
-            page = new("What was learned")
-            x, y, w, h = page.card(0.5, 0.9, W - 1.0, 3.6, "The subject's error removed: training photos against held-out photos")
-            sweep_chart(page.axes(x + 0.5, y, w - 0.55, h - 0.4), run)
-            parts = ("face", "hair", "skin", "clothes", "background", "subject")
-            x, y, w, h = page.card(0.5, 4.7, W - 1.0, 0.9 + 0.21 * len(run.sweeps), "Region sweeps: % of the starting error removed (training / held-out)")
-            page.text(x, y, "step", size=7.5, color=MUTED, weight="bold")
-            for j, part in enumerate(parts):
-                page.text(x + 0.7 + j * 1.08, y, part, size=7.5, color=MUTED, weight="bold")
-            for i, s in enumerate(run.sweeps[:28]):
-                yy = y + 0.25 + i * 0.21
-                page.text(x, yy, str(s.get("step")), size=7.8)
-                for j, part in enumerate(parts):
-                    a, b2 = (s.get("train") or {}).get(part), (s.get("held") or {}).get(part)
-                    page.text(x + 0.7 + j * 1.08, yy, f"{'' if a is None else f'{100 * a:.0f}'}"
-                              + ("" if b2 is None else f" / {100 * b2:.0f}"), size=7.8)
+            page = new("Region sweeps")
+            try:
+                line = regionsweep.describe(run.sweeps[-1])
+            except (KeyError, TypeError, ValueError, AttributeError):
+                line = ""
+            notes = [t for _, t in verdict(run) if t.startswith(("Held-out photos peaked", "Face may be memorised", "Hair may be memorised", "Skin may be memorised", "Clothes may be memorised", "Background may be memorised", "Subject may be memorised"))]
+            text = f"Sweep at step {run.sweeps[-1].get('step')}: {line}" if line else ""
+            page.text(0.55, 0.85, "\n".join(_wrap("  ".join([text] + notes).strip(), 120)[:4]), size=7.5, color=MUTED)
+            x, y, w, h = page.card(0.5, 1.75, W - 1.0, 3.1, "Training minus held-out gap (points)" if sweep_gaps(run.sweeps) else "Training error removed (%)")
+            sweep_chart(page.axes(x + 0.55, y + 0.05, w - 0.7, h - 0.48), run)
+            page.text(0.55, 5.05, "ERROR REMOVED (%): TRAINING SOLID, HELD-OUT DASHED", size=7.5, color=MUTED, weight="bold")
+            for i, part in enumerate(SWEEP_COLORS):
+                ax = page.axes(0.95 + (i % 2) * 3.65, 5.55 + (i // 2) * 1.78, 2.95, 1.18)
+                sweep_region_chart(ax, run, part)
             done(out, page)
+
+            parts = tuple(SWEEP_COLORS)
+            for start in range(0, len(run.sweeps), 38):
+                chunk = run.sweeps[start:start + 38]
+                page = new("Region sweep table")
+                x, y, w, h = page.card(0.5, 0.9, W - 1.0, 0.9 + 0.21 * len(chunk), "Error removed (%): training / held-out")
+                page.text(x, y, "step", size=7.5, color=MUTED, weight="bold")
+                for j, part in enumerate(parts):
+                    page.text(x + 0.7 + j * 1.08, y, part, size=7.5, color=MUTED, weight="bold")
+                for i, row in enumerate(chunk):
+                    yy = y + 0.25 + i * 0.21
+                    page.text(x, yy, str(row.get("step")), size=7.8)
+                    for j, part in enumerate(parts):
+                        a, b2 = sweep_series([row], part, "train"), sweep_series([row], part, "held")
+                        value = (f"{a[0][1]:.0f}" if a else "-") + (f" / {b2[0][1]:.0f}" if b2 else "")
+                        page.text(x + 0.7 + j * 1.08, yy, value, size=7.8)
+                done(out, page)
+
+        if run.watch:
+            summary_w, rows_w = run.watch["summary"], run.watch["rows"]
+            try:
+                line = regionwatch.describe(summary_w)
+            except (KeyError, TypeError, ValueError, AttributeError):
+                line = ""
+            for start in range(0, max(1, len(rows_w)), 35):
+                chunk = rows_w[start:start + 35]
+                page = new("Region watch contrast")
+                page.text(0.55, 0.85, "\n".join(_wrap(f"Epoch {summary_w.get('epoch')} (step {summary_w.get('step')}): {line}", 110)[:3]), size=8, color=MUTED)
+                x, y, w, h = page.card(0.5, 1.6, W - 1.0, 1.0 + 0.22 * len(chunk), "Per-image contrast (1 = starting contrast)")
+                cols = (("image", 0), ("background", 2.7), ("clothes", 3.75), ("sweep bg", 4.75), ("sweep clothes", 5.75))
+                for label, dx in cols:
+                    page.text(x + dx, y, label, size=7, color=MUTED, weight="bold")
+                for i, row in enumerate(chunk):
+                    yy = y + 0.27 + i * 0.22
+                    page.text(x, yy, _short(row["image"], 30), size=7)
+                    for (label, dx), key in zip(cols[1:], ("background", "clothes", "sweep_background", "sweep_clothes")):
+                        page.text(x + dx, yy, _num(row.get(key), 3), size=7)
+                done(out, page)
 
         # 4b: the block audit
         if run.audits:
