@@ -1672,6 +1672,8 @@ class Trainer(RaceParallelMixin):
         if cfg.sample_prompts and cfg.sample_before_training and step == 0:
             self.sample_images(model, step)
         at_start = self.controller is not None and step == 0 and self._probe_at_start()
+        if at_start and self.remote is not None:  # the first probe interval (a delegated probe's deadline) starts here
+            self.remote.note_probe_step()
         if at_start and self.probe_worker is not None:
             self._probe_async_start(step, injected)  # the baseline renders on the probe GPU while training starts
         elif at_start:
@@ -2205,7 +2207,8 @@ class Trainer(RaceParallelMixin):
         if self.probe_worker is not None:  # a probe still rendering when training stopped: its score still counts
             probe_safely(lambda: self._probe_async_take(step, optimizer, scheduler, wait=True))
         if self.remote is not None:  # a probe still out counts; the sample rounds are in before the final samples
-            probe_safely(lambda: self._remote_probe_take(model, step, step, optimizer, scheduler, wait=True))
+            probe_safely(lambda: self._remote_probe_take(model, step, step, optimizer, scheduler, wait=True,
+                                                         capped=True))
             self._remote_finish(model)
         if self.compiled:
             compiling.report("end of training")
@@ -5655,7 +5658,7 @@ class Trainer(RaceParallelMixin):
         if self.remote_probe is not None:
             stop = bool(self._side_job(f"The remote probe of step {self.remote_probe.step}",
                                        lambda: self._remote_probe_take(model, step, step, optimizer, scheduler,
-                                                                       wait=wait), False))
+                                                                       wait=wait, capped=wait), False))
         for r in list(self.remote_samples):
             self._side_job(f"The remote samples of step {r.step}", lambda r=r: self._remote_sample_take(model, r, False))
         return stop
@@ -5665,10 +5668,14 @@ class Trainer(RaceParallelMixin):
         """A probe is due and a remote renderer is on: act on the probe still out (it was acted on in step order), then
         render this one on the helper while training goes on, or here (the final probe, a self-training round's, and
         whenever no helper is ready). The first probe a helper gets is a shadow round: rendered on both, the
-        instance's scores drive the decisions, the helper's are compared (_remote_shadow_settle). True to stop."""
+        instance's scores drive the decisions, the helper's are compared (_remote_shadow_settle). True to stop.
+        The probe still out is not waited for: if it is in it is acted on, else it is taken back at once and rendered
+        here from the same weights (a miss; two in a row end delegation). It had until about this moment."""
         rr = self.remote
         rr.poll()
-        stop = safely(lambda: self._remote_probe_take(model, step, step, optimizer, scheduler, wait=True))
+        rr.note_probe_step()  # (the wall time between probe steps is what a delegated probe's deadline is made from)
+        stop = safely(lambda: self._remote_probe_take(model, step, step, optimizer, scheduler, wait=False,
+                                                      give_up="it did not come in before the next probe"))
         safely(lambda: self._remote_shadow_settle(step, force=True))
         if stop and not last:
             return True
@@ -5696,7 +5703,8 @@ class Trainer(RaceParallelMixin):
     def _remote_probe_submit(self, step: int, injected, shadow: bool) -> None:
         """Hand the helper this probe: the LoRA as probes score it (the weight average with lora_ema, taken the way
         _probe_async_start takes it), with the probe's jobs. A shadow round's pictures go to remote_render/shadow so
-        they do not land on the instance's own."""
+        they do not land on the instance's own. Its deadline is until the next probe is due (RemoteRenderer.
+        probe_deadline: at least the old rule, else 1.5 x the wall time between the last two probe steps)."""
         rr = self.remote
         with self._averaged():
             state = lora_mod.lora_state(injected)
@@ -5705,7 +5713,9 @@ class Trainer(RaceParallelMixin):
             folder = rr.root / "shadow"
             folder.mkdir(exist_ok=True)
             jobs = [dataclasses.replace(j, out_path=folder / j.out_path.name) for j in jobs]
-        r = rr.submit("probe", step, jobs, state, "probe", shadow=shadow)
+        seconds, why = rr.probe_deadline(len(jobs))
+        r = rr.submit("probe", step, jobs, state, "probe", shadow=shadow, deadline_s=seconds)
+        log.info("Remote render: the probe round of step %d gets %.0fs (%s)", step, seconds, why)
         if shadow:
             self.remote_shadow = {"round": r, "face": None, "body": None, "set": False}
             log.info("Remote render: the probe of step %d renders on the helper %s and here (a shadow round: the "
@@ -5716,17 +5726,23 @@ class Trainer(RaceParallelMixin):
                      "up to probe_every steps later, and rendered here if the helper is late)", step, rr.label)
             self.status.update(stage=f"training; probe of step {step} rendering on {rr.label}")
 
-    def _remote_probe_take(self, model, step: int, now: int, optimizer, scheduler, wait: bool) -> bool:
+    def _remote_probe_take(self, model, step: int, now: int, optimizer, scheduler, wait: bool, give_up: str = "",
+                           capped: bool = False) -> bool:
         """Act on the probe round the helper has, if any: score its pictures and act (best saves write the weights that
         were scored). Late, failed or unreadable (or the helper gone): render it here from the same weights. wait:
-        until it is in or lost (bounded by the round's deadline and the helper's heartbeat). True to stop."""
+        until it is in or lost (bounded by the round's deadline and the helper's heartbeat). give_up: a round still open
+        is taken back at once instead (the reason given), and rendered here. capped (end of training): the wait lasts at
+        most the old rule's seconds from now, whatever deadline the round was given. True to stop."""
         rr = self.remote
         r = self.remote_probe
         if r is None:
             return False
         if wait and rr.check(r) == "open":
             self.status.update(stage=f"waiting for the probe of step {r.step} on {rr.label}")
-        got, why = rr.collect(r, wait)
+        cap = None  # capped: no longer than the old rule gave, counted from when the round was handed over
+        if capped:
+            cap = max(0.0, r.submitted + rr.deadline_for("probe", len(r.jobs)) - rr.clock())
+        got, why = rr.collect(r, wait, give_up, cap)
         if why == "open":
             return False
         self.remote_probe = None
@@ -5751,8 +5767,11 @@ class Trainer(RaceParallelMixin):
 
         sh, self.remote_shadow = self.remote_shadow, None
         if sh is not None:
+            name = sh["round"].name
             self.remote.reclaim(sh["round"])
-            shutil.rmtree(self.remote.root / "abandoned" / sh["round"].name, ignore_errors=True)
+            self.remote.rounds.pop(name, None)  # (its LoRA state goes with it)
+            for state in ("abandoned", "done", "failed"):  # done/failed: the helper finished just as it was dropped
+                shutil.rmtree(self.remote.root / state / name, ignore_errors=True)
             log.info("Remote render: the shadow probe of step %d is dropped (%s); the next probe is a shadow round "
                      "again", sh["round"].step, why)
 
