@@ -69,6 +69,27 @@ def test_past_runs_become_table_rows():
     assert {c["field"] for c in webui.FLEET_RUN_COLUMNS} <= set(rows[0])
 
 
+def test_the_download_dialog_ticks_the_kinds_a_run_has_rules_for():
+    import rulz_fleet
+
+    order = list(rulz_fleet.DOWNLOAD_KINDS)
+    rules = {"logs": "during", "probes": "during", "samples": "end", "maps": "off", "best": "end", "loras": "off"}
+    assert webui.fleet_download_defaults(order, rules) == ["logs", "probes", "samples", "best"]
+    assert webui.fleet_download_defaults(order, rules, {"loras": "end", "logs": "off"}) == \
+        ["probes", "samples", "best", "loras"]
+    assert webui.fleet_download_defaults(order, {k: "off" for k in order}) == ["logs", "best"]
+    assert webui.fleet_download_defaults(order, {k: "off" for k in order}, {"maps": "end"}) == ["maps"]
+
+
+def test_a_card_downloads_its_running_run_or_else_its_newest():
+    runs = [{"key": "7-new", "instance": 7, "state": "done"}, {"key": "7-live", "instance": 7, "state": "running"},
+            {"key": "8-old", "instance": 8, "state": "error"}]
+    assert webui.fleet_card_run(runs, 7)["key"] == "7-live"
+    assert webui.fleet_card_run(runs[:1] + runs[2:], 7)["key"] == "7-new"
+    assert webui.fleet_card_run(runs, "8")["key"] == "8-old"
+    assert webui.fleet_card_run(runs, 9) is None
+
+
 def test_the_small_chart_has_the_loss_and_the_likeness_on_its_own_axis():
     options = webui.fleet_spark({"losses": [[10, 0.5], [20, 0.4]],
                                  "probes": [{"step": 10, "combined_ema": 30.0}, {"step": 20, "combined": 35.0},
@@ -116,3 +137,169 @@ def test_the_update_dialog_says_versions_changes_and_whether_it_can_go():
     assert not can and "It already runs the newest RulZ AI Trainer." in [t for _, t in lines]
     lines, can = webui.fleet_update_plan_text(dict(plan, checkout=False, behind=None, changed=[], changed_count=0))
     assert can and any("not a git checkout" in t for _, t in lines)
+
+
+def test_a_download_reads_as_one_line_with_a_bar_value_and_a_kind():
+    going = {"run": "k", "job": "a", "instance": 7, "kinds": ["logs", "probes"], "state": "going", "files_done": 3,
+             "files_total": 20, "bytes_done": 12_500_000, "bytes_total": 80_000_000, "speed": 2_500_000.0}
+    text, value, kind = webui.fleet_download_line(going)
+    assert kind == "going" and abs(value - 12.5 / 80) < 1e-9
+    assert text == ("a · instance 7 · Logs and settings, Probe images · 12.5 / 80.0 MB · 3 / 20 files · 2.5 MB/s "
+                    "· 27 s left".replace("27 s left", webui.eta_text(67.5e6 / 2.5e6) + " left"))
+    listing = dict(going, files_total=0, bytes_total=0, bytes_done=0, files_done=0, speed=0.0)
+    assert webui.fleet_download_line(listing) == ("a · instance 7 · Logs and settings, Probe images · listing the "
+                                                  "files", 0.0, "going")
+    done = {"run": "k", "job": "a", "instance": 7, "kinds": ["best"], "state": "done", "fetched": 2, "mb": 12.5}
+    assert webui.fleet_download_line(done) == ("a · instance 7 · Best LoRA · 2 files, 12.5 MB", 1.0, "done")
+    assert webui.fleet_download_line(dict(done, fetched=0))[0].endswith("nothing new to fetch")
+    failed = {"run": "k", "job": "a", "instance": 7, "kinds": ["maps"], "state": "failed", "error": "ssh timed out",
+              "bytes_done": 5, "bytes_total": 10}
+    assert webui.fleet_download_line(failed) == ("a · instance 7 · Training maps · ssh timed out", 0.5, "failed")
+    assert webui.fleet_download_line({"state": "going", "files_total": 4, "files_done": 9})[1] == 1.0  # clamped
+
+
+def test_open_folder_makes_the_folder_and_asks_the_system_to_show_it(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(webui.sys, "platform", "win32")
+    monkeypatch.setattr(webui.os, "startfile", lambda p: calls.append(("startfile", p)), raising=False)
+    target = tmp_path / "pulls" / "7"
+    assert webui.open_folder(target) == str(target) and target.is_dir()
+    assert calls == [("startfile", str(target))]
+    monkeypatch.setattr(webui.sys, "platform", "linux")
+    monkeypatch.setattr(webui.subprocess, "Popen", lambda cmd, **kw: calls.append(tuple(cmd)))
+    webui.open_folder(target)
+    monkeypatch.setattr(webui.sys, "platform", "darwin")
+    webui.open_folder(target)
+    assert calls[1:] == [("xdg-open", str(target)), ("open", str(target))]
+
+
+def test_region_data_reads_a_downloaded_job_folder(tmp_path):
+    import json
+
+    assert webui.region_data(tmp_path) == {"rw": None, "ba": None, "rs": None}
+    assert webui.region_signature(tmp_path) == ()
+    status = {"region_watch": {"epoch": 2, "step": 40, "frozen": False, "baseline": 3, "baseline_min": 8, "rows": []},
+              "block_audit": {"step": 40, "line": "audit line"}}
+    (tmp_path / "status.json").write_text(json.dumps(status), encoding="utf-8")
+    sweep = {"step": 20, "train": {"face": 0.5}, "held": {"face": 0.25}, "pictures": 4, "swept": 4, "seconds": 1.0}
+    (tmp_path / "region_sweep.jsonl").write_text(json.dumps({"step": 10, "first": True}) + "\n" + json.dumps(sweep) +
+                                                 "\n{torn", encoding="utf-8")
+    data = webui.region_data(tmp_path)
+    assert data["rw"]["epoch"] == 2 and data["ba"]["line"] == "audit line"
+    assert data["rs"]["step"] == 20 and data["rs"]["line"].startswith("training pictures learned face 50%")
+    assert [n for n, *_ in webui.region_signature(tmp_path)] == ["status.json", "region_sweep.jsonl"]
+    # a status without region work falls back to the saved region watch state
+    (tmp_path / "status.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "region_watch.json").write_text(json.dumps(
+        {"epoch": 3, "frozen": True, "history": [{"step": 60, "learned": {"face": 0.4}, "contrast": {}}]}),
+        encoding="utf-8")
+    data = webui.region_data(tmp_path)
+    assert data["rw"]["step"] == 60 and data["ba"] is None
+    assert "face 40%" in webui.region_watch_line(data["rw"])
+
+
+def test_downloaded_probe_images_become_comparison_entries(tmp_path):
+    probes = tmp_path / "probes"
+    probes.mkdir()
+    for name in ("step000200_face_0.png", "step000200_body_1.png", "lora16_step000400_face_0.png",
+                 "x_audit-g1-s000600_face_0.png", "notes.txt"):
+        (probes / name).write_bytes(b"x")
+    # the fleet's own record keeps the agent's probe columns only: no normalised face or body, no image names
+    trimmed = [{"step": 200, "face": 61.0, "body": 40.0, "combined": 52.0, "face_ema": 60.0, "body_ema": 39.0,
+                "combined_ema": 51.0, "face_norm_ema": 66.0, "body_norm_ema": 44.0, "best": 52.0, "best_step": 200}]
+    entries = webui.fleet_probe_entries(tmp_path, trimmed)
+    assert [(e["step"], e["kind"], e["seed"], e["racer"]) for e in entries] == [
+        (400, "face", 0, "lora16"), (200, "body", 1, ""), (200, "face", 0, "")]
+    assert entries[2]["combined"] == 52.0 and entries[2]["face"] is None and entries[2]["body"] is None  # not raw
+    # a status.json record (full=True) shows what the history shows: normalised where it has them, else raw
+    full = [dict(trimmed[0], face_norm=70.0, body_norm=45.0), {"step": 400, "face": 30.0, "body": 20.0}]
+    entries = webui.fleet_probe_entries(tmp_path, full, full=True)
+    assert entries[2]["face"] == 70.0 and entries[2]["body"] == 45.0 and entries[0]["face"] == 30.0
+    assert webui.fleet_probe_entries(tmp_path / "none", trimmed) == [] and webui.fleet_probe_entries(None) == []
+    rec = {"key": "k", "job": "a", "instance": 7, "folder": str(tmp_path), "probes": trimmed}
+    runs = webui.fleet_compare_runs([rec])
+    assert [g[0] for g in webui.probe_image_groups(runs)] == ["a · instance 7 lora16", "a · instance 7 winner"]
+    assert runs[0]["probes"]["face"] == [[200, 66.0]]  # the *_norm_ema column, as history.probe_series reads it
+    import json
+
+    (tmp_path / "status.json").write_text(json.dumps({"probes": full}), encoding="utf-8")
+    runs = webui.fleet_compare_runs([rec])  # the downloaded status.json's records win
+    assert runs[0]["probe_images"][2]["face"] == 70.0 and runs[0]["probe_raw"]["records"][0]["face"] == 61.0
+
+
+def test_the_page_only_follows_folders_inside_the_downloads_folder(tmp_path):
+    root = tmp_path / "pulls"
+    inside = root / "7" / "job"
+    inside.mkdir(parents=True)
+    assert webui.fleet_folder({"folder": str(inside)}, root) == inside.resolve()
+    assert webui.fleet_folder({"folder": str(root)}, root) is None
+    assert webui.fleet_folder({"folder": str(tmp_path)}, root) is None
+    assert webui.fleet_folder({"folder": str(inside / ".." / ".." / "..")}, root) is None
+    assert webui.fleet_folder({}, root) is None
+    runs = webui.fleet_compare_runs([{"key": "k", "job": "a", "instance": 7, "folder": str(tmp_path)}], root)
+    assert runs[0]["probe_images"] == []
+
+
+def test_compared_runs_get_history_shaped_series_and_unique_labels():
+    probes = [{"step": 0, "face": 10.0, "body": 5.0, "face_ema": 10.0, "body_ema": 5.0, "combined_ema": 8.0},
+              {"step": 100, "face": 30.0, "body": 9.0, "face_ema": 20.0, "body_ema": 7.0, "combined_ema": 15.0}, {}]
+    runs = webui.fleet_compare_runs([
+        {"key": "a", "job": "j", "instance": 7, "probes": probes, "losses": [[1, 0.5], [2, 0.4]], "config": {"x": 1}},
+        {"key": "b", "job": "j", "instance": 7}])
+    assert [r["label"] for r in runs] == ["j · instance 7", "j · instance 7 (2)"]
+    assert runs[0]["probes"]["combined"] == [[0, 8.0], [100, 15.0]] and runs[0]["loss"] == [[1, 0.5], [2, 0.4]]
+    assert runs[1]["probes"]["combined"] == [] and runs[1]["probe_images"] == []
+    series = webui.history_series(runs, "probes", ["combined"])
+    assert [s["name"] for s in series] == ["j · instance 7"]
+
+
+def test_a_chart_added_after_the_page_was_drawn_takes_the_pages_look():
+    class Chart:
+        def __init__(self):
+            self.options = webui.chart_options({"type": "value"}, {"type": "value"}, [], [])
+            self.updates = 0
+
+        def update(self):
+            self.updates += 1
+
+    look = {"light": False}
+    charts = webui.ChartList(look)
+    dark = Chart()
+    charts.append(dark)
+    assert not getattr(dark, "_rz_light", False) and dark.updates == 0  # dark is how charts are built
+    look["light"] = True
+    light = Chart()
+    charts.append(light)
+    assert light._rz_light and light.updates == 1 and list(charts) == [dark, light]
+
+    light.options["series"] = [{"name": "x", "itemStyle": {"color": "#F4F4F5"}, "lineStyle": {"color": "#60A5FA"},
+                                "data": [[1, "#F4F4F5"]]}]
+    before = light.updates
+    charts.restyle(light)  # series set after the chart joined the list: dark colours, swapped now
+    assert light.options["series"][0]["itemStyle"]["color"] == "#1C1C21"
+    assert light.options["series"][0]["lineStyle"]["color"] == "#2563EB"
+    assert light.options["series"][0]["data"] == [[1, "#F4F4F5"]] and light.updates == before + 1
+    look["light"] = False
+    dark.options["series"] = [{"itemStyle": {"color": "#F4F4F5"}}]
+    charts.restyle(dark)
+    assert dark.options["series"][0]["itemStyle"]["color"] == "#F4F4F5"
+    charts.discard([light])
+    assert list(charts) == [dark]
+
+
+def test_a_chart_in_an_instance_card_makes_room_for_its_legends_second_row():
+    class Chart:
+        def __init__(self):
+            self.options = webui.chart_options(webui._axis("step"), webui._axis("training minus held-out (points)"),
+                                               [], ["face", "hair", "skin", "clothes", "background", "subject"])
+            self.classes, self._rz_width = ["w-full", "h-72"], 1280
+
+        def style(self, replace=""):
+            self.height = replace
+
+    wide, card = Chart(), Chart()
+    card._rz_box = webui.FLEET_CARD_PLOT
+    webui.fit_chart(wide)
+    webui.fit_chart(card)
+    assert wide.options["grid"]["top"] == 25 + 34  # one legend row across the page
+    assert card.options["grid"]["top"] == 2 * 25 + 34 and card.height == "height: 313px"  # two rows in a card

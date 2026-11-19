@@ -3156,6 +3156,32 @@ def recolor_chart(chart, light: bool) -> None:
     chart.update()
 
 
+class ChartList(list):
+    """A page's charts. One added after the page was drawn (the Fleet tab's region and compare charts are built when
+    there is something to show) takes the page's look at once instead of staying dark until the look changes."""
+
+    def __init__(self, look: dict):
+        super().__init__()
+        self.look = look
+
+    def append(self, chart) -> None:
+        super().append(chart)
+        recolor_chart(chart, bool(self.look.get("light")))
+
+    def restyle(self, chart) -> None:
+        """Series set on a chart after it joined the list are dark: swap their colours when the look is light
+        (recolor_chart does nothing once a chart is marked light). Updates the chart."""
+        if self.look.get("light"):
+            chart._rz_light = True
+            chart.options.update(_recolor(dict(chart.options), CHART_LIGHT))
+        chart.update()
+
+    def discard(self, items) -> None:
+        """Drop charts that left the page (a card that was rebuilt)."""
+        gone = {id(c) for c in items}
+        self[:] = [c for c in self if id(c) not in gone]
+
+
 def setup_theme() -> None:
     """Once per process, before the first page: logo files, the stylesheet and outlined form fields."""
     app.add_static_files("/assets", ASSETS)
@@ -3480,12 +3506,16 @@ def chart_options(x: dict, y, series: list, legend: list[str]) -> dict:
             "grid": {"left": 52, "right": 24, "top": 40, "bottom": 44}}
 
 
+FLEET_CARD_PLOT = 330  # px of plot in the narrowest instance card (.rz-fleet-grid's 400 px less padding and axes)
+
+
 def fit_chart(chart) -> None:
     """Fit a chart_options() chart to its browser's width (chart._rz_width, the window's): the legend's rows are
     counted the way ECharts wraps them and the plot starts below them, with smaller text and margins on a phone."""
     width = getattr(chart, "_rz_width", 1280)
     narrow = width < 600
     plot = min(width, 1440) - (100 if narrow else 160)  # less the page's and the card's padding (a 375 px phone: 282)
+    plot = min(plot, getattr(chart, "_rz_box", plot))  # a chart in a narrow box (an instance card) wraps sooner
     legend = chart.options.get("legend") or {}
     names = [n["name"] if isinstance(n, dict) else str(n) for n in legend.get("data") or []]
     font, icon, gap = (11, 16, 8) if narrow else (12, 25, 12)
@@ -8835,6 +8865,7 @@ FLEET_RUN_COLUMNS = [
     {"name": "ended", "label": "Last seen", "field": "ended", "align": "left", "sortable": True, **_WIDE},
     {"name": "group", "label": "Split race", "field": "group", "align": "left", "sortable": True, **_WIDE},
     {"name": "files", "label": "Downloaded", "field": "files", "align": "left", **_WIDE},
+    {"name": "actions", "label": "", "field": "actions", "align": "right"},
 ]
 FLEET_SOURCES = {"form": "The Train tab's settings", "file": "A config file on this computer",
                  "run": "A past run's settings"}
@@ -9030,8 +9061,347 @@ def fleet_run_rows(runs: list[dict]) -> list[dict]:
             "time": eta_text(r.get("elapsed")) if r.get("elapsed") else "",
             "cost": f"${r['cost']:.2f}" if isinstance(r.get("cost"), (int, float)) else "",
             "ended": time.strftime("%Y-%m-%d %H:%M", time.localtime(when)) if when else "",
-            "group": r.get("group") or "", "files": ", ".join(r.get("downloaded") or [])})
+            "group": r.get("group") or "", "files": ", ".join(r.get("downloaded") or []),
+            "actions": ""})  # the download button is drawn by the table's body-cell-actions slot
     return rows
+
+
+def fleet_download_defaults(order, rules: dict, own: dict | None = None) -> list[str]:
+    """The kinds the download dialog ticks first: the ones the run already has a rule for (the fleet's rules with
+    the run's own on top), or logs and the best LoRA when every rule is off."""
+    modes = {**(rules or {}), **(own or {})}
+    kinds = [k for k in order if modes.get(k, "off") != "off"]
+    return kinds or [k for k in ("logs", "best") if k in order]
+
+
+def fleet_card_run(runs: list[dict], iid) -> dict | None:
+    """The run a card's download button is for: the one running on that instance, else its newest on record
+    (runs come newest first). None when the instance has no run on record."""
+    mine = [r for r in runs if str(r.get("instance")) == str(iid)]
+    return next((r for r in mine if r.get("state") == "running"), mine[0] if mine else None)
+
+
+def open_folder(path) -> str:
+    """Show a folder in the computer's file manager (the one that runs this WebUI), creating it first when it is not
+    there yet. Returns the folder's path."""
+    folder = Path(path)
+    folder.mkdir(parents=True, exist_ok=True)
+    if sys.platform.startswith("win"):
+        os.startfile(str(folder))  # noqa: S606  (Windows only)
+    else:
+        subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(folder)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return str(folder)
+
+
+FLEET_PULL_WORDS = {"going": ("Downloading", "downloading"), "done": ("Downloaded", "check_circle"),
+                    "failed": ("Failed", "error_outline")}
+
+
+def fleet_download_line(entry: dict) -> tuple[str, float, str]:
+    """One download of the fleet (Fleet.downloads()) as (the line, how far 0..1, "going" | "done" | "failed"):
+    "<job> · instance 7 · Probe images · 12.5 / 80.0 MB · 3 / 20 files · 2.1 MB/s · 32 s left". A finished one says
+    what it fetched, a failed one why."""
+    import rulz_fleet
+
+    mb = lambda b: f"{(b or 0) / 1e6:.1f}"  # noqa: E731
+    kind = entry.get("state") if entry.get("state") in FLEET_PULL_WORDS else "going"
+    head = " · ".join(x for x in (str(entry.get("job") or "?"), f"instance {entry.get('instance')}",
+                                  ", ".join(rulz_fleet.DOWNLOAD_KINDS.get(k, k) for k in entry.get("kinds") or [])) if x)
+    done, total = entry.get("bytes_done") or 0, entry.get("bytes_total") or 0
+    files_done, files_total = entry.get("files_done") or 0, entry.get("files_total") or 0
+    value = done / total if total else (files_done / files_total if files_total else 0.0)
+    value = max(0.0, min(1.0, value))
+    if kind == "done":
+        fetched = entry.get("fetched") or 0
+        return (f"{head} · " + (f"{fetched} file{'s' if fetched != 1 else ''}, {entry.get('mb') or 0:g} MB"
+                                if fetched else "nothing new to fetch"), 1.0, "done")
+    if kind == "failed":
+        return f"{head} · {entry.get('error') or 'did not work'}", value, "failed"
+    if not files_total:
+        return f"{head} · listing the files", 0.0, "going"
+    parts = [f"{mb(done)} / {mb(total)} MB", f"{files_done} / {files_total} files"]
+    speed = entry.get("speed") or 0
+    if speed > 0:
+        parts.append(f"{speed / 1e6:.1f} MB/s")
+        if total > done:
+            parts.append(f"{eta_text((total - done) / speed)} left")
+    return f"{head} · " + " · ".join(parts), value, "going"
+
+
+REGION_FILES = ("status.json", "region_watch.json", "region_sweep.json", "region_sweep.jsonl", "block_audit.json",
+                "block_audit.jsonl")
+
+
+def region_signature(job_dir) -> tuple:
+    """(file, mtime, size) of the job-folder files the region block reads: it is read again only when this moves."""
+    out = []
+    for name in REGION_FILES:
+        try:
+            s = (Path(job_dir) / name).stat()
+        except OSError:
+            continue
+        out.append((name, s.st_mtime_ns, s.st_size))
+    return tuple(out)
+
+
+def region_data(job_dir) -> dict:
+    """What the Monitor's status holds on region work, read from a job folder (a run's downloaded logs):
+    {"rw": region watch summary, "ba": block audit row, "rs": region sweep row (with its "line" and "history")}, each
+    None when the run had none. status.json first (the Monitor's own source); a status without them falls back to
+    the region files themselves."""
+    from rulztrainer import blockaudit as _blockaudit
+    from rulztrainer import regionsweep as _regionsweep
+    from rulztrainer import regionwatch as _regionwatch
+
+    job_dir = Path(job_dir)
+    try:
+        st = json.loads((job_dir / "status.json").read_text(encoding="utf-8"))
+        st = st if isinstance(st, dict) else {}
+    except (OSError, ValueError):
+        st = {}
+    rw, ba, rs = st.get("region_watch"), st.get("block_audit"), st.get("region_sweep")
+    if not rw:
+        state = _regionwatch.read(job_dir)
+        last = ((state or {}).get("history") or [{}])[-1] if state else {}
+        if state and last:
+            rw = {"epoch": state.get("epoch"), "step": last.get("step"), "frozen": state.get("frozen"),
+                  "late": state.get("late"), "learned": last.get("learned") or {}, "contrast": last.get("contrast") or {},
+                  "steer": last.get("steer"), "rows": []}
+    if not rs:
+        rows = []
+        try:
+            with open(job_dir / "region_sweep.jsonl", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(row, dict) and "step" in row:
+                        rows.append(row)
+        except OSError:
+            pass
+        if rows:
+            try:
+                text = _regionsweep.describe(rows[-1])
+            except (KeyError, TypeError, ValueError):
+                text = ""
+            rs = {**rows[-1], "line": text}
+    if not ba:
+        rows = _blockaudit.read_log(job_dir)
+        if rows:
+            try:
+                text = _blockaudit.describe(rows[-1])
+            except (KeyError, TypeError, ValueError, IndexError):
+                text = ""
+            ba = {**rows[-1], "line": text}
+    return {"rw": rw or None, "ba": ba or None, "rs": rs or None}
+
+
+class RegionBlock:
+    """The Monitor's Region watch parts (the region watch's line and per-picture table, the block audit line, the
+    region sweep's line, its gap chart and one chart per region) for a job folder on this computer. It builds its
+    widgets into `parent` the first time there is something to show, and reads the folder's files again only when
+    one of them changed."""
+
+    def __init__(self, parent, charts: list | None = None, box: int | None = None):
+        """box: the plot width in px when the block sits in a narrow place (an instance card), so the charts' legends
+        wrap the way they are drawn there, and the region charts go two to a row instead of by the window's width."""
+        self.parent, self.charts, self.box = parent, charts if charts is not None else [], box
+        self.own: list = []  # this block's charts, for the page to drop when the block's card is rebuilt
+        self.built, self.shown, self.sig = False, False, None
+
+    def _style(self, chart) -> None:
+        restyle = getattr(self.charts, "restyle", None)
+        if restyle:
+            restyle(chart)
+        else:
+            chart.update()
+
+    def fill(self, job_dir) -> bool:
+        """Draw what the folder holds; True when there is anything to show."""
+        sig = (str(job_dir), region_signature(job_dir)) if job_dir else None
+        if sig == self.sig:
+            return self.shown
+        self.sig = sig
+        data = region_data(job_dir) if job_dir else {}
+        self.shown = any(data.get(k) for k in ("rw", "ba", "rs"))
+        if self.shown and not self.built:
+            self._build()
+        if self.built:
+            self._paint(data, job_dir)
+        return self.shown
+
+    def _build(self) -> None:
+        self.built = True
+        with self.parent:
+            self.rw_label = hint("")
+            self.rs_label = hint("")
+            self.ba_label = hint("")
+            with ui.column().classes("w-full gap-1") as self.rs_box:
+                with ui.column().classes("w-full gap-1") as self.gap_box:
+                    hint("Gap between the training pictures and the held-out photos, sweep by sweep: how many "
+                         "points further each region has been learned on the pictures the model trains on than on "
+                         "the photos kept out of training. A line that keeps rising is that region being memorised "
+                         "rather than learned. The subject is face, hair and skin together. Click a name in the "
+                         "legend to hide or show its line.")
+                    self.gap_chart = RzChart(chart_options(
+                        _axis("step", min="dataMin"), _axis("training minus held-out (points)", scale=True), [], [])) \
+                        .classes("w-full h-72")
+                    if self.box:
+                        self.gap_chart._rz_box = self.box
+                    self.charts.append(self.gap_chart)
+                    self.own.append(self.gap_chart)
+                hint("Each region on its own: how much of its starting error is gone (0% = as at the first sweep), "
+                     "on the training pictures and on the held-out photos (grey, dashed).")
+                self.regions: dict = {}
+                cols = "grid-cols-2" if self.box else "grid-cols-1 md:grid-cols-2 xl:grid-cols-3"
+                with ui.element("div").classes(f"w-full grid {cols} gap-3"):
+                    for region in SWEEP_COLORS:
+                        with ui.column().classes("w-full gap-0 min-w-0") as cell:
+                            ui.label(region.capitalize() + (" (face, hair and skin)" if region == "subject"
+                                                            else "")).classes("text-sm font-medium")
+                            chart = RzChart(chart_options(_axis("step", min="dataMin"), _axis("% gone", scale=True),
+                                                          [], [])).classes("w-full h-52")
+                            self.charts.append(chart)
+                            self.own.append(chart)
+                        self.regions[region] = (cell, chart)
+            self.rw_note = hint("Contrast: a picture's background (or clothes) loss against its subject's, relative "
+                                "to its own start. Under 1 = that region is being learned faster than the subject in "
+                                "this picture. One training sample per picture per epoch is a noisy reading, so "
+                                "read it as a trend.")
+            self.table = ui.table(columns=[
+                {"name": "image", "label": "image", "field": "image", "align": "left", "sortable": True},
+                {"name": "background", "label": "background vs subject", "field": "background", "sortable": True},
+                {"name": "clothes", "label": "clothes vs subject", "field": "clothes", "sortable": True},
+                {"name": "sweep_background", "label": "background (sweep)", "field": "sweep_background",
+                 "sortable": True},
+                {"name": "sweep_clothes", "label": "clothes (sweep)", "field": "sweep_clothes", "sortable": True},
+                {"name": "weights", "label": "steered weights", "field": "weights", "align": "left"},
+                {"name": "cells", "label": "cells: face / hair / skin / clothes / background", "field": "cells",
+                 "align": "left"},
+                {"name": "seen", "label": "seen", "field": "seen", "sortable": True},
+            ], rows=[], row_key="path", pagination=15).props("flat dense").classes("w-full text-xs")
+
+    def _paint(self, data: dict, job_dir) -> None:
+        rw, ba, rs = data.get("rw"), data.get("ba"), data.get("rs")
+        self.rw_label.visible = bool(rw)
+        if rw:
+            self.rw_label.text = f"Epoch {rw.get('epoch')} (step {rw.get('step')}): {region_watch_line(rw)}"
+        has_rows = bool(rw and rw.get("rows"))
+        self.rw_note.visible = self.table.visible = has_rows
+        if has_rows:
+            self.table.rows = rw["rows"]
+            self.table.update()
+        self.ba_label.visible = bool(ba)
+        if ba:
+            self.ba_label.text = f"Block audit at step {ba.get('step')}: {ba.get('line') or ''}"
+        self.rs_label.visible = bool(rs)
+        if not rs:
+            self.rs_box.visible = False
+            return
+        self.rs_label.text = f"Sweep at step {rs.get('step')}: {rs.get('line') or ''}"
+        history = sweep_history(rs, job_dir)
+        series, legend = sweep_gap_series(history)
+        self.gap_chart.options["series"] = series
+        self.gap_chart.options["legend"]["data"] = legend
+        self._style(self.gap_chart)
+        self.gap_box.visible = any(len(sr["data"]) > 1 for sr in series)
+        drawn = False
+        for region, (cell, chart) in self.regions.items():
+            series, legend = sweep_region_series(history, region, rs.get("best"))
+            chart.options["series"] = series
+            chart.options["legend"]["data"] = legend
+            self._style(chart)
+            cell.visible = any(len(sr["data"]) > 1 for sr in series)
+            drawn = drawn or cell.visible
+        self.rs_box.visible = drawn
+
+
+_FLEET_PROBE_IMAGE = re.compile(r"^(?:(?P<racer>.+?)_)?step(?P<step>\d{6})_(?P<kind>face|body)_(?P<seed>\d+)\.png$")
+
+
+def fleet_folder(rec: dict | None, root) -> Path | None:
+    """A run's downloaded folder when it lies inside `root` (the fleet's downloads folder), else None: a record
+    can only send the page to files it downloaded."""
+    folder = (rec or {}).get("folder")
+    if not folder:
+        return None
+    try:
+        path, base = Path(folder).resolve(), Path(root).resolve()
+        return path if path != base and path.is_relative_to(base) else None
+    except (OSError, ValueError):
+        return None
+
+
+_STATUS_PROBES: dict = {}  # status.json path -> ((mtime, size), its probe records)
+
+
+def fleet_full_probes(folder) -> list[dict]:
+    """The run's complete probe records from its downloaded status.json (the "logs" kind brings it): the fleet's own
+    record keeps only the agent's probe columns (no normalised scores, no image names). [] without one."""
+    if not folder:
+        return []
+    path = Path(folder) / "status.json"
+    try:
+        st = path.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+        if _STATUS_PROBES.get(str(path), (None,))[0] != sig:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            probes = [p for p in (data.get("probes") if isinstance(data, dict) else None) or []
+                      if isinstance(p, dict) and p.get("step") is not None]
+            _STATUS_PROBES[str(path)] = (sig, probes)
+        return _STATUS_PROBES[str(path)][1]
+    except (OSError, ValueError):
+        return []
+
+
+def fleet_probe_entries(folder, probes: list[dict] | None = None, full: bool = False) -> list[dict]:
+    """A downloaded run's probe images (folder/probes) as the entries the Previous runs comparison draws:
+    {"step", "kind", "seed", "racer", "path", "face", "body", "combined"} with that probe's scores from the run's
+    probe records. Face and body show normalised where the record has them; a record from status.json (full=True)
+    without them is a run that did not normalise, so its raw scores show, as in the history; the fleet's own
+    trimmed records (no normalised scores) show only the combined score. Block-audit renders and other files are
+    left out."""
+    if not folder or not (Path(folder) / "probes").is_dir():
+        return []
+    by_step = {int(p["step"]): p for p in probes or [] if p.get("step") is not None}
+    out = []
+    for path in sorted((Path(folder) / "probes").glob("*.png")):
+        m = _FLEET_PROBE_IMAGE.match(path.name)
+        if not m or blockaudit.is_audit_image(path.name):
+            continue
+        step = int(m["step"])
+        rec = by_step.get(step) or {}
+        norm = rec.get("face_norm") is not None or rec.get("body_norm") is not None
+        shown = norm or full
+        out.append({"step": step, "kind": m["kind"], "seed": int(m["seed"]), "racer": m["racer"] or "",
+                    "path": str(path), "face": (rec.get("face_norm") if norm else rec.get("face")) if shown else None,
+                    "body": (rec.get("body_norm") if norm else rec.get("body")) if shown else None,
+                    "combined": rec.get("combined")})
+    return out
+
+
+def fleet_compare_runs(recs: list[dict], root=None) -> list[dict]:
+    """Past-run records of the fleet as the history-shaped runs the Previous runs charts take: "label", "config",
+    "probes" (the smoothed face, body and combined series), "probe_raw" (for the common scale), "loss" and the run's
+    kept probe images ("probe_images", from its downloaded folder, only when it lies inside `root`). The probe records
+    are the downloaded status.json's where there is one, else the record's own (probe columns only: no normalised
+    scores, which history.probe_series then reads from the *_norm_ema columns). Labels stay unique."""
+    out, seen = [], {}
+    for r in recs:
+        folder = fleet_folder(r, root) if root is not None else (Path(r["folder"]) if r.get("folder") else None)
+        full = fleet_full_probes(folder)
+        probes = full or [p for p in r.get("probes") or [] if isinstance(p, dict) and p.get("step") is not None]
+        label = f"{r.get('job') or 'run'} · instance {r.get('instance')}"
+        seen[label] = seen.get(label, 0) + 1
+        if seen[label] > 1:
+            label += f" ({seen[label]})"
+        out.append({"id": r["key"], "label": label, "job": r.get("job") or "", "state": r.get("state") or "",
+                    "config": r.get("config") or {}, "probes": history.probe_series(probes),
+                    "probe_raw": history.probe_raw({"probes": probes}), "loss": r.get("losses") or [],
+                    "probe_images": fleet_probe_entries(folder, probes, full=bool(full))})
+    return out
 
 
 def fleet_spark(series: dict | None) -> dict:
@@ -9053,14 +9423,39 @@ def fleet_spark(series: dict | None) -> dict:
                         "lineStyle": {"width": 1.5, "color": "#60A5FA"}, "itemStyle": {"color": "#60A5FA"}}]}
 
 
-def build_fleet_tab(form_config=None):
+def build_fleet_tab(form_config=None, charts: list | None = None):
     """Fleet: every vast.ai instance's run on one page, a queue whose next run goes to the first idle instance,
     the download rules, the watches, and every run on record. All of it is scripts/vast/rulz_fleet.py's Fleet;
     this page draws its state and calls it."""
     fl = fleet()
     import rulz_fleet
 
+    charts = charts if charts is not None else ChartList({})  # the page's charts: fitted to the window and recoloured
     state: dict = {"shape": None, "cards": {}, "seen": {}, "dl": {}, "accept": {}, "render_wait": set()}
+
+    def pull_entries() -> list[dict]:
+        """The downloads going or just finished (newest first); none while the fleet module has no such list."""
+        try:
+            found = list(getattr(fl, "downloads", lambda: [])() or [])
+            return sorted(found, key=lambda e: (e.get("started") or 0, str(e.get("run"))))
+        except (OSError, ValueError):
+            return []
+
+    def open_here(path) -> None:
+        base = Path(fl.pulls).resolve()
+        try:
+            inside = Path(path).resolve() == base or Path(path).resolve().is_relative_to(base)
+        except (OSError, ValueError):
+            inside = False
+        if not inside:
+            ui.notify(f"Only folders inside {base} can be opened from here.", type="warning", multi_line=True)
+            return
+        try:
+            shown = open_folder(path)
+        except OSError as e:
+            ui.notify(f"Could not open {path}: {e}", type="warning", multi_line=True)
+            return
+        ui.notify(f"Opened {shown} on the computer that runs this WebUI", type="info", multi_line=True)
 
     async def act(func, *args, ok: str = "", **kw):
         """A fleet call off the page's thread (most of them go over ssh); a refusal becomes a notice."""
@@ -9101,6 +9496,9 @@ def build_fleet_tab(form_config=None):
             ui.button("Find instances", icon="travel_explore", on_click=find, color=None) \
                 .props("outline dense no-caps").tooltip("Ask vast.ai which instances are running: new RulZ AI Trainer "
                                                         "instances join, stopped and destroyed ones are marked")
+            ui.button("Open downloads folder", icon="folder_open", on_click=lambda: open_here(fl.pulls),
+                      color=None).props("outline dense no-caps")                 .tooltip(f"Opens {fl.pulls}, where this page puts the files it downloads, on the computer that runs "
+                         "this WebUI")
             ui.button("Look now", icon="refresh", on_click=look_now, color=None).props("flat dense no-caps")
         vast_note = ui.label("").classes("rz-banner warning")
         vast_note.visible = False
@@ -9109,6 +9507,10 @@ def build_fleet_tab(form_config=None):
              "nothing moves the queue, downloads files or checks the watches unless "
              "python scripts/vast/rulz_fleet.py daemon runs instead. Nothing here rents, stops or destroys an "
              "instance; an instance's menu can reboot it or update its RulZ AI Trainer when you ask.")
+    with card() as pull_strip:
+        ui.label("Downloads").classes("text-base font-medium")
+        pull_list = ui.column().classes("w-full gap-2")
+    pull_strip.visible = False
     grid = ui.element("div").classes("rz-fleet-grid w-full")
     no_instances = hint("No instances in the fleet yet. Rent one from your RulZ AI Trainer template on vast.ai, then "
                         "Find instances.")
@@ -9144,6 +9546,80 @@ def build_fleet_tab(form_config=None):
 
     async def answer_of(dlg) -> object:
         return await dlg
+
+    async def ask_download(key):
+        """One dialog for the three Download buttons (a card, a row of Past runs, the ticked run's details): pick the
+        kinds, then fetch them now."""
+        rec = fl.load_run(key) if key else None
+        if rec is None:
+            ui.notify("That run is not on record any more.", type="warning")
+            return
+        if state.get("dl_open"):
+            return
+        state["dl_open"] = True
+        try:
+            first = fleet_download_defaults(rulz_fleet.DOWNLOAD_KINDS, fl.read()["settings"]["download"],
+                                            rec.get("download"))
+            folder = rec.get("folder") or str(fl.pulls / str(rec.get("instance")) / str(rec.get("job")))
+            with ui.dialog().props("persistent") as dlg, ui.card().classes("w-[34rem] max-w-full"):
+                ui.label(f"Download files of {rec.get('job')}").classes("text-base font-medium")
+                hint(f"Instance {rec.get('instance')} · {rec.get('state')}")
+                kinds = ui.select(rulz_fleet.DOWNLOAD_KINDS, value=first, multiple=True, label="Files to download") \
+                    .classes("w-full").props("use-chips")
+                hint(f"The files go to {folder}. Only files that are not there yet at their size are fetched.")
+                pbar = ui.linear_progress(value=0, show_value=False, size="6px").props("rounded").classes("w-full")
+                ptext = hint("")
+                pbar.visible = ptext.visible = False
+                tick = ui.timer(1.0, lambda: paint_pull(), active=False)  # only while this dialog's pull runs
+                with ui.row().classes("w-full items-center justify-end gap-2"):
+                    spin = ui.spinner(size="sm")
+                    spin.visible = False
+                    cancel = ui.button("Cancel", on_click=lambda: dlg.submit(False)).props("flat")
+                    go = ui.button("Download", icon="cloud_download").props("unelevated no-caps")
+
+            def paint_pull() -> None:
+                entry = next((e for e in pull_entries() if e.get("run") == key), None)
+                if entry is None:
+                    return
+                text, value, kind = fleet_download_line(entry)
+                pbar.value = value
+                pbar.props("color=warning" if kind == "failed" else "color=primary")
+                ptext.text = text
+                pbar.visible = ptext.visible = True
+
+            async def fetch_now():
+                if not kinds.value:
+                    ui.notify("Pick at least one kind of file.", type="warning")
+                    return
+                go.disable()
+                cancel.disable()
+                spin.visible = True
+                pbar.value, ptext.text = 0, "Listing the files…"
+                pbar.visible = ptext.visible = True
+                tick.active = True
+                try:
+                    result = await act(fl.pull_now, key, list(kinds.value))
+                finally:
+                    tick.active = False
+                    spin.visible = False
+                    go.enable()
+                    cancel.enable()
+                if isinstance(result, dict):
+                    ui.notify(result.get("error") or f"{result['fetched']} files, {result['mb']} MB",
+                              type="warning" if result.get("error") else "positive", multi_line=True)
+                    dlg.submit(True)
+
+            go.on_click(fetch_now)
+            try:
+                await dlg
+            finally:
+                tick.cancel()
+                dlg.delete()
+            picked = picked_run()
+            if picked is not None and picked["key"] == key:
+                show_run()
+        finally:
+            state["dl_open"] = False
 
     async def update_trainer(iid: int):
         """Check what an update would change, show it, and on a yes update the instance and restart its WebUI."""
@@ -9235,6 +9711,12 @@ def build_fleet_tab(form_config=None):
             w["line"] = hint("")
             w["probe"] = hint("")
             w["chart"] = ui.echart(fleet_spark(None)).classes("w-full h-36")
+            with section("Region watch", "How far each part of the pictures has been learned", "grid_view",
+                         open_=False) as w["region_exp"]:
+                w["region_box"] = ui.column().classes("w-full gap-1")
+            w["region_exp"].visible = False
+            # builds itself once the run has region files; its charts wrap their legends for a card's width
+            w["region"] = RegionBlock(w["region_box"], charts, box=FLEET_CARD_PLOT)
             w["machine"] = hint("")
             w["version"] = hint("")
             w["theirs"] = hint("")
@@ -9243,6 +9725,9 @@ def build_fleet_tab(form_config=None):
                 w["open"] = ui.button("Open WebUI", icon="open_in_new", color=None).props("outline dense no-caps") \
                     .tooltip("This instance's own RulZ AI Trainer page in a new tab, signed in through vast.ai's Instance "
                              "Portal")
+                w["download"] = ui.button("Download files", icon="cloud_download", color=None) \
+                    .props("outline dense no-caps").tooltip("Choose which files of this instance's run to download "
+                                                            "to this computer now")
                 w["accept"] = ui.switch("Takes queued runs", value=inst.get("accept", True),
                                         on_change=lambda e, i=iid: act(fl.set_instance, i, accept=bool(e.value))
                                         if e.value != state["accept"].get(i, True) else None)
@@ -9387,6 +9872,9 @@ def build_fleet_tab(form_config=None):
         w["theirs"].visible = bool(w["theirs"].text)
         w["stop"].visible = running
         w["stop_target"] = (iid, job.get("job") or "")
+        mine = fleet_card_run(state.get("runs") or [], iid)
+        w["download_key"] = mine["key"] if mine else None
+        w["download"].visible = mine is not None
         w["version"].text = fleet_version_line(inst)
         w["version"].visible = bool(w["version"].text)
         usable = inst["state"] != "gone"
@@ -9407,20 +9895,80 @@ def build_fleet_tab(form_config=None):
         instances = view["instances"]
         shape = [(i["id"], i.get("label")) for i in instances]
         if shape != state["shape"]:
+            for old in state["cards"].values():
+                charts.discard(old["region"].own)
             state["shape"], state["cards"] = shape, {}
             grid.clear()
             with grid:
                 for inst in instances:
                     w = state["cards"][inst["id"]] = make_card(inst)
                     w["stop"].on_click(lambda _, w=w: stop_run(*w["stop_target"]))
+                    w["download"].on_click(lambda _, w=w: ask_download(w.get("download_key")))
                     w["open"].on("click", lambda _, i=inst["id"]: open_webui(i), js_handler=fleet_open_tab_js(inst["id"]))
                     w["update_item"].on_click(lambda _, i=inst["id"]: update_trainer(i))
                     w["reboot_item"].on_click(lambda _, w=w: reboot_instance(*w["reboot_target"]))
                     w["watch_item"].on_click(lambda _, w=w: act(fl.set_instance, w["watch_target"][0],
                                                                 enabled=w["watch_target"][1]))
+        current_runs()
         for inst in instances:
             fill_card(state["cards"][inst["id"]], inst)
         no_instances.visible = not instances
+
+    def current_runs() -> list[dict]:
+        """The run records, read again only when a record file changed."""
+        sig = fl.runs_signature()
+        if state.get("runs_sig") != sig or "runs" not in state:
+            state["runs"], state["runs_sig"] = fl.runs(), sig
+        return state["runs"]
+
+    def fill_regions() -> None:
+        """Each card's Region watch, from its running run's downloaded folder. The files are read again only when
+        one of them changed (RegionBlock.fill compares their modification times), so this is cheap every 3 s."""
+        runs = current_runs()
+        for iid, w in state["cards"].items():
+            mine = fleet_card_run(runs, iid)
+            folder = fleet_folder(mine, fl.pulls) if mine and mine.get("state") == "running" else None
+            w["region_exp"].visible = w["region"].fill(folder) if folder else False
+
+    def paint_run_pull() -> None:
+        """The ticked run's own download bar in its details, while that run is downloading."""
+        rec = picked_run()
+        entry = next((e for e in pull_entries() if rec and e.get("run") == rec["key"]), None)
+        run_pull_bar.visible = run_pull_text.visible = entry is not None
+        if entry is not None:
+            text, value, kind = fleet_download_line(entry)
+            run_pull_bar.value = value
+            run_pull_bar.props("color=warning" if kind == "failed" else "color=primary")
+            run_pull_text.text = text
+
+    def draw_pulls() -> None:
+        """The Downloads strip: one row per download going or just finished, drawn again only when one moved."""
+        entries = pull_entries()
+        pull_strip.visible = bool(entries)
+        shape = [(e.get("run"), e.get("state")) for e in entries]
+        if shape != state.get("pull_shape"):
+            state["pull_shape"], state["pull_rows"] = shape, {}
+            pull_list.clear()
+            with pull_list:
+                for e in entries:
+                    with ui.row().classes("w-full items-center no-wrap gap-3"):
+                        icon = ui.icon("downloading").classes("text-xl")
+                        with ui.column().classes("gap-1 min-w-0 flex-1"):
+                            bar = ui.linear_progress(value=0, show_value=False, size="6px").props("rounded")                                 .classes("w-full")
+                            line = hint("")
+                        word = ui.label("").classes("text-sm font-medium whitespace-nowrap")
+                    state["pull_rows"][e.get("run")] = (icon, bar, line, word)
+        for e in entries:
+            icon, bar, line, word = state["pull_rows"][e.get("run")]
+            text, value, kind = fleet_download_line(e)
+            label, name = FLEET_PULL_WORDS[kind]
+            icon.props(f"name={name}")
+            word.text = label
+            bar.value = value
+            bar.props("color=warning" if kind == "failed" else "color=primary")
+            line.text = text
+            line.classes(replace="rz-hint rz-warn" if kind == "failed" else "rz-hint")
+        paint_run_pull()
 
     # ------------------------------------------------------------ the queue
     with section("Fleet queue", "Runs waiting for an instance", "queue", open_=True) as queue_exp:
@@ -9643,42 +10191,186 @@ def build_fleet_tab(form_config=None):
                 hint("Nothing yet.")
 
     # ------------------------------------------------------------ past runs
+    cmp = {"open": False, "picks": [], "captions": [], "shown": None}
     with section("Past runs", "Every run the fleet has seen, on any instance", "history", open_=True):
         with ui.row().classes("w-full items-center gap-3"):
             run_filter = ui.input("Filter", placeholder="job, instance, state, split race").classes("w-72") \
                 .props("clearable")
             run_count = hint("")
-        run_table = ui.table(columns=FLEET_RUN_COLUMNS, rows=[], row_key="key", selection="single",
+            ui.space()
+            cmp_hint = hint("")
+            cmp_btn = ui.button("Compare", icon="compare", color=None).props("outline dense no-caps")
+            cmp_btn.disable()
+        run_table = ui.table(columns=FLEET_RUN_COLUMNS, rows=[], row_key="key", selection="multiple",
                              pagination={"rowsPerPage": 12, "sortBy": "ended", "descending": True},
-                             on_select=lambda _: show_run()).props("flat dense").classes("w-full")
+                             on_select=lambda _: pick_changed()).props("flat dense").classes("w-full")
         run_filter.bind_value_to(run_table, "filter")
+        run_table.add_slot("body-cell-actions", """
+            <q-td :props="props" auto-width>
+                <q-btn flat dense round icon="cloud_download"
+                       @click.stop="() => $parent.$emit('download', props.row.key)">
+                    <q-tooltip>Choose which files of this run to download now</q-tooltip>
+                </q-btn>
+            </q-td>""")
+        run_table.on("download", lambda e: ask_download(e.args))
         hint("Kept on this computer, so a run stays here after its instance is destroyed. Runs that were already "
-             "on an instance when it joined are listed too. Tick a run for its numbers, charts and files.")
+             "on an instance when it joined are listed too, and their files are downloaded by the download rules. "
+             "Tick a run for its numbers, charts and files, or two or more and click Compare to chart them "
+             "together; the cloud icon on a row downloads that run's files now.")
+        run_multi = hint("")
         with ui.column().classes("w-full gap-3") as run_detail:
             run_title = ui.label("").classes("text-base font-medium")
             run_facts = hint("")
             run_group = hint("")
             run_chart = ui.echart(fleet_spark(None)).classes("w-full h-56")
+            with section("Region watch", "How far each part of the pictures has been learned, from the run's "
+                         "downloaded logs", "grid_view", open_=True) as run_region_exp:
+                run_region_note = hint("")
+                run_region_box = ui.column().classes("w-full gap-1")
+            run_region_exp.visible = False
+            run_region = RegionBlock(run_region_box, charts)
             run_settings = hint("")
             run_folder = hint("")
+            run_pull_bar = ui.linear_progress(value=0, show_value=False, size="6px").props("rounded") \
+                .classes("w-full")
+            run_pull_text = hint("")
+            run_pull_bar.visible = run_pull_text.visible = False
             run_images = ui.row().classes("w-full gap-2")
             with ui.row().classes("w-full items-center gap-2"):
                 run_kinds = ui.select(rulz_fleet.DOWNLOAD_KINDS, value=["logs", "probes"], multiple=True,
                                       label="Download now").classes("w-72").props("use-chips")
                 run_pull = ui.button("Download", icon="cloud_download", color=None).props("outline dense no-caps")
+                with ui.element("span"):
+                    run_open = ui.button("Open folder", icon="folder_open", color=None) \
+                        .props("outline dense no-caps")
+                    run_open_tip = ui.tooltip("")
                 ui.space()
                 run_forget = ui.button("Forget this run", icon="delete_outline", color=None) \
                     .props("flat dense no-caps").tooltip("Drop it from this list. Downloaded files stay.")
         run_detail.visible = False
 
+        # ---- the comparison of the ticked runs (the Previous runs page's charts and probe images)
+        with ui.column().classes("w-full gap-3") as cmp_box:
+            with ui.row().classes("w-full items-center gap-2"):
+                cmp_title = ui.label("").classes("text-base font-medium")
+                ui.space()
+                ui.button("Close comparison", icon="close", color=None, on_click=lambda: close_compare()) \
+                    .props("flat dense no-caps")
+            cmp_note = hint("", warn=True)
+            subhead("Likeness probes")
+            hint("Each ticked run's smoothed probe scores (0 = a stranger, 100 = your references), one chart per "
+                 "score, and the loss. Click a run's name in a legend to hide or show it.")
+            with ui.row().classes("w-full items-center gap-3"):
+                cmp_scale_on = ui.switch("Compare on one scale", value=False, on_change=lambda _: draw_compare()) \
+                    .tooltip("Rescore every ticked run's probes on the same face / body scale and weights instead of "
+                             "each run's own. Each run keeps its own floor (its step-0 probe) and references' level; "
+                             "only the span, curve and weights become common. Needs the run's raw probe scores, "
+                             "which a run has once its probes are on record.")
+                cmp_scale_inputs = {}
+                with ui.row().classes("items-center gap-2") as cmp_scale_row:
+                    dflt = TrainConfig()
+                    for sk, slabel, sval, smn, sstep in (
+                            ("face_scale_span", "Face span", dflt.face_scale_span, 1, 0.05),
+                            ("face_scale_curve", "Face curve", dflt.face_scale_curve, 1, 0.1),
+                            ("body_scale_span", "Body span", dflt.body_scale_span, 1, 0.05),
+                            ("body_scale_curve", "Body curve", dflt.body_scale_curve, 1, 0.1),
+                            ("face_weight", "Face weight %", round(dflt.face_weight * 100), 0, 5)):
+                        cmp_scale_inputs[sk] = ui.number(slabel, value=sval, min=smn,
+                                                         max=100 if sk == "face_weight" else 10, step=sstep,
+                                                         on_change=lambda _: draw_compare()) \
+                            .props("dense").classes("w-28")
+                    ui.button("Recommended", icon="auto_fix_high", color=None, on_click=lambda: [
+                        cmp_scale_inputs[k].set_value(v) for k, v in (
+                            ("face_scale_span", 1.1), ("face_scale_curve", 3.0), ("body_scale_span", 1.0),
+                            ("body_scale_curve", 1.0), ("face_weight", 80))]).props("flat dense no-caps") \
+                        .tooltip("Face 1.1 / 3, body 1 / 1, 80% face")
+                cmp_scale_row.bind_visibility_from(cmp_scale_on, "value")
+            cmp_scale_note = hint("", warn=True)
+            cmp_charts: dict = {}
+            with ui.element("div").classes("w-full grid grid-cols-1 lg:grid-cols-2 gap-3"):
+                for cname, ctitle, caxis in (("face", "Face", "likeness %"), ("body", "Body", "likeness %"),
+                                             ("combined", "Combined", "likeness %"), ("loss", "Loss", "loss")):
+                    with ui.column().classes("w-full gap-0 min-w-0"):
+                        ui.label(ctitle).classes("text-sm font-medium")
+                        cchart = RzChart(chart_options(_axis("step", min="dataMin"),
+                                                       _axis(caxis, scale=True) if cname == "loss" else
+                                                       _axis(caxis, min=0), [], [])).classes("w-full h-60")
+                        if cname != "loss":
+                            cchart.options["tooltip"][":formatter"] = HISTORY_TOOLTIP
+                        charts.append(cchart)
+                    cmp_charts[cname] = cchart
+            subhead("Probe images")
+            hint("The ticked runs' downloaded probe images at the same step, the same test picture side by side. Tick "
+                 "two images to compare them large.")
+            with ui.row().classes("w-full items-center gap-2"):
+                cmp_kind = ui.toggle({"face": "Face", "body": "Body"}, value="face",
+                                     on_change=lambda _: draw_compare()).props("dense no-caps")
+                with ui.row().classes("items-center gap-1 no-wrap rz-grow-phone"):
+                    ui.button(icon="chevron_left", color=None, on_click=lambda: step_by(-1)) \
+                        .props("flat dense round").tooltip("Earlier probe")
+                    cmp_step = ui.select({}, on_change=lambda _: draw_compare()) \
+                        .props("dense options-dense outlined").classes("rz-step-pick")
+                    ui.button(icon="chevron_right", color=None, on_click=lambda: step_by(1)) \
+                        .props("flat dense round").tooltip("Later probe")
+            with ui.row().classes("w-full items-center gap-2"):
+                cmp_pick_label = hint("").classes("flex-1 min-w-[10rem]")
+                cmp_pair_btn = ui.button("Compare images", icon="compare", color=None,
+                                         on_click=lambda: open_pair()).props("outline dense no-caps")
+                ui.button("Clear", icon="deselect", color=None, on_click=lambda: clear_picks()) \
+                    .props("flat dense no-caps").tooltip("Untick the picked images")
+            cmp_warn = hint("", warn=True)
+            cmp_grid = ui.column().classes("w-full gap-2")
+        cmp_box.visible = False
+    with ui.dialog().props("maximized") as cmp_dlg, ui.card().tight().classes("w-full h-full bg-black"):
+        with ui.row().classes("w-full items-center justify-between px-3 py-1"):
+            ui.label("Compare").classes("text-sm text-white")
+            ui.button(icon="close", on_click=cmp_dlg.close).props("flat dense round color=white")
+        with ui.row().classes("w-full no-wrap gap-2 px-2 rz-compare"):
+            cmp_imgs, cmp_caps = [], []
+            for _ in range(2):
+                with ui.column().classes("items-center gap-1 rz-compare-half"):
+                    cmp_imgs.append(ui.image("").props("fit=contain").classes("w-full rz-compare-img"))
+                    cmp_caps.append(ui.label("").classes("text-xs text-white text-center"))
+    show_full = image_viewer()
+    cmp_btn.on_click(lambda: open_compare())
+    run_open.on_click(lambda: open_here(fleet_folder(picked_run(), fl.pulls) or fl.pulls))
+
+    def picked_keys() -> list[str]:
+        return [row["key"] for row in run_table.selected]
+
     def picked_run() -> dict | None:
-        key = run_table.selected[0]["key"] if run_table.selected else None
-        return fl.load_run(key) if key else None
+        """The run whose details show: the one ticked run (none with zero or several ticked)."""
+        keys = picked_keys()
+        return fl.load_run(keys[0]) if len(keys) == 1 else None
+
+    def pick_changed() -> None:
+        n = len(picked_keys())
+        cmp_btn.set_enabled(n >= 2)
+        cmp_hint.text = "Tick a second run to compare" if n == 1 else ""
+        if n < 2:
+            cmp["open"] = False
+        show_run()
+        draw_compare()
+
+    def open_compare() -> None:
+        cmp["open"] = True
+        show_run()
+        draw_compare()
+
+    def close_compare() -> None:
+        cmp["open"] = False
+        show_run()
+        draw_compare()
 
     def show_run() -> None:
         rec = picked_run()
         run_detail.visible = rec is not None
+        n = len(picked_keys())
+        run_multi.text = f"{n} runs ticked. Click Compare to chart them together." \
+            if n >= 2 and not cmp["open"] else ""
+        run_multi.visible = bool(run_multi.text)
         if rec is None:
+            paint_run_pull()
             return
         cfg = rec.get("config") or {}
         run_title.text = f"{rec.get('job')} · {rec.get('state')}"
@@ -9714,10 +10406,24 @@ def build_fleet_tab(form_config=None):
                 and not k.startswith("probe_") and k != "job_name"][:18]
         run_settings.text = ("Settings: " + ", ".join(f"{k} {cfg[k]}" for k in keys)) if keys else \
             "Its settings are not on record yet."
-        folder = Path(rec["folder"]) if rec.get("folder") else None
+        folder = fleet_folder(rec, fl.pulls)
         run_folder.text = (f"Files: {folder} ({rec.get('downloaded_mb', 0)} MB: "
                            f"{', '.join(rec.get('downloaded') or [])})" if folder else "No files downloaded.") + \
             (f" · last download failed: {rec['pull_error']}" if rec.get("pull_error") else "")
+        has_region = run_region.fill(folder) if folder else False
+        note = ""
+        if not has_region and (not cfg or cfg.get("region_watch") or cfg.get("region_sweep_every")
+                               or cfg.get("block_audit_every")):
+            note = ("This run's logs are not downloaded yet, so there is no region watch to show: download its logs."
+                    if "logs" not in (rec.get("downloaded") or []) else
+                    "The downloaded logs hold no region watch yet.")
+        run_region_note.text = note
+        run_region_note.visible = bool(note)
+        run_region_box.visible = has_region
+        run_region_exp.visible = has_region or bool(note)
+        run_open.set_enabled(folder is not None)
+        run_open_tip.text = f"Opens {folder} on this computer" if folder else \
+            "Nothing is downloaded for this run yet: download some files first."
         run_images.clear()
         images = sorted(p for p in (folder / "probes").glob("*.png") if not blockaudit.is_audit_image(p.name))[-8:] \
             if folder and (folder / "probes").is_dir() else []
@@ -9725,6 +10431,149 @@ def build_fleet_tab(form_config=None):
             for img in images:
                 ui.image(image_url(img)).classes("w-40 rounded").tooltip(img.name)
         run_forget.visible = rec.get("state") != "running"
+        paint_run_pull()
+
+    # ---- the comparison
+    def cmp_scale() -> dict | None:
+        if not cmp_scale_on.value:
+            return None
+        vals = {k: w.value for k, w in cmp_scale_inputs.items()}
+        if any(v is None for v in vals.values()):
+            return None
+        return {**vals, "face_weight": float(vals["face_weight"]) / 100.0}
+
+    def step_by(delta: int) -> None:
+        keys = list(cmp_step.options)
+        if cmp_step.value in keys:
+            cmp_step.value = keys[min(len(keys) - 1, max(0, keys.index(cmp_step.value) + delta))]
+
+    def picked_recs() -> list[dict]:
+        return [r for r in (fl.load_run(k) for k in picked_keys()) if r]
+
+    def draw_compare() -> None:
+        if cmp.get("busy"):
+            return
+        recs = picked_recs() if cmp["open"] else []
+        cmp_box.visible = cmp["open"] and len(recs) >= 2
+        if not cmp_box.visible:
+            cmp["shown"] = None
+            return
+        runs, own = rescaled_runs(fleet_compare_runs(recs, fl.pulls), cmp_scale())
+        groups = probe_image_groups(runs)
+        kind = cmp_kind.value
+        steps = probe_image_steps(groups, kind)
+        opts = {s: f"Step {s:,}" for s in steps}
+        if cmp_step.options != opts:
+            cmp["busy"] = True  # set_options fires cmp_step's on_change, which must not draw again from inside
+            try:
+                cmp_step.set_options(opts, value=cmp_step.value if cmp_step.value in opts else
+                                     (steps[-1] if steps else None))
+            finally:
+                cmp["busy"] = False
+        step = cmp_step.value
+        paths = {e["path"] for r in runs for e in r["probe_images"]}
+        if any(q not in paths for q in cmp["picks"]):  # images of runs that are not ticked any more
+            keep = [i for i, q in enumerate(cmp["picks"]) if q in paths]
+            cmp["picks"], cmp["captions"] = [cmp["picks"][i] for i in keep], [cmp["captions"][i] for i in keep]
+        last = lambda pts: pts[-1] if pts else None  # noqa: E731  (a thinned series keeps its length: its end moves)
+        sig = (tuple(r["id"] for r in runs),
+               tuple((len(r["loss"]), last(r["loss"]), len(r["probes"].get("combined") or []),
+                      last(r["probes"].get("combined") or []), last(r["probes"].get("face") or []),
+                      last(r["probes"].get("body") or []), len(r["probe_images"])) for r in runs),
+               json.dumps(cmp_scale(), sort_keys=True), kind, step, tuple(cmp["picks"]))
+        if sig == cmp["shown"]:
+            return
+        cmp["shown"] = sig
+        cmp_title.text = f"{len(runs)} runs compared"
+        no_probes = [r["label"] for r in runs if not (r["probes"].get("combined") or r["probes"].get("face"))]
+        cmp_note.text = f"No probe scores on record yet: {', '.join(no_probes)}." if no_probes else ""
+        cmp_note.visible = bool(no_probes)
+        cmp_scale_note.text = (f"On their own scale (no raw probe scores): {', '.join(own)}"
+                               if own and cmp_scale_on.value else "")
+        cmp_scale_note.visible = bool(cmp_scale_note.text)
+        for metric in ("face", "body", "combined"):
+            series = history_series(runs, "probes", [metric])
+            chart = cmp_charts[metric]
+            chart.options["series"] = series
+            chart.options["legend"]["data"] = list(dict.fromkeys(sr["name"] for sr in series))
+            charts.restyle(chart)
+        loss_series = []
+        for i, r in enumerate(runs):
+            if len(r["loss"]) > 1:
+                color = HISTORY_COLORS[i % len(HISTORY_COLORS)]
+                loss_series.append({"name": r["label"], "id": f"{r['label']} · loss", "type": "line",
+                                    "data": r["loss"], "showSymbol": False, "itemStyle": {"color": color},
+                                    "lineStyle": {"color": color, "width": 1.5}})
+        cmp_charts["loss"].options["series"] = loss_series
+        cmp_charts["loss"].options["legend"]["data"] = [sr["name"] for sr in loss_series]
+        charts.restyle(cmp_charts["loss"])
+        diffs = probe_settings_differences(runs)
+        cmp_warn.text = ("Probe settings differ, so these probes are not the same test: " + "; ".join(diffs)) \
+            if diffs else ""
+        cmp_warn.visible = bool(cmp_warn.text)
+        cmp_pick_label.text = f"{len(cmp['picks'])} of 2 picked" if cmp["picks"] else \
+            "Tick any two images (any run, any step) to compare them large"
+        cmp_pair_btn.enabled = len(cmp["picks"]) == 2
+        cmp_grid.clear()
+        with cmp_grid:
+            not_here = [r["label"] for r in runs if not r["probe_images"]]
+            if not_here:
+                hint(f"Probes not downloaded: {', '.join(not_here)}. Click the cloud icon on a run's row to download "
+                     "its probe images.")
+            if not steps:
+                return
+            missing, items = probe_compare(groups, step, kind)
+            if missing:
+                hint(f"No {kind} probe by step {step:,}: {', '.join(missing)}")
+            captions = {id(e): " · ".join(x for x in (heading, label, f"Step {e['step']:,}", probe_caption(e)) if x)
+                        for heading, e, label, _ in items}
+            view = [(e["path"], captions[id(e)]) for _, e, _, _ in items]
+            for heading in dict.fromkeys(h for h, _, _, _ in items):
+                ui.label(heading).classes("rz-subhead w-full")
+                with ui.element("div").classes("rz-gallery"):
+                    for _, e, label, note in (it for it in items if it[0] == heading):
+                        path = e["path"]
+                        picked_now = path in cmp["picks"]
+                        with ui.column().classes("rz-shot gap-0" + (" rz-picked" if picked_now else "")):
+                            ui.image(image_url(path)).props("ratio=1 fit=contain") \
+                                .classes("w-full rz-imgbg cursor-pointer") \
+                                .on("click", lambda _, q=path: show_full(q, view))
+                            ui.button(icon="check_box" if picked_now else "check_box_outline_blank", color=None,
+                                      on_click=lambda _, q=path, c=captions[id(e)]: toggle_pick(q, c)) \
+                                .props("flat dense round size=sm").classes("rz-shot-pick") \
+                                .tooltip("Tick to compare with another image")
+                            ui.label(label).classes("rz-shot-title")
+                            ui.label(" · ".join(x for x in (probe_caption(e), note) if x)).classes("rz-shot-sub")
+
+    def toggle_pick(path: str, caption: str) -> None:
+        if path in cmp["picks"]:
+            i = cmp["picks"].index(path)
+            del cmp["picks"][i]
+            del cmp["captions"][i]
+        else:
+            if len(cmp["picks"]) == 2:  # a third pick replaces the older one
+                cmp["picks"].pop(0)
+                cmp["captions"].pop(0)
+            cmp["picks"].append(path)
+            cmp["captions"].append(caption)
+        cmp["shown"] = None
+        if len(cmp["picks"]) == 2:  # before the redraw, which removes the button this click came from
+            open_pair()
+        draw_compare()
+
+    def open_pair() -> None:
+        if len(cmp["picks"]) != 2:
+            return
+        for img, cap, path, text in zip(cmp_imgs, cmp_caps, cmp["picks"], cmp["captions"]):
+            img.set_source(image_url(path))
+            cap.text = text
+        cmp_dlg.open()
+
+    def clear_picks() -> None:
+        cmp["picks"].clear()
+        cmp["captions"].clear()
+        cmp["shown"] = None
+        draw_compare()
 
     async def pull_run():
         rec = picked_run()
@@ -9732,7 +10581,7 @@ def build_fleet_tab(form_config=None):
             return
         run_pull.disable()
         try:
-            result = await act(lambda: fl.pull(fl.instance(rec["instance"]), rec["key"], list(run_kinds.value)))
+            result = await act(fl.pull_now, rec["key"], list(run_kinds.value))
         finally:
             run_pull.enable()
         if isinstance(result, dict):
@@ -9744,7 +10593,7 @@ def build_fleet_tab(form_config=None):
         rec = picked_run()
         if rec is not None and await act(fl.forget_run, rec["key"], ok=f"{rec['job']} dropped from the list"):
             run_table.selected = []
-            show_run()
+            pick_changed()
 
     run_pull.on_click(pull_run)
     run_forget.on_click(forget_run)
@@ -9762,7 +10611,7 @@ def build_fleet_tab(form_config=None):
         if options != q_run.options:
             q_run.set_options(options, value=q_run.value if q_run.value in options else None)
         if keep:
-            show_run()
+            pick_changed()
 
     def changed(name: str, value) -> bool:
         """Whether a part of the page differs from what is drawn (and remember it as drawn)."""
@@ -9793,6 +10642,9 @@ def build_fleet_tab(form_config=None):
             draw_queue(view)
         if changed("settings", view["settings"]):
             draw_downloads(view)
+        if changed("pulls", pull_entries()):
+            draw_pulls()
+        fill_regions()
         if changed("watches", view["watches"]):
             draw_watches(view)
         draw_events()
@@ -9814,7 +10666,7 @@ def build_page(local: bool = True):
     job_running = reattach_job()
     look = {"light": False}  # this browser's look, read from its localStorage once the page is connected
     form_state: dict = {"text": "", "warned": False}  # persist()'s last saved settings; "pristine": the defaults
-    charts: list = []  # ECharts to recolor when the look changes
+    charts: list = ChartList(look)  # ECharts to recolor when the look changes
 
     def set_look(light: bool, save: bool = True) -> None:
         look["light"] = light
@@ -13561,7 +14413,7 @@ def build_page(local: bool = True):
         if tab_fleet is not None:
             with ui.tab_panel(tab_fleet):
                 with ui.column().classes("rz-page gap-4"):
-                    build_fleet_tab(form_config)
+                    build_fleet_tab(form_config, charts)
 
         # ------------------------------------------------------------ Help
         with ui.tab_panel(tab_help):
@@ -13894,7 +14746,21 @@ instances, one part each; the parts are compared by best likeness under Past run
 **Automatic downloads**: logs, probe images, sample images, training maps, the best LoRA and every LoRA each have
 their own rule: never, when the run ends, or while it runs. **Watches** raise an event when a number goes above or
 below a value (loss, a probe score, free disk, ...). **Past runs** keeps every run the fleet has seen, also after its
-instance is gone.
+instance is gone. A run that had already finished when the Fleet first saw it (say you opened RulZ AI Trainer after
+it ended) is downloaded by the same rules. To fetch files by hand, click **Download files** on an instance's card or
+the cloud icon on a row of Past runs, pick the kinds, and click **Download**; only files not already on this computer
+are fetched. The **Downloads** strip under the header shows each download as it goes (files, megabytes, speed, time
+left) and for a few seconds after it ends. **Open downloads folder** shows the folder the files go to, and **Open
+folder** in a run's details shows that run's own folder; both open on the computer that runs this WebUI.
+
+**Region watch**: for a run whose logs are downloaded, the run's details (under Past runs) and a running instance's
+card (a collapsible Region watch) show the same region watch, sweep and block audit lines and charts as the Monitor.
+Nothing shows for a run that had none, or whose logs are not downloaded yet.
+
+**Compare**: tick two or more runs under Past runs and click **Compare**. Their face, body and combined likeness
+and their loss are drawn together, one line per run (**Compare on one scale** rescores them the way Previous runs does),
+and their downloaded probe images are shown side by side at a step you pick; tick two images to see them large. A
+run whose probe images are not downloaded says so: use the cloud icon on its row.
 
 The WebUI does the looking while it runs. Closed, run `python scripts/vast/rulz_fleet.py daemon` instead, or nothing
 moves the queue, downloads files or checks the watches. The same file is the command line for all of this

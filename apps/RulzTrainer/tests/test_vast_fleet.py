@@ -267,8 +267,115 @@ def test_runs_already_on_an_instance_are_taken_into_the_history_without_events(w
     machine.finish("error", error="boom")
     world.tick()
     rec = world.fleet.find_run("old")
-    assert rec["state"] == "error" and rec["imported"] and not rec.get("final_pull")
-    assert not world.kinds("run_started", "run_failed") and not world.fetched
+    assert rec["state"] == "error" and rec["imported"]
+    assert not world.kinds("run_started", "run_failed", "run_done")
+    # its files come by the download rules, like a closed run's
+    assert world.fetched and rec["downloaded"] and rec["pulled_final"] and not rec["final_pull"]
+
+
+def test_an_imported_run_with_every_download_rule_off_is_not_pulled(world):
+    world.fleet.set_download({k: "off" for k in fleet_module.DOWNLOAD_KINDS})
+    machine = world.machines["1"]
+    machine.run("old")
+    machine.finish()
+    world.tick()
+    world.tick()
+    rec = world.fleet.find_run("old")
+    assert rec["imported"] and not world.fetched and not rec.get("downloaded") and not rec["final_pull"]
+
+
+def test_pull_now_fetches_the_asked_kinds(world):
+    world.machines["1"].run("a")
+    world.tick()
+    result = world.fleet.pull_now(world.fleet.find_run("a")["key"], ["best", "loras"])
+    assert result["fetched"] == 2 and "error" not in result
+    assert ("pull", world.fleet.find_run("a")["key"]) not in world.fleet.busy
+
+
+def test_pull_now_refuses_while_the_looker_pulls_the_same_run(world):
+    world.machines["1"].run("a")
+    world.tick()
+    key = world.fleet.find_run("a")["key"]
+    world.fleet.busy.add(("pull", key))
+    with pytest.raises(Refused, match="already going"):
+        world.fleet.pull_now(key, ["logs"])
+    assert ("pull", key) in world.fleet.busy  # the looker's mark is not ours to drop
+
+
+def test_pull_now_says_so_when_the_instance_is_gone(world):
+    world.machines["2"].run("b")
+    world.tick()
+    key = world.fleet.find_run("b")["key"]
+    world.listed = lambda: listing([world.machines["1"]])
+    world.fleet.discover()
+    with pytest.raises(Refused, match="Instance 2 is gone"):
+        world.fleet.pull_now(key, ["logs"])
+    with pytest.raises(Refused, match="No run"):
+        world.fleet.pull_now("nope", ["logs"])
+
+
+def test_pull_now_drops_its_mark_when_the_pull_fails(world):
+    world.machines["1"].run("a")
+    world.tick()
+    key = world.fleet.find_run("a")["key"]
+    world.machines["1"].down = True
+    result = world.fleet.pull_now(key, ["logs"])
+    assert result.get("error") and ("pull", key) not in world.fleet.busy
+
+
+def test_download_progress_is_shared_and_manual(world, tmp_path):
+    world.machines["1"].run("a")
+    world.tick()
+    key = world.fleet.find_run("a")["key"]
+    other = world.new_fleet(tmp_path)
+    seen = []
+
+    def fetch(target, base, files, dest, *, progress):
+        world.clock.t += 2
+        progress(3, 1)
+        seen.extend(other.downloads())
+
+    world.fleet.fetch = fetch
+    world.fleet.pull_now(key, ["best", "loras"])
+    going = next(item for item in seen if item["run"] == key)
+    assert (going["state"], going["bytes_done"], going["bytes_total"]) == ("going", 3, 10)
+    assert (going["files_done"], going["files_total"], going["manual"]) == (1, 2, True)
+    done = other.downloads()[0]
+    assert (done["state"], done["files_done"], done["bytes_done"], done["fetched"]) == ("done", 2, 10, 2)
+    assert done["speed"] > 0 and done["pid"] > 0
+    world.clock.t += 16
+    assert other.downloads() == []
+
+
+def test_download_stale_and_failure(world):
+    world.machines["1"].run("a")
+    world.tick()
+    key = world.fleet.find_run("a")["key"]
+    now = world.clock()
+    world.fleet._write_json(world.fleet.downloads_file, {key: {"run": key, "state": "going", "updated": now}})
+    world.clock.t += 61
+    stale = world.fleet.downloads()[0]
+    assert stale["state"] == "failed" and stale["error"] == "stopped answering"
+    world.clock.t += 10  # a stale entry stays `keep` (15 s) after it went stale (60 s), then goes
+    assert world.fleet.downloads()[0]["error"] == "stopped answering"
+    world.fleet._download_write({"run": "other", "state": "done", "updated": world.clock()})
+    assert {e["run"] for e in world.fleet.downloads()} == {key, "other"}  # a write keeps it for the same time
+    world.clock.t += 6
+    assert [e["run"] for e in world.fleet.downloads()] == ["other"]
+    world.machines["1"].down = True
+    result = world.fleet.pull_now(key, ["logs"])
+    failed = world.fleet.downloads()[0]
+    assert failed["state"] == "failed" and failed["error"] == result["error"] and failed["manual"]
+
+
+def test_empty_pull_is_recorded(world):
+    world.machines["1"].run("a")
+    world.tick()
+    key = world.fleet.find_run("a")["key"]
+    world.fleet.pull_now(key, ["best"])
+    world.fleet.pull_now(key, ["best"])
+    entry = world.fleet.downloads()[0]
+    assert (entry["state"], entry["files_total"], entry["bytes_total"]) == ("done", 0, 0)
 
 
 def test_a_failed_and_a_killed_run_say_so(world):
@@ -1065,3 +1172,44 @@ def test_a_sent_config_keeps_its_small_numbers():
                                      "lora_rank": " 16 ", "job_name": "1e-4"})
     assert (by_hand.learning_rate, by_hand.steps, by_hand.lora_rank, by_hand.job_name) == (1e-4, 2000, 16, "1e-4")
     assert TrainConfig.numbers({"steps": "2.5", "learning_rate": "fast"}) == {"steps": "2.5", "learning_rate": "fast"}
+
+
+def test_a_broken_stream_is_a_failed_download_not_a_crash(world):
+    import tarfile
+
+    world.machines["1"].run("a")
+    world.tick()
+    key = world.fleet.find_run("a")["key"]
+
+    def fetch(target, base, files, dest):
+        raise tarfile.ReadError("unexpected end of data")
+
+    world.fleet.fetch = fetch
+    result = world.fleet.pull_now(key, ["loras"])
+    assert "unexpected end of data" in result["error"]
+    entry = world.fleet.downloads()[0]
+    assert entry["state"] == "failed" and entry["manual"]
+    assert world.fleet.load_run(key)["pull_fails"] == 1
+
+
+def test_a_download_going_in_another_process_is_refused(world):
+    import os
+
+    world.machines["1"].run("a")
+    world.tick()
+    key = world.fleet.find_run("a")["key"]
+    world.fleet._write_json(world.fleet.downloads_file, {key: {
+        "run": key, "state": "going", "updated": world.clock(), "pid": os.getpid() + 1}})
+    with pytest.raises(Refused, match="already going"):
+        world.fleet.pull_now(key, ["logs"])
+    world.clock.t += 61  # stopped answering: no longer in the way
+    assert "error" not in world.fleet.pull_now(key, ["logs"])
+
+
+def test_a_job_name_that_is_not_a_folder_name_is_not_a_run(world):
+    m = world.machines["1"]
+    m.run("a")
+    for bad in ("../x", "a/b", "..", "."):
+        m.jobs[bad] = dict(m.jobs["a"], job=bad, run_id=f"r-{bad}")
+    world.tick()
+    assert [r["job"] for r in world.fleet.runs()] == ["a"]
