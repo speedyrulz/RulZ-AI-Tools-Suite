@@ -127,3 +127,41 @@ def test_finding_under_isolation_names_adamws_rate():
                                  lora_rank=16, lora_alpha=8.0), None)
     assert f.evidence['lr_at_alpha_rank'] == pytest.approx(1e-4)
     assert "AdamW's learning rate under isolation 2.0e-04 acts like 1.0e-04" in f.detail
+
+
+def test_lr_alpha_scale_in_the_trainer_keys():
+    from rulz_optimizer.trainer_keys import DEFAULTS
+    assert KEYS['lr_alpha_scale'] == 'bool' and DEFAULTS['lr_alpha_scale'] is False
+
+
+def test_lr_alpha_scale_makes_the_entered_rate_the_equivalent():
+    # off (or key missing): learning_rate x alpha / rank; on: the entered rate itself
+    assert lr_at_alpha_rank(run_with(learning_rate=1e-4, lora_alpha=1.0).config) == pytest.approx(1e-4 / 16)
+    assert lr_at_alpha_rank(run_with(learning_rate=1e-4, lora_alpha=1.0, lr_alpha_scale=True).config) == pytest.approx(1e-4)
+    # no effect where it does not apply
+    assert lr_at_alpha_rank(run_with(lr_alpha_scale=True, lora_alpha=16.0).config) == pytest.approx(1e-4)
+    assert lr_at_alpha_rank(run_with(lr_alpha_scale=True, lora_alpha=1.0, optimizer='keel').config) is None
+    assert lr_at_alpha_rank(run_with(lr_alpha_scale=True, lora_alpha=1.0, network_type='oft').config) is None
+    assert lr_at_alpha_rank(run_with(lr_alpha_scale=True, lora_alpha=1.0, finetune=True).config) is None
+    # isolation swaps Keel for AdamW, so the toggle applies; the entered (in-range) rate is the equivalent
+    assert lr_at_alpha_rank(run_with(optimizer='keel', isolation=True, dop_weight=2.0, learning_rate=1e-4, lora_alpha=1.0,
+                                     lr_alpha_scale=True).config) == pytest.approx(1e-4)
+
+
+def test_finding_says_the_rate_was_scaled():
+    f, = alpha_findings(run_with(learning_rate=1e-4, lora_alpha=1.0, lr_alpha_scale=True), None)
+    assert f.evidence['lr_at_alpha_rank'] == pytest.approx(1e-4)
+    assert 'was scaled by x16 (Scale LR to alpha = rank) and trained at 1.6e-03' in f.detail
+    assert 'acts like 1.0e-04 at alpha = rank' in f.detail
+    f, = alpha_findings(run_with(learning_rate=1e-4, lora_alpha=1.0), None)
+    assert 'Scale LR' not in f.detail
+    assert alpha_findings(run_with(learning_rate=1e-4, lora_alpha=16.0, lr_alpha_scale=True), None) == []
+    assert alpha_findings(run_with(lora_alpha=1.0, lr_alpha_scale=True, optimizer='hull'), None) == []
+
+
+def test_finding_warns_on_the_entered_rate_when_scaled(knowledge):
+    recommended = recommend(knowledge, 'krea2', None, Goals()).choices['learning_rate'].value
+    f, = alpha_findings(run_with(learning_rate=recommended * 4, lora_alpha=1.0, lr_alpha_scale=True), knowledge)
+    assert f.symptom == 'alpha_lr_off' and 'above the recommended' in f.detail
+    f, = alpha_findings(run_with(learning_rate=recommended, lora_alpha=1.0, lr_alpha_scale=True), knowledge)
+    assert f.severity == 'info'
