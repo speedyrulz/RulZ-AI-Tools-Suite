@@ -11,7 +11,9 @@ What is kept is what the Monitor's two likeness charts plot:
 on the normalized scale (0 = a stranger, 100 = the references) where the run had one, else the raw percentages.
 The probe images are kept too, as small JPEG copies in output/_history/<run id>/ (a later run with the same job name
 overwrites the job folder's own), each with its step, kind, seed, configuration and that probe's scores
-(probe_images), for the Previous Runs tab's side-by-side comparison. Runs from before the history existed are imported
+(probe_images), for the Previous Runs tab's side-by-side comparison. The region sweeps are kept in the record
+(sweeps: per step the training and held-out shares per region) and the training maps as a copy of the job's
+training_maps/ files in output/_history/<run id>/maps/ (record "maps": true; copied when the run ends). Runs from before the history existed are imported
 from their job folders' status.json."""
 from __future__ import annotations
 
@@ -236,8 +238,70 @@ def race_names(status: dict) -> list[str]:
     return [str(n) for n in ((status.get("race") or {}).get("names") or [])]
 
 
+def sweep_series(status: dict, folder=None) -> list[dict]:
+    """The run's region sweeps, compact: [{"step", "train": {region: share}, "held": {region: share}}] oldest first,
+    from the status's region_sweep history, else (a status written without one) the folder's region_sweep.jsonl. A step
+    seen twice keeps the later row; the shares (of the starting error that is gone) are rounded to 5 decimals."""
+    rows = list(((status.get("region_sweep") or {}).get("history")) or [])
+    if not rows and folder is not None:
+        try:
+            with open(Path(folder) / "region_sweep.jsonl", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rows.append(json.loads(line))
+                    except ValueError:
+                        continue  # a line still being written
+        except OSError:
+            pass
+    by: dict[int, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            step = int(row["step"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        entry: dict = {"step": step}
+        for key in ("train", "held"):
+            vals = row.get(key)
+            entry[key] = {str(r): round(float(v), 5) for r, v in (vals.items() if isinstance(vals, dict) else ())
+                          if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        if entry["train"] or entry["held"]:
+            by[step] = entry
+    return [by[s] for s in sorted(by)]
+
+
+MAPS_SUBDIR = "maps"  # root/<run id>/maps/: the kept copy of the job's training_maps/ folder
+MAPS_DIRNAME = "training_maps"  # trainmaps.DIRNAME (not imported here)
+
+
+def keep_maps(run_id: str, job_dir, root: Path = HISTORY_DIR) -> bool:
+    """Copy the job's training_maps/ files (probes.json, maps.jsonl, probe_*.jpg) into root/<run id>/maps/; a file
+    already there with the same size and modification time is left alone. True when the kept copy has maps."""
+    import shutil
+
+    src = Path(job_dir) / MAPS_DIRNAME if job_dir else None
+    dest = root / run_id / MAPS_SUBDIR
+    if src is not None and (src / "maps.jsonl").is_file():
+        for p in [src / "probes.json", src / "maps.jsonl", *sorted(src.glob("probe_*.jpg"))]:
+            try:
+                if not p.is_file():
+                    continue
+                st, target = p.stat(), dest / p.name
+                if target.is_file() and (target.stat().st_size, target.stat().st_mtime_ns) == (st.st_size,
+                                                                                              st.st_mtime_ns):
+                    continue
+                dest.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(p, target)
+            except OSError:
+                continue
+    return (dest / "maps.jsonl").is_file()
+
+
 def build_record(cfg: dict, arch: str, run_id: str, started: float, status: dict, state: str,
-                 updated: float | None = None) -> dict:
+                 updated: float | None = None, folder=...) -> dict:
+    """folder: where the run's files are when that is not the config's output_dir/job_name (a vast.ai download), or None
+    when they are not here; its region_sweep.jsonl stands in for a status without the sweep history."""
     job_dir = Path(cfg.get("output_dir") or "output") / cfg.get("job_name", "")
     return {"version": 1, "id": run_id, "job": cfg.get("job_name", ""), "job_dir": str(job_dir.resolve()),
             "label": "", "arch": arch,
@@ -246,7 +310,8 @@ def build_record(cfg: dict, arch: str, run_id: str, started: float, status: dict
             "config": {k: cfg[k] for k in CONFIG_KEYS if k in cfg},
             "identity": identity_series(status.get("face_scores") or []),
             "probes": probe_series(status.get("probes") or [], race_names(status)),
-            "probe_raw": probe_raw(status)}
+            "probe_raw": probe_raw(status),
+            "sweeps": sweep_series(status, job_dir if folder is ... else folder)}
 
 
 def has_data(record: dict) -> bool:
@@ -300,6 +365,11 @@ def save_run(cfg, run_id: str, started: float, status: dict, state: str = "runni
         return None
     path = root / f"{run_id}.json"
     record["probe_images"] = keep_probe_images(run_id, status, root)
+    # the maps are copied once the run is over (this runs often while it trains); a copy already kept stays marked
+    if state != "running":
+        keep_maps(run_id, record["job_dir"], root)
+    if (root / run_id / MAPS_SUBDIR / "maps.jsonl").is_file():
+        record["maps"] = True
     # the label is read last, right before the write: copying the pictures takes a while, and a label the WebUI set
     # meanwhile (set_label) was written over with the one read before it
     try:
@@ -389,7 +459,7 @@ def import_jobs(output: Path | None = None, root: Path = HISTORY_DIR) -> int:
     unsplit = {r["job"]: r for r in runs if (r.get("config") or {}).get("race") and "racers" not in r["probes"]}
     incomplete: dict[str, list[dict]] = {}  # without probe images or raw scores; a job name can have several runs
     for r in runs:
-        if "probe_images" not in r or "probe_raw" not in r:
+        if "probe_images" not in r or "probe_raw" not in r or "sweeps" not in r or "maps" not in r:
             incomplete.setdefault(r["job"], []).append(r)
     added = 0
     for status_path in sorted(output.rglob("status.json")) if output.is_dir() else []:
@@ -424,6 +494,12 @@ def import_jobs(output: Path | None = None, root: Path = HISTORY_DIR) -> int:
                 if raw["records"]:
                     rec["probe_raw"] = raw
                     changed = True
+            if "sweeps" not in rec:
+                rec["sweeps"] = sweep_series(status, job_dir)
+                changed = True
+            if "maps" not in rec and keep_maps(rec["id"], job_dir, root):
+                rec["maps"] = True
+                changed = True
         if changed:
             _write(root / f"{rec['id']}.json", rec)
             added += 1
@@ -439,10 +515,12 @@ def import_jobs(output: Path | None = None, root: Path = HISTORY_DIR) -> int:
         state = "error" if status.get("error") else "finished" if status.get("done") else "stopped"
         started, updated = cfg_path.stat().st_mtime, status_path.stat().st_mtime
         record = build_record({**cfg, "job_name": job}, arch, new_run_id(job, started) + "-imported", started, status,
-                              state, updated)
+                              state, updated, folder=job_dir)
         record["job_dir"] = str(job_dir.resolve())
         if has_data(record):
             record["probe_images"] = keep_probe_images(record["id"], status, root)
+            if keep_maps(record["id"], job_dir, root):
+                record["maps"] = True
             _write(root / f"{record['id']}.json", record)
             have.add(job)
             added += 1
@@ -529,13 +607,15 @@ def import_fleet_runs(fleet_dir: Path = FLEET_RUNS_DIR, root: Path = HISTORY_DIR
             arch = ""
         started = fr.get("started") or fr.get("first_seen") or 0
         record = build_record(cfg, arch, run_id, started, status, VAST_STATES.get(fr.get("state"), "stopped"),
-                              fr.get("ended") or fr.get("modified") or started)
+                              fr.get("ended") or fr.get("modified") or started, folder=folder)
         if not has_data(record):
             continue
         record["job_dir"] = str(folder) if folder else ""
         record["source"] = {"kind": "vast", "instance": fr.get("instance"), "gpu": fr.get("gpu"), "key": fr["key"],
                             "stamp": stamp}
         record["probe_images"] = keep_probe_images(run_id, status, root, folder) if folder else []
+        if folder and keep_maps(run_id, folder, root):
+            record["maps"] = True
         record["label"] = old.get("label", "")
         try:
             _write(out_path, record)

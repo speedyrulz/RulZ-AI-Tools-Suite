@@ -2782,6 +2782,19 @@ saved before it existed, while their job folder is still there. *Rename* gives a
 its history file only (never the job folder). *Export spreadsheet* downloads each ticked run's likeness spreadsheet (see
 *Export spreadsheet* under the likeness probes), from the raw probe scores the history keeps for it.
 
+**Region sweeps and training maps.** Under the likeness chart, *Region sweeps* overlays the ticked runs' region sweeps
+(the Monitor's chart): pick a region (subject, face, hair, skin, clothes, background) and turn the training or
+held-out pictures on or off; the line is the share of the region's starting error that is gone at each step, one colour
+per run, held-out pictures dashed. *Training maps* shows the same training picture of every ticked run side by side
+(Picture 1, 2, 3 is each run's own first, second and third map picture), at the step you pick (a run with no capture
+there shows its latest one before it). Choose the map, the noise level and, for *Learned since the start*, how it is
+measured: the default, *Share, same scale for every run*, puts every picture on one colour scale, so two runs'
+colours mean the same. The history keeps both after the job folder is reused: the sweeps in the run's history file,
+the maps as a copy of its `training_maps/` folder in `output/_history/<run>/maps/` (copied when the run ends; a run
+that is still training is read from its job folder). A vast.ai run has them once its `region_sweep.jsonl` / `status.json`
+and `training_maps/` folder are downloaded. A run saved before this existed gets them from *Import old runs* while
+its job folder still holds that run. Runs without sweeps or maps (turn on Training maps before a run) say so.
+
 **Saved files** (under the table) has the Monitor's downloads for a ticked run (with several ticked, pick which): one
 LoRA, all of them as a zip, the logs and settings as a zip, or all the probe images or all the sample images as a
 zip, so a run's files can still be fetched after the next run
