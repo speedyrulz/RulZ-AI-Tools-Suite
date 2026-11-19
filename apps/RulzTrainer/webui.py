@@ -1017,6 +1017,46 @@ def last_log_line(path, tail_bytes: int = 16384) -> str:
     return ""
 
 
+SECOND_GPU_JOBS = {"probe": ("Likeness probe", "probes"), "sample": ("Samples", "sample rounds"),
+                   "sweep": ("Region sweep", "region sweeps"), "maps": ("Training maps", "training maps")}
+
+
+def second_gpu_text(sg: dict | None, running: bool, now: float) -> dict | None:
+    """The Monitor's second-GPU tile from status second_gpu (trainer._second_gpu_status): {"title", "dot" (rz-dot
+    class: live, done, error or "" for idle), "value" (the job), "detail" (its step and how long it has run), "sub"
+    (what comes next, what is done)}; None when the run uses no second GPU."""
+    if not isinstance(sg, dict) or not sg.get("device"):
+        return None
+    state = sg.get("state")
+    if not running and state in ("loading", "working", "idle"):  # the run ended without closing it
+        state = "stopped"
+    since = sg.get("since")
+    took = f"for {duration_text(now - since)}" if isinstance(since, (int, float)) else ""
+    done = sg.get("done") or {}
+    done_text = ", ".join(f"{n} {SECOND_GPU_JOBS.get(k, (k, k))[1]}" for k, n in done.items() if n)
+    done_line = f"done: {done_text}" if done_text else ""
+    detail, parts = "", []
+    if state == "loading":
+        dot, value, detail = "live", "Loading models", took
+    elif state == "working":
+        dot, value = "live", SECOND_GPU_JOBS.get(sg.get("kind"), (str(sg.get("kind") or "Job"), ""))[0]
+        detail = " · ".join(p for p in (f"step {int(sg.get('step') or 0):,}", took) if p)
+        queued = sg.get("queued") or []
+        if queued:
+            q = queued[0]
+            parts.append(f"next: {SECOND_GPU_JOBS.get(q.get('kind'), (str(q.get('kind')), ''))[0].lower()} of step "
+                         f"{int(q.get('step') or 0):,}" + (f" (+{len(queued) - 1})" if len(queued) > 1 else ""))
+        parts.append(done_line)
+    elif state == "idle":
+        dot, value, parts = "", "Waiting for work", [done_line or "nothing done yet"]
+    elif state == "failed":
+        dot, value, detail, parts = "error", "Failed", str(sg.get("note") or ""), [done_line]
+    else:
+        dot, value, parts = "done", "Stopped", [done_line or str(sg.get("note") or "")]
+    return {"title": f"Second GPU · {sg['device']}", "dot": dot, "value": value, "detail": detail,
+            "sub": " · ".join(p for p in parts if p)}
+
+
 def working_rate_text(st: dict) -> str:
     """Automagic 4's working rate (the raw rate x its mean brake) for the Monitor's lr tile, e.g. "working 1.2e-04
     (18% braked)"; "" when the status has none."""
@@ -2676,6 +2716,7 @@ h1, h2, h3, .rz-pane-title { font-family: "Segoe UI Variable Display", "Segoe UI
 .rz-tile-label { font-size: 12px; color: var(--rz-muted); text-transform: uppercase; letter-spacing: .08em; }
 .rz-tile-value { font-size: 20px; font-weight: 600; color: var(--rz-heading); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 .rz-tile-sub { font-size: 13px; color: var(--rz-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.rz-tile-sub.rz-wrap { white-space: normal; }
 .rz-banner { border-radius: 10px; padding: 10px 14px; font-size: 14px; width: 100%; }
 .rz-banner.error { background: rgba(237, 0, 13, .12); border: 1px solid rgba(255, 59, 48, .45); color: var(--rz-err-text); }
 .rz-banner.warning { background: rgba(245, 158, 11, .10); border: 1px solid rgba(245, 158, 11, .40); color: var(--rz-warn-text); }
@@ -13944,6 +13985,16 @@ def build_page(local: bool = True):
                 # wide screen these and the status tiles stand in columns at the sides instead: .rz-monitor CSS)
                 with ui.element("div").classes("rz-machine"):
                     gpu_box = ui.element("div").classes("rz-machine-gpus")
+                    # what the second GPU's process (probe_async, sample_async, maps_async, sweep_async) is doing
+                    with ui.element("div").classes("rz-machine-gpus"):
+                        with ui.column().classes("rz-tile rz-gpu gap-1") as gpu2_tile:
+                            gpu2_title = ui.label("").classes("text-sm font-semibold rz-strong")
+                            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                                gpu2_dot = ui.element("span").classes("rz-dot")
+                                gpu2_value = ui.label("").classes("rz-tile-value text-base")
+                            gpu2_detail = ui.label("").classes("rz-tile-sub")
+                            gpu2_sub = ui.label("").classes("rz-tile-sub rz-wrap")
+                        gpu2_tile.visible = False
                     sys_box = ui.element("div").classes("rz-machine-sys")
                 # one part of the run at a time instead of one long page
                 monitor_view = ViewSwitch(MONITOR_VIEWS, "overview")
@@ -14472,6 +14523,13 @@ def build_page(local: bool = True):
                 view_notes()
                 st = read_status()
                 running = _running()
+                gpu2 = second_gpu_text(st.get("second_gpu") if st else None, running, time.time())
+                gpu2_tile.visible = gpu2 is not None
+                if gpu2 is not None:
+                    gpu2_title.text, gpu2_value.text = gpu2["title"], gpu2["value"]
+                    gpu2_detail.text, gpu2_sub.text = gpu2["detail"], gpu2["sub"]
+                    gpu2_detail.visible, gpu2_sub.visible = bool(gpu2["detail"]), bool(gpu2["sub"])
+                    gpu2_dot.classes(replace=f"rz-dot {gpu2['dot']}".strip())
                 if st is None:
                     show("state", "Starting" if running else "Idle", _job_dir.name if _job_dir else "no job yet")
                     for key in ("stage", "step", "loss", "lr", "eta"):
@@ -15387,6 +15445,8 @@ that were scored. It pays off when one probe on the second GPU takes less time t
 (measured 10-24% faster on Qwen 2.1); with large probes every few steps training waits for them and it is slower. The
 log shows each probe's time as "on cuda:0, in at step N", and the end of training how long training waited. Not used
 in a configuration race or a fine-tune; if the second GPU runs out of memory, probes go back to the training GPU.
+While a run uses the second GPU (for probes, samples, training maps or region sweeps), the Monitor's *Second GPU* tile
+shows what it is working on, for which step, what comes next and how many jobs it has done.
 
 ## Near-duplicate photos
 Before training, unless *Copy check* is off, SSCD compares your training photos with each other (it is about 99 MB,

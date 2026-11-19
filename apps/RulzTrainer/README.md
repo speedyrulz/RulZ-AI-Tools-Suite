@@ -2412,7 +2412,8 @@ It saves the most when one probe on the second GPU finishes in less time than `p
 
 ### More jobs on the second GPU (`sample_async`, `maps_async`, `sweep_async`, since 3.43.0)
 
-**Never run on real GPUs yet: unit-tested with fakes only.** Four independent switches, all off by default, any
+**Run on real GPUs since 3.43.1** (FIBO 2 on 2× RTX 5090: probes, maps and sweeps on the second card; in 3.43.0 maps
+and sweeps never started there). Four independent switches, all off by default, any
 combination, all on the same second GPU (`probe_device`) and the same single process. Each moves one kind of job
 that otherwise pauses training; with a switch off that job runs on the training GPU as before.
 
@@ -2423,6 +2424,11 @@ that otherwise pauses training; with a switch off that job runs on the training 
 | `maps_async` | the [training maps](#training-maps-training_maps) captures | nothing acts on maps; the capture is recorded (`maps.jsonl`, the Training maps tab) when it is in |
 | `sweep_async` | the [region sweeps](#region-sweeps-and-held-out-photos-experimental) (the held-out photos too) | the held-out best checkpoint, `holdout_patience`'s stop and region steering, when the sweep is recorded |
 
+- **What it is doing now** (since 3.45.0). The Monitor shows a **Second GPU** tile beside the GPU tiles while a run
+  uses one: *Loading models*, the job it is on (*Likeness probe*, *Samples*, *Region sweep*, *Training maps*) with the
+  step whose weights it reads and how long it has run, the next job queued, and how many of each it has done; then
+  *Waiting for work*, and at the end *Stopped*, or *Failed* when everything went back to the training GPU. It is
+  written to `status.json` as `second_gpu` and refreshed every training step.
 - **The weights each job reads.** At the step a job is due, the trainer takes the LoRA as it stands (the `lora_ema`
   average if on) and keeps it with the job; the process reads exactly that state, and the schedule moves on at once, so
   the next job is due one interval later, not again at once. One job of each kind is out at a time: if the next is due
