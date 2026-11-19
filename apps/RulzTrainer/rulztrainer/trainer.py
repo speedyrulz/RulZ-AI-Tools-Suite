@@ -28,7 +28,8 @@ from . import profiling
 from . import race as race_mod
 from .ema import LoraEMA
 from . import quant as Q
-from .config import AUTOMAGIC, KEEL, KEEL_FB, KEEL_ON_A3, MUON_EDGE_TARGETS, TrainConfig, alpha_lr_note, effective_optimizer, \
+from .config import AUTOMAGIC, KEEL, KEEL_FB, KEEL_ON_A3, MUON_EDGE_TARGETS, TrainConfig, alpha_lr_note, effective_optimizer, trained_optimizer, \
+    alpha_lr_factor, _saved_alpha_cfg, \
     keel_band_weights, keel_consensus_mode
 from .config import side_to_mp
 from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, dropout_text_path,
@@ -543,16 +544,16 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None, ref_norms=None, scales
     """`params` may be a list of tensors or a list of param-group dicts (LoRA+). `pairs`: the (lora_down, lora_up)
     pairs among them (lora.lora_pairs), which Keel preconditions; the other optimizers ignore them. `ref_norms` and
     `scales`: each pair's frozen-weight norm and alpha / rank, for Hull."""
-    name, lr, _ = effective_optimizer(cfg)
+    name, lr, wd = trained_optimizer(cfg)  # (the optimizer effective_optimizer picks, with lr_alpha_scale applied)
     if name not in ("adamw", "adamw8bit") and (cfg.adam_beta1, cfg.adam_beta2, cfg.adam_eps) != (0.9, 0.99, 1e-8):
         log.info("adam_beta1 / adam_beta2 / adam_eps are ignored with %s (they set adamw and adamw8bit only)", name)
     if name == "adamw":
-        return torch.optim.AdamW(params, lr=lr, weight_decay=cfg.weight_decay, betas=_adam_betas(cfg),
+        return torch.optim.AdamW(params, lr=lr, weight_decay=wd, betas=_adam_betas(cfg),
                                  eps=float(cfg.adam_eps))
     if name == "adamw8bit":
         import bitsandbytes as bnb
 
-        return bnb.optim.AdamW8bit(params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
+        return bnb.optim.AdamW8bit(params, lr=lr, weight_decay=wd,
                                    betas=_adam_betas(cfg), eps=float(cfg.adam_eps))
     if name in ("muon", "normuon"):  # LoRA+ groups keep their own lr: lora_up's step is ratio x lora_down's
         from .optimizers.muon import Muon
@@ -564,12 +565,12 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None, ref_norms=None, scales
                         "on AdamW. Race it against %s without them if they matter.", name, ", ".join(edge), name)
         if name == "normuon":
             log.info("normuon is experimental and untested in RulZ AI Trainer")
-        return Muon(params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay, normuon=name == "normuon")
+        return Muon(params, lr=lr, weight_decay=wd, normuon=name == "normuon")
     if name == "adafactor":
         from transformers.optimization import Adafactor
 
-        return Adafactor(params, lr=cfg.learning_rate, scale_parameter=False, relative_step=False,
-                         warmup_init=False, weight_decay=cfg.weight_decay)
+        return Adafactor(params, lr=lr, scale_parameter=False, relative_step=False,
+                         warmup_init=False, weight_decay=wd)
     if name == "hull":
         from .optimizers.hull import Hull
 
@@ -2700,6 +2701,8 @@ class Trainer(RaceParallelMixin):
                                  f"4 and Keel states convert into each other)")
         optimizer.load_state_dict(st["optimizer"])
         scheduler.load_state_dict(st["scheduler"])
+        if fresh_at is None:
+            self._rescale_resumed_alpha_lr(optimizer, scheduler, st.get("config") or {})
         if fresh_at is not None and getattr(scheduler, "lr_lambdas", None):  # the schedule's rate at that step
             for g, base, fn in zip(optimizer.param_groups, scheduler.base_lrs, scheduler.lr_lambdas):
                 g["lr"] = base * fn(fresh_at)
@@ -2718,6 +2721,27 @@ class Trainer(RaceParallelMixin):
         self.resumed_dp_counts = st.get("dp_counts")
         self.resumed_controller = st.get("controller")
         return int(st["step"])
+
+    def _rescale_resumed_alpha_lr(self, optimizer, scheduler, saved_config: dict) -> None:
+        """A state saved with lr_alpha_scale's factor different from now (the toggle switched, or a state from before
+        it: factor 1): loading it brought back the saved rates and weight decay, so move them to the current factor.
+        The rates (and the schedule's base rates) go up by now / saved, the weight decay down by the same."""
+        saved = _saved_alpha_cfg(saved_config)
+        saved_f = alpha_lr_factor(saved) if saved is not None else 1.0
+        now_f = alpha_lr_factor(self.cfg)
+        if abs(now_f - saved_f) <= 1e-12 * max(now_f, saved_f):
+            return
+        r = now_f / saved_f
+        for g in optimizer.param_groups:
+            g["lr"] = g["lr"] * r
+            if "initial_lr" in g:
+                g["initial_lr"] = g["initial_lr"] * r
+            if g.get("weight_decay"):
+                g["weight_decay"] = g["weight_decay"] / r
+        if getattr(scheduler, "base_lrs", None):
+            scheduler.base_lrs = [b * r for b in scheduler.base_lrs]
+        log.info("Training state was saved with Scale LR to alpha = rank at x%g, now x%g: its rates are scaled by "
+                 "x%g and its weight decay by 1/%g", saved_f, now_f, r, r)
 
     def _resume_controller(self) -> None:
         """A resumed run carries on with the likeness controller it had: its scale, best scores, patience, smoothing
@@ -3357,7 +3381,7 @@ class Trainer(RaceParallelMixin):
         return f"{self.race.active.name}_" if self._race_running() else ""
 
     def _make_optimizer(self, cfg, injected):
-        name, lr, _ = effective_optimizer(cfg)
+        name, lr, _ = trained_optimizer(cfg)  # (lr_alpha_scale: the rate the groups train at)
         note = alpha_lr_note(cfg)
         if note is not None:
             log.info("%s", note[0])

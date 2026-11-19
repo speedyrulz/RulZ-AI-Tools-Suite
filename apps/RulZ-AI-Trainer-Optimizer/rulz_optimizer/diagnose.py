@@ -112,8 +112,9 @@ def _float(value):
 
 def lr_at_alpha_rank(config: dict) -> float | None:
     """The learning rate a run config acts like at alpha = rank (RulZ AI Trainer's convention, scale 1):
-    learning_rate x alpha / rank. Mirrors lr_at_alpha_rank in the trainer's config.py. None where it does not apply:
-    a fine-tune, LoKr / OFT, a missing rank, and an optimizer that sets its own rate."""
+    learning_rate x alpha / rank. Mirrors lr_at_alpha_rank in the trainer's config.py. With lr_alpha_scale on (and
+    alpha differing from rank) the run trained at learning_rate x rank / alpha, so the entered rate is the one. None
+    where it does not apply: a fine-tune, LoKr / OFT, a missing rank, and an optimizer that sets its own rate."""
     def get(key):
         return config[key] if config.get(key) is not None else DEFAULTS.get(key)
     rank, alpha, lr = _float(get('lora_rank')), _float(get('lora_alpha')), _float(get('learning_rate'))
@@ -122,7 +123,23 @@ def lr_at_alpha_rank(config: dict) -> float | None:
     name, lr = _trained_rate(config)
     if name in SELF_SETTING_RATE or lr is None:
         return None
+    if alpha_scale_factor(config) != 1.0:
+        return lr  # lr_alpha_scale: the entered rate is the alpha = rank rate
     return lr * alpha / rank
+
+
+def alpha_scale_factor(config: dict) -> float:
+    """rank / alpha when the run had lr_alpha_scale on and it applied (a plain LoRA with alpha not equal to rank, trained
+    by an optimizer that takes the rate as set), else 1. Mirrors alpha_lr_factor in the trainer's config.py. The
+    Optimizer never turns it on itself."""
+    def get(key):
+        return config[key] if config.get(key) is not None else DEFAULTS.get(key)
+    rank, alpha = _float(get('lora_rank')), _float(get('lora_alpha'))
+    if not get('lr_alpha_scale') or str(get('network_type')).lower() != 'lora' or get('finetune'):
+        return 1.0
+    if not rank or rank <= 0 or not alpha or alpha <= 0 or abs(alpha - rank) <= 1e-9:
+        return 1.0
+    return 1.0 if _trained_rate(config)[0] in SELF_SETTING_RATE else rank / alpha
 
 
 def _trained_rate(config: dict) -> tuple[str, float | None]:
@@ -148,9 +165,12 @@ def alpha_findings(run: Run, k: Knowledge | None) -> list[Finding]:
         return []
     name, rate = _trained_rate(config)  # (isolation trains an Automagic / Keel pick with AdamW at its own rate)
     swapped = name != str(config.get('optimizer', DEFAULTS.get('optimizer'))).lower()
+    factor = alpha_scale_factor(config)
     text = (f'alpha {alpha:g} at rank {rank:g} scales each update by {alpha / rank:.3g}: '
             + ("AdamW's learning rate under isolation " if swapped else 'learning rate ')
-            + f'{rate:.1e} acts like {equivalent:.1e} at alpha = rank.')
+            + (f'{rate:.1e} acts like {equivalent:.1e} at alpha = rank.' if factor == 1.0 else
+               f'{rate:.1e} was scaled by x{factor:g} (Scale LR to alpha = rank) and trained at {rate * factor:.1e}, '
+               f'so it acts like {equivalent:.1e} at alpha = rank.'))
     evidence = {'lr_at_alpha_rank': equivalent, 'alpha': alpha, 'rank': rank}
     model = run.arch or config.get('model_arch')
     recommended = None

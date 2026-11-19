@@ -77,15 +77,51 @@ def alpha_differs(cfg) -> bool:
     return alpha_scaled_lora(cfg) and abs(float(cfg.lora_alpha) - float(cfg.lora_rank)) > 1e-9
 
 
+def alpha_lr_factor(cfg) -> float:
+    """rank / alpha when lr_alpha_scale is on and it applies, else 1. It applies to a plain LoRA whose alpha differs
+    from its rank, trained by an optimizer that takes the rate as set (after effective_optimizer's swap: isolation
+    trains an Automagic / Keel pick with AdamW). Automagic, Keel and Hull set their own rate, so it is 1 for them."""
+    if not getattr(cfg, "lr_alpha_scale", False) or not alpha_differs(cfg) or float(cfg.lora_alpha) <= 0:
+        return 1.0
+    if effective_optimizer(cfg)[0] in SELF_SETTING_RATE:
+        return 1.0
+    return float(cfg.lora_rank) / float(cfg.lora_alpha)
+
+
+def trained_optimizer(cfg):
+    """(optimizer name, learning rate, weight decay) the optimizer is built with: effective_optimizer's, then with
+    lr_alpha_scale's factor f = rank / alpha applied (lr x f, weight decay / f). cfg itself is not changed: the
+    learning_rate field stays the value the user entered. effective_optimizer picks first, because it replaces a
+    rate outside (1e-6, 1e-3] and the scaled rate may be above that."""
+    name, lr, _ = effective_optimizer(cfg)
+    f = alpha_lr_factor(cfg)
+    return name, float(lr) * f, float(cfg.weight_decay) / f
+
+
 def lr_at_alpha_rank(cfg) -> float | None:
     """The learning rate this run acts like at alpha = rank (RulZ AI Trainer's convention, scale 1):
     learning_rate x alpha / rank. LoRA's update is scaled by alpha / rank, so alpha only changes the effective rate.
-    None where it does not apply: a fine-tune, LoKr / OFT, and an optimizer that sets its own rate (Automagic, Keel,
-    Hull), whose learning_rate field is not the rate the weights get."""
+    With lr_alpha_scale on (and applying) the run trains at learning_rate x rank / alpha, so it acts like
+    learning_rate itself. None where it does not apply: a fine-tune, LoKr / OFT, and an optimizer that sets its own
+    rate (Automagic, Keel, Hull), whose learning_rate field is not the rate the weights get."""
     name, lr, _ = effective_optimizer(cfg)  # (isolation trains an Automagic / Keel pick with AdamW at its own rate)
     if not alpha_scaled_lora(cfg) or name in SELF_SETTING_RATE:
         return None
+    if alpha_lr_factor(cfg) != 1.0:  # the entered rate IS the alpha = rank rate
+        return float(lr)
     return float(lr) * float(cfg.lora_alpha) / float(cfg.lora_rank)
+
+
+def alpha_scale_reason(cfg) -> str:
+    """Why lr_alpha_scale does nothing for this config (the WebUI greys the checkbox with it), "" when it applies."""
+    if cfg.network_type != "lora" or cfg.finetune:
+        return "Only a plain LoRA has an alpha scale (a fine-tune, LoKr and OFT train at scale 1)."
+    if not alpha_differs(cfg):
+        return "Alpha equals rank, so there is nothing to scale."
+    name = effective_optimizer(cfg)[0]
+    if name in SELF_SETTING_RATE:
+        return f"{name} sets its own rate, so the learning rate field is not scaled."
+    return ""
 
 
 def alpha_lr_warning(equivalent: float, recommended: float | None) -> str | None:
@@ -104,36 +140,67 @@ def alpha_lr_note(cfg, recommended: float | None = None) -> tuple[str, bool] | N
     """The alpha-aware learning-rate readout as (text, warn), or None when alpha equals rank or alpha does not apply.
     warn is True when the equivalent rate is far from `recommended` (the per-model recommendation, if there is one)."""
     if not alpha_differs(cfg):
+        if getattr(cfg, "lr_alpha_scale", False) and alpha_scaled_lora(cfg):
+            return "Scale LR to alpha = rank does nothing: alpha equals rank.", False
         return None
     rank, alpha = int(cfg.lora_rank), float(cfg.lora_alpha)
     scale = f"LoRA alpha {alpha:g} at rank {rank} scales each update by {alpha:g}/{rank}"
     eq = lr_at_alpha_rank(cfg)
     if eq is None:
+        extra = " Scale LR to alpha = rank does nothing here." if getattr(cfg, "lr_alpha_scale", False) else ""
         return (f"{scale}. {effective_optimizer(cfg)[0]} sets its own rate, so the learning rate field is not the rate "
-                "the weights get and no alpha = rank equivalent is given; alpha still scales its updates.", False)
+                f"the weights get and no alpha = rank equivalent is given; alpha still scales its updates.{extra}", False)
     name, lr, swapped = effective_optimizer(cfg)
+    f = alpha_lr_factor(cfg)
+    if f != 1.0:
+        _, trained, wd = trained_optimizer(cfg)
+        who = "AdamW's learning rate (isolation)" if swapped else "learning rate"
+        text = (f"{scale}. Scale LR to alpha = rank is on: the {who} {float(lr):.1e} x {rank}/{alpha:g} trains at "
+                f"{trained:.1e}, with weight decay {float(cfg.weight_decay):g} / {f:g} = {wd:.2e}, so it acts like "
+                f"{eq:.1e} at alpha = rank (RulZ AI Trainer's convention).")
+        warning = alpha_lr_warning(eq, recommended)
+        return (f"{text} {warning}" if warning else text), warning is not None
     rate = f"AdamW's learning rate {float(lr):.1e} (isolation)" if swapped else f"learning rate {float(lr):.1e}"
     text = f"{scale}: {rate} acts like {eq:.1e} at alpha = rank (RulZ AI Trainer's convention)."
     warning = alpha_lr_warning(eq, recommended)
     return (f"{text} {warning}" if warning else text), warning is not None
 
 
-def alpha_equivalent_text(c: dict) -> str:
-    """For a saved config (a dict, keys may be missing): "acts like lr 1.9e-05 at alpha = rank" when it is a LoRA whose
-    alpha differs from its rank and the optimizer takes the learning rate as given, else an empty string."""
+def _saved_alpha_cfg(c: dict):
+    """A stand-in with the fields the alpha helpers read, from a saved config (a dict, keys may be missing), or None."""
     from types import SimpleNamespace
 
     try:
-        cfg = SimpleNamespace(network_type=str(c.get("network_type") or "lora"), finetune=bool(c.get("finetune")),
-                              lora_rank=int(c.get("lora_rank") or 0), lora_alpha=float(c.get("lora_alpha") or 0),
-                              optimizer=str(c.get("optimizer") or "adamw8bit"),
-                              learning_rate=float(c.get("learning_rate") or 0), isolation=bool(c.get("isolation")),
-                              dop_weight=float(c["dop_weight"]) if c.get("dop_weight") is not None
-                              else TrainConfig.dop_weight)  # (a saved config without it trained at the default)
+        return SimpleNamespace(network_type=str(c.get("network_type") or "lora"), finetune=bool(c.get("finetune")),
+                               lora_rank=int(c.get("lora_rank") or 0), lora_alpha=float(c.get("lora_alpha") or 0),
+                               optimizer=str(c.get("optimizer") or "adamw8bit"),
+                               learning_rate=float(c.get("learning_rate") or 0), isolation=bool(c.get("isolation")),
+                               weight_decay=float(c["weight_decay"]) if c.get("weight_decay") is not None
+                               else TrainConfig.weight_decay,
+                               lr_alpha_scale=bool(c.get("lr_alpha_scale")),  # (a saved config without it: off)
+                               dop_weight=float(c["dop_weight"]) if c.get("dop_weight") is not None
+                               else TrainConfig.dop_weight)  # (a saved config without it trained at the default)
     except (TypeError, ValueError):
+        return None
+
+
+def alpha_equivalent_text(c: dict) -> str:
+    """For a saved config (a dict, keys may be missing): "acts like lr 1.9e-05 at alpha = rank" when it is a LoRA whose
+    alpha differs from its rank and the optimizer takes the learning rate as given, else an empty string."""
+    cfg = _saved_alpha_cfg(c)
+    if cfg is None:
         return ""
     eq = lr_at_alpha_rank(cfg) if alpha_differs(cfg) else None
     return f"acts like lr {eq:.1e} at alpha = rank" if eq is not None else ""
+
+
+def alpha_trained_text(c: dict) -> str:
+    """For a saved config: "trains at 1.6e-03 (scaled x16 to alpha = rank)" when lr_alpha_scale was on and applied,
+    else an empty string."""
+    cfg = _saved_alpha_cfg(c)
+    if cfg is None or alpha_lr_factor(cfg) == 1.0:
+        return ""
+    return f"trains at {trained_optimizer(cfg)[1]:.1e} (scaled x{alpha_lr_factor(cfg):g} to alpha = rank)"
 
 
 KEEL_BAND_LOGIT_RANGE = 4.0  # Keel's noise bands span logit(sigma) in [-range, range] (sigma 0.018 to 0.982)
@@ -873,6 +940,11 @@ class TrainConfig:
     #                           | hull | muon (orthogonalized momentum, step matched to AdamW's: AdamW's rates apply)
     #                           | normuon (muon with each row's step evened out; experimental, untested)
     weight_decay: float = 0.01
+    lr_alpha_scale: bool = False  # LoRA: take learning_rate as the rate at alpha = rank and train at learning_rate x
+    #                               rank / alpha (weight decay divided by the same), so a LoRA whose alpha differs
+    #                               from its rank behaves like one at alpha = rank (config.alpha_lr_factor). Off:
+    #                               learning_rate is the rate the optimizer gets. No effect where the optimizer sets
+    #                               its own rate (Automagic, Keel, Hull), on a fine-tune, LoKr / OFT or alpha = rank
     automagic_min_lr: float = 2e-5  # automagic3/4 and keel: hard floor for the adapted lr. Was 1e-8 before 3.24.0:
     #                                 the community saw Automagic's lr sink to 1e-5 and below and learning stop
     #                                 (ostris; Qwen-Image 2.1, FLUX.3, MOSS, FIBO 2, Ideogram), fixed with a floor of

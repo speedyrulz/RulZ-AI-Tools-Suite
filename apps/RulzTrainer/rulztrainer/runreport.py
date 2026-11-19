@@ -41,7 +41,7 @@ SWEEP_COLORS = {"face": "#FF3B30", "hair": "#b87400", "skin": "#d64570", "clothe
 PROBE_RE = re.compile(r"^(?:(?P<racer>.+)_)?step(?P<step>\d{6})_(?P<kind>face|body|check-[^_]+)_(?P<seed>\d+)\.(?:png|jpg|jpeg|webp)$")
 # the settings the summary lists, in this order: (label, config key or a function of the config)
 SUMMARY_KEYS = (
-    ("Network", lambda c: _network(c)), ("Optimizer", "optimizer"), ("Learning rate", "learning_rate"),
+    ("Network", lambda c: _network(c)), ("Optimizer", "optimizer"), ("Learning rate", lambda c: _learning_rate(c)),
     ("Steps", "steps"), ("Batch size", "batch_size"), ("Resolution", lambda c: _resolution(c)),
     ("Trigger word", "trigger_word"), ("Seed", "seed"), ("Noise levels", "timestep_sampling"),
     ("Caption dropout", "caption_dropout"), ("Weight average (EMA)", "lora_ema"),
@@ -232,6 +232,14 @@ def _network(c: dict) -> str:
     equal = alpha_equivalent_text(c)
     return (f"{'DoRA' if c.get('dora') else 'LoRA'}, rank {c.get('lora_rank')} "
             f"(alpha {_value(c.get('lora_alpha'))}{'; ' + equal if equal else ''})")
+
+
+def _learning_rate(c: dict) -> str:
+    """The entered rate, and the rate it trained at when Scale LR to alpha = rank scaled it."""
+    from .config import alpha_trained_text
+
+    trained = alpha_trained_text(c)
+    return f"{_value(c.get('learning_rate'))}{'; ' + trained if trained else ''}"
 
 
 def _resolution(c: dict) -> str:
