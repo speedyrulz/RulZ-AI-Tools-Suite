@@ -2171,7 +2171,8 @@ class Form:
             keel_lookahead_lr=float(v("keel_lookahead_lr")), keel_lookahead_grace=int(v("keel_lookahead_grace")),
             keel_face_gain=float(v("keel_face_gain")), keel_face_gain_max=float(v("keel_face_gain_max")),
             keel_face_gain_beta=float(v("keel_face_gain_beta")), keel_body_weight=float(v("keel_body_weight")),
-            timestep_shift=float(v("timestep_shift")), timestep_buckets=int(v("timestep_buckets") or 0),
+            timestep_shift=float(v("timestep_shift")), resolution_shift=bool(v("resolution_shift")),
+            timestep_buckets=int(v("timestep_buckets") or 0),
             sigmoid_scale=float(v("sigmoid_scale")),
             logsnr_mean=float(v("logsnr_mean")), logsnr_std=float(v("logsnr_std")),
             block_swap=int(v("block_swap") or 0), block_swap_compile=bool(v("block_swap_compile")),
@@ -5355,7 +5356,8 @@ RACE_LABELS = {
     "keel_lookahead_lr": "Keel pull lr factor", "keel_lookahead_grace": "Keel grace probes",
     "keel_face_gain": "Keel face gain", "keel_face_gain_max": "Keel face gain limit",
     "keel_face_gain_beta": "Keel face gain EMA", "keel_body_weight": "Keel body weight",
-    "lora_ema": "Weight average", "timestep_sampling": "Timestep sampling", "loss_weighting": "Loss weighting",
+    "lora_ema": "Weight average", "timestep_sampling": "Timestep sampling", "resolution_shift": "Resolution shift",
+    "loss_weighting": "Loss weighting",
     "loss_type": "Loss type",
     "region_weights": "Region-weighted loss", "face_loss_weight": "Face loss weight",
     "body_loss_weight": "Body loss weight", "background_loss_weight": "Background loss weight",
@@ -6120,6 +6122,12 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                                     "this setting would be applied on top of it")
     elif not character:  # the identity recipe sets logit_normal itself
         r["timestep_sampling"] = ("logit_normal", "the default: most steps at middle noise, fewer at the extremes")
+    sampling = r["timestep_sampling"][0] if "timestep_sampling" in r else cfg.timestep_sampling
+    if goal != "style" and sampling != "reference" and (fibo or krea or qwen or klein or ideo
+                                                         or cfg.arch_name() == "moss_image"):
+        r["resolution_shift"] = (True, "shifts the noise levels by the picture's size, as the model's sampler does: "
+                                       "OneTrainer's community finds 1024 px learns slowly without a higher shift, "
+                                       "and BFL's samplers shift by size too")
     r["batch_size"] = (1, "small batches with more steps beat large batches for LoRAs")
     if zimage and not cfg.finetune:
         if zi_turbo:
@@ -11968,6 +11976,13 @@ def build_page(local: bool = True):
                                                           lambda x: x == "logit_normal")
                                 w["timestep_shift"] = ui.number("Timestep shift", value=d.timestep_shift) \
                                     .classes("w-32")
+                                w["resolution_shift"] = ui.switch("Resolution shift", value=d.resolution_shift) \
+                                    .tooltip("Shifts the sampled noise levels by the picture's size, the way the "
+                                             "model's own sampler does: the larger the picture, the more of its steps "
+                                             "go to high noise (about x1.8 at 512 px, x2 to x3 at 1024 px, by model). "
+                                             "Works with every mode above except reference (whose curve already "
+                                             "carries the shift), on top of Timestep shift. Community reports say "
+                                             "1024 px barely learns without a higher shift.")
                                 w["timestep_buckets"] = ui.number("Timestep buckets (0 = off)",
                                                                   value=d.timestep_buckets, min=0, precision=0) \
                                     .classes("w-48").tooltip(
@@ -12037,7 +12052,7 @@ def build_page(local: bool = True):
                                 ui.timer(0.1, clean_hint_update, once=True)
                                 for key in ("timestep_sampling", "logit_mean", "logit_std", "sigmoid_scale",
                                             "content_power", "sigma_min", "sigma_max", "timestep_shift",
-                                            "clean_share"):
+                                            "resolution_shift", "clean_share"):
                                     w[key].on_value_change(clean_hint_update)
 
                     # ---- Saving & samples
