@@ -28,7 +28,8 @@ from . import profiling
 from . import race as race_mod
 from .ema import LoraEMA
 from . import quant as Q
-from .config import AUTOMAGIC, KEEL, KEEL_FB, KEEL_ON_A3, MUON_EDGE_TARGETS, TrainConfig, effective_optimizer, keel_band_weights, keel_consensus_mode
+from .config import AUTOMAGIC, KEEL, KEEL_FB, KEEL_ON_A3, MUON_EDGE_TARGETS, TrainConfig, alpha_lr_note, effective_optimizer, \
+    keel_band_weights, keel_consensus_mode
 from .config import side_to_mp
 from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, dropout_text_path,
                       ideogram4_caption_warning, items_for_side, load_batch,
@@ -3336,6 +3337,9 @@ class Trainer(RaceParallelMixin):
 
     def _make_optimizer(self, cfg, injected):
         name, lr, _ = effective_optimizer(cfg)
+        note = alpha_lr_note(cfg)
+        if note is not None:
+            log.info("%s", note[0])
         if name in AUTOMAGIC and cfg.automagic_groups == "by_type":
             groups = lora_mod.lora_param_groups_by(injected, cfg.learning_rate, self.arch.param_group_of)
             log.info("%s: an adaptive lr per layer type (%s)", cfg.optimizer, ", ".join(

@@ -63,6 +63,79 @@ def effective_optimizer(cfg):
     return name, lr, None
 
 
+SELF_SETTING_RATE = AUTOMAGIC + ("hull",)  # the learning_rate field is not the rate their weights get (Hull's step is hull_rho)
+ALPHA_LR_WARN_FACTOR = 3.0  # the alpha = rank equivalent this many times above or below the recommendation draws a warning
+
+
+def alpha_scaled_lora(cfg) -> bool:
+    """Whether alpha / rank scales this run's updates: a plain LoRA (DoRA included). A full fine-tune has no adapter;
+    LoKr and OFT train at scale 1 whatever lora_alpha says (lora.py: scale = alpha / rank for kind "lora" only)."""
+    return cfg.network_type == "lora" and not cfg.finetune and cfg.lora_rank > 0
+
+
+def alpha_differs(cfg) -> bool:
+    return alpha_scaled_lora(cfg) and abs(float(cfg.lora_alpha) - float(cfg.lora_rank)) > 1e-9
+
+
+def lr_at_alpha_rank(cfg) -> float | None:
+    """The learning rate this run acts like at alpha = rank (RulZ AI Trainer's convention, scale 1):
+    learning_rate x alpha / rank. LoRA's update is scaled by alpha / rank, so alpha only changes the effective rate.
+    None where it does not apply: a fine-tune, LoKr / OFT, and an optimizer that sets its own rate (Automagic, Keel,
+    Hull), whose learning_rate field is not the rate the weights get."""
+    name, lr, _ = effective_optimizer(cfg)  # (isolation trains an Automagic / Keel pick with AdamW at its own rate)
+    if not alpha_scaled_lora(cfg) or name in SELF_SETTING_RATE:
+        return None
+    return float(lr) * float(cfg.lora_alpha) / float(cfg.lora_rank)
+
+
+def alpha_lr_warning(equivalent: float, recommended: float | None) -> str | None:
+    """A sentence when the alpha = rank equivalent is more than 3x above or below the recommended rate, else None."""
+    if not recommended or recommended <= 0 or equivalent <= 0:
+        return None
+    ratio = equivalent / recommended
+    if ratio > ALPHA_LR_WARN_FACTOR:
+        return f"That is {ratio:.1f}x above the recommended {recommended:.1e}."
+    if ratio < 1 / ALPHA_LR_WARN_FACTOR:
+        return f"That is {1 / ratio:.1f}x below the recommended {recommended:.1e}."
+    return None
+
+
+def alpha_lr_note(cfg, recommended: float | None = None) -> tuple[str, bool] | None:
+    """The alpha-aware learning-rate readout as (text, warn), or None when alpha equals rank or alpha does not apply.
+    warn is True when the equivalent rate is far from `recommended` (the per-model recommendation, if there is one)."""
+    if not alpha_differs(cfg):
+        return None
+    rank, alpha = int(cfg.lora_rank), float(cfg.lora_alpha)
+    scale = f"LoRA alpha {alpha:g} at rank {rank} scales each update by {alpha:g}/{rank}"
+    eq = lr_at_alpha_rank(cfg)
+    if eq is None:
+        return (f"{scale}. {effective_optimizer(cfg)[0]} sets its own rate, so the learning rate field is not the rate "
+                "the weights get and no alpha = rank equivalent is given; alpha still scales its updates.", False)
+    name, lr, swapped = effective_optimizer(cfg)
+    rate = f"AdamW's learning rate {float(lr):.1e} (isolation)" if swapped else f"learning rate {float(lr):.1e}"
+    text = f"{scale}: {rate} acts like {eq:.1e} at alpha = rank (RulZ AI Trainer's convention)."
+    warning = alpha_lr_warning(eq, recommended)
+    return (f"{text} {warning}" if warning else text), warning is not None
+
+
+def alpha_equivalent_text(c: dict) -> str:
+    """For a saved config (a dict, keys may be missing): "acts like lr 1.9e-05 at alpha = rank" when it is a LoRA whose
+    alpha differs from its rank and the optimizer takes the learning rate as given, else an empty string."""
+    from types import SimpleNamespace
+
+    try:
+        cfg = SimpleNamespace(network_type=str(c.get("network_type") or "lora"), finetune=bool(c.get("finetune")),
+                              lora_rank=int(c.get("lora_rank") or 0), lora_alpha=float(c.get("lora_alpha") or 0),
+                              optimizer=str(c.get("optimizer") or "adamw8bit"),
+                              learning_rate=float(c.get("learning_rate") or 0), isolation=bool(c.get("isolation")),
+                              dop_weight=float(c["dop_weight"]) if c.get("dop_weight") is not None
+                              else TrainConfig.dop_weight)  # (a saved config without it trained at the default)
+    except (TypeError, ValueError):
+        return ""
+    eq = lr_at_alpha_rank(cfg) if alpha_differs(cfg) else None
+    return f"acts like lr {eq:.1e} at alpha = rank" if eq is not None else ""
+
+
 KEEL_BAND_LOGIT_RANGE = 4.0  # Keel's noise bands span logit(sigma) in [-range, range] (sigma 0.018 to 0.982)
 
 
