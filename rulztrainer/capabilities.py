@@ -140,7 +140,16 @@ _FRAME_REASONS = {
 # SDXL's CLIP encoders are loaded as they are (sdxl/loading.py never reads text_encoder_quant)
 _SDXL.append(_only("text_encoder_quant", "SDXL's CLIP text encoders stay unquantized", "auto", ignored=True))
 
-_TABLES: dict[str, list[Rule]] = {"sdxl": _SDXL}
+# resolution_shift moves the sampled noise levels; neither family samples them (SDXL trains on its own DDPM timesteps,
+# MiniMax-H3-Image on its 6 sampling sigmas as drawn), so the setting does nothing there
+_SDXL.append(_only("resolution_shift", "SDXL trains on the model's own timesteps (timestep_sampling: reference), "
+                                       "which no shift moves", False, ignored=True))
+
+_TABLES: dict[str, list[Rule]] = {
+    "sdxl": _SDXL,
+    "minimax_h3_image": [_only("resolution_shift", "MiniMax-H3-Image trains on its 6 sampling noise levels as drawn, "
+                                                   "which no shift moves", False, ignored=True)],
+}
 
 # settings only some families read: (rules, the families that read them). Everywhere else they are ignored.
 _ONLY_READ_BY: list[tuple[list[Rule], tuple]] = [
