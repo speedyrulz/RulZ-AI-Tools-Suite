@@ -9362,6 +9362,37 @@ def fleet_folder(rec: dict | None, root) -> Path | None:
         return None
 
 
+def fleet_remove_plan(recs: list[dict], root, downloading=lambda key: False) -> list[dict]:
+    """What Remove would do with these runs, for its confirm dialog: one entry per run with its key, a line of text
+    (job · instance, the MB downloaded on this computer), its MB and `skip` (why it is left out, else "")."""
+    import rulz_fleet
+
+    plan = []
+    for rec in recs:
+        folder = fleet_folder(rec, root)
+        mb = rulz_fleet.folder_mb(folder) if folder is not None and folder.is_dir() else 0.0
+        skip = "still going" if rec.get("state") == "running" else \
+            "a download of it is going" if downloading(rec["key"]) else ""
+        label = f"{rec.get('job')} · instance {rec.get('instance')}"
+        text = f"{label}: skipped, {skip}" if skip else \
+            f"{label}: {fleet_num(mb)} MB downloaded" if mb else f"{label}: no downloaded files"
+        plan.append({"key": rec["key"], "text": text, "mb": 0.0 if skip else mb, "skip": skip})
+    return plan
+
+
+def fleet_remove_summary(done: list[dict], failed: list[str]) -> str:
+    """The notice after Remove: how many runs went, how many MB went to the Recycle Bin, and which failed."""
+    binned = sum(d.get("mb") or 0.0 for d in done if d.get("binned"))
+    deleted = sum(d.get("mb") or 0.0 for d in done if d.get("folder") and not d.get("binned"))
+    parts = [f"{len(done)} run{'s' if len(done) != 1 else ''} removed"]
+    if binned:
+        parts.append(f"{fleet_num(binned)} MB moved to the Recycle Bin")
+    if deleted:
+        parts.append(f"{fleet_num(deleted)} MB deleted (this computer has no Recycle Bin)")
+    text = ", ".join(parts) + "."
+    return text + (" Not removed: " + "; ".join(failed) if failed else "")
+
+
 _REPORT_IMAGES = {".png", ".jpg", ".jpeg", ".webp"}
 
 
@@ -10361,6 +10392,11 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
                          "run's folder lacks first (logs, probe images, training maps) while its instance is "
                          "there, then writes them into the run's folder under report/ and downloads them here.")
             report_btn.disable()
+            remove_btn = ui.button("Remove", icon="delete_outline", color=None) \
+                .props("outline dense no-caps").classes("rz-danger") \
+                .tooltip("Removes the ticked runs from this list and moves their downloaded files on this "
+                         "computer to the Recycle Bin. The instance is not touched.")
+            remove_btn.disable()
         run_table = ui.table(columns=FLEET_RUN_COLUMNS, rows=[], row_key="key", selection="multiple",
                              pagination={"rowsPerPage": 12, "sortBy": "ended", "descending": True},
                              on_select=lambda _: pick_changed()).props("flat dense").classes("w-full")
@@ -10377,7 +10413,8 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
              "on an instance when it joined are listed too, and their files are downloaded by the download rules. "
              "Tick a run for its numbers, charts and files, or two or more and click Compare to chart them "
              "together; the cloud icon on a row downloads that run's files now. Run report makes a summary picture "
-             "and a PDF of each ticked run (downloading first what its folder lacks).")
+             "and a PDF of each ticked run (downloading first what its folder lacks). Remove drops the ticked runs from "
+             "this list and moves their downloaded files to the Recycle Bin.")
         run_multi = hint("")
         with ui.column().classes("w-full gap-3") as run_detail:
             run_title = ui.label("").classes("text-base font-medium")
@@ -10411,6 +10448,10 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
                 ui.space()
                 run_forget = ui.button("Forget this run", icon="delete_outline", color=None) \
                     .props("flat dense no-caps").tooltip("Drop it from this list. Downloaded files stay.")
+                run_remove = ui.button("Remove and delete files", icon="delete_forever", color=None) \
+                    .props("flat dense no-caps").classes("rz-danger") \
+                    .tooltip("Drop it from this list and move its downloaded files on this computer to the "
+                             "Recycle Bin. The instance is not touched.")
         run_detail.visible = False
 
         # ---- the comparison of the ticked runs (the Previous runs page's charts and probe images)
@@ -10511,6 +10552,7 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
         n = len(picked_keys())
         cmp_btn.set_enabled(n >= 2)
         report_btn.set_enabled(n >= 1)
+        remove_btn.set_enabled(n >= 1)
         cmp_hint.text = "Tick a second run to compare" if n == 1 else ""
         if n < 2:
             cmp["open"] = False
@@ -10595,7 +10637,7 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
         with run_images:
             for img in images:
                 ui.image(image_url(img)).classes("w-40 rounded").tooltip(img.name)
-        run_forget.visible = rec.get("state") != "running"
+        run_forget.visible = run_remove.visible = rec.get("state") != "running"
         paint_run_pull()
 
     # ---- the comparison
@@ -10760,6 +10802,48 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
             run_table.selected = []
             pick_changed()
 
+    async def remove_runs(keys: list[str]):
+        """Remove: one confirm dialog listing the runs and their downloaded MB, then each run is dropped and its
+        folder moved to the Recycle Bin (a running run, or one being downloaded, is skipped)."""
+        recs = [r for r in (fl.load_run(k) for k in keys) if r is not None]
+        if not recs:
+            ui.notify("Tick a run first.", type="warning")
+            return
+        plan = await run.io_bound(fleet_remove_plan, recs, fl.pulls, fl.downloading)
+        todo = [p for p in plan if not p["skip"]]
+        total = sum(p["mb"] for p in todo)
+        with ui.dialog() as dlg, ui.card().classes("w-[36rem] max-w-full"):
+            ui.label(f"Remove {len(todo)} run{'s' if len(todo) != 1 else ''} and delete their files?") \
+                .classes("text-base font-medium")
+            with ui.column().classes("w-full gap-1"):
+                for p in plan:
+                    hint(p["text"], warn=bool(p["skip"]))
+            if todo:
+                hint(f"Total {fleet_num(total)} MB.")
+            hint("Their downloaded files on this computer go to the Recycle Bin. Files on the instance are not "
+                 "touched.")
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("Cancel", on_click=lambda: dlg.submit(False)).props("flat")
+                go_btn = ui.button("Remove and delete files", icon="delete_forever", color="negative",
+                                   on_click=lambda: dlg.submit(True)).props("unelevated no-caps") \
+                    .classes("rz-danger")
+                go_btn.set_enabled(bool(todo))
+        go = await dlg
+        dlg.delete()
+        if not go:
+            return
+        done, failed = [], []
+        for p in todo:
+            try:
+                done.append(await run.io_bound(fl.delete_run, p["key"]))
+            except (rulz_fleet.Refused, OSError) as e:
+                failed.append(str(e) or p["text"])
+        failed += [p["text"] for p in plan if p["skip"]]
+        ui.notify(fleet_remove_summary(done, failed), type="warning" if failed else "positive", multi_line=True)
+        run_table.selected = []
+        pick_changed()
+        refresh(force=True)
+
     async def report_pull(key, kinds):
         """pull_now for a report: a refusal (instance gone, a download already going) comes back as text."""
         try:
@@ -10806,6 +10890,8 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
     run_report.on_click(lambda: report_runs([r["key"]] if (r := picked_run()) else []))
     run_pull.on_click(pull_run)
     run_forget.on_click(forget_run)
+    remove_btn.on_click(lambda: remove_runs(picked_keys()))
+    run_remove.on_click(lambda: remove_runs([r["key"]] if (r := picked_run()) else []))
 
     def draw_runs() -> None:
         if not changed("runs", fl.runs_signature()):  # the record files as they are on disk: no run is read for it
@@ -15037,6 +15123,10 @@ and the notice says what was missing. Several ticked runs are done one after ano
 **Region watch**: for a run whose logs are downloaded, the run's details (under Past runs) and a running instance's
 card (a collapsible Region watch) show the same region watch, sweep and block audit lines and charts as the Monitor.
 Nothing shows for a run that had none, or whose logs are not downloaded yet.
+
+**Remove**: tick runs under Past runs and click **Remove** (or **Remove and delete files** in one run's details) to
+drop them from the list and move their downloaded files on this computer to the Recycle Bin after a confirmation;
+nothing on the instance is touched. A run that is still going or being downloaded is skipped.
 
 **Compare**: tick two or more runs under Past runs and click **Compare**. Their face, body and combined likeness
 and their loss are drawn together, one line per run (**Compare on one scale** rescores them the way Previous runs does),

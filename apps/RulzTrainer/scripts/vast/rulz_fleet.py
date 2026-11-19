@@ -35,6 +35,7 @@ import json
 import os
 import queue as queue_module
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -103,6 +104,57 @@ PORTAL_PORT = 7870  # the WebUI's Instance Portal port in the container (the tem
 
 class Refused(Exception):
     """A request that can't be carried out; its message is the answer."""
+
+
+WINDOWS = os.name == "nt"
+
+
+def move_to_recycle_bin(path) -> bool:
+    """Move a file or folder to the Recycle Bin and return True. Raises OSError when it did not work.
+
+    On Windows this is SHFileOperationW with FOF_ALLOWUNDO (no new dependency). Windows deletes for good, not into
+    the bin, for a path on a network share or a drive with no bin, and when the item is bigger than the bin's
+    limit; it still reports success then. Elsewhere there is no bin: the folder is removed outright and the answer
+    is False."""
+    target = Path(path).resolve()
+    if not WINDOWS:
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    class ShFileOp(ctypes.Structure):
+        _pack_ = 1 if ctypes.sizeof(ctypes.c_void_p) == 4 else 8
+        _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", wintypes.LPCWSTR),
+                    ("pTo", wintypes.LPCWSTR), ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
+                    ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
+
+    FO_DELETE, FOF_SILENT, FOF_NOCONFIRMATION, FOF_ALLOWUNDO, FOF_NOERRORUI = 3, 0x4, 0x10, 0x40, 0x400
+    op = ShFileOp()
+    op.hwnd, op.wFunc, op.pTo = None, FO_DELETE, None
+    op.pFrom = str(target) + "\0"  # the list ends with a second NUL (ctypes adds the first)
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
+    code = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    if code != 0:
+        raise OSError(f"Windows could not move it to the Recycle Bin (error code {code:#x}).")
+    if op.fAnyOperationsAborted:
+        raise OSError("Moving it to the Recycle Bin was stopped before it finished.")
+    return True
+
+
+def folder_mb(path) -> float:
+    """The size of a folder's files in MB (one decimal)."""
+    total = 0
+    for here, _, names in os.walk(path):
+        for name in names:
+            try:
+                total += os.path.getsize(os.path.join(here, name))
+            except OSError:
+                pass
+    return round(total / 1e6, 1)
 
 
 def try_lock(path: Path):
@@ -450,6 +502,57 @@ class Fleet:
         if rec.get("state") == "running":
             raise Refused("That run is still going.")
         self.run_path(rec["key"]).unlink(missing_ok=True)
+
+    def run_folder(self, rec: dict) -> Path | None:
+        """The run's downloaded folder when it lies strictly inside the downloads root, else None (a record can
+        only point at files this fleet downloaded)."""
+        folder = rec.get("folder")
+        if not folder:
+            return None
+        try:
+            path, base = Path(folder).resolve(), self.pulls.resolve()
+            return path if path != base and path.is_relative_to(base) else None
+        except (OSError, ValueError):
+            return None
+
+    def downloading(self, key: str) -> bool:
+        """Whether a download of this run is going now (here or in another program)."""
+        with self.guard:
+            if ("pull", key) in self.busy:
+                return True
+        return any(e.get("run") == key and e.get("state") == "going" for e in self.downloads())
+
+    def delete_run(self, key: str) -> dict:
+        """Drop a run from the history and move its downloaded folder to the Recycle Bin (not on the instance).
+
+        Refused while the run goes or a download of it goes, and when the bin move fails (the record stays then).
+        Only a folder strictly inside the downloads root is touched: a record that points elsewhere is dropped and
+        that folder is left alone ("folder" is None in the answer). A missing folder just drops the record. Where
+        there is no Recycle Bin the folder is deleted outright ("binned" False); on a network share Windows deletes
+        for good even into the bin. An instance folder left empty is removed too."""
+        rec = self.find_run(key)
+        if rec.get("state") == "running":
+            raise Refused(f"{rec.get('job')}: that run is still going.")
+        if self.downloading(rec["key"]):
+            raise Refused(f"{rec.get('job')}: a download of this run is going; wait for it to finish.")
+        folder = self.run_folder(rec)
+        result: dict = {"job": rec.get("job"), "mb": 0.0, "folder": None, "binned": False}
+        if folder is not None and folder.exists():
+            result["folder"] = str(folder)
+            result["mb"] = folder_mb(folder)
+            try:
+                result["binned"] = bool(move_to_recycle_bin(folder))
+            except OSError as e:
+                raise Refused(f"{rec.get('job')}: its files could not be removed ({e}). The run stays listed.") from e
+            parent = folder.parent
+            try:
+                if parent != self.pulls.resolve() and parent.is_relative_to(self.pulls.resolve()) \
+                        and not any(parent.iterdir()):
+                    parent.rmdir()
+            except OSError:
+                pass
+        self.run_path(rec["key"]).unlink(missing_ok=True)
+        return result
 
     # ---------------------------------------------------------------- instances
 
@@ -1833,6 +1936,9 @@ def cmd_run(fleet: Fleet, args) -> int:
         fleet.forget_run(rec["key"])
         show({"forgotten": rec["key"]})
         return 0
+    if args.delete:
+        show(dict(fleet.delete_run(rec["key"]), deleted=rec["key"]))
+        return 0
     if not args.full:
         rec = {k: v for k, v in rec.items() if k not in ("losses", "config")}
         rec["probes"] = (rec.get("probes") or [])[-args.probes:] if args.probes > 0 else rec.get("probes")
@@ -2035,6 +2141,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--full", action="store_true", help="with its settings and loss series")
     p.add_argument("--probes", type=int, default=8, help="how many of the last probes to show; 0 = all")
     p.add_argument("--forget", action="store_true", help="drop it from the history (downloaded files stay)")
+    p.add_argument("--delete", action="store_true",
+                   help="drop it from the history and move its downloaded files to the Recycle Bin")
     p = command("group", cmd_group, "a split race's parts side by side, best likeness first")
     p.add_argument("name")
     p = command("download", cmd_download, "each kind of file's download rule: KIND=off|end|during")
