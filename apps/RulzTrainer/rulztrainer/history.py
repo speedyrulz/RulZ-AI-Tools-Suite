@@ -324,6 +324,11 @@ HIDDEN_VAST = "_hidden_vast.json"
 FLEET_RUNS_DIR = Path(os.environ.get("RULZ_VAST_HOME") or Path.home() / ".rulz_vast") / "fleet" / "runs"
 # the Fleet's run state -> the history's
 VAST_STATES = {"done": "finished", "error": "error", "ended": "stopped", "running": "running"}
+# the shape of an imported vast.ai record, kept in its stamp: raise it whenever import_fleet_runs starts keeping
+# something new (2: sweeps and maps, 3.47.0), so the runs imported before that are imported once more. Without it a
+# finished run's stamp never changes and its record never gets the new fields (3.47.0 left the runs imported under
+# 3.46.0 without region sweeps on Previous Runs).
+VAST_IMPORT_VERSION = 2
 
 REPLACE_TRIES = 6  # on Windows a reader (the Previous Runs poll, a scan) can briefly hold the target open
 
@@ -547,7 +552,7 @@ def import_fleet_runs(fleet_dir: Path = FLEET_RUNS_DIR, root: Path = HISTORY_DIR
     """History for the training runs the Fleet tracked on vast.ai instances (one JSON per run in the Fleet's runs
     folder): id "vast-<key>", the likeness data from the run's downloaded status.json where there is one, else from
     the Fleet's own record; probe images from the download's probes/ folder. A run is rewritten only when its Fleet
-    data changed; a label the user gave it is kept; runs the user removed (delete_runs) are not brought back.
+    data changed or its record was imported by an older version (VAST_IMPORT_VERSION); a label the user gave it is kept; runs the user removed (delete_runs) are not brought back.
     Returns how many runs were added or updated."""
     if not fleet_dir.is_dir():
         return 0
@@ -567,7 +572,7 @@ def import_fleet_runs(fleet_dir: Path = FLEET_RUNS_DIR, root: Path = HISTORY_DIR
         if folder is not None and not folder.is_dir():
             folder = None
         status_path = folder / "status.json" if folder else None
-        stamp = [fr.get("modified"), fr.get("step"), fr.get("state"), fr.get("ended"),
+        stamp = [VAST_IMPORT_VERSION, fr.get("modified"), fr.get("step"), fr.get("state"), fr.get("ended"),
                  _mtime(status_path) if status_path else 0, sorted(fr.get("downloaded") or [])]
         out_path = root / f"{run_id}.json"
         old: dict = {}
