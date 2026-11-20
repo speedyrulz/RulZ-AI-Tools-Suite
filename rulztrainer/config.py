@@ -315,10 +315,11 @@ ARCH_DEFAULT_TARGETS = {"moss_image": _CORE_TARGETS, "fibo2": _CORE_TARGETS,
                         "flux2_klein4b": _CORE_TARGETS,  # the same block naming as the 9B
                         "minimax_h3": _CORE_TARGETS}  # H3: attn.qkv_proj, out_proj, mlp.fc1, fc2 (musubi-tuner's)
 # (sample steps, sample CFG) per family at full quality, in this trainer's guidance convention (uncond + cfg * (cond -
-# uncond), 1 = off): MOSS-Image's reference CFG 3; Bria's FIBO 2.0 pipeline, 30 steps at 5; Krea's pipeline, 28 steps
+# uncond), 1 = off): MOSS-Image's 25 steps at CFG 3.5 (community: CFG 2.5 makes good LoRAs look broken; the reference
+# sampler's 20 steps at CFG 3 before 3.53.0); Bria's FIBO 2.0 pipeline, 30 steps at 5; Krea's pipeline, 28 steps
 # at its guidance_scale 4.5, which computes cond + g * (cond - uncond): cfg 5.5 here; Qwen-Image 2.1 is meant to be
 # sampled without guidance (ComfyUI's template: 25 steps at CFG 1; the diffusers pipeline 40)
-ARCH_FULL_SAMPLE = {"moss_image": (20, 3.0), "fibo2": (30, 5.0), "krea2": (28, 5.5), "qwen_image21": (25, 1.0),
+ARCH_FULL_SAMPLE = {"moss_image": (25, 3.5), "fibo2": (30, 5.0), "krea2": (28, 5.5), "qwen_image21": (25, 1.0),
                     "flux3_klein": (50, 3.5)}  # FLUX 3 Klein Base: BFL's 50 steps at guidance 3.5 (diffusers' CFG)
 # MiniMax H3 is guidance-distilled (no CFG); 30 steps as musubi-tuner's one-frame example (the pipeline: 49)
 ARCH_FULL_SAMPLE["minimax_h3"] = (30, 1.0)
