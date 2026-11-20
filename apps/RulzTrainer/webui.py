@@ -30,7 +30,7 @@ from nicegui import app, background_tasks, run, ui
 from rulztrainer.archs import get_arch
 from rulztrainer.config import (AUTOMAGIC, KEEL, alpha_differs, alpha_lr_note, alpha_scale_reason, effective_optimizer, lr_at_alpha_rank, trained_optimizer, LR_SCHEDULERS, KEEL_FB, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
                                 MODEL_PRESETS, ARCH_SAMPLE_LORA, VIDEO_ARCHS, VIDEO_EXTS, VIDEO_DATA_PRESETS,
-                                STILL_FFN_TARGETS, detect_video_data_preset, video_data_preset,
+                                ARCH_FULL_SAMPLE, STILL_FFN_TARGETS, detect_video_data_preset, video_data_preset,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
 from rulztrainer import (__version__, blockaudit, bodysim, capabilities, facesim, history, lookfilter, machine, oom_recovery,
                          promptcheck)
@@ -2307,6 +2307,7 @@ class Form:
             lr_cycles=num("lr_cycles", int), adam_beta1=num("adam_beta1", float), adam_beta2=num("adam_beta2", float),
             adam_eps=num("adam_eps", float),
             max_grad_norm=float(v("max_grad_norm")), timestep_sampling=v("timestep_sampling"),
+            weight_decay=num("weight_decay", float), sample_skip_layer=num("sample_skip_layer", int),
             automagic_min_lr=float(v("automagic_min_lr")), automagic_max_lr=float(v("automagic_max_lr")),
             automagic_polarity_history=int(v("automagic_polarity_history")), automagic_groups=v("automagic_groups"),
             automagic_clip_threshold=float(v("automagic_clip_threshold")),
@@ -2469,7 +2470,7 @@ class Form:
                          if v("noise_run") else []),
             noise_seeds=int(v("noise_seeds") or 16),
         )
-        # the settings without a field on this page (weight_decay, lora_dropout, the hull_* tuning, cache_dir, ...)
+        # the settings without a field on this page (lora_dropout, the hull_* tuning, cache_dir, ...)
         # stay as the loaded or uploaded config had them, not the defaults: Load then Start (or Save) keeps them
         # (model_arch: auto, so the family follows the model picked here)
         base = getattr(self, "_base", None)
@@ -2480,6 +2481,7 @@ class Form:
 
     def from_config(self, cfg: TrainConfig) -> None:
         self._base = copy.deepcopy(cfg)  # what to_config keeps of the settings this page has no field for
+        self.loads = getattr(self, "loads", 0) + 1  # the wizard reads it: values it put in the form are now the config's
         preset = next((k for k, v in MODEL_PRESETS.items() if v == cfg.model_path), CUSTOM)
         values = {**cfg.to_dict(), "model_preset": preset, "sample_prompts": "\n".join(cfg.sample_prompts),
                   "reward_prompts": "\n".join(cfg.reward_prompts),
@@ -6073,6 +6075,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                                             cfg.transformer_file if cfg.model_source == "files" and cfg.transformer_file
                                             else cfg.model_path) == "turbo"
     zi_note = " (Fizgig's measurement, not RulZ's)"
+    moss = cfg.arch_name() == "moss_image"
     character = goal == "character"
     vram = min(g["total"] for g in gpus) / 1024 if gpus else None
     gpu_name = "your smallest GPU" if len(gpus) > 1 else "your GPU"
@@ -6165,7 +6168,15 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     if zimage and target >= 1.0:
         reason += ("; Fizgig's Z-Image presets train at 0.5 MP (about 0.9 s a step at 1 MP), and 0.5 MP uses less "
                    "memory than the 1 MP the memory figures here are for")
-    r["resolutions"] = ([target], reason)
+    sizes = [target]
+    if moss and (vram is None or vram >= 12):  # mixed buckets, capped at the photos' size by the rule above
+        sizes = [mp for mp in MOSS_MIXED_RESOLUTIONS if mp <= target + 1e-9] or [0.25]
+        if len(sizes) > 1:
+            reason = ("512 + 768 + 1024 px buckets together beat 1024 alone for MOSS-Image users, and 512 alone is "
+                      "poor for skin (community reports; not compared in RulZ AI Trainer)"
+                      + (f"; sizes above your photos' {data['median_mp']:.2f} MP are left out"
+                         if data and data.get("median_mp") and data["median_mp"] < 0.9 else ""))
+    r["resolutions"] = (sizes, reason)
     r["enable_buckets"] = (True, "keeps every image's aspect ratio instead of cropping it square")
     if character:
         r["flip_augment"] = (False, "faces are not symmetric (hair parting, moles, logos); mirrored copies blur them")
@@ -6284,6 +6295,9 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                 r["lora_rank"] = (rank, "Fizgig's Klein 9B full-model recipe (\"Old Reliable\"): rank 16, alpha 16"
                                   + k2_note)
             r["lora_alpha"] = (float(rank), "alpha equal to rank keeps the adapter's scale at 1")
+    if moss and not cfg.finetune and cfg.optimizer not in AUTOMAGIC:  # AdamW-style decay: a fine-tune has none
+        r["weight_decay"] = (1e-4, "MOSS-Image users ran 5e-5 to 2e-4 (the trainer's default is 0.01): 1e-4 is the "
+                                   "middle; community values, not compared in RulZ AI Trainer")
     if goal == "style":
         r["timestep_sampling"] = ("logsnr", "spends most steps at very high noise, where an art style is learned "
                                             "(the style-friendly sampler)")
@@ -6297,6 +6311,13 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                                                "ai-toolkit and Tongyi use shift 3 too)")
         r["timestep_shift"] = (1.0, "leave it at 1: the reference timesteps already carry Z-Image's shift of 3, and "
                                     "this setting would be applied on top of it")
+    elif moss and character:  # over the identity recipe's logit_normal (the wizard applies it: MODEL_WIZARD_AUTO)
+        r["timestep_sampling"] = ("reference", "MOSS-Image's own high-noise training curve (sigma = 1 - sigmoid(Z), Z "
+                                               "~ N(-1.09, 0.95), median sigma about 0.75). Community: the best posted "
+                                               "MOSS character result came from a high-noise bias; not compared with "
+                                               "logit_normal in RulZ AI Trainer")
+        r["timestep_shift"] = (1.0, "leave it at 1: the reference curve is already MOSS's own, and this setting would "
+                                    "be applied on top of it")
     elif not character:  # the identity recipe sets logit_normal itself
         r["timestep_sampling"] = ("logit_normal", "the default: most steps at middle noise, fewer at the extremes")
     sampling = r["timestep_sampling"][0] if "timestep_sampling" in r else cfg.timestep_sampling
@@ -6387,9 +6408,17 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     elif ideo:
         r["sample_steps"] = (20, "Ideogram's V4_DEFAULT_20 preset (V4_QUALITY_48 for its best)")
         r["sample_cfg"] = (7.0, "Ideogram's guidance 7 (the last steps drop to 3 by themselves, as in its presets)")
+    elif moss:
+        steps, guidance = ARCH_FULL_SAMPLE["moss_image"]
+        r["sample_steps"] = (steps, "community: about 25 steps for MOSS-Image Base (the turbo LoRA's 12 render faster)")
+        r["sample_cfg"] = (guidance, "community: CFG 3.5-4 on Base; at 2.5 good LoRAs look broken")
     else:
         r["sample_steps"] = (20, "the reference MOSS-Image sampler")
         r["sample_cfg"] = (3.0, "the reference MOSS-Image guidance scale")
+    if moss:
+        r["sample_skip_layer"] = (-1, "off: the trainer trains block 22 (all blocks, with none picked), and skipping "
+                                      "layer 22 in the negative branch while sampling strips that likeness (community "
+                                      "report). Only acts with guidance above 1, i.e. without the turbo LoRA")
     if character:
         r["probe_every"] = (25, "frequent quick checks give the best-checkpoint and early-stop decisions enough points")
         if (cfg.turbo_lora and not (klein and cfg.turbo_lora == "auto")) or cfg.samples_on_distilled_model():
@@ -6889,6 +6918,13 @@ def _show(widget, value) -> str:
 WIZARD_FOCUS = ("face_focus", "face_body", "face_only")
 WIZARD_BASICS = {"network_type": "lora", "finetune": False, "lora_rank": 32, "lora_alpha": 32.0,
                  "optimizer": "adamw8bit", "learning_rate": 1e-4, "lr_alpha_scale": False}
+# What the wizard also applies by itself for one model family, over the identity recipe's: MOSS-Image's high-noise
+# timestep curve, weight decay and preview skip layer. Other families keep what their recommendations only offer.
+MODEL_WIZARD_AUTO = {"moss_image": ("timestep_sampling", "timestep_shift", "weight_decay", "sample_skip_layer")}
+MODEL_AUTO_OFF = {"timestep_sampling": "logit_normal",  # the identity recipe's, back after leaving the family
+                  "timestep_shift": TrainConfig.timestep_shift, "weight_decay": TrainConfig.weight_decay,
+                  "sample_skip_layer": TrainConfig.sample_skip_layer}
+MOSS_MIXED_RESOLUTIONS = (0.25, 0.5, 1.0)  # 512 / 768 / 1024 px buckets
 WIZARD_AUTO = ("multi_gpu", "dp_balance", "transformer_quant", "text_encoder_quant", "gradient_checkpointing",
                "checkpoint_keep_blocks", "block_swap", "compile_model", "resolutions", "enable_buckets",
                "flip_augment", "face_refs", "body_refs", "adapter_mode", "target_text_fusion", "target_attn_gate",
@@ -7207,6 +7243,11 @@ class Wizard:
         self.extras_cards: dict[bool, ui.card] = {}
         self.steps: dict[str, ui.step] = {}
         self.set_up = False  # the identity recipe and the wizard's basics were put in place this session
+        self.family = ""  # the model family the last recommendations were made for
+        self.model_auto_family = ""  # the family whose MODEL_WIZARD_AUTO values the wizard has put in the form
+        self.model_auto_applied: dict[str, object] = {}  # those values by key (the "off" of an extra that holds one)
+        self.model_auto_prev: dict[str, object] = {}  # the values they displaced, given back on leaving the family
+        self.model_auto_loads = 0  # Form.loads when they were put there (a later load makes them the config's own)
         # the race: how many racers, the settings they may differ in, and each racer's name and assigned values
         # (a value only once it is assigned: the others follow the base setup on the earlier pages)
         self.n_racers = 2
@@ -7335,6 +7376,10 @@ class Wizard:
             self.estimate_race()
             self.check_race()
         self.recs = wizard_recommendations(cfg, self.goal, self.smi, self.data, self.focus)
+        self.family = cfg.arch_name()
+        if self.set_up and (self.family != self.model_auto_family or self.model_auto_stale()):
+            self.follow_model_auto()  # also a family picked by a custom model path, or after a mid-edit field
+            return  # it refreshed the rows itself
         for key, row, icon, label, btn in self.rec_rows:
             rec = self.recs.get(key)
             row.visible = rec is not None
@@ -7384,10 +7429,15 @@ class Wizard:
             return
         self.set_up = True
         if self.w["preset_toggle"].value and not force:
-            self.refresh()
+            self.model_auto_loads = -1  # stale on purpose: the refresh notes the family and applies nothing
+            self.refresh()  # a loaded identity config keeps its own values
             return
         if not self.w["preset_toggle"].value:
             self.w["preset_toggle"].value = True  # applies the identity recipe (the Train tab's switch)
+        # the family values go on again below, for the model now picked; the preset's load is the wizard's own
+        self.model_auto_family, self.model_auto_applied, self.model_auto_prev = "", {}, {}
+        self.model_auto_loads = getattr(self.f, "loads", 0)
+        self.set_up = True
         for key, value in WIZARD_BASICS.items():
             self.w[key].value = value
         self.experiments_off()
@@ -7397,7 +7447,37 @@ class Wizard:
                 self.goal, (self.w["trigger_word"].value or "").strip(), self.focus))
         self.refresh()
         self.apply([k for k in WIZARD_AUTO if k in self.recs])
+        self.follow_model_auto()
         ui.notify("Set up for a character / person LoRA with the recommended settings", type="info")
+
+    def model_auto_stale(self) -> bool:
+        """A config was loaded into the form since the wizard put its family values there: they are not its any more."""
+        return self.model_auto_loads != getattr(self.f, "loads", 0)
+
+    def follow_model_auto(self):
+        """Put the picked family's MODEL_WIZARD_AUTO values over the identity recipe's (MOSS-Image: reference timesteps,
+        weight decay 1e-4, no preview skip layer), and give the previous family's back the values they displaced while
+        they are still the ones the wizard put there. The identity preset applies once, when it is switched on; nothing
+        re-applies it after. A loaded config is kept as it is (its family counts as followed)."""
+        if not self.set_up:
+            return
+        if self.model_auto_stale():
+            self.model_auto_family, self.model_auto_applied, self.model_auto_prev = self.family, {}, {}
+            self.model_auto_loads = getattr(self.f, "loads", 0)
+        if self.family == self.model_auto_family:
+            return
+        for key, value in list(self.model_auto_applied.items()):
+            if _same(self.w[key].value, value):
+                self.w[key].value = self.model_auto_prev.get(key, MODEL_AUTO_OFF[key])
+        self.model_auto_applied, self.model_auto_prev = {}, {}
+        self.model_auto_family = self.family  # first, so the refreshes below do not come back here
+        self.refresh()
+        keys = [k for k in MODEL_WIZARD_AUTO.get(self.family, ()) if k in self.recs]
+        # what each displaced (unknown when it already held the family's value, as after Reset: the plain default)
+        prev = {k: MODEL_AUTO_OFF[k] if _same(self.w[k].value, self.recs[k][0]) else self.w[k].value for k in keys}
+        self.apply(keys)
+        self.model_auto_applied = {k: self.recs[k][0] for k in keys}
+        self.model_auto_prev = prev
 
     def reset(self):
         self.set_up_identity(force=True)
@@ -7427,7 +7507,7 @@ class Wizard:
                         self.steps[name] = step
                         getattr(self, f"step_{name}")()
         self.w["preset_toggle"].on_value_change(lambda _: self.refresh())
-        self.w["model_preset"].on_value_change(lambda _: (self.mark_model(), self.refresh()))
+        self.w["model_preset"].on_value_change(lambda _: (self.mark_model(), self.refresh(), self.follow_model_auto()))
         self.w["race"].on_value_change(lambda _: (self.mark_race(), self.refresh()))
         self.mark_model()
         self.mark_race()
@@ -8013,12 +8093,18 @@ class Wizard:
         with ui.stepper_navigation():
             ui.button("Back", icon="arrow_back", on_click=lambda: self.move(-1)).props("flat")
 
+    def experiment_off(self, ex: dict):
+        """An extra's off value: its own, except where the wizard put the family's (MOSS-Image's reference timesteps)."""
+        if self.model_auto_stale():
+            return ex["off"]  # a loaded config's own value, not the wizard's
+        return self.model_auto_applied.get(ex["key"], ex["off"])
+
     def experiment_on(self, ex: dict) -> bool:
-        return not _same(self.w[ex["key"]].value, ex["off"])
+        return not _same(self.w[ex["key"]].value, self.experiment_off(ex))
 
     def experiments_off(self):
         for ex in EXPERIMENTS:
-            self.w[ex["key"]].value = ex["off"]
+            self.w[ex["key"]].value = self.experiment_off(ex)
 
     def extras_answer(self, yes: bool, quiet: bool = False):
         self.extras_yes = yes
@@ -12765,6 +12851,11 @@ def build_page(local: bool = True):
                                                                        precision=0).classes("w-40")
                                 w["max_grad_norm"] = ui.number("Max grad norm (0 = off)", value=d.max_grad_norm) \
                                     .classes("w-44")
+                                w["weight_decay"] = ui.number("Weight decay", value=d.weight_decay, format="%.1e",
+                                                              step=1e-5, min=0).classes("w-36") \
+                                    .tooltip("AdamW-style decay of the trained weights (the trainer's default 0.01). "
+                                             "The MOSS-Image wizard uses 1e-4: its users ran 5e-5 to 2e-4. A fine-tune "
+                                             "and some optimizers (Automagic, Hull) ignore it.")
                                 w["loss_weighting"] = ui.select(["none", "min_snr", "sigma_sqrt"], value="none",
                                                                 label="Loss weighting").classes("w-40")
                                 w["loss_type"] = ui.select(["mse", "band"], value=d.loss_type, label="Loss type")                                     .classes("w-32")                                     .tooltip("mse: the plain loss. band (experimental, from AI-Toolkit): splits each "
@@ -12960,6 +13051,12 @@ def build_page(local: bool = True):
                             w["sample_shift"] = ui.number("Shift", value=d.sample_shift).classes("w-28") \
                                 .tooltip("MOSS-Image only (5); the other models take their shift from the image size "
                                          "(FLUX 3 Klein's is fixed at 6.93)")
+                            w["sample_skip_layer"] = ui.number("Skip layer", value=d.sample_skip_layer, precision=0) \
+                                .classes("w-28") \
+                                .tooltip("MOSS-Image only: the layer skipped in the negative branch of the guided "
+                                         "sampler (the reference sampler's 22; -1 = off, which the MOSS wizard sets: "
+                                         "the trainer trains block 22, and skipping it strips that likeness). Does "
+                                         "nothing at CFG 1, as with the turbo LoRA.")
                         hint("FIBO 2.0: with its turbo LoRA (Edit Turbo as a LoRA on dev) samples render 4 steps at "
                              "CFG 1; without it Bria samples dev at 50 steps / CFG 5 (20-30 is fine for previews). An "
                              "empty negative prompt means the null caption it was trained with. Prompts can be plain "
