@@ -197,7 +197,7 @@ def recommend(k: Knowledge, model_id: str, scan: DatasetScan | None, goals: Goal
                 notes.append(rule.note)
     spec = model.steps
     crop = choices.get('crop_augment').value if 'crop_augment' in choices else 'none'
-    factor = {'face': 1.6, 'face+bust': 2.2}.get(crop, 1)
+    factor = 1 if model_id == 'ideogram4' else {'face': 1.6, 'face+bust': 2.2}.get(crop, 1)
     count = (scan.image_count * factor + len(scan.videos)) if scan else 0
     repeats = choices.get('repeats').value if 'repeats' in choices else 1
     batch = choices.get('batch_size').value if 'batch_size' in choices else 1
@@ -243,6 +243,9 @@ def recommend(k: Knowledge, model_id: str, scan: DatasetScan | None, goals: Goal
                         put(key, base[key], 'Preserved from base config.', origin='base_config')
         except (OSError, yaml.YAMLError, ValueError) as exc:
             warnings.append(f'Could not read base config: {exc}')
+    if model_id == 'ideogram4' and str(choices['network_type'].value).lower() == 'lokr':
+        choices.pop('lora_rank', None)
+        choices.pop('lora_alpha', None)
     if str(choices['network_type'].value).lower() == 'oft':
         choices.pop('lora_rank', None)
         choices.pop('lora_alpha', None)
@@ -250,7 +253,7 @@ def recommend(k: Knowledge, model_id: str, scan: DatasetScan | None, goals: Goal
             wizard('learning_rate', 5e-5, 'The wizard OFT learning rate.')
         if model_id == 'krea2':
             wizard('isolation', False, 'Krea OFT does not use isolation.')
-    if str(choices['optimizer'].value).lower().startswith(('automagic', 'keel3')):
+    if str(choices['optimizer'].value).lower().startswith(('automagic', 'keel3')) and model_id != 'ideogram4':
         choices.pop('learning_rate', None)
     if 'resolution_shift' in choices and choices['resolution_shift'].value and 'timestep_sampling' in choices \
             and str(choices['timestep_sampling'].value) == 'reference':

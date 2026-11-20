@@ -498,7 +498,11 @@ ARCH_DEFAULT_TARGETS["ideogram4"] = _CORE_TARGETS
 ARCH_FULL_SAMPLE["ideogram4"] = (20, 7.0)
 ARCH_TURBO["ideogram4"] = {"repo": "ostris/ideogram_4_turbotime_lora", "file": "ideogram_4_turbotime_v1.safetensors",
                            "strength": 1.0, "steps": 8, "cfg": 1.0, "shift": 5.0}
-ARCH_SAMPLE_DEFAULTS["ideogram4"] = (ARCH_TURBO["ideogram4"]["steps"], ARCH_TURBO["ideogram4"]["cfg"])
+ARCH_SAMPLE_DEFAULTS["ideogram4"] = (ARCH_TURBO["ideogram4"]["steps"], ARCH_TURBO["ideogram4"]["cfg"])  # with the LoRA on
+# Families whose new setups (the form on picking the model, the wizard) start with the turbo LoRA off, though one
+# exists: community reports say Ideogram 4's TurboTime LoRA at CFG 1 wrecks character LoRAs. A saved config's own
+# turbo_lora ("auto" or a file) is never changed, and the LoRA stays one pick away (Turbo LoRA: auto).
+ARCH_TURBO_DEFAULT_OFF = ("ideogram4",)
 COMFY_REPOS["ideogram4"] = "Comfy-Org/Ideogram-4"
 COMFY_DIFFUSION_FILES["ideogram-ai/ideogram-4-fp8"] = "diffusion_models/ideogram4_{quant}.safetensors"
 COMFY_DIFFUSION_FILES["unsloth/ideogram-4-fp8"] = "diffusion_models/ideogram4_{quant}.safetensors"
