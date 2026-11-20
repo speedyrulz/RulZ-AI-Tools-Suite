@@ -3,7 +3,7 @@
 id: moss_image
 name: MOSS-Image
 kind: image
-updated: 2026-11-16
+updated: 2026-11-19
 summary: >-
   Train on the Base transformer, not SFT (SFT gives a smooth, bright, artificial look), judge on Base without the 8-step
   DMD2 turbo LoRA at about 25 steps and CFG 3.5-4, and train on mixed 512/768/1024 buckets (512-only is terrible for skin
@@ -14,16 +14,16 @@ summary: >-
 model_preset: MOSS-Image-Base
 model_path: OpenMOSS-Team/MOSS-Image-Base
 facts:
-  - text: "Train on Base. 'Pretty much necessary' for a good result (October 2026); LoRAs trained on SFT looked like smooth, bright, artificial FLUX.1-Dev images (likeness came fast, seed-to-seed consistency did not improve with training); Base-trained LoRAs work on SFT and Base, and SFT has unfixed stripe artifacts. One writeup says train on SFT (disputed, one source)."
+  - text: "Train on Base. 'Pretty much necessary' for a good result (October 2026); LoRAs trained on SFT looked like smooth, bright, artificial FLUX.1-Dev images (likeness came fast, seed-to-seed consistency did not improve with training); Base-trained LoRAs work on SFT and Base, and SFT has unfixed stripe artifacts. One writeup says train on SFT (disputed, one source). Against a hard rule: one same-data, same-settings character A/B found little difference (perhaps slightly steadier likeness on SFT), another user first found SFT much better, and one A/B rated a Base LoRA applied on SFT worse than Base on Base (a later user needed strength above 1 on Base). The 'train Base, generate SFT' line is still the most repeated (about nine users across both Discords by November)."
     confidence: CONF
     sources: [moss_base_2026_10, web_moss_2026_10]
-  - text: "Two stacks both posted finished faces. A: sigmoid timesteps with a high-noise bias, automagic v3 with a minimum LR of 3e-5 starting at 1e-4 (higher if automagic dives), LoKr factor 4 or LoRA rank 32; facial detail, imperfections, tattoos and birthmarks came out cleanly and quickly and it overtrains easily (two users with samples, three thumbs-up on the min_lr post). B (about 32 runs): AdamW fixed at 1e-4 for about 100 epochs beats automagic on likeness (automagic is more stable but needed 250+ epochs), a clean-end timestep and block 22 improved likeness, and min_lr 'behaved like AdamW without automagic's stability'. A third camp found shift made likeness appear in ComfyUI where sigmoid did not; a fourth said shift kills the image."
+  - text: "Two stacks both posted finished faces. A: sigmoid timesteps with a high-noise bias, automagic v3 with a minimum LR of 3e-5 starting at 1e-4 (higher if automagic dives), LoKr factor 4 or LoRA rank 32; facial detail, imperfections, tattoos and birthmarks came out cleanly and quickly and it overtrains easily (two users with samples, three thumbs-up on the min_lr post). B (about 32 runs): AdamW fixed at 1e-4 for about 100 epochs beats automagic on likeness (automagic is more stable but needed 250+ epochs), a clean-end timestep and block 22 improved likeness, and min_lr 'behaved like AdamW without automagic's stability'. A third camp found shift made likeness appear in ComfyUI where sigmoid did not; a fourth said shift kills the image. November: the stack-A user posted a same-settings shift/balanced against sigmoid/high comparison ('nothing helped at all until changing to high'), runs EMA 0.98 ('a big difference') and a 300-image character at automagic v3 5e-4, floor 3e-5, 3,000 steps, and said AdamW overtrained in early tests but was never retried with high noise; another user found flat/balanced beat high noise over several runs on a synthetic set (2026-11-18)."
     confidence: DISP
-    sources: [moss_stackA_2026_10, moss_stackB_2026_10, moss_shift_2026_10]
+    sources: [moss_stackA_2026_10, moss_stackB_2026_10, moss_shift_2026_10, moss_nov_2026_11]
   - text: "Block 22: AI Toolkit's default config ignored layers.22. Putting it back improved likeness from the first epochs and made epochs more stable (two users, side by side). RulZ AI Trainer trains every block when lora_blocks is empty, so block 22 is included. An inference skip of layer 22 or 26 can then strip that likeness, but skipping layer 26 transformed some LoRAs that looked like horror at about 60% likeness without it."
     confidence: CONF
     sources: [moss_block22_2026_10, moss_eval_2026_11]
-  - text: "Buckets: 512 + 768 + 1024 beats 1024-only; 512-only is terrible for skin detail and a face with bad skin. 1,000 steps of mixed 512+1024 beat 3,000 of 512-only. Krea 2 will swallow a junk 512 dataset where MOSS will not."
+  - text: "Buckets: 512 + 768 + 1024 beats 1024-only; 512-only is terrible for skin detail and a face with bad skin. 1,000 steps of mixed 512+1024 beat 3,000 of 512-only. Krea 2 will swallow a junk 512 dataset where MOSS will not. Counter-reports: two users got good, fast 512-only runs, and 4,000 LoKr steps at 512 plus 1,000 at 1,024 gave only a slight gain ('512 runs just fine'); the strong claim rests on one heavy tester."
     confidence: CONF
     sources: [moss_buckets_2026_10]
   - text: "Timestep in RulZ AI Trainer: 'reference' is the MOSS-Image report's own distribution (sigma = 1 - sigmoid(Z), Z about N(-1.09, 0.95), truncated at 0.95, 1% uniform: about 11-13% of steps below sigma 0.5, median about 0.75), a heavy high-noise bias comparable in spirit to the public stack A; it has not been compared with it here. Users also report logit-normal (sigmoid), shift and a Fizgig clean-end share."
@@ -38,15 +38,18 @@ facts:
   - text: "Trigger: one regular uses a unique trigger with no digits; another uses the class word ('woman' or 'man') as the only trigger because a unique token made prompts that did not match training kill likeness, at the price that every 'woman' becomes the subject. A token like 'ohwx' slightly improved likeness and stability for him."
     confidence: DISP
     sources: [moss_stackB_2026_10, moss_captions_2026_10]
-  - text: "Evaluate on Base, no turbo, about 25 steps, CFG 3.5-4 (a template CFG of 2.5 makes a good LoRA look broken); the 8-step DMD2 (Kromoss) turbo LoRA makes skin waxy and can change identity (one user also uses it at 0.4 with 16 steps and CFG 3 on Base for realism). Several users had likeness in the trainer and none in ComfyUI until the timestep or workflow changed; small deltas vanish on int8 ComfyUI weights. Export and test."
+  - text: "Evaluate on Base, no turbo, about 25 steps, CFG 3.5-4 (a template CFG of 2.5 makes a good LoRA look broken); the 8-step DMD2 (Kromoss) turbo LoRA makes skin waxy and can change identity (one user also uses it at 0.4 with 16 steps and CFG 3 on Base for realism). Several users had likeness in the trainer and none in ComfyUI until the timestep or workflow changed; small deltas vanish on int8 ComfyUI weights. Export and test. CFG 3 is the most common setting on Base in the banodoco channel (2.5 on SFT); several users like the DMD2 LoRA at about 0.4 with 16-26 steps for the final look, so judge likeness without it and decide on the look separately."
     confidence: CONF
-    sources: [moss_eval_2026_11, moss_shift_2026_10]
+    sources: [moss_eval_2026_11, moss_shift_2026_10, moss_nov_2026_11]
   - text: "Likeness varies more between seeds than on Krea 2 (use several seeds; one regular evaluates at LoRA strength 1.5). The last 10% of likeness against Krea 2 is unsolved as of late October; whose LoRAs win is disputed."
     confidence: DISP
     sources: [moss_eval_2026_11, moss_vs_krea_2026_11]
   - text: "Automagic's effective LR on MOSS sank to about 5e-6 (and 'often 2e-6 after only 100 steps' on MOSS and FIBO for others); floors of 3e-5 up to 2.5e-4 and 1e-3 were reported to work. Automagic v4 climbs and 'fries' MOSS for one user and was closer to AdamW for another."
     confidence: CONF
     sources: [atk_automagic_floor_2026_10, moss_stackA_2026_10, atk_automagic4_2026_11]
+  - text: "LoKr factor 4 (full-rank second factor) is the most common network among users with finished faces (at least five, 'my standard with other models, and seems to work well with moss too'); LoRA rank 32 and LoRA rank 8 also locked faces. Since mid-November two more users say LoKr works better than LoRA on MOSS for some things. One heavy user trains character LoKrs on blocks 24-41 only and style LoRAs on 0-33, found by training all blocks and reading where the change sat; that excludes block 22, which others found helps when trained."
+    confidence: REP
+    sources: [moss_net_2026_10, moss_nov_2026_11]
   - text: "Late-MLP-only LoKr (a block regex over the later feed-forward layers, 2,000 steps, 768 then 1,024) matched a full LoKr on a face-recognition score in about 10 minutes with a much smaller file (one user); interesting, not the default."
     confidence: REP
     sources: [moss_mlp_2026_10]
@@ -79,6 +82,16 @@ base:
     why: "AdamW fixed at 1e-4 for about 100 epochs; the common LoRA rate on MOSS (SimpleTuner, AI Toolkit default, several users) with weight decay 5e-5 to 2e-4."
     confidence: CONF
     sources: [moss_stackB_2026_10, web_moss_2026_10, moss_net_2026_10]
+  weight_decay:
+    value: 1.0e-4
+    why: "Users with finished faces ran 5e-5 to 2e-4 (1e-4 for the AdamW stack); the trainer's own default of 0.01 is far above anything reported on MOSS. Not compared on one set."
+    confidence: REP
+    sources: [moss_stackB_2026_10, moss_net_2026_10]
+  lora_ema:
+    value: 0.98
+    why: "The stack-A user runs EMA 0.98 and calls it a big difference; others used 0.99 and one suspected EMA off is better. 0.98 is also the trainer's default."
+    confidence: DISP
+    sources: [moss_nov_2026_11, doc_trainer_3_28]
   lr_scheduler:
     value: constant
     why: "Constant is the trainer's default; cosine with 100 warm-up is the AI Toolkit default for the LoRA recipe."
@@ -342,6 +355,8 @@ open_questions:
   - "Whether the last 10% of likeness that Krea 2 reaches is reachable on MOSS; no setting posted closed it."
   - "A unique trigger or the class word as the only trigger; no A/B."
   - "Whether training the late-MLP blocks alone (a much smaller file, 10 minutes) matches a full LoRA for identity."
+  - "High-noise against balanced timesteps: a same-settings comparison favoured high noise for one character set, several runs on a synthetic set favoured balanced (2026-11-18)."
+  - "Late blocks only (24-41, no block 22) against all blocks including 22 for a character LoKr; both have a heavy user behind them."
   - "Interaction of the trained block 22 with the trainer's skip-layer sampling (sample_skip_layer defaults to 22 for MOSS samples); not examined."
 sources:
   moss_base_2026_10:
@@ -435,6 +450,13 @@ sources:
     people: 2
     url: null
     note: "One user: 90% of the way but not Krea's last 10%; another: MOSS slightly faster and perhaps better at identity. Disputed."
+  moss_nov_2026_11:
+    kind: community
+    where: "AI Toolkit Discord #moss_image and banodoco Discord #moss-image"
+    date: "2026-11"
+    people: 8
+    url: null
+    note: "Read 2026-11-19: shift/balanced vs sigmoid/high comparison, EMA 0.98, 300 images at automagic 5e-4 floor 3e-5 for 3,000 steps; balanced beat high on a synthetic set; LoKr preferred over LoRA, character LoKrs on blocks 24-41; low-strength DMD2 for the look; CFG 3; a same-settings Base/SFT A/B with little difference."
   web_moss_2026_10:
     kind: web
     where: "imagelora.dev MOSS-Image page, SimpleTuner MOSS-Image quickstart and AcademiaSD defaults"
