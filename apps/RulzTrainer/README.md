@@ -1428,9 +1428,11 @@ between two sweeps only the weights change and a picture's learned share is meas
 | `region_steer_holdout` | 0 (off) | With region steering and held-out photos: a region learned this much further on the training pictures than on the held-out ones, and no better on those for two sweeps, is turned down in every picture. It may turn the face, hair or skin down. |
 | `region_steer_subject_ahead` | 0 (off) | With region steering and sweeps of the training pictures: a picture's face, hair or skin with less than this x the median picture's error left is turned down in that picture alone. The training steps have no clean reading of one picture's subject; the sweeps do. Needs at least 4 swept pictures with that region. |
 
-**Cost.** 3 forward passes per picture per sweep. Sweeping every training picture every epoch about doubles the
-training time (an epoch trains each picture once, at about 3 forward passes' worth of time); every 4th epoch adds about
-a quarter; 8 pictures in turn of a set of 62 about an eighth; the held-out photos alone next to nothing.
+**Cost.** The three noise levels of a picture are batched, as are pictures of the same size and text length. The
+time saved depends on the model: most when a batch-1 forward is held up by the CPU or block swap, least when the GPU
+is already busy at batch 1. Pictures and their fixed noise are kept in memory between sweeps, up to 4 GiB. Readings at
+another batch size can differ very slightly with bf16 kernels; a batch size reduced after a GPU memory error stays
+reduced for the rest of the run.
 
 **Held-out photos** are picked by file name, evenly through the set, so the same set always holds out the same ones
 and a resumed run keeps them. A set needs at least 10 photos and at most a fifth may be held out. What the model
@@ -1440,11 +1442,27 @@ limits: with two or three held-out photos the score rests on very few pictures, 
 matches a training photo (the near-duplicate check names such pairs before training) is not unseen.
 
 Like the training maps, a sweep changes nothing about training (no gradients, eval mode and back, the RNG restored, the
-weight average used), a failed sweep turns the sweeps off for the rest of the run, and a race has none. They are
-measured against a first sweep at one resolution, so not with `resolution_step_up`. A resumed run reads
+weight average used), and a failed sweep turns the sweeps off for the rest of the run (in a race: of that configuration).
+They are measured against a first sweep at one resolution, so not with `resolution_step_up`. A resumed run reads
 `region_sweep.json` back; without one its first sweep is of the already trained model and the log says so. Output:
 `region_sweep.jsonl` (one line per sweep), the Monitor's Region watch section (a sweep line, and the sweeps' contrast
 beside the training steps' in the table).
+
+**In a configuration race** (see [Configuration race](#configuration-race-race)) the same settings work, in both race
+modes (the configurations in turn, and `race_parallel`), as a report only. The same photos are held out of every
+configuration. Each configuration has its own sweep: a first sweep of that configuration before it trains (at its own
+step 0), then every `region_sweep_every` of its own epochs on its own step count, and one at its last step, each
+measured against its own first sweep. In turns, a sweep runs while its configuration is swapped in; with `race_parallel`
+the configuration's weight average is loaded into the first GPU's model copy, as for its probe, and swept there while
+the other lanes wait. The log gives the cost at the start (configurations x pictures). Nothing the sweeps read stops or
+steers anything: `holdout_patience` and `holdout_track_best` are off in a race (one log line says so when they are set)
+and stay off for the winner that trains on alone, whose sweeps go on in its own files, and region watch and region
+steering stay off in a race. `sweep_async` and `sweep_split` do not apply: race sweeps run on the training GPU (one log
+line). A race cannot resume, so every configuration's sweeps start fresh. Output per configuration `i` (its position in
+`race_configs`, from 0): `region_sweep.race<i>.json` and `region_sweep.race<i>.jsonl`, with the sweep's usual rows plus
+`config` (its name) and `index`; the plain `region_sweep.*` files are not written. `status.json` has
+`region_sweep_race.configs`, one entry per configuration that has swept: the latest row, its `line` and `history`, and
+`dropped` or `finished` once it has left. A configuration that is dropped keeps its files and its entry.
 
 **The sweep charts** (Monitor, Details view, Region watch section; one chart in 3.6.0, split up in 3.6.1) draw every
 sweep of the run against the step. On top is **the gap chart**: per region, how many points further it has been
@@ -2960,6 +2978,11 @@ average, parked on the CPU while it waits; the model copies carry the weights of
 identity loss or self-training; `torch.compile` is off; no training states. Manual drops, the gallery and the race table work as before
 (the table marks every configuration that is training). A three-configuration test on an RTX 5060 Ti and an RTX 4060
 Ti ran two at once at about 6.6 s per step each, against about 13 s one after the other.
+
+**Region sweeps and held-out photos in a race.** They work in both race modes as a report: every configuration is
+swept on its own steps against its own first sweep, the same photos are held out of all of them, and nothing is stopped
+or saved from them; region watch and region steering stay off in a race. The details are under
+[Region sweeps and held-out photos](#region-sweeps-and-held-out-photos-experimental).
 
 **On the Monitor.** The *Likeness probes* chart draws every configuration's smoothed face, body and combined scores
 as its own lines, named after it (`lora16 face`, `lokr8 combined`): one colour per configuration, the combined score
