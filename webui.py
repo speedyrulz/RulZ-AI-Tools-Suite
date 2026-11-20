@@ -1413,7 +1413,8 @@ def sweep_history(sweep: dict | None, job_dir=None) -> list[dict]:
     if rows or not sweep or job_dir is None:
         return rows
     try:
-        with open(Path(job_dir) / "region_sweep.jsonl", encoding="utf-8") as f:
+        name = (f"region_sweep.race{sweep['index']}.jsonl" if "index" in sweep else "region_sweep.jsonl")
+        with open(Path(job_dir) / name, encoding="utf-8") as f:
             for line in f:
                 try:
                     row = json.loads(line)
@@ -1424,6 +1425,67 @@ def sweep_history(sweep: dict | None, job_dir=None) -> list[dict]:
     except OSError:
         return []
     return rows[-400:]
+
+
+def race_file_index(name) -> int | None:
+    """The configuration index in a region_sweep.race<N>.json(l) file name, else None."""
+    match = re.fullmatch(r"region_sweep\.race(\d+)\.jsonl?", str(name))
+    return int(match.group(1)) if match else None
+
+
+def race_sweep_files(folder) -> list[tuple[int, Path]]:
+    """[(index, path)] of the folder's region_sweep.race<N>.jsonl files, by the integer index (race10 after race2)."""
+    found = []
+    for path in Path(folder).glob("region_sweep.race*.jsonl"):
+        index = race_file_index(path.name)
+        if index is not None:
+            found.append((index, path))
+    return sorted(found)
+
+
+def race_config_label(config: dict) -> str:
+    """A configuration's name with its state: 'name (dropped)', '(finished)' or '(failed)'."""
+    name = str(config.get("config") or f"Configuration {config.get('index')}")
+    flags = [word for word in ("dropped", "finished", "failed") if config.get(word)]
+    return name + (f" ({', '.join(flags)})" if flags else "")
+
+
+def race_select_options(configs) -> dict:
+    return {c["index"]: race_config_label(c) for c in configs}
+
+
+def race_config_pick(configs, value) -> dict:
+    """The configuration the select shows: the one with index `value`, else the first."""
+    return next((c for c in configs if c["index"] == value), configs[0])
+
+
+def fill_race_select(select, configs, painting: dict) -> None:
+    """Set the select's options together with a value that is among them. The change this causes is silent: the
+    on_change handlers return at once while painting["on"] is set, so one paint follows one change."""
+    options = race_select_options(configs)
+    value = select.value if select.value in options else next(iter(options))
+    if select.options != options or select.value != value:
+        painting["on"] = True
+        try:
+            select.set_options(options, value=value)
+        finally:
+            painting["on"] = False
+
+
+def race_sweep_gap_series(configs, job_dir=None):
+    """Compare each racer's subject gap on its own step axis."""
+    series, legend = [], []
+    for i, config in enumerate(configs):
+        history = sweep_history(config, job_dir)
+        pts = [[int(r["step"]), round(100 * (r["train"]["subject"] - r["held"]["subject"]), 1)]
+               for r in history if (r.get("train") or {}).get("subject") is not None
+               and (r.get("held") or {}).get("subject") is not None]
+        if pts:
+            name = race_config_label(config)
+            color = "#A1A1AA" if config.get("dropped") else CHART_COLORS[i % len(CHART_COLORS)]
+            series.append(_line(name, color, data=pts, showSymbol=True, symbolSize=4))
+            legend.append(name)
+    return series, legend
 
 
 def sweep_gap_series(history: list[dict]) -> tuple[list[dict], list[str]]:
@@ -9659,7 +9721,10 @@ REGION_FILES = ("status.json", "region_watch.json", "region_sweep.json", "region
 def region_signature(job_dir) -> tuple:
     """(file, mtime, size) of the job-folder files the region block reads: it is read again only when this moves."""
     out = []
-    for name in REGION_FILES:
+    races = sorted((race_file_index(p.name), p.name) for p in Path(job_dir).glob("region_sweep.race*.json*")
+                   if race_file_index(p.name) is not None)
+    names = list(REGION_FILES) + [name for _, name in races]
+    for name in names:
         try:
             s = (Path(job_dir) / name).stat()
         except OSError:
@@ -9684,6 +9749,20 @@ def region_data(job_dir) -> dict:
     except (OSError, ValueError):
         st = {}
     rw, ba, rs = st.get("region_watch"), st.get("block_audit"), st.get("region_sweep")
+    race = st.get("region_sweep_race") or {}
+    configs = list(race.get("configs") or [])
+    for index, path in race_sweep_files(job_dir):
+        if any(c.get("index") == index for c in configs):
+            continue
+        rows = sweep_history({"index": index}, job_dir)
+        if rows:
+            try:
+                line = _regionsweep.describe(rows[-1])
+            except (KeyError, TypeError, ValueError):
+                line = ""
+            configs.append({**rows[-1], "index": index, "history": rows, "line": line})
+    configs = sorted((c for c in configs if isinstance(c, dict) and isinstance(c.get("index"), int)),
+                     key=lambda c: c["index"])
     if not rw:
         state = _regionwatch.read(job_dir)
         last = ((state or {}).get("history") or [{}])[-1] if state else {}
@@ -9718,7 +9797,7 @@ def region_data(job_dir) -> dict:
             except (KeyError, TypeError, ValueError, IndexError):
                 text = ""
             ba = {**rows[-1], "line": text}
-    return {"rw": rw or None, "ba": ba or None, "rs": rs or None}
+    return {"rw": rw or None, "ba": ba or None, "rs": rs or None, "race": configs}
 
 
 class RegionBlock:
@@ -9748,7 +9827,7 @@ class RegionBlock:
             return self.shown
         self.sig = sig
         data = region_data(job_dir) if job_dir else {}
-        self.shown = any(data.get(k) for k in ("rw", "ba", "rs"))
+        self.shown = any(data.get(k) for k in ("rw", "ba", "rs", "race"))
         if self.shown and not self.built:
             self._build()
         if self.built:
@@ -9759,7 +9838,10 @@ class RegionBlock:
         self.built = True
         with self.parent:
             self.rw_label = hint("")
-            self.rs_label = hint("")
+            self.rs_label = hint("").classes("whitespace-pre-line")
+            self.painting = {"on": False}
+            self.rs_select = ui.select({}, label="Configuration", on_change=self._pick) \
+                .props("dense outlined").classes("w-64")
             self.ba_label = hint("")
             with ui.column().classes("w-full gap-1") as self.rs_box:
                 with ui.column().classes("w-full gap-1") as self.gap_box:
@@ -9806,8 +9888,19 @@ class RegionBlock:
                 {"name": "seen", "label": "seen", "field": "seen", "sortable": True},
             ], rows=[], row_key="path", pagination=15).props("flat dense").classes("w-full text-xs")
 
+    def _pick(self) -> None:
+        """The configuration select was changed by the user: paint again (not while _paint sets the select)."""
+        if not self.painting["on"]:
+            self._paint(self.data, self.job_dir)
+
     def _paint(self, data: dict, job_dir) -> None:
         rw, ba, rs = data.get("rw"), data.get("ba"), data.get("rs")
+        self.data, self.job_dir = data, job_dir
+        configs = data.get("race") or []
+        self.rs_select.visible = bool(configs)
+        if configs:
+            fill_race_select(self.rs_select, configs, self.painting)
+            rs = race_config_pick(configs, self.rs_select.value)
         self.rw_label.visible = bool(rw)
         if rw:
             self.rw_label.text = f"Epoch {rw.get('epoch')} (step {rw.get('step')}): {region_watch_line(rw)}"
@@ -9823,22 +9916,24 @@ class RegionBlock:
         if not rs:
             self.rs_box.visible = False
             return
-        self.rs_label.text = f"Sweep at step {rs.get('step')}: {rs.get('line') or ''}"
+        self.rs_label.text = ("\n".join(f"{race_config_label(c)}: step {c.get('step')} {c.get('line') or ''}"
+                                       for c in configs)
+                              if configs else f"Sweep at step {rs.get('step')}: {rs.get('line') or ''}")
         history = sweep_history(rs, job_dir)
-        series, legend = sweep_gap_series(history)
+        series, legend = race_sweep_gap_series(configs, job_dir) if configs else sweep_gap_series(history)
         self.gap_chart.options["series"] = series
         self.gap_chart.options["legend"]["data"] = legend
         self._style(self.gap_chart)
-        self.gap_box.visible = any(len(sr["data"]) > 1 for sr in series)
+        self.gap_box.visible = any(len(sr["data"]) >= (1 if configs else 2) for sr in series)
         drawn = False
         for region, (cell, chart) in self.regions.items():
             series, legend = sweep_region_series(history, region, rs.get("best"))
             chart.options["series"] = series
             chart.options["legend"]["data"] = legend
             self._style(chart)
-            cell.visible = any(len(sr["data"]) > 1 for sr in series)
+            cell.visible = any(len(sr["data"]) >= (1 if configs else 2) for sr in series)
             drawn = drawn or cell.visible
-        self.rs_box.visible = drawn
+        self.rs_box.visible = (drawn or self.gap_box.visible) if configs else drawn
 
 
 _FLEET_PROBE_IMAGE = re.compile(r"^(?:(?P<racer>.+?)_)?step(?P<step>\d{6})_(?P<kind>face|body)_(?P<seed>\d+)\.png$")
@@ -13475,12 +13570,18 @@ def build_page(local: bool = True):
                                 "is measured against its own first sweep: a clean reading where the region watch's "
                                 "is a noisy one. 3 forward passes per picture per sweep, so sweeping every picture "
                                 "every epoch about doubles the training time; the first sweep always takes all of "
-                                "them. Not in a race, not with the resolution step-up.")
+                                "them. In a race each configuration gets its own sweep: report only there, they "
+                                "never stop the run or save a held-out best. Not with the resolution step-up. "
+                                "Cheaper: Pictures per sweep 8 (all held-out photos are still swept every time, "
+                                "8 training pictures in turn), a sweep every 2 or 4 epochs, or Region sweeps on "
+                                "the second GPU (plain runs, below).")
                             w["region_sweep_pictures"] = ui.number("Pictures per sweep (0 = all, -1 = held-out only)",
                                                                    value=d.region_sweep_pictures, min=-1,
                                                                    precision=0).classes("w-80").tooltip(
                                 "How many training pictures a sweep takes: all of them, this many in turn, or none "
-                                "(only the held-out photos, the cheapest).")
+                                "(only the held-out photos, the cheapest). The held-out photos are always all "
+                                "swept, so 8 in turn keeps the training-versus-held-out gap at a fraction of the "
+                                "cost: about an eighth of a full sweep on a set of 62.")
                             w["holdout_images"] = ui.number("Hold out N photos (0 = none)", value=d.holdout_images,
                                                             min=0, precision=0).classes("w-56").tooltip(
                                 "Experimental. Keeps N photos (and every crop made from them) out of training, "
@@ -13497,6 +13598,10 @@ def build_page(local: bool = True):
                                 .classes("w-96 max-w-full").tooltip(
                                 "Ends training when the held-out subject score has not improved for this many sweeps "
                                 "in a row. With two or three held-out photos that score rests on very few pictures.")
+                        hint("Region sweeps cost 3 forward passes per picture. To make them cheaper: Pictures per "
+                             "sweep 8 (all held-out photos are still swept every time), Region sweep every 2 or 4 "
+                             "epochs, or Region sweeps on the second GPU (second GPU section, plain runs; in a race "
+                             "the sweeps run on the training GPU).")
                         with fields():
                             w["look_warmup"] = ui.switch("Warm up look outliers", value=d.look_warmup).tooltip(
                                 "Images the look consistency filter (Dataset tab) put under its fence, real but "
@@ -13664,7 +13769,8 @@ def build_page(local: bool = True):
                                          "train while training goes on, and recorded when they come back, up to one "
                                          "interval later. Best held-out checkpoint saves exactly the weights that "
                                          "were swept; held-out patience and region steering act then. Same model "
-                                         "copy and fallback as the maps.")
+                                         "copy and fallback as the maps. Not in a race (race sweeps run on the "
+                                         "training GPU).")
                             w["sweep_split"] = ui.switch("Split the region sweeps with the training GPU",
                                                          value=d.sweep_split) \
                                 .tooltip("Experimental, never run on a real GPU yet. Needs Region sweeps on the second "
@@ -14709,7 +14815,9 @@ def build_page(local: bool = True):
                 lw_state = {"sig": None}
                 with section("Region watch", "How far each part of the pictures has been learned", "grid_view") as rw_exp:
                     rw_label = hint("")
-                    rs_label = hint("")
+                    rs_label = hint("").classes("whitespace-pre-line")
+                    rs_select = ui.select({}, label="Configuration").props("dense outlined").classes("w-64")
+                    rs_select.visible = False
                     ba_label = hint("")
                     ba_label.visible = False
                     with ui.column().classes("w-full gap-1") as rs_box:
@@ -14759,7 +14867,53 @@ def build_page(local: bool = True):
                     rw_table.visible = False  # (the per-picture table is the region watch's: a run with sweeps only
                     # has none)
                 rw_exp.visible = False
-                rw_state = {"sig": None, "sweep": None}
+                rw_state = {"sig": None, "sweep": None, "status": {}}
+                rs_painting = {"on": False}
+
+                def paint_region_sweep(st: dict) -> None:
+                    """The region sweep part of the Region watch section, from a status: the refresh runs it with
+                    every new status, and picking a configuration runs it with the last one."""
+                    rw_state["status"] = st
+                    configs = sorted((st.get("region_sweep_race") or {}).get("configs") or [],
+                                     key=lambda c: c["index"])
+                    rs_select.visible = bool(configs)
+                    if configs:
+                        fill_race_select(rs_select, configs, rs_painting)
+                    rs = race_config_pick(configs, rs_select.value) if configs else st.get("region_sweep")
+                    if not rs:
+                        rs_box.visible = False
+                        return
+                    rw_exp.visible = True
+                    rs_label.text = ("\n".join(f"{race_config_label(c)}: step {c.get('step')} {c.get('line') or ''}"
+                                               for c in configs)
+                                     if configs else f"Sweep at step {rs.get('step')}: {rs.get('line') or ''}")
+                    sig = (str(_job_dir), rs_select.value if configs else None,
+                           json.dumps(configs, sort_keys=True) if configs
+                           else (rs.get("step"), len(rs.get("history") or [])))
+                    if sig == rw_state["sweep"]:
+                        return
+                    rw_state["sweep"] = sig
+                    history = sweep_history(rs, _job_dir)
+                    series, legend = race_sweep_gap_series(configs, _job_dir) if configs else sweep_gap_series(history)
+                    rs_gap_chart.options["series"] = series
+                    rs_gap_chart.options["legend"]["data"] = legend
+                    rs_gap_chart.update()
+                    rs_gap_box.visible = any(len(sr["data"]) >= (1 if configs else 2) for sr in series)
+                    drawn = False
+                    for region, (cell, chart) in rs_region.items():
+                        series, legend = sweep_region_series(history, region, rs.get("best"))
+                        chart.options["series"] = series
+                        chart.options["legend"]["data"] = legend
+                        chart.update()
+                        cell.visible = any(len(sr["data"]) >= (1 if configs else 2) for sr in series)
+                        drawn = drawn or cell.visible
+                    rs_box.visible = (drawn or rs_gap_box.visible) if configs else drawn
+
+                def pick_race_config() -> None:
+                    if not rs_painting["on"]:
+                        paint_region_sweep(rw_state["status"])
+
+                rs_select.on_value_change(pick_race_config)
                 with section("Saved files", "Download the run's LoRAs, logs and settings, probe and sample images",
                              "download") as files_exp:
                     job_files = JobFiles()
@@ -15174,30 +15328,7 @@ def build_page(local: bool = True):
                 if ba:  # the block audit's latest line (report only), by the region sweep's
                     rw_exp.visible = True
                     ba_label.text = f"Block audit at step {ba.get('step')}: {ba.get('line') or ''}"
-                rs = st.get("region_sweep")
-                if rs:
-                    rw_exp.visible = True
-                    rs_label.text = f"Sweep at step {rs.get('step')}: {rs.get('line') or ''}"
-                    sig = (str(_job_dir), rs.get("step"), len(rs.get("history") or []))
-                    if sig != rw_state["sweep"]:
-                        rw_state["sweep"] = sig
-                        history = sweep_history(rs, _job_dir)
-                        series, legend = sweep_gap_series(history)
-                        rs_gap_chart.options["series"] = series
-                        rs_gap_chart.options["legend"]["data"] = legend
-                        rs_gap_chart.update()
-                        rs_gap_box.visible = any(len(sr["data"]) > 1 for sr in series)
-                        drawn = False
-                        for region, (cell, chart) in rs_region.items():
-                            series, legend = sweep_region_series(history, region, rs.get("best"))
-                            chart.options["series"] = series
-                            chart.options["legend"]["data"] = legend
-                            chart.update()
-                            cell.visible = any(len(sr["data"]) > 1 for sr in series)
-                            drawn = drawn or cell.visible
-                        rs_box.visible = drawn
-                else:
-                    rs_box.visible = False
+                paint_region_sweep(st)
                 dup_note = near_duplicate_note(st.get("near_duplicates"))
                 near_dup_label.visible = bool(dup_note)
                 near_dup_label.text = dup_note

@@ -10,6 +10,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 @pytest.fixture(autouse=True)
+def _fresh_sweep_state(monkeypatch):
+    """The region sweep keeps a batch size cut by a GPU memory error and a picture cache for the whole process: each
+    test starts with neither (a test that fakes an out-of-memory error would otherwise shrink later tests' batches)."""
+    from rulztrainer import regionsweep
+
+    monkeypatch.setattr(regionsweep, "_batch_sizes", {})
+    regionsweep.clear_cache()
+    yield
+    regionsweep.clear_cache()
+
+
+@pytest.fixture(autouse=True)
 def _own_vram_record(tmp_path, monkeypatch):
     from rulztrainer import measured
 
