@@ -1,4 +1,4 @@
-"""The wizard's MOSS-Image defaults (3.53.0): reference timesteps with a shift of 1, weight decay 1e-4, mixed 512 / 768 /
+"""The wizard's MOSS-Image defaults (3.54.0): reference timesteps with a shift of 1, weight decay 1e-4, mixed 512 / 768 /
 1024 px buckets, no preview skip layer, and full-quality previews at 25 steps, CFG 3.5; the other families keep theirs."""
 import sys
 from pathlib import Path

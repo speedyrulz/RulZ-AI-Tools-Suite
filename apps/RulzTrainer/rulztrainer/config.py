@@ -316,7 +316,7 @@ ARCH_DEFAULT_TARGETS = {"moss_image": _CORE_TARGETS, "fibo2": _CORE_TARGETS,
                         "minimax_h3": _CORE_TARGETS}  # H3: attn.qkv_proj, out_proj, mlp.fc1, fc2 (musubi-tuner's)
 # (sample steps, sample CFG) per family at full quality, in this trainer's guidance convention (uncond + cfg * (cond -
 # uncond), 1 = off): MOSS-Image's 25 steps at CFG 3.5 (community: CFG 2.5 makes good LoRAs look broken; the reference
-# sampler's 20 steps at CFG 3 before 3.53.0); Bria's FIBO 2.0 pipeline, 30 steps at 5; Krea's pipeline, 28 steps
+# sampler's 20 steps at CFG 3 before 3.54.0); Bria's FIBO 2.0 pipeline, 30 steps at 5; Krea's pipeline, 28 steps
 # at its guidance_scale 4.5, which computes cond + g * (cond - uncond): cfg 5.5 here; Qwen-Image 2.1 is meant to be
 # sampled without guidance (ComfyUI's template: 25 steps at CFG 1; the diffusers pipeline 40)
 ARCH_FULL_SAMPLE = {"moss_image": (25, 3.5), "fibo2": (30, 5.0), "krea2": (28, 5.5), "qwen_image21": (25, 1.0),
