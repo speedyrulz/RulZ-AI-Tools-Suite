@@ -242,7 +242,42 @@ def sweep_series(status: dict, folder=None) -> list[dict]:
     """The run's region sweeps, compact: [{"step", "train": {region: share}, "held": {region: share}}] oldest first,
     from the status's region_sweep history, else (a status written without one) the folder's region_sweep.jsonl. A step
     seen twice keeps the later row; the shares (of the starting error that is gone) are rounded to 5 decimals."""
-    rows = list(((status.get("region_sweep") or {}).get("history")) or [])
+    configs = list((status.get("region_sweep_race") or {}).get("configs") or [])
+    if folder is not None:
+        races = []
+        for path in Path(folder).glob("region_sweep.race*.jsonl"):
+            match = re.fullmatch(r"region_sweep\.race(\d+)\.jsonl", path.name)
+            if match:
+                races.append((int(match.group(1)), path))
+        for index, path in sorted(races):  # by the integer index: race10 after race2
+            try:
+                entry = next((c for c in configs if c.get("index") == index), None)
+                if entry is None:
+                    entry = {"index": index}
+                    configs.append(entry)
+                if not entry.get("history"):
+                    with path.open(encoding="utf-8") as f:
+                        parsed = []
+                        for line in f:
+                            try:
+                                parsed.append(json.loads(line))
+                            except ValueError:
+                                continue
+                    entry = dict(entry, history=parsed)
+                    configs = [entry if c.get("index") == index else c for c in configs]
+            except (OSError, ValueError):
+                continue
+    if configs:
+        configs.sort(key=lambda c: c.get("index") if isinstance(c.get("index"), int) else 0)
+        eligible = [c for c in configs if not c.get("dropped") and not c.get("failed")] or configs
+        def last_step(c):
+            steps = [r.get("step", 0) for r in c.get("history") or [] if isinstance(r, dict)
+                     and isinstance(r.get("step"), (int, float))]
+            return max(steps, default=c.get("step") or 0)
+        chosen = max(eligible, key=last_step)
+        rows = list(chosen.get("history") or ([chosen] if "step" in chosen else []))
+    else:
+        rows = list(((status.get("region_sweep") or {}).get("history")) or [])
     if not rows and folder is not None:
         try:
             with open(Path(folder) / "region_sweep.jsonl", encoding="utf-8") as f:

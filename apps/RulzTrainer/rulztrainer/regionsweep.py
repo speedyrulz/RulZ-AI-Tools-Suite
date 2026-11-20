@@ -3,7 +3,9 @@
 The region watch reads each picture once an epoch from its training step, at a random noise level: free, but noisy.
 A sweep runs the model again on a picture at three fixed noise levels with fixed noise (as the training maps do), so
 between two sweeps only the weights change, and a picture's "learned" is measured against its own first sweep. It
-costs 3 forward passes per picture per sweep.
+reads three noise levels per picture per sweep. Compatible pictures and levels are batched, and loaded pictures and
+fixed noise are kept on the CPU between sweeps up to a shared memory limit. Readings at another batch size can differ
+very slightly with bf16 kernels; a batch size reduced after a GPU memory error stays reduced for the rest of the run.
 
 Two kinds of picture are swept:
   * training pictures (region_sweep_every, region_sweep_pictures): a clean per-picture reading, and what the "ahead"
@@ -18,6 +20,10 @@ the sweeps stop for the rest of the run.
 
 Output in the job folder: region_sweep.jsonl (one line per sweep) and region_sweep.json (the whole state: a resumed
 run reads it back, because a first sweep of an already trained model would be the wrong start).
+
+In a configuration race every configuration has its own RegionSweep (tag "race<i>"): its files are
+region_sweep.race<i>.json / .jsonl, each row carries "config" and "index" as well, and it is measured against its own
+first sweep and scheduled on its own step count. The plain files are not written then.
 """
 from __future__ import annotations
 
@@ -35,6 +41,14 @@ log = logging.getLogger("rulztrainer")
 SIGMAS = (0.25, 0.5, 0.75)
 SEED = 4321
 STATE_FILE, LOG_FILE = "region_sweep.json", "region_sweep.jsonl"
+
+
+def file_names(tag: str = "") -> tuple[str, str]:
+    """(state file, log file) of a sweep: the plain run's, or a race configuration's (tag "race<i>")."""
+    mid = f".{tag}" if tag else ""
+    return f"region_sweep{mid}.json", f"region_sweep{mid}.jsonl"
+
+
 MIN_SET = 10  # photos a set needs before any may be held out
 MAX_SHARE = 0.2  # of the photos, at most this share held out
 STALL = 0.005  # a held-out score within this of its earlier best has not improved
@@ -81,6 +95,84 @@ def fixed_noise(key: str, level: int, shape):
     return torch.randn(shape, generator=g)
 
 
+SWEEP_BATCH = 12
+CACHE_BYTES = 4 * 1024 ** 3
+_cache_bytes = 0
+_cache = {}
+_batch_sizes = {}
+
+
+def clear_cache():
+    """Release all cached pictures and reset the shared byte count."""
+    global _cache_bytes
+    _cache.clear()
+    _cache_bytes = 0
+
+
+def _cache_identity(pr):
+    paths = (pr.get("latent_path"), pr.get("text_path"))
+    if not any(paths):
+        return ("probe", id(pr)), None
+    names = tuple(str(p) if p is not None else None for p in paths)
+    stamps = []
+    for name in names:
+        try:
+            stat = Path(name).stat() if name is not None else None
+            stamps.append((stat.st_mtime_ns, stat.st_size) if stat else None)
+        except OSError:
+            stamps.append(None)
+    return ("files", *names, pr["key"]), tuple(stamps)
+
+
+def _picture_data(pr):
+    """Load a picture and its fixed noise, retaining it on the CPU if the budget permits."""
+    import torch
+    global _cache_bytes
+    identity, stamp = _cache_identity(pr)
+    entry = _cache.get(identity)
+    if entry is not None:
+        if entry[0] == stamp:
+            return entry[1], True
+        _cache_bytes -= entry[2]
+        del _cache[identity]
+    latents, embeds, mask = pr["load"]()
+    latents = latents.to("cpu", torch.float32).clone()
+    embeds, mask = embeds.to("cpu").clone(), mask.to("cpu").clone()
+    noises = tuple(fixed_noise(pr["key"], i, latents.shape) for i in range(len(SIGMAS)))
+    tensors = (latents, embeds, mask, *noises)
+    size = sum(t.numel() * t.element_size() for t in tensors)
+    data = (latents, embeds, mask, noises)
+    if _cache_bytes + size <= CACHE_BYTES:
+        _cache_bytes += size
+        # Retain fake probe dictionaries to prevent their ids being reused while cached.
+        _cache[identity] = (stamp, data, size, pr if identity[0] == "probe" else None)
+        return data, True
+    return data, False
+
+
+def _forward_chunk(model, device, chunk):
+    """Read compatible picture/level items in one forward pass."""
+    import torch
+
+    latents = torch.cat([item[2][0] for item in chunk]).to(device, torch.float32)
+    embeds = torch.cat([item[2][1] for item in chunk]).to(device)
+    mask = torch.cat([item[2][2] for item in chunk]).to(device)
+    noise = torch.cat([item[2][3][item[1]] for item in chunk]).to(device)
+    levels = torch.tensor([SIGMAS[item[1]] for item in chunk], device=device, dtype=torch.float32)
+    scale = levels.view(-1, *([1] * (latents.ndim - 1)))
+    noisy = ((1 - scale) * latents + scale * noise).to(torch.bfloat16)
+    err = (model(noisy, levels * 1000.0, embeds, mask).float() - (noise - latents)).pow(2)
+    if err.dim() != 4:
+        raise RuntimeError("the model's prediction is not a latent grid")
+    rows = []
+    for i, (pr, _, _) in enumerate(chunk):
+        losses, cells = region_losses(err[i:i + 1], [pr["parts"]])
+        if losses[0] is None:
+            raise RuntimeError(f"the parts map of {Path(pr['key']).name} does not fit its latent")
+        rows.append([losses[0], cells[0]])
+    return rows
+
+
 def forward_readings(model, device, chosen: list[dict], averaged=None) -> dict:
     """key -> per noise level [losses, cells] (COLUMNS order) at the fixed noise."""
     import torch
@@ -94,25 +186,44 @@ def forward_readings(model, device, chosen: list[dict], averaged=None) -> dict:
     try:
         model.eval()
         with (averaged() if averaged is not None else contextlib.nullcontext()), torch.no_grad(), eager_stance():
+            groups = {}
+            device_key = str(torch.device(device))
+            batch_size = min(SWEEP_BATCH, _batch_sizes.get(device_key, SWEEP_BATCH))
+
+            def read_items(items):
+                nonlocal batch_size
+                start = 0
+                while start < len(items):
+                    chunk = items[start:start + batch_size]
+                    try:
+                        rows = _forward_chunk(model, device, chunk)
+                    except RuntimeError as e:
+                        if not isinstance(e, torch.cuda.OutOfMemoryError) and "out of memory" not in str(e).lower():
+                            raise
+                        if len(chunk) == 1:
+                            raise
+                        batch_size = max(1, batch_size // 2)
+                        _batch_sizes[device_key] = batch_size
+                        e.__traceback__ = None  # release the failed forward's tensors before emptying the cache
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+                    for (pr, i, _), row in zip(chunk, rows):
+                        out[pr["key"]][i] = row
+                    start += len(chunk)
+
             for pr in chosen:
-                latents, embeds, mask = pr["load"]()
-                latents = latents.to(device, torch.float32)
-                embeds, mask = embeds.to(device), mask.to(device)
-                rows = []
-                for i, s in enumerate(SIGMAS):
-                    noise = fixed_noise(pr["key"], i, latents.shape).to(device)
-                    noisy = ((1 - s) * latents + s * noise).to(torch.bfloat16)
-                    sigma = torch.full((latents.shape[0],), s * 1000.0, device=device)
-                    err = (model(noisy, sigma, embeds, mask).float() - (noise - latents)).pow(2)
-                    if err.dim() != 4:
-                        raise RuntimeError("the model's prediction is not a latent grid")
-                    losses, cells = region_losses(err, [pr["parts"]])
-                    if losses[0] is None:
-                        raise RuntimeError(f"the parts map of {Path(pr['key']).name} does not fit its latent")
-                    rows.append([losses[0], cells[0]])
-                    del noise, noisy, err
-                out[pr["key"]] = rows
-                del latents, embeds, mask
+                data, cached = _picture_data(pr)
+                items = [(pr, i, data) for i in range(len(SIGMAS))]
+                out[pr["key"]] = [None] * len(SIGMAS)
+                if cached:
+                    shape = tuple((tuple(t.shape), t.dtype) for t in data[:3])
+                    groups.setdefault(shape, []).extend(items)
+                else:
+                    read_items(items)
+                del data, items
+            for items in groups.values():
+                read_items(items)
     finally:
         model.train(was_training)
         torch.set_rng_state(cpu_rng)
@@ -193,11 +304,15 @@ class SplitSizer:
 class RegionSweep:
     """probes: [{"key", "held": bool, "parts": the picture's parts tensor, "load": () -> (latents [1, C, h, w],
     embeds [1, S, D], mask [1, S])}]. every: steps between sweeps. rotate: training pictures per sweep (0 = all); the
-    first sweep and the held-out pictures always take all."""
+    first sweep and the held-out pictures always take all. tag / extra (a race configuration's sweep): the tag
+    picks the file names (file_names) and the extra keys are added to every summary row."""
 
     def __init__(self, job_dir, probes: list[dict], every: int, rotate: int = 0, resume: bool = False,
-                 patience: int = 0):
+                 patience: int = 0, tag: str = "", extra: dict | None = None):
         self.job_dir = Path(job_dir)
+        self.tag = str(tag or "")
+        self.extra = dict(extra or {})
+        self.state_name, self.log_name = file_names(self.tag)
         self.probes = [p for p in probes if p.get("parts") is not None]
         self.every = max(1, int(every))
         self.rotate = max(0, int(rotate))
@@ -218,14 +333,14 @@ class RegionSweep:
         if resume:
             self.late = not self._load()
         else:
-            for name in (STATE_FILE, LOG_FILE):
+            for name in (self.state_name, self.log_name):
                 with contextlib.suppress(OSError):
                     (self.job_dir / name).unlink()
 
     # ------------------------------------------------------------ persistence
     def _load(self) -> bool:
         try:
-            data = json.loads((self.job_dir / STATE_FILE).read_text(encoding="utf-8"))
+            data = json.loads((self.job_dir / self.state_name).read_text(encoding="utf-8"))
             keys = {p["key"] for p in self.probes}
             if not data.get("base") or set(data.get("held") or []) != {p["key"] for p in self.probes if p["held"]}:
                 return False  # nothing swept yet, or other pictures held out: start again
@@ -253,7 +368,7 @@ class RegionSweep:
                 "held_best": self.held_best, "held_flat": self.held_flat}
         from .atomic import writing  # here, not at the top: atomic loads PyTorch, which this module leaves to callers
 
-        with contextlib.suppress(OSError), writing(self.job_dir / STATE_FILE) as tmp:  # whole: a resumed run reads it
+        with contextlib.suppress(OSError), writing(self.job_dir / self.state_name) as tmp:  # whole: a resumed run reads it
             tmp.write_text(json.dumps(data), encoding="utf-8")
 
     # ------------------------------------------------------------ schedule
@@ -313,9 +428,10 @@ class RegionSweep:
         for key in keys:
             self._record(key, readings[key], step)
         row = self._summarise(step, epoch, len(keys), seconds)
+        row.update(self.extra)  # (a race configuration's name and index)
         self.history.append(row)
         with contextlib.suppress(OSError):
-            with open(self.job_dir / LOG_FILE, "a", encoding="utf-8") as f:
+            with open(self.job_dir / self.log_name, "a", encoding="utf-8") as f:
                 f.write(json.dumps(row) + "\n")
         self._save()
         return row
@@ -426,9 +542,9 @@ def describe(row: dict) -> str:
     return text + f" ({row.get('swept', 0)} pictures, {row.get('seconds', 0):.1f}s)"
 
 
-def read(job_dir) -> dict | None:
-    """A job's saved sweep state (region_sweep.json), or None."""
+def read(job_dir, tag: str = "") -> dict | None:
+    """A job's saved sweep state (region_sweep.json, or a race configuration's region_sweep.<tag>.json), or None."""
     try:
-        return json.loads((Path(job_dir) / STATE_FILE).read_text(encoding="utf-8"))
+        return json.loads((Path(job_dir) / file_names(tag)[0]).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None

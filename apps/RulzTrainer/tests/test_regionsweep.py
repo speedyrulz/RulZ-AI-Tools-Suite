@@ -79,7 +79,7 @@ def test_a_sweep_reads_each_region_against_its_own_first_sweep(tmp_path):
     before = torch.get_rng_state()
     first = sweep.run(0, 0.0, model, "cpu")
     assert bool((torch.get_rng_state() == before).all()) and model.training  # nothing of training is touched
-    assert first["first"] and first["swept"] == 3 and model.calls == 9  # 3 pictures x 3 noise levels
+    assert first["first"] and first["swept"] == 3 and model.calls == 1  # 3 pictures x 3 noise levels, batched in one forward
     assert first["train"]["face"] == 0.0 and first["held"]["background"] == 0.0
     assert "first sweep of 3 pictures" in RS.describe(first)
     assert not sweep.due(0) and not sweep.due(9) and sweep.due(10) and sweep.due(5, last=True)
@@ -301,7 +301,8 @@ def test_trainer_sweeps_only_what_is_asked_and_stays_off_when_it_cannot(tmp_path
     assert t.sweep.rotate == 4 and t.sweep.every == 33 and len(t.sweep.probes) == 12  # every 3 epochs of 11 steps
     t.race_rows = [("a", t.cfg)]
     t._setup_sweep(t.cfg, 0)
-    assert t.sweep is None and t._split_holdout(t.cfg, items) == items and t.holdout_items == []  # a race: all train
+    # a race: no configuration is training yet, so no sweep to take; the photos are held out all the same
+    assert t.sweep is None and len(t._split_holdout(t.cfg, items)) == 11 and len(t.holdout_items) == 1
     t.race_rows, t.region_watch_off = None, "RuntimeError: no parser"
     assert t._split_holdout(t.cfg, items) == items
     t.region_watch_off = ""
