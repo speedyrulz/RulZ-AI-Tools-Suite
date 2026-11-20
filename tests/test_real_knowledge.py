@@ -15,6 +15,23 @@ APP = Path(__file__).resolve().parents[1]
 ROOT = APP / 'knowledge'
 
 
+@pytest.mark.parametrize(('count', 'expected'), [(10, 3000), (30, 6000), (60, 8000)])
+def test_ideogram_character_recipe(tmp_path, count, expected):
+    image = ImageInfo(tmp_path / 'image.png', 1024, 1024, 1.0, 'subject')
+    scan = DatasetScan([tmp_path], [image] * count, [], count, 1.0, 1024, {}, [], [], 'subject', [])
+    rec = recommend(load(ROOT), 'ideogram4', scan, Goals('balanced', 'face_body', vram_gb=24))
+    cfg = build_config(rec, 'test')
+    assert {key: cfg[key] for key in ('network_type', 'lokr_factor', 'optimizer', 'learning_rate',
+                                       'timestep_sampling', 'resolutions', 'batch_size', 'turbo_lora',
+                                       'sample_steps', 'steps', 'save_every', 'keep_checkpoints',
+                                       'resolution_shift')} == {
+        'network_type': 'lokr', 'lokr_factor': 4, 'optimizer': 'automagic3', 'learning_rate': 1e-5,
+        'timestep_sampling': 'logit_normal', 'resolutions': [0.25, 0.5, 1.0], 'batch_size': 1,
+        'turbo_lora': '', 'sample_steps': 20, 'steps': expected,
+        'save_every': 250, 'keep_checkpoints': 12, 'resolution_shift': True,
+    }
+
+
 def test_real_slow_likeness_step_rounding():
     knowledge = load(ROOT)
     proposals = propose(knowledge, 'minimax_h3_image', ['slow_likeness'])
