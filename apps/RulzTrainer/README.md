@@ -24,8 +24,9 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
   bf16, with the Qwen3-4B text encoder; its own model entry ([details](#flux2-klein-4b)).
 - **Z-Image** (6.15B, Tongyi-MAI, Apache 2.0, not gated): LoRAs and full fine-tunes for Base and the 8-step Turbo, with
   a training adapter for Turbo; 12 GB cards with block swap ([details](#z-image)).
-- **Ideogram 4** (9.3B): LoRAs on one 16 GB card from the fp8 release, structured JSON captions or wrapped plain
-  ones; non-commercial license ([details](#ideogram-4)).
+- **Ideogram 4** (9.3B): LoRAs on one 16 GB card from the fp8 release, plain captions (wrapped into JSON) or
+  structured JSON ones, with a character setup taken from community reports; non-commercial license
+  ([details](#ideogram-4)).
 - **MiniMax H3** (33B video + audio): experimental LoRAs for H3 video generation from pictures (one-frame, as
   musubi-tuner trains them) and video clips, with clip samples and probes; two 16 GB cards or one with block swap
   ([details](#minimax-h3), [video clips](#video-clip-training-pan-2-minimax-h3)).
@@ -3302,7 +3303,7 @@ probe images, never during training steps.
 | Krea 2 | `krea2_turbo_lora_rank_64_bf16` ([Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2)) | 8 | 1 | from the image size |
 | FIBO 2.0 | `fibo_2.0_turbo_lora_avg_rank_270_bf16` ([Comfy-Org/Fibo-2.0](https://huggingface.co/Comfy-Org/Fibo-2.0)): Edit Turbo as a LoRA on dev | 4 | 1 | from the image size |
 | Qwen-Image 2.1 | `qwen_image_2.1_turbo_lora_avg_rank_178_bf16` ([Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1)), extracted from Qwen-Image-2.1-Turbo | 8 | 1 | the Turbo checkpoint's own sigmas |
-| Ideogram 4 | `ideogram_4_turbotime_v1` ([ostris/ideogram_4_turbotime_lora](https://huggingface.co/ostris/ideogram_4_turbotime_lora), community, rank 128, 847 MB): few steps, no CFG and no unconditional model | 8 | 1 | logit-normal, mu 0, std 1.75 (ai-toolkit's sampler, its samples') |
+| Ideogram 4 | `ideogram_4_turbotime_v1` ([ostris/ideogram_4_turbotime_lora](https://huggingface.co/ostris/ideogram_4_turbotime_lora), community, rank 128, 847 MB): few steps, no CFG and no unconditional model. A new setup starts without it (community reports: it wrecks character LoRAs); *Turbo LoRA: the model's own* turns it on | 8 | 1 | logit-normal, mu 0, std 1.75 (ai-toolkit's sampler, its samples') |
 | MiniMax H3 | lightx2v's `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16` ([Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3)), the FL2VA Turbo 8-step LoRA | 8 | 1 | 12 |
 | FLUX.2 Klein 9B | vafipas663's `flux-2-klein-9b_extracted_lora_rank_256-bf16` ([vafipas663/flux2-klein-base-9b-distill-lora](https://huggingface.co/vafipas663/flux2-klein-base-9b-distill-lora)), the distilled Klein extracted against Base | 4 | 1 | 2.02 |
 
@@ -3881,7 +3882,7 @@ AdaLN, q/k RMSNorm, 3-axis interleaved MRoPE), conditioned on 13 layers of Qwen3
   same architecture and size (9.29 GB), its own weights (they differ from the conditional model's by about 0.1-8%
   per tensor, a separately trained model, not a copy), run on the image tokens alone with no text. LoRAs train on the
   conditional model only; the unconditional one is not downloaded.
-- **Captions.** Ideogram 4 was trained on structured JSON captions only (the schema is in Ideogram's
+- **Captions.** Ideogram 4 was trained on structured JSON captions (the schema is in Ideogram's
   [prompting guide](https://github.com/ideogram-oss/ideogram4/blob/main/docs/prompting.md); plain prompts "will not
   work" there and are rewritten by an LLM first). A same-name `.json` caption is used as it is (compacted, key order
   kept), and what Ideogram's caption verifier would flag is logged; a plain `.txt` caption is wrapped into the smallest
@@ -3897,6 +3898,38 @@ AdaLN, q/k RMSNorm, 3-axis interleaved MRoPE), conditioned on 13 layers of Qwen3
   learns. When most of a run's pictures have a plain `.txt` caption with a median under 20 words, the log warns once
   at the start. A structured `.json` caption or a richer description lowers it. The wrapper above is still a short
   caption, and whether it avoids the effect is untested here.
+  What trainers report about which style to use is disputed (community reports, none of it tested in RulZ AI Trainer):
+  for one character several got equal or better results with plain natural-language captions, while JSON with correct
+  boxes is what a multi-character LoRA needs, and a bad JSON caption hurts more than plain text. Boxes are
+  `[y_min, x_min, y_max, x_max]` normalised 0-1000 whatever the training resolution (they do not change with it), and
+  vision captioners often swap x and y, so check them. Do not caption traits that should always appear (tattoos, a
+  default outfit, hair or eye colour). In a JSON caption, put the full caption and the trigger in
+  `high_level_description` and only the trigger in the character element: a colour palette there shifts hair colour.
+  Test the LoRA with prompts in the same style as the captions. A plain "woman" or "man" (or a real name) works better
+  as the trigger word than a made-up token, which got printed as text in the picture.
+- **Character setup (community reports).** The wizard's character defaults for Ideogram 4 follow what several trainers
+  reported on Ideogram 4 character LoRAs. None of these settings has been run in RulZ AI Trainer yet, so treat them as
+  a starting point to race against your own:
+  - *Adapter*: a LoKr at factor 4. It beat a rank-64 LoRA and factor 8 on moles and tattoos, and its file is about
+    1 GB; factor 8 or a rank 32-64 LoRA was fine for simple subjects. This trainer's LoKr is full rank in LyCORIS's
+    sense (`w1` a small matrix of the factor's size, `w2` the whole rest, no low-rank split), which is what "full
+    rank" meant in the reports.
+  - *Optimizer*: Automagic 3 starting at 1e-5 (it raises the rate itself; higher starts baked in artifacts, and it is
+    for small sets: on hundreds of images it climbed far too high). `automagic_min_lr` stays at 2e-5, which is not
+    below the start rate, so the trainer lowers the floor to a fifth of the start, 2e-6. With isolation on, the
+    trainer trains an Automagic pick as AdamW (DOP's pull-back drives Automagic's rate to its floor), so the wizard
+    then picks AdamW8bit at 5e-5, the
+    reported range being 5e-5 to 8e-5 (1e-4 borderline, 2e-4 destroyed a model by step 1500). For a style, AdamW8bit at
+    8e-5 learned one where Automagic 3 did not (one report).
+  - *Timesteps*: logit-normal, the nearest here to AI Toolkit's "weighted" timesteps that most of them used. Linear and
+    sigmoid were reported too, and which is better is disputed. Resolution shift stays on.
+  - *Resolution*: 512 + 768 + 1024 px buckets (0.25, 0.5, 1 MP; 0.5 MP stands in for 768 px). Training at 256 alone, or
+    at 512 alone with a quantized model, did not learn.
+  - *Batch size* 1: larger batches spiked memory and trained oddly.
+  - *Steps*: about 200 per picture (images x repeats), 3000 to 8000 in all. A first likeness showed at 1500-3000;
+    tattoos and fine marks needed 5500-7000. Save a checkpoint every 250 steps and compare several: some middle
+    checkpoints failed while their neighbours were fine, and overtraining showed as artifacts and baked colour, not
+    as a collapse.
 - **Text features** follow `Ideogram4Pipeline.encode_prompt`: the caption in Qwen3-VL's user turn, the outputs of
   decoder layers 0, 3, ..., 33 and 35 stacked per token with the layer index fastest. The empty prompt has no tokens
   at all: the pipeline's image-only unconditional branch.
@@ -3904,22 +3937,27 @@ AdaLN, q/k RMSNorm, 3-axis interleaved MRoPE), conditioned on 13 layers of Qwen3
   normalized with Ideogram's own per-channel shift and scale (its `latent_norm.py`, what its pipeline and ai-toolkit
   use), not the VAE's batch-norm statistics of MOSS-Image and FIBO 2.0 (up to 0.4 apart in shift): they are cached
   under their own names (`_ideo4`). diffusers' pipeline and ComfyUI decode with the bn statistics instead.
-- **Samples** render with ostris' community TurboTime LoRA (8 steps, CFG 1, no guidance pass). Without it, Ideogram's
-  presets: V4_DEFAULT_20 (20 steps at guidance 7, the last 2 at 3; mu 0, std 1.75), V4_QUALITY_48 (48, the last 3 at
-  3; std 1.5) and V4_TURBO_12 (12, the last at 3; mu 0.5): the logit-normal schedule with the resolution-aware mean,
-  checked against diffusers' and Ideogram's own. Ideogram's guidance g * cond + (1 - g) * uncond is this trainer's CFG
-  g. The trainer has no unconditional model: the guidance pass runs the image alone (the empty negative) on the model
-  you train, as ai-toolkit does, so full samples are close to, not the same as, the official pipeline's.
+- **Samples** start as Ideogram's full presets, without a turbo LoRA: V4_DEFAULT_20 (20 steps at guidance 7, the last 2
+  at 3; mu 0, std 1.75), V4_QUALITY_48 (48, the last 3 at 3; std 1.5) and V4_TURBO_12 (12, the last at 3; mu 0.5): the
+  logit-normal schedule with the resolution-aware mean, checked against diffusers' and Ideogram's own. Community
+  reports say ostris' TurboTime LoRA (8 steps, CFG 1, no guidance pass) at CFG 1 wrecks character LoRAs, so a new setup
+  (the Train tab after picking Ideogram 4, and the wizard) has *Turbo LoRA* on none; pick the model's own to use it. A
+  config saved earlier keeps its own Turbo LoRA setting. Ideogram's guidance g * cond + (1 - g) * uncond is this
+  trainer's CFG g. The trainer has no unconditional model: the guidance pass runs the image alone (the empty negative)
+  on the model you train, as ai-toolkit does, so samples are close to, not the same as, the official pipeline's, and
+  community reports say they can look distorted while the LoRA is fine. Judge final checkpoints in ComfyUI with the
+  LoRA on both the conditional and the unconditional model (main 1.0, unconditional about 0.2-0.5).
 - **Timesteps** (`timestep_sampling: reference`): Ideogram has not published its training distribution; the reference
   recipe is its documented logit-normal with the resolution-aware mean at the reference pipeline's defaults (mu 0.5,
-  std 1).
+  std 1). The wizard's character setup uses `logit_normal` instead (see Character setup above).
 - **LoRA targets**: q, k and v are one fused layer (`attention.qkv`, as in the checkpoint, ComfyUI and ai-toolkit), so
   any of the three trains it; `o`, `ffn_up_gate` (`feed_forward.w1` / `w3`) and `ffn_down` (`w2`) as usual. `adaln`
   adds the per-block modulation (ai-toolkit's Ideogram LoRAs train it), `text_in` the text projection
   (`llm_cond_proj`) and `embed` the image / timestep projections and the final layer.
 - **Export** keeps the checkpoint's module names, `diffusion_model.layers.<n>.attention.qkv.lora_down.weight` (and
   `lora_up`, `alpha`), the layout ai-toolkit saves. ComfyUI has no Ideogram 4 key mapping, so this is the layout it
-  loads: a *LoraLoaderModelOnly* on the conditional model (`ideogram4_*`, not `ideogram4_unconditional_*`). diffusers'
+  loads: a *LoraLoaderModelOnly* on the conditional model (`ideogram4_*`); community reports apply the same file to
+  the unconditional model (`ideogram4_unconditional_*`) too, at about 0.2-0.5 against 1.0 on the conditional one. diffusers'
   Ideogram 4 loader converts it (q / k / v split, alpha folded) when the LoRA holds only block layers (the default
   targets and `adaln`). Sampling-only LoRAs may also be in diffusers' layout (`attention.to_q/to_k/to_v/to_out.0`).
 - **Licence**: the Ideogram Non-Commercial Model Agreement. Non-commercial use only; a LoRA trained on Ideogram 4 is a

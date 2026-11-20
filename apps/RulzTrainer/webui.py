@@ -31,7 +31,7 @@ from nicegui import app, background_tasks, run, ui
 from rulztrainer.archs import get_arch
 from rulztrainer.config import (AUTOMAGIC, KEEL, alpha_differs, alpha_lr_note, alpha_scale_reason, weight_noise_reason, effective_optimizer, lr_at_alpha_rank, trained_optimizer, LR_SCHEDULERS, KEEL_FB, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
                                 MODEL_PRESETS, ARCH_SAMPLE_LORA, VIDEO_ARCHS, VIDEO_EXTS, VIDEO_DATA_PRESETS,
-                                ARCH_FULL_SAMPLE, STILL_FFN_TARGETS, detect_video_data_preset, video_data_preset,
+                                ARCH_FULL_SAMPLE, ARCH_TURBO_DEFAULT_OFF, STILL_FFN_TARGETS, detect_video_data_preset, video_data_preset,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
 from rulztrainer import (__version__, blockaudit, bodysim, capabilities, facesim, history, lookfilter, machine, oom_recovery,
                          promptcheck)
@@ -2018,7 +2018,9 @@ class Form:
         # the sample steps / CFG likewise: each family samples at its own (its turbo LoRA's, or full quality)
         if not self.loading:
             self.clear_foreign_sampling_files(family)
-            self.follow_sample_defaults(self.target_family, family, self.turbo_on(), self.turbo_on())
+            old_turbo = self.turbo_on()
+            self.follow_family_turbo(self.target_family, family)
+            self.follow_sample_defaults(self.target_family, family, old_turbo, self.turbo_on())
             self.set_quant_options(family)
             self.apply_family_support(family, notify=True)
         self.target_family = family
@@ -2052,6 +2054,21 @@ class Form:
     def turbo_on(self) -> bool:
         mode = self.w.get("turbo_mode")
         return mode is None or mode.value != "none"
+
+    def follow_family_turbo(self, old_family: str, new_family: str) -> None:
+        """Ideogram 4 (ARCH_TURBO_DEFAULT_OFF) starts without its turbo LoRA: picking it moves Turbo LoRA from auto to
+        none, and leaving it moves back the none this set. A mode the user chose (none or a file, for another model
+        too) stays, and a saved config never comes through here (the form is loading)."""
+        mode = self.w.get("turbo_mode")
+        if mode is None:
+            return
+        if new_family in ARCH_TURBO_DEFAULT_OFF and old_family not in ARCH_TURBO_DEFAULT_OFF and mode.value == "auto":
+            mode.value = "none"
+            self.turbo_none_by_family = True
+        elif old_family in ARCH_TURBO_DEFAULT_OFF and new_family not in ARCH_TURBO_DEFAULT_OFF:
+            if mode.value == "none" and getattr(self, "turbo_none_by_family", False):
+                mode.value = "auto"
+            self.turbo_none_by_family = False
 
     def follow_sample_defaults(self, old_family: str, new_family: str, old_turbo: bool, new_turbo: bool) -> None:
         """Move the sample steps / CFG to the new family's or mode's defaults (turbo LoRA: ARCH_SAMPLE_DEFAULTS; none:
@@ -2518,6 +2535,7 @@ class Form:
         if not cfg.resolutions:  # legacy single `resolution`: snap to the nearest megapixel choice
             values["resolutions"] = [min(MEGAPIXEL_CHOICES, key=lambda m: abs(m - side_to_mp(cfg.resolution)))]
         self.loading = True
+        self.turbo_none_by_family = False  # a loaded config's turbo mode is its own, never one the family set
         try:
             self.apply_family_support(release=True)
             self.set_quant_options(cfg.arch_name())  # the loaded family's download formats, before its values
@@ -4756,13 +4774,22 @@ def build_dataset_tab(f: Form):
                  "screen is kept on meanwhile where the browser allows it). A file with the same name is replaced. "
                  "Click a picture to see it full size. Captions are saved to the image's .txt file as you type. "
                  "Face ref / Body ref pick the images that character LoRAs are scored against.")
-            hint("Ideogram 4 was trained on structured JSON captions only: a same-name .json caption in its schema "
-                 "(github.com/ideogram-oss/ideogram4, docs/prompting.md) trains it best and wins over the .txt. A "
-                 "plain .txt caption is wrapped into the smallest valid JSON caption, and the trigger word goes into "
-                 "its subject (object) element. Long JSON captions can pass 1024 tokens: raise Max caption tokens "
-                 "(Train tab) to 2048, Ideogram's limit, so they are not cut. Each cached caption keeps 104 KB per "
-                 "token (13 text encoder layers): about 4 MB for a short wrapped caption, 17-110 MB for JSON "
-                 "captions of 165-1077 tokens like Ideogram's examples.")
+            hint("Ideogram 4 was trained on structured JSON captions. A same-name .json caption in its schema "
+                 "(github.com/ideogram-oss/ideogram4, docs/prompting.md) wins over the .txt; a plain .txt caption is "
+                 "wrapped into the smallest valid JSON caption, and the trigger word goes into its subject (object) "
+                 "element. Long JSON captions can pass 1024 tokens: raise Max caption tokens (Train tab) to 2048, "
+                 "Ideogram's limit, so they are not cut. Each cached caption keeps 104 KB per token (13 text encoder "
+                 "layers): about 4 MB for a short wrapped caption, 17-110 MB for JSON captions of 165-1077 tokens "
+                 "like Ideogram's examples.")
+            hint("Community reports on Ideogram 4 captions (not tested in RulZ AI Trainer, and disputed): for one "
+                 "character several trainers got equal or better results with plain natural-language captions. JSON "
+                 "with correct boxes is what a multi-character LoRA needs, and a bad JSON caption hurts more than "
+                 "plain text. Boxes are [y_min, x_min, y_max, x_max] normalised 0-1000 whatever the training "
+                 "resolution, and vision captioners often swap x and y, so check them. Do not caption traits that "
+                 "should always appear (tattoos, a default outfit, hair or eye colour). In JSON, put the full "
+                 "caption and the trigger in high_level_description and only the trigger in the character element "
+                 "(a colour palette there shifts hair colour). Test the LoRA with prompts in the same style as the "
+                 "captions.")
         with section("Look consistency filter", "Find the pictures whose face drifts from the look you want",
                      "face_retouching_natural", open_=False):
             hint("Tick Baseline on a few pictures below that nail the look (3 is a good number), then Scan: every "
@@ -6018,7 +6045,8 @@ MODEL_NOTES = {
                           "170-photo character set: no adapter 54.8 likeness, ostris v2 72.3, Fizgig's 78.1. A full "
                           "fine-tune of Turbo loses its few-step behaviour: fine-tune Z-Image (Base). Apache 2.0, not "
                           "gated. Samples 8 steps at CFG 1. Never run on real weights here."),
-    "Ideogram-4": ("", "Ideogram 4 (9.3B), strong at typography and layout, trained on structured JSON captions. "
+    "Ideogram-4": ("", "Ideogram 4 (9.3B), strong at typography and layout, trained on structured JSON captions "
+                       "(plain captions work for one character, community reports). "
                        "Comfy-Org's single files (int8, 9.6 GB, with the 9.4 GB Qwen3-VL-8B text encoder) train on "
                        "one 16 GB card; its LoRAs load in ComfyUI and diffusers. Ideogram Non-Commercial Model "
                        "Agreement: non-commercial use only; a LoRA trained on it is a Model Derivative under the same "
@@ -6100,6 +6128,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     zi_note = " (Fizgig's measurement, not RulZ's)"
     moss = cfg.arch_name() == "moss_image"
     character = goal == "character"
+    ideo_character = ideo and character and not cfg.finetune  # Ideogram 4's community character setup
     vram = min(g["total"] for g in gpus) / 1024 if gpus else None
     gpu_name = "your smallest GPU" if len(gpus) > 1 else "your GPU"
     # hardware
@@ -6199,6 +6228,14 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                       "poor for skin (community reports; not compared in RulZ AI Trainer)"
                       + (f"; sizes above your photos' {data['median_mp']:.2f} MP are left out"
                          if data and data.get("median_mp") and data["median_mp"] < 0.9 else ""))
+    elif ideo_character and (vram is None or vram >= 12):  # the same three buckets (0.5625 MP is not a choice: 0.5)
+        sizes = [mp for mp in MOSS_MIXED_RESOLUTIONS if mp <= target + 1e-9] or [0.25]
+        if len(sizes) > 1:
+            reason = ("512 + 768 + 1024 px buckets together are what most Ideogram 4 character trainers used; 256 "
+                      "alone and 512 alone (with a quantized model) did not learn (community reports; not compared "
+                      "in RulZ AI Trainer; 0.5 MP stands in for 768 px)"
+                      + (f"; sizes above your photos' {data['median_mp']:.2f} MP are left out"
+                         if data and data.get("median_mp") and data["median_mp"] < 0.9 else ""))
     r["resolutions"] = (sizes, reason)
     r["enable_buckets"] = (True, "keeps every image's aspect ratio instead of cropping it square")
     if character:
@@ -6260,6 +6297,16 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     if klein and n:
         r["steps"] = (int(min(4000, max(1000, round(per_epoch * 200, -2)))),
                       f"BFL's FLUX 3 Klein recipe: 4000 steps for 20 images, about 200 epochs ({n} images here)")
+    if ideo_character:  # about 200 steps per picture (repeats counted), 3000 to 8000 in all
+        if n:
+            r["steps"] = (int(min(8000, max(3000, round(items * 200, -2)))),
+                          f"community reports: about 200 steps per picture ({n} images" +
+                          (f" x repeats = {items}" if items != n else "") + "), 3000 to 8000 in all. A first "
+                          "likeness shows at 1500-3000; tattoos and fine marks needed 5500-7000. Save often and "
+                          "compare several checkpoints (not compared in RulZ AI Trainer)")
+        else:
+            r["steps"] = (4000, "community reports: about 200 steps per picture, 3000 to 8000 in all; check your photos "
+                                "(Photos page) for a number that fits. Tattoos and fine marks needed 5500-7000")
     if cfg.finetune:
         r["learning_rate"] = (1e-5, "a full fine-tune needs about a tenth of a LoRA's rate (Fizgig's measured 1e-5)")
         r["optimizer"] = ("adafactor", "Fizgig's measured optimizer for a fine-tune: a much smaller state than AdamW")
@@ -6318,6 +6365,36 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                 r["lora_rank"] = (rank, "Fizgig's Klein 9B full-model recipe (\"Old Reliable\"): rank 16, alpha 16"
                                   + k2_note)
             r["lora_alpha"] = (float(rank), "alpha equal to rank keeps the adapter's scale at 1")
+    if ideo and not cfg.finetune:
+        dop = bool(cfg.isolation) and float(cfg.dop_weight or 0) > 0  # isolation trains Automagic as AdamW
+        if ideo_character:
+            r["network_type"] = ("lokr", "community reports: LoKr at factor 4 beat a rank-64 LoRA and factor 8 on "
+                                         "moles and tattoos, with the largest file (about 1 GB). A rank 32-64 LoRA or "
+                                         "factor 8 is fine for simple subjects. This trainer's LoKr is full rank in "
+                                         "LyCORIS's sense (w1 a small [factor] matrix, w2 the whole rest, no low-rank "
+                                         "split), the 'full rank' the reports used. Not compared in RulZ AI Trainer")
+            r["lokr_factor"] = (4, "community reports: factor 4 learned moles and tattoos that factor 8 and a "
+                                   "rank-64 LoRA missed (file about 1 GB); 8 for simpler subjects")
+            if dop:
+                r["optimizer"] = ("adamw8bit", "isolation is on, and the trainer trains Automagic as AdamW then (its "
+                                               "pull-back drives Automagic's rate to the floor): AdamW8bit at 5e-5 to "
+                                               "8e-5 is the community's setting for it (1e-4 was borderline, 2e-4 "
+                                               "destroyed a model by step 1500)")
+                r["learning_rate"] = (5e-5, "community reports: AdamW8bit 5e-5 to 8e-5 on Ideogram 4; 1e-4 borderline, "
+                                            "2e-4 destroyed a model by step 1500. With Automagic the start is 1e-5")
+            else:
+                r["optimizer"] = ("automagic3", "the most repeated Ideogram 4 character setup (community reports; "
+                                                "AdamW8bit 5e-5 to 8e-5 is the alternative). It tunes its own rate, "
+                                                "so it suits a small set; on hundreds of images it climbed far too "
+                                                "high. With isolation on the trainer trains AdamW instead")
+                r["learning_rate"] = (1e-5, "the start rate (Automagic raises it itself): community reports say a "
+                                            "higher start bakes in artifacts. Min lr stays at 2e-5, which is not "
+                                            "below the start, so the trainer lowers the floor to a fifth of it: "
+                                            "2e-6 (the rate can sink to there)")
+        elif goal == "style":
+            r["optimizer"] = ("adamw8bit", "AdamW learned a style on Ideogram 4 where Automagic 3 did not (one "
+                                           "community report)")
+            r["learning_rate"] = (8e-5, "community reports: AdamW8bit 5e-5 to 8e-5; 2e-4 destroyed a model by step 1500")
     if moss and not cfg.finetune and cfg.optimizer not in AUTOMAGIC:  # AdamW-style decay: a fine-tune has none
         r["weight_decay"] = (1e-4, "MOSS-Image users ran 5e-5 to 2e-4 (the trainer's default is 0.01): 1e-4 is the "
                                    "middle; community values, not compared in RulZ AI Trainer")
@@ -6341,6 +6418,13 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                                                "logit_normal in RulZ AI Trainer")
         r["timestep_shift"] = (1.0, "leave it at 1: the reference curve is already MOSS's own, and this setting would "
                                     "be applied on top of it")
+    elif ideo_character:  # the identity recipe's logit_normal, named
+        r["timestep_sampling"] = ("logit_normal", "the closest to AI Toolkit's 'weighted' timesteps most Ideogram 4 "
+                                                  "character trainers used (a bell around the middle noise levels). "
+                                                  "Others reported linear or sigmoid, which is disputed, and none "
+                                                  "was compared in RulZ AI Trainer. Resolution shift stays on, as "
+                                                  "Ideogram's sampler shifts by size; 'reference' is Ideogram's own "
+                                                  "documented curve")
     elif not character:  # the identity recipe sets logit_normal itself
         r["timestep_sampling"] = ("logit_normal", "the default: most steps at middle noise, fewer at the extremes")
     sampling = r["timestep_sampling"][0] if "timestep_sampling" in r else cfg.timestep_sampling
@@ -6349,7 +6433,9 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         r["resolution_shift"] = (True, "shifts the noise levels by the picture's size, as the model's sampler does: "
                                        "OneTrainer's community finds 1024 px learns slowly without a higher shift, "
                                        "and BFL's samplers shift by size too")
-    r["batch_size"] = (1, "small batches with more steps beat large batches for LoRAs")
+    r["batch_size"] = (1, "small batches with more steps beat large batches for LoRAs"
+                       + ("; on Ideogram 4 batches above 1 spiked memory and trained oddly (community reports)"
+                          if ideo else ""))
     if zimage and not cfg.finetune:
         if zi_turbo:
             r["adapter_mode"] = ("auto", "Fizgig's Z-Image Turbo training adapter (on while the LoRA trains, off for "
@@ -6377,6 +6463,15 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     saves = total // max(1, int(cfg.save_every or every))  # with the save interval as it is now
     r["keep_checkpoints"] = ((0, f"{saves} small files at most: keep them all to compare") if saves <= 10 else
                              (8, f"{saves} checkpoints would pile up: delete all but the newest 8 as you go"))
+    if ideo_character:  # results are not monotonic: some middle checkpoints fail while their neighbours are fine
+        every = 250
+        r["save_every"] = (every, "community reports: checkpoints are not monotonic (some middle ones fail while "
+                                  "neighbours are fine; overtraining shows as artifacts and baked colour, not "
+                                  "collapse), so save often and compare several")
+        saves = total // max(1, int(cfg.save_every or every))
+        r["keep_checkpoints"] = ((0, f"{saves} files at most (a factor-4 LoKr is about 1 GB each): keep them all to "
+                                     "compare") if saves <= 12 else
+                                 (12, f"{saves} checkpoints of about 1 GB each would pile up: keep the newest 12"))
     r["lora_ema"] = (0.98, "measured by Fizgig: 5 likeness points above no average late in a run, with half the swing "
                            "between checkpoints; longer averages (0.995) lag behind")
     r["sample_every"] = (every, "a sample set at every checkpoint shows which one to keep")
@@ -6429,7 +6524,8 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         r["sample_steps"] = (25, "ComfyUI's Qwen-Image 2.1 template (the diffusers pipeline: 40)")
         r["sample_cfg"] = (1.0, "Qwen-Image 2.1 is meant to be sampled without guidance")
     elif ideo:
-        r["sample_steps"] = (20, "Ideogram's V4_DEFAULT_20 preset (V4_QUALITY_48 for its best)")
+        r["sample_steps"] = (20, "Ideogram's V4_DEFAULT_20 preset (V4_QUALITY_48 for its best). Samples only approximate "
+                                 "Ideogram's pipeline: judge final checkpoints in ComfyUI")
         r["sample_cfg"] = (7.0, "Ideogram's guidance 7 (the last steps drop to 3 by themselves, as in its presets)")
     elif moss:
         steps, guidance = ARCH_FULL_SAMPLE["moss_image"]
@@ -6438,6 +6534,12 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     else:
         r["sample_steps"] = (20, "the reference MOSS-Image sampler")
         r["sample_cfg"] = (3.0, "the reference MOSS-Image guidance scale")
+    if ideo:
+        r["turbo_mode"] = ("none", "community reports: Ideogram 4's turbo LoRA at CFG 1 wrecks character LoRAs, so "
+                                   "previews and probes render the full 20 steps at guidance 7. The guidance pass "
+                                   "runs on the model you train, not Ideogram's separate unconditional model, so "
+                                   "samples only approximate: judge final checkpoints in ComfyUI with the LoRA on both "
+                                   "models (main 1.0, unconditional about 0.2-0.5)")
     if moss:
         r["sample_skip_layer"] = (-1, "off: the trainer trains block 22 (all blocks, with none picked), and skipping "
                                       "layer 22 in the negative branch while sampling strips that likeness (community "
@@ -6943,10 +7045,17 @@ WIZARD_BASICS = {"network_type": "lora", "finetune": False, "lora_rank": 32, "lo
                  "optimizer": "adamw8bit", "learning_rate": 1e-4, "lr_alpha_scale": False}
 # What the wizard also applies by itself for one model family, over the identity recipe's: MOSS-Image's high-noise
 # timestep curve, weight decay and preview skip layer. Other families keep what their recommendations only offer.
-MODEL_WIZARD_AUTO = {"moss_image": ("timestep_sampling", "timestep_shift", "weight_decay", "sample_skip_layer")}
+MODEL_WIZARD_AUTO = {"moss_image": ("timestep_sampling", "timestep_shift", "weight_decay", "sample_skip_layer"),
+                     # Ideogram 4 (community reports, not run here): full-rank LoKr factor 4, Automagic 3 from 1e-5
+                     # (AdamW8bit with isolation on), logit-normal timesteps, no turbo LoRA for previews
+                     "ideogram4": ("network_type", "lokr_factor", "optimizer", "learning_rate", "timestep_sampling",
+                                   "turbo_mode")}
 MODEL_AUTO_OFF = {"timestep_sampling": "logit_normal",  # the identity recipe's, back after leaving the family
                   "timestep_shift": TrainConfig.timestep_shift, "weight_decay": TrainConfig.weight_decay,
-                  "sample_skip_layer": TrainConfig.sample_skip_layer}
+                  "sample_skip_layer": TrainConfig.sample_skip_layer,
+                  "network_type": WIZARD_BASICS["network_type"], "lokr_factor": TrainConfig.lokr_factor,
+                  "optimizer": WIZARD_BASICS["optimizer"], "learning_rate": WIZARD_BASICS["learning_rate"],
+                  "turbo_mode": "auto"}
 MOSS_MIXED_RESOLUTIONS = (0.25, 0.5, 1.0)  # 512 / 768 / 1024 px buckets
 WIZARD_AUTO = ("multi_gpu", "dp_balance", "transformer_quant", "text_encoder_quant", "gradient_checkpointing",
                "checkpoint_keep_blocks", "block_swap", "compile_model", "resolutions", "enable_buckets",
@@ -7471,6 +7580,8 @@ class Wizard:
         self.refresh()
         self.apply([k for k in WIZARD_AUTO if k in self.recs])
         self.follow_model_auto()
+        # the family's values may change what the previews take (Ideogram 4: no turbo LoRA): once more
+        self.apply([k for k in ("sample_steps", "sample_cfg", "probe_steps", "probe_cfg") if k in self.recs])
         ui.notify("Set up for a character / person LoRA with the recommended settings", type="info")
 
     def model_auto_stale(self) -> bool:
@@ -7570,6 +7681,13 @@ class Wizard:
                           "already have one."):
             self.bind(ui.input("Trigger word"), "trigger_word").classes("w-full")
             self.w["trigger_word"].on_value_change(lambda _: self.trigger_changed())
+        with self.setting(None, "Trigger word on Ideogram 4",
+                          "Community reports: a plain 'woman' or 'man' (or the person's real name) works better than "
+                          "a made-up token, which Ideogram 4 printed as text in the picture. Not tested in RulZ AI "
+                          "Trainer; what you type above is used as it is.",
+                          show_if=("model_preset",
+                                   lambda p: preset_arch(p, self.w["model_path"].value) == "ideogram4")):
+            pass
         ui.label("What should the likeness cover?").classes("rz-setting-title pt-2")
         with ui.element("div").classes("rz-choices"):
             for key, (icon, title, text) in CHARACTER_FOCUS.items():
@@ -7742,10 +7860,18 @@ class Wizard:
         self.refs_note = refs_note
         self.show_when(refs_note, lambda: not self.adv)
         with self.setting(None, "Ideogram 4 captions",
-                          "Ideogram 4 was trained on structured JSON captions only. A same-name .json caption in its "
-                          "schema (Ideogram's prompting guide) trains it best and wins over the .txt; a plain .txt "
-                          "caption is wrapped into the smallest valid JSON caption, with the trigger word in its "
-                          "subject element. JSON captions can be long: Max caption tokens 2048 keeps them whole.",
+                          "Ideogram 4 was trained on structured JSON captions, but for one character several trainers "
+                          "report equal or better results with plain natural-language captions (community reports, "
+                          "not tested here). JSON with correct boxes is what a multi-character LoRA needs; a bad JSON "
+                          "caption hurts more than plain text. A same-name .json caption (Ideogram's prompting guide) "
+                          "wins over the .txt; a plain .txt caption is wrapped into the smallest valid JSON caption, "
+                          "with the trigger word in its subject element. Boxes are [y_min, x_min, y_max, x_max] "
+                          "normalised 0-1000 whatever the resolution, and vision captioners often swap x and y. Do "
+                          "not caption traits that should always appear (tattoos, a default outfit, hair or eye "
+                          "colour). In JSON: the full caption and the trigger in high_level_description, only the "
+                          "trigger in the character element (a colour palette there shifts hair colour). Test with "
+                          "prompts in the caption style. JSON captions can be long: Max caption tokens 2048 keeps "
+                          "them whole.",
                           show_if=("model_preset",
                                    lambda p: preset_arch(p, self.w["model_path"].value) == "ideogram4")):
             pass
@@ -8053,7 +8179,9 @@ class Wizard:
                           "A step-distilled LoRA used only while rendering samples and probes, never in training: "
                           "previews take seconds. The model's own is downloaded (MOSS-Image: 12 steps at CFG 1; Krea 2, "
                           "Qwen-Image 2.1, Ideogram 4 and MiniMax H3: 8; FIBO 2.0: 4; the Kleins have none) and the "
-                          "steps and guidance below follow it.", adv=True, form_key="turbo_mode"):
+                          "steps and guidance below follow it. A new Ideogram 4 setup starts with none: community "
+                          "reports say its turbo LoRA at CFG 1 wrecks character LoRAs.",
+                          adv=True, form_key="turbo_mode"):
             self.bind(ui.select(TURBO_MODES, label="Turbo LoRA"), "turbo_mode").classes("w-full")
             self.bind(path_field("Turbo LoRA file", "file", width="w-full"), "turbo_lora") \
                 .parent_slot.parent.bind_visibility_from(self.w["turbo_mode"], "value", lambda x: x == "file")
@@ -13071,7 +13199,8 @@ def build_page(local: bool = True):
                                          "in training. The model's own: MOSS-Image lodestones' 8-step DMD LoRA (12 "
                                          "steps, CFG 1, shift 5), Krea 2 and Qwen-Image 2.1 Comfy-Org's Turbo LoRAs "
                                          "(8 steps, CFG 1), FIBO 2.0 Comfy-Org's Turbo LoRA (4 steps, CFG 1), "
-                                         "Ideogram 4 ostris' TurboTime LoRA (8 steps, CFG 1), MiniMax H3 "
+                                         "Ideogram 4 ostris' TurboTime LoRA (8 steps, CFG 1; a new Ideogram 4 setup "
+                                         "starts with none), MiniMax H3 "
                                          "lightx2v's FL2VA Turbo 8-step LoRA (8 steps, CFG 1).")
                             path_input(f, "turbo_lora", "Turbo / step-distill LoRA file", "file", "", "w-[30rem]")
                             f.w["turbo_lora"].parent_slot.parent.bind_visibility_from(w["turbo_mode"], "value",
@@ -13115,13 +13244,18 @@ def build_page(local: bool = True):
                              "is meant to be sampled without guidance).").bind_visibility_from(
                             w["model_preset"], "value",
                             lambda p: preset_arch(p, w["model_path"].value) == "qwen_image21")
-                        hint("Ideogram 4: with ostris' TurboTime LoRA (community, 847 MB) samples render 8 steps at "
-                             "CFG 1, no unconditional pass. Without it, Ideogram's V4_DEFAULT_20: 20 steps at CFG 7, "
-                             "the last 2 at 3. Its guidance pass runs the image without text on the model you train "
-                             "(Ideogram's pipeline uses a separate unconditional model, not loaded here), so full "
-                             "samples are close to, not the same as, the official pipeline's. Prompts can be plain "
-                             "sentences (wrapped into its JSON caption) or JSON captions, which it was trained on; an "
-                             "empty negative prompt is the text-free pass.").bind_visibility_from(
+                        hint("Ideogram 4: a new setup renders full samples, without a turbo LoRA: Ideogram's "
+                             "V4_DEFAULT_20, 20 steps at CFG 7, the last 2 at 3. Community reports say ostris' "
+                             "TurboTime LoRA (847 MB; Turbo LoRA: the model's own turns it on, 8 steps at CFG 1, no "
+                             "unconditional pass) wrecks character LoRAs. The guidance pass runs the image without "
+                             "text on the model you train (Ideogram's pipeline uses a separate unconditional model, "
+                             "not loaded here), so samples only approximate the official pipeline's, and can look "
+                             "distorted while the LoRA is fine. Judge final checkpoints in ComfyUI with the LoRA on "
+                             "both the conditional and the unconditional model (main 1.0, unconditional about "
+                             "0.2-0.5). None of this is compared in RulZ AI Trainer yet. Prompts can be plain "
+                             "sentences (wrapped into its JSON caption) or JSON captions, which it was trained on; "
+                             "use the caption style you trained on. An empty negative prompt is the text-free "
+                             "pass.").bind_visibility_from(
                             w["model_preset"], "value",
                             lambda p: preset_arch(p, w["model_path"].value) == "ideogram4")
                         hint("MiniMax H3: samples are single-frame videos on the plain model (the training adapter "
@@ -16447,19 +16581,36 @@ same model, used for caching and then unloaded), so one 16 GB card trains it. Th
 Hugging Face source (ideogram-ai/ideogram-4-fp8, gated, or its unsloth/ideogram-4-fp8 mirror) is fp8 and is
 dequantized on load, then quantized for your GPU. Buckets are on the 16 px grid.
 
-**Captions**: Ideogram 4 was trained on structured JSON captions only (Ideogram's prompting guide has the schema). A
-same-name `.json` caption is used as it is and trains best; a plain `.txt` caption is wrapped into the smallest valid
-JSON caption, and the trigger word goes into its subject (object) element. Set *Max caption tokens* to 2048 for long
-JSON captions. Sample prompts can be plain sentences (wrapped the same way) or JSON captions.
+**Captions**: Ideogram 4 was trained on structured JSON captions (Ideogram's prompting guide has the schema). A
+same-name `.json` caption is used as it is; a plain `.txt` caption is wrapped into the smallest valid JSON caption, and
+the trigger word goes into its subject (object) element. Set *Max caption tokens* to 2048 for long JSON captions.
+Sample prompts can be plain sentences (wrapped the same way) or JSON captions. What trainers report (community
+reports, disputed, not tested in RulZ AI Trainer): for one character several got equal or better results with plain
+natural-language captions; JSON with correct boxes is what a multi-character LoRA needs, and a bad JSON caption hurts
+more than plain text. Boxes are `[y_min, x_min, y_max, x_max]` normalised 0-1000 whatever the training resolution, and
+vision captioners often swap x and y, so check them. Do not caption traits that should always appear (tattoos, a
+default outfit, hair or eye colour). In JSON, put the full caption and the trigger in `high_level_description` and only
+the trigger in the character element (a colour palette there shifts hair colour). Test the LoRA with prompts in the
+same style as the captions. A plain "woman" or "man" (or a real name) works better as the trigger than a made-up
+token, which got printed as text.
 
-Samples render with ostris' community **TurboTime LoRA** (8 steps, CFG 1). Without it, Ideogram's V4_DEFAULT_20
-preset: 20 steps at CFG 7 with the last 2 at 3. Ideogram's pipeline guides with a second, separately trained
-*unconditional* model on the image alone; the trainer has one model, so its guidance pass runs the image without
-text on the model you train: close to, not the same as, the official pipeline's samples.
+**Setup the wizard picks for a character** (community reports, not run in RulZ AI Trainer): a LoKr at factor 4 (full
+rank in LyCORIS's sense, files of about 1 GB), Automagic 3 starting at 1e-5 (AdamW8bit at 5e-5 with isolation on, which
+trains Automagic as AdamW), logit-normal timesteps, 512 + 768 + 1024 px buckets, batch size 1, about 200 steps per
+picture (3000 to 8000), a checkpoint every 250 steps to compare several (some middle ones fail while their neighbours
+are fine), and previews without the turbo LoRA.
+
+Previews start as Ideogram's V4_DEFAULT_20 preset: 20 steps at CFG 7 with the last 2 at 3, no turbo LoRA (community
+reports say ostris' **TurboTime LoRA**, 8 steps at CFG 1, wrecks character LoRAs; set *Turbo LoRA* to the model's own to
+use it). Ideogram's pipeline guides with a second, separately trained *unconditional* model on the image alone; the
+trainer has one model, so its guidance pass runs the image without text on the model you train: previews only
+approximate the official pipeline's, and can look distorted while the LoRA is fine. Judge final checkpoints in ComfyUI
+with the LoRA on both the conditional and the unconditional model (main 1.0, unconditional about 0.2-0.5).
 
 LoRAs are saved with the checkpoint's own module names (`diffusion_model.layers.N.attention.qkv`, as ai-toolkit's):
-ComfyUI loads them with *LoraLoaderModelOnly* on the conditional model (ideogram4_*, not ideogram4_unconditional_*),
-and diffusers converts them itself:
+ComfyUI loads them with *LoraLoaderModelOnly* on the conditional model (ideogram4_*); community reports apply the same
+LoRA to the unconditional model (ideogram4_unconditional_*) as well, at a lower strength. diffusers converts them
+itself:
 
 ```python
 from diffusers import Ideogram4Pipeline
