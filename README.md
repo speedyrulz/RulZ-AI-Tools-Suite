@@ -124,7 +124,7 @@ The basics are filled in for you: the identity recipe (see [Identity training](#
 with LoRA rank 32 / alpha 32, adamw8bit at 1e-4, and recommendations worked out from your GPUs (memory) and your
 photos (count and size) for the hardware, resolution, steps and samples. *Reset* puts that setup back.
 
-**MOSS-Image defaults (since 3.53.0, from MOSS users' posts in the community Discord logs; not compared against the
+**MOSS-Image defaults (since 3.54.0, from MOSS users' posts in the community Discord logs; not compared against the
 old values in RulZ AI Trainer).** For a character on MOSS-Image the wizard also sets: `timestep_sampling: reference`
 (MOSS's own high-noise curve, median sigma about 0.75; `timestep_shift` 1, resolution shift off), `weight_decay` 1e-4
 (the trainer's default is 0.01; MOSS users ran 5e-5 to 2e-4), training sizes 0.25 + 0.5 + 1.0 MP (512, 768 and 1024 px
@@ -613,7 +613,7 @@ section) and samples with its own turbo LoRA by default where it has one ([Turbo
   authors recommend.
 - **Samples** use MOSS-Image's turbo LoRA by default (12 steps, CFG 1, shift 5; on Base also Kijai's SFT sampling
   LoRA). With *Turbo LoRA* set to none they use the Euler schedule at shift 5 with 25 steps and CFG 3.5 (community
-  values for Base; 20 steps and CFG 3 before 3.53.0) and the negative-branch layer-22 skip (`sample_skip_layer`, 22;
+  values for Base; 20 steps and CFG 3 before 3.54.0) and the negative-branch layer-22 skip (`sample_skip_layer`, 22;
   the wizard sets it to -1, see below).
 
 ## Using two GPUs
@@ -3283,7 +3283,7 @@ LoRA set by hand on a Turbo model logs a warning.
 
 MOSS-Image renders 12 steps rather than the card's 8 because Fizgig found 12 much better; Fizgig also found that
 its turbo LoRA can understate likeness, so judge a run's likeness on full-quality samples (`turbo_lora: ""`, 25 steps,
-CFG 3.5 since 3.53.0; CFG 2.5 makes good MOSS LoRAs look broken). The WebUI's *Turbo LoRA* choice (the model's own, none, or a file) moves the steps and CFG between the turbo
+CFG 3.5 since 3.54.0; CFG 2.5 makes good MOSS LoRAs look broken). The WebUI's *Turbo LoRA* choice (the model's own, none, or a file) moves the steps and CFG between the turbo
 and the full-quality defaults while they are still at a default. `turbo_lora` can also be a path to any
 ComfyUI-format LoRA with `turbo_lora_strength`. `sample_lora` + `sample_lora_strength` stack a second sampling-only
 LoRA (for example a style LoRA) alongside the turbo one.
