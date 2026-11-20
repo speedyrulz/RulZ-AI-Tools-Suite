@@ -1082,6 +1082,40 @@ with the swing between epochs down from 3.9 to 1.6 points; 0.99 smoothed without
 so many steps that it lagged the run and finished below no average. Fizgig uses 0.98 for Krea 2 and MOSS-Image too;
 it has not been measured on the models here.
 
+## Weight noise (`weight_noise`, since 3.55.0, off by default)
+
+After every optimizer step, small Gaussian noise is added to the LoRA's own weights. The noise goes on the weights,
+not on the gradients, and leaves the optimizer's state alone. This is ported from the
+[ai-toolkit-perceptual](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual) fork of ai-toolkit
+(MIT). Its authors report that it pushes training toward flatter minima, spreads learning over more of the LoRA's
+rank (+20% stable rank on one Flux 2 Klein 9B LoKr run) and resists overcooking on small datasets. **None of that has
+been measured in RulZ AI Trainer yet**: race it against off before relying on it.
+
+```yaml
+weight_noise: 0.0125            # sigma; 0 = off (0 to 0.1). The port's pick; 0.01 to 0.017 was its useful range
+weight_noise_mode: relative     # relative: sigma x each tensor's own RMS | absolute: sigma as it is
+weight_noise_bound_norm: false  # scale each tensor back to its pre-noise norm after the noise
+```
+
+- **Relative** (the default) scales the noise to each tensor's size. A LoRA-up tensor starts at zero, so it gets no
+  noise until it has learned something.
+- **Relative noise can let the weight norm creep up over a long run**, because a tensor that grows a little draws a
+  little more noise. `weight_noise_bound_norm` stops that. The train log shows `weight norm` and `noise norm` every
+  few steps: a weight norm still climbing after the loss has settled is the sign to turn it on.
+- **Order and randomness.** The noise is applied after the step and the weight average (`lora_ema`) update, so the
+  average smooths it out, and on the primary GPU before the other GPUs copy the LoRA. Steps skipped for non-finite
+  gradients get none. It has its own random generator, seeded from the run's seed and the step, so turning it on
+  changes no other random draw (data order, timesteps, dropout), and a resumed run draws the same noise as an
+  uninterrupted one.
+- **Where it applies.** LoRA and LoKr tensors only. DoRA's magnitude vector is left alone. It does nothing on OFT
+  (rotation generators, not plain weights) or on a full fine-tune, and the WebUI greys the controls there with the
+  reason.
+- **Racing.** `weight_noise`, `weight_noise_mode` and `weight_noise_bound_norm` can vary per configuration in a race,
+  for example `weight_noise=0` against `weight_noise=0.0125`.
+- **Mid-run checkpoints.** The fork's authors note that samples can look worse mid-run with noise on (extra limbs,
+  body horror) before the run settles, and that the best checkpoint often sits in a narrow window. Keep the held-out
+  best marker or frequent saves on.
+
 ## Samples and monitoring
 
 `sample_seed` is the seed of the first prompt; with `sample_walk_seed` each further prompt uses seed + 1.

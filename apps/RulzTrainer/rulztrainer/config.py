@@ -124,6 +124,16 @@ def alpha_scale_reason(cfg) -> str:
     return ""
 
 
+def weight_noise_reason(cfg) -> str:
+    """Why weight_noise does nothing for this config (the WebUI greys its controls with it), "" when it applies."""
+    if cfg.finetune:
+        return "A fine-tune trains the model's own weights, not a LoRA, so there is no adapter to add noise to."
+    if cfg.network_type == "oft":
+        return ("OFT trains rotation generators (skew-symmetric blocks), not plain weights, so noise is not added "
+                "to them.")
+    return ""
+
+
 def alpha_lr_warning(equivalent: float, recommended: float | None) -> str | None:
     """A sentence when the alpha = rank equivalent is more than 3x above or below the recommended rate, else None."""
     if not recommended or recommended <= 0 or equivalent <= 0:
@@ -946,6 +956,14 @@ class TrainConfig:
     #                               from its rank behaves like one at alpha = rank (config.alpha_lr_factor). Off:
     #                               learning_rate is the rate the optimizer gets. No effect where the optimizer sets
     #                               its own rate (Automagic, Keel, Hull), on a fine-tune, LoKr / OFT or alpha = rank
+    weight_noise: float = 0.0  # LoRA / LoKr: after every optimizer step, add Gaussian noise of this sigma to the
+    #                            adapter's own weights (weightnoise.py; ported from ai-toolkit-perceptual, whose
+    #                            authors report better likeness and less overcooking on small datasets: not yet
+    #                            measured here). 0 = off, 0 to 0.1; 0.0125 is the port's pick (relative). No effect
+    #                            on a fine-tune or OFT (config.weight_noise_reason)
+    weight_noise_mode: str = "relative"  # relative: sigma x each tensor's own RMS (a zero LoRA-up gets none until it
+    #                                      learns) | absolute: sigma as it is
+    weight_noise_bound_norm: bool = False  # scale each tensor back to its pre-noise norm, so the noise cannot grow it
     automagic_min_lr: float = 2e-5  # automagic3/4 and keel: hard floor for the adapted lr. Was 1e-8 before 3.24.0:
     #                                 the community saw Automagic's lr sink to 1e-5 and below and learning stop
     #                                 (ostris; Qwen-Image 2.1, FLUX.3, MOSS, FIBO 2, Ideogram), fixed with a floor of
@@ -1834,6 +1852,10 @@ class TrainConfig:
             raise ValueError(f"remote_render must be auto or off, got {self.remote_render!r}")
         if not 0.0 <= self.lora_ema < 1.0:
             raise ValueError(f"lora_ema must be 0 (off) or a decay below 1, got {self.lora_ema!r}")
+        if not 0.0 <= self.weight_noise <= 0.1:
+            raise ValueError(f"weight_noise must be 0 (off) to 0.1, got {self.weight_noise!r}")
+        if self.weight_noise_mode not in ("relative", "absolute"):
+            raise ValueError(f"weight_noise_mode must be relative or absolute, got {self.weight_noise_mode!r}")
         if self.dp_balance not in ("off", "auto", "grow"):
             raise ValueError(f"dp_balance must be off, auto or grow, got {self.dp_balance!r}")
         if self.multi_gpu not in ("off", "data_parallel", "model_split"):

@@ -269,3 +269,16 @@ def test_an_emptied_number_box_is_the_trainers_default_and_a_typed_zero_stays():
     f.w["soup_rank"].value = 0
     out = f.to_config()
     assert out.lora_ema == 0 and out.soup_rank == 0
+
+
+def test_weight_noise_goes_to_the_page_and_back():
+    loaded = TrainConfig(weight_noise=0.0125, weight_noise_mode="absolute", weight_noise_bound_norm=True,
+                         datasets=[{"path": "a"}])
+    f = _filled_form(loaded)
+    assert (f.w["weight_noise"].value, f.w["weight_noise_mode"].value, f.w["weight_noise_bound_norm"].value) == \
+        (0.0125, "absolute", True)
+    f.w["datasets"].value = loaded.datasets
+    out = f.to_config()
+    assert (out.weight_noise, out.weight_noise_mode, out.weight_noise_bound_norm) == (0.0125, "absolute", True)
+    f.w["weight_noise"].value = None  # an emptied box is the default (off), not 0.0125
+    assert f.to_config().weight_noise == 0.0
