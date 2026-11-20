@@ -23,12 +23,13 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import Request
 from nicegui import app, background_tasks, run, ui
 
 from rulztrainer.archs import get_arch
-from rulztrainer.config import (AUTOMAGIC, KEEL, alpha_differs, alpha_lr_note, alpha_scale_reason, effective_optimizer, lr_at_alpha_rank, trained_optimizer, LR_SCHEDULERS, KEEL_FB, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
+from rulztrainer.config import (AUTOMAGIC, KEEL, alpha_differs, alpha_lr_note, alpha_scale_reason, weight_noise_reason, effective_optimizer, lr_at_alpha_rank, trained_optimizer, LR_SCHEDULERS, KEEL_FB, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
                                 MODEL_PRESETS, ARCH_SAMPLE_LORA, VIDEO_ARCHS, VIDEO_EXTS, VIDEO_DATA_PRESETS,
                                 ARCH_FULL_SAMPLE, STILL_FFN_TARGETS, detect_video_data_preset, video_data_preset,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
@@ -2291,6 +2292,8 @@ class Form:
                                             or []) if t],
             still_lora_blocks=s("still_lora_blocks") if "still_lora_blocks" in self.w else "",
             lora_save_dtype=v("lora_save_dtype"), lora_ema=num("lora_ema", float),
+            weight_noise=num("weight_noise", float), weight_noise_mode=v("weight_noise_mode") or "relative",
+            weight_noise_bound_norm=bool(v("weight_noise_bound_norm")),
             save_state=bool(v("save_state")), resume_state=s("resume_state"),
             save_state_every=int(v("save_state_every")), keep_states=int(v("keep_states")),
             oom_retries=3 if v("oom_retries") is None else max(0, int(v("oom_retries"))),
@@ -3631,6 +3634,25 @@ ALPHA_SCALE_TIP = ("Takes the learning rate as the rate at alpha = rank and trai
                    "exactly, but lora_down starts from the same random values and moves further relative to them: "
                    "close, not identical. Does nothing with Automagic, Keel or Hull, a fine-tune, LoKr, OFT or "
                    "when alpha equals rank. Off: the learning rate is the rate the optimizer gets.")
+
+
+WEIGHT_NOISE_TIP = ("Adds small random noise to the LoRA weights after each step. Ported from ai-toolkit-perceptual, "
+                    "whose authors report better likeness and less overcooking on small datasets; not yet measured "
+                    "in RulZ. Try 0.0125 (relative). 0 = off.")
+WEIGHT_NOISE_MODE_TIP = ("Relative: the noise is sigma times each weight tensor's own size (RMS), so a LoRA-up that "
+                         "has not learned yet gets none. Absolute: sigma as it is, on every tensor.")
+WEIGHT_NOISE_BOUND_TIP = ("After the noise, scales each weight tensor back to the norm it had before it, so the noise "
+                          "moves the weights but cannot grow them. Relative noise alone can let the norm drift up "
+                          "over a long run.")
+
+
+def sync_weight_noise(cfg, boxes, why) -> None:
+    """Grey out the weight noise controls where it does nothing (a fine-tune, OFT) and say why in `why` (a hint)."""
+    reason = weight_noise_reason(cfg)
+    for box in boxes:
+        (box.disable if reason else box.enable)()
+    why.text = reason
+    why.visible = bool(reason)
 
 
 def sync_alpha_scale(cfg, boxes, why) -> None:
@@ -5535,7 +5557,8 @@ RACE_LABELS = {
     "keel_lookahead_lr": "Keel pull lr factor", "keel_lookahead_grace": "Keel grace probes",
     "keel_face_gain": "Keel face gain", "keel_face_gain_max": "Keel face gain limit",
     "keel_face_gain_beta": "Keel face gain EMA", "keel_body_weight": "Keel body weight",
-    "lora_ema": "Weight average", "timestep_sampling": "Timestep sampling", "resolution_shift": "Resolution shift",
+    "lora_ema": "Weight average", "weight_noise": "Weight noise", "weight_noise_mode": "Weight noise mode",
+    "weight_noise_bound_norm": "Weight noise norm bound", "timestep_sampling": "Timestep sampling", "resolution_shift": "Resolution shift",
     "loss_weighting": "Loss weighting",
     "loss_type": "Loss type",
     "region_weights": "Region-weighted loss", "face_loss_weight": "Face loss weight",
@@ -13002,6 +13025,27 @@ def build_page(local: bool = True):
                                          "over about the last 1 / (1 - decay) images (50 at 0.98); training goes on "
                                          "with the raw weights. Fizgig measured 0.98 at +5 likeness points late in a "
                                          "run with half the swing between checkpoints; 0.995 lagged behind.")
+                            w["weight_noise"] = ui.number("Weight noise sigma (0 = off)", value=d.weight_noise, min=0,
+                                                          max=0.1, step=0.0025, format="%.4f").classes("w-56") \
+                                .tooltip(WEIGHT_NOISE_TIP)
+                            w["weight_noise_mode"] = ui.select({"relative": "Relative", "absolute": "Absolute"},
+                                                               value=d.weight_noise_mode, label="Weight noise mode") \
+                                .classes("w-44").tooltip(WEIGHT_NOISE_MODE_TIP)
+                            w["weight_noise_bound_norm"] = ui.checkbox("Keep weight norm",
+                                                                       value=d.weight_noise_bound_norm) \
+                                .tooltip(WEIGHT_NOISE_BOUND_TIP)
+                        weight_noise_why = hint("")  # why the weight noise controls are greyed out
+                        weight_noise_why.visible = False
+
+                        def show_weight_noise(_=None):
+                            sync_weight_noise(SimpleNamespace(finetune=bool(w["finetune"].value),
+                                                              network_type=w["network_type"].value),
+                                              [w["weight_noise"], w["weight_noise_mode"],
+                                               w["weight_noise_bound_norm"]], weight_noise_why)
+
+                        for key in ("network_type", "finetune"):
+                            w[key].on_value_change(show_weight_noise)
+                        show_weight_noise()
                         w["sample_prompts"] = ui.textarea("Sample prompts (one per line; empty = no samples)") \
                             .classes("w-full")
                         with fields():

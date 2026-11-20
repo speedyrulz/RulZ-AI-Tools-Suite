@@ -26,11 +26,12 @@ from . import history
 from . import lora as lora_mod
 from . import profiling
 from . import race as race_mod
+from . import weightnoise
 from .ema import LoraEMA
 from . import quant as Q
 from .config import AUTOMAGIC, KEEL, KEEL_FB, KEEL_ON_A3, MUON_EDGE_TARGETS, TrainConfig, alpha_lr_note, effective_optimizer, trained_optimizer, \
     alpha_lr_factor, _saved_alpha_cfg, \
-    keel_band_weights, keel_consensus_mode
+    keel_band_weights, keel_consensus_mode, weight_noise_reason
 from .config import side_to_mp
 from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, dropout_text_path,
                       ideogram4_caption_warning, items_for_side, load_batch,
@@ -790,6 +791,7 @@ class Trainer(RaceParallelMixin):
         self.resumed_ema = None  # its state from a resumed training state
         self.resumed_controller = None  # the likeness controller's, from a resumed training state
         self.crash_save = None  # while training: saves the LoRA as it stands (run() calls it after an error)
+        self._wn_logged: set[int] = set()  # configurations weight_noise has said its piece about
         self.bad_steps = 0  # steps in a row left out for non-finite gradients (a parallel race: per configuration)
         self.skipped_steps = 0  # in the whole run
         self.vaes: dict[str, object] = {}  # VAE copies on the other GPUs (sampling / caching side jobs)
@@ -2051,6 +2053,7 @@ class Trainer(RaceParallelMixin):
             if getattr(optimizer, "gather", None) is not None:  # Keel: the micro-batch sums join the replicas' on
                 optimizer.gather()                              # p.grad for the clip
             grad_norm = step_grad_norm(params, cfg.clip_norm)
+            wn_stats = None  # weight_noise's norms, for the lines of this step that are logged
             if bad_gradients(params, grad_norm):  # the step counts, but nothing of it reaches the LoRA
                 if getattr(optimizer, "disarm", None) is not None:  # Keel: no step() to end its accumulation
                     optimizer.disarm()                              # (zero_grad arms it again)
@@ -2077,6 +2080,8 @@ class Trainer(RaceParallelMixin):
                         g["lr"] = lr0
                 if self.ema is not None:
                     self.ema.update(step_images)
+                if cfg.weight_noise > 0:  # after the average, on the primary LoRA; sync_weights below copies it on
+                    wn_stats = self._apply_weight_noise(cfg, injected, step, (step + 1) % 5 == 0 or compute_done == 0)
             scheduler.step()
             if retries0 is not None:
                 self._ease_memory_pressure(retries0)
@@ -2160,6 +2165,8 @@ class Trainer(RaceParallelMixin):
                     lr_s = f"{lr_now:.2e} (working {brake['lr_working']:.2e}, {100 * brake['braked_share']:.0f}% braked)"
                 else:
                     lr_s = f"{lr_now:.2e}"
+                if wn_stats is not None:
+                    id_s += (f" | weight norm {wn_stats['weight_norm']:.4g}, noise norm {wn_stats['noise_norm']:.3g}")
                 log.info("%sstep %d/%d loss %.4f avg %.4f lr %s grad %s %.1fs/it (last %d steps %.2fs each)%s", who,
                          step, cfg.steps, accum_loss, avg, lr_s, format_grad_norm(grad_norm, cfg.clip_norm),
                          elapsed / done_steps, len(last), sum(last) / len(last), id_s)
@@ -2167,6 +2174,8 @@ class Trainer(RaceParallelMixin):
                     if str(d).startswith("cuda")} if torch.cuda.is_available() else {}
             if self.race is not None:  # progress over every configuration's steps; the race table separately
                 id_extra = {**id_extra, "race": self._race_status(), "race_step": step}
+            if wn_stats is not None:  # (the last logged step's, kept on the status until the next one)
+                id_extra = {**id_extra, **wn_stats}
             if brake is not None:  # Automagic 4 / Keel: lr is the raw group rate, these are what the weights moved by
                 id_extra = {**id_extra, "lr_working": brake["lr_working"], "braked_share": brake["braked_share"],
                             "mean_brake": brake["mean_balance"], "brake_reference": brake["reference"]}
@@ -2584,6 +2593,28 @@ class Trainer(RaceParallelMixin):
                     self.status.data["states"].remove(str(old))
         self.status.write()
         return state_dir
+
+    def _apply_weight_noise(self, cfg, injected, step: int, want_stats: bool) -> dict | None:
+        """weight_noise after one optimizer step of the configuration `cfg` (never called for a skipped bad step):
+        noise on its LoRA / LoKr tensors, the norms when `want_stats`. The first call per configuration says in the
+        log whether the noise is on or why it is not (a fine-tune, OFT). Seeded from (the configuration's seed, step)
+        on a generator of its own, so no other random stream moves."""
+        first = id(cfg) not in self._wn_logged
+        self._wn_logged.add(id(cfg))
+        why = weight_noise_reason(cfg)
+        if first:
+            if why:
+                log.warning("weight_noise %g does nothing here: %s", cfg.weight_noise, why)
+            else:
+                log.info("Weight noise on: sigma %g (%s)%s, added to the adapter weights after every optimizer step. "
+                         "Ported from ai-toolkit-perceptual; not yet measured in RulZ AI Trainer",
+                         cfg.weight_noise, cfg.weight_noise_mode, ", norm bound to its pre-noise value"
+                         if cfg.weight_noise_bound_norm else "")
+        if why or self.ft is not None:
+            return None
+        return weightnoise.apply_weight_noise(
+            weightnoise.adapter_tensors(injected), cfg.weight_noise, cfg.weight_noise_mode,
+            cfg.weight_noise_bound_norm, cfg.seed, step, stats=want_stats)
 
     def _skip_bad_step(self, step: int, streak: int) -> None:
         """A step with non-finite gradients is left out (streak: how many in a row, this one included). Many in a row

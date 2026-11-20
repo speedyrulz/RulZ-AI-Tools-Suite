@@ -329,6 +329,8 @@ class RaceParallelMixin:
                         g["lr"] = lr0
                 if st["ema"] is not None:
                     st["ema"].update(step_images[v.idx])
+                if cfg.weight_noise > 0:  # on the configuration's own LoRA, before attach hands it to the replicas
+                    self._apply_weight_noise(cfg, st["injected"], st["step"], False)
             st["optimizer"].zero_grad(set_to_none=True)
             st["scheduler"].step()
             for r in reps:
