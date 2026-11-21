@@ -1,6 +1,10 @@
 // Single source of truth for IPC channels between the renderer and the main process.
 import type { BatchRun } from './batch'
 import type {
+  AdapterConvertRequest,
+  AdapterConvertResult,
+  AdapterConverterStatus,
+  AdapterEntry,
   ApiRequestLog,
   ApiServerStatus,
   AppSettings,
@@ -58,6 +62,15 @@ export interface IpcInvoke {
   'models:getDefaults': (modelId: string) => { config: LoadConfig; custom: boolean }
   'models:setDefaults': (modelId: string, config: LoadConfig | null) => void
   'models:estimate': (modelId: string, config: LoadConfig) => MemoryEstimate
+
+  /** LoRA adapter GGUFs in the models folder (filled by the same scan as models:list). */
+  'adapters:list': () => AdapterEntry[]
+  /** Sends an adapter file to the Recycle Bin. */
+  'adapters:trash': (adapterId: string) => void
+  'adapters:converterStatus': () => AdapterConverterStatus
+  /** Runs one conversion (one at a time); output lines arrive as adapters:convertLog events. */
+  'adapters:convert': (req: AdapterConvertRequest) => AdapterConvertResult
+  'adapters:cancelConvert': () => void
 
   'instances:list': () => LoadedInstance[]
   'instances:load': (modelId: string, config: LoadConfig | null) => LoadedInstance
@@ -131,6 +144,9 @@ export interface IpcInvoke {
 /** Push channels (webContents.send → ipcRenderer.on). */
 export interface IpcEvents {
   'models:changed': ModelEntry[]
+  'adapters:changed': AdapterEntry[]
+  /** One output line of the running adapter conversion. */
+  'adapters:convertLog': string
   'instances:changed': LoadedInstance[]
   'instances:error': InstanceErrorEvent
   'hardware:update': HardwareSnapshot
