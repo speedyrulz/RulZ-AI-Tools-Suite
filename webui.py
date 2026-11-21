@@ -3972,8 +3972,11 @@ DOWNLOAD_TMP_MAX_AGE = 24 * 3600.0
 
 def download_tmp_file(suffix: str) -> str:
     """A new, empty temporary file for a download, in a folder of its own that sweep_download_tmp() cleans."""
-    DOWNLOAD_TMP_DIR.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(suffix=suffix, dir=DOWNLOAD_TMP_DIR)
+    DOWNLOAD_TMP_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # a shared /tmp (Linux): a folder of that name that is a link or someone else's is not used
+    own = DOWNLOAD_TMP_DIR.is_dir() and not DOWNLOAD_TMP_DIR.is_symlink() and (
+        not hasattr(os, "getuid") or DOWNLOAD_TMP_DIR.stat().st_uid == os.getuid())
+    fd, tmp = tempfile.mkstemp(suffix=suffix, dir=DOWNLOAD_TMP_DIR if own else None)
     os.close(fd)
     return tmp
 
@@ -3982,7 +3985,7 @@ def sweep_download_tmp(max_age: float = DOWNLOAD_TMP_MAX_AGE, folder: Path | Non
     """Remove the files in the downloads folder older than max_age seconds (a download whose client went away before
     the BackgroundTask ran leaves its file). Only files directly inside that folder; returns how many went."""
     folder = DOWNLOAD_TMP_DIR if folder is None else Path(folder)
-    if not folder.is_dir():
+    if not folder.is_dir() or folder.is_symlink() or (hasattr(os, "getuid") and folder.stat().st_uid != os.getuid()):
         return 0
     gone = 0
     now = time.time()
