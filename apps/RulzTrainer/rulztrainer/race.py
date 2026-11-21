@@ -1004,4 +1004,7 @@ def describe_round(entry: dict, schedule: RaceSchedule) -> str:
 def write_report(path, schedule: RaceSchedule, variants: list[Variant], extra: dict | None = None) -> None:
     rows = [{"name": v.name, "settings": format_overrides(v.overrides), "dropped_after_round":
              schedule.dropped.get(v.idx)} for v in variants]
-    path.write_text(json.dumps({**schedule.state(), "configs": rows, **(extra or {})}, indent=2), encoding="utf-8")
+    from .atomic import writing
+
+    with writing(path) as tmp:  # a kill mid-write must not leave a torn report
+        tmp.write_text(json.dumps({**schedule.state(), "configs": rows, **(extra or {})}, indent=2), encoding="utf-8")

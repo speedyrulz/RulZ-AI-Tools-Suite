@@ -26,6 +26,10 @@ DONE_KEPT = 10  # started / failed runs kept for the queue's "recently" list
 REPLACE_TRIES = 6  # on Windows a reader (a virus scan, the search indexer) can briefly hold the queue file open
 
 
+class DuplicateJob(ValueError):
+    """A run of that job name is already waiting in the queue."""
+
+
 def _lock_file(f) -> None:
     """Wait for the OS lock on an open file. The OS drops it if the holder dies, so a crash can't leave it stuck."""
     if sys.platform == "win32":
@@ -115,12 +119,19 @@ class TrainQueue:
             return self._read()
 
     # ---- editing
-    def add(self, config: dict, label: str = "") -> dict:
-        """Queue a run (its config as TrainConfig.to_dict()). Returns the entry."""
+    def add(self, config: dict, label: str = "", refuse_duplicate: bool = False) -> dict:
+        """Queue a run (its config as TrainConfig.to_dict()). Returns the entry. refuse_duplicate=True raises
+        DuplicateJob when a waiting run has the same job name (as folders go on this system); the check is made under
+        the queue's own lock, so two adds that overlap cannot both pass it (the WebUI's callers leave it off)."""
         entry = {"id": uuid.uuid4().hex[:10], "job": config.get("job_name", ""), "label": label,
                  "added": time.time(), "config": config}
         with self.lock:
             data = self._read()
+            if refuse_duplicate:
+                from . import runplan  # here: runplan is not needed by the rest of this module
+
+                if runplan.name_in(entry["job"], [e.get("job", "") for e in data["waiting"]]):
+                    raise DuplicateJob(f"Job name {entry['job']!r} is already queued.")
             data["waiting"].append(entry)
             self._write(data)
         return entry

@@ -299,7 +299,9 @@ class TrainingMaps:
                          "pair": bool(getattr(it, "pair_side", "")),
                          "words": [w for w in pr.get("trigger", {}) if w], "trigger_off": bool(pr.get("off")),
                          "size": [int(it.width), int(it.height)]})
-        with open(self.dir / "probes.json", "w", encoding="utf-8") as f:
+        from .atomic import writing
+
+        with writing(self.dir / "probes.json") as tmp, open(tmp, "w", encoding="utf-8") as f:
             json.dump({"probes": meta, "sigmas": list(self.sigmas), "every": self.every, "words": words or []}, f,
                       indent=1)
         self.next_step = step

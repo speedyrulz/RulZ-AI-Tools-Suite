@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import inspect
 import json
 import os
 import re
@@ -592,7 +593,13 @@ def cmd_start(args) -> int:
     try:
         if args.resume_queue:
             q.set_paused(False)
-        entry = q.add(cfg.to_dict(), label=cfg.arch_name())
+        # the duplicate check is made inside the queue's own lock (cmd_start's own check above is not: two starts
+        # that overlap could both pass it); an install from before that option is left with the check above
+        extra = {"refuse_duplicate": True} if "refuse_duplicate" in inspect.signature(q.add).parameters else {}
+        try:
+            entry = q.add(cfg.to_dict(), label=cfg.arch_name(), **extra)
+        except ValueError as e:  # train_queue.DuplicateJob
+            raise Refused(f"Job name {cfg.job_name!r} is already running or queued.") from e
     except BaseException:  # not queued after all: the earlier run goes back under its name
         if aside is not None and not aside.exists():
             try:
@@ -628,19 +635,38 @@ def report_start(q, entry: dict, plan: dict, busy: bool) -> int:
     return 0
 
 
+def kill_tree(proc) -> None:
+    """Kill a job and the processes it started, children first (as the WebUI's Kill): the probe process holds a second
+    model on the GPU and would go on rendering after a kill of the trainer alone."""
+    try:
+        children = proc.children(recursive=True)  # before the kill: then they have no parent
+    except Exception:  # noqa: BLE001  (gone already, access denied)
+        children = []
+    for child in children:
+        try:
+            child.kill()
+        except Exception:  # noqa: BLE001  (ended on its own)
+            pass
+    proc.kill()
+
+
 def cmd_stop(args) -> int:
-    proc, current = job_process(), current_job_dir()
+    data = read_json(JOB_FILE) or {}  # one read: the process and the folder of the same job
+    proc = live_process(data.get("pid"), data.get("create_time")) if data.get("pid") is not None else None
+    current = Path(data["job_dir"]) if data.get("job_dir") and Path(data["job_dir"]).is_dir() else None
     if proc is None or current is None:
         raise Refused("No job running.")
+    if args.job and current.name != args.job:  # the run meant has ended and the queue went on: touch nothing
+        raise Refused(f"{args.job!r} is not the running job ({current.name!r} is): nothing was stopped.")
     if not args.kill:
         (current / "STOP").touch()
         show({"job": current.name, "state": "stopping",
               "note": "The trainer saves the LoRA after the current step, then ends."})
         return 0
-    proc.kill()
     q = queue()
     if q.snapshot()["waiting"]:  # as the WebUI's Kill: stopping everything, so the queued runs wait for a resume
-        q.set_paused(True)
+        q.set_paused(True)  # (before the kill: else the WebUI could start the next run in between)
+    kill_tree(proc)
     show({"job": current.name, "state": "killed", "note": "No final save.", "queue": queue_view()})
     return 0
 
@@ -984,6 +1010,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="check everything, show the plan, queue nothing")
     p.add_argument("--resume-queue", action="store_true", help="also resume the queue when it is paused")
     p = command("stop", cmd_stop)
+    p.add_argument("--job", default="", help="only when this is the running job (nothing is touched otherwise)")
     p.add_argument("--kill", action="store_true", help="kill the process: no final save, a waiting queue pauses")
     p = command("queue", cmd_queue)
     p.add_argument("action", nargs="?", choices=("show", "pause", "resume", "remove"), default="show")

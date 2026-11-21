@@ -38,6 +38,8 @@ def test_an_interrupted_download_is_resumed(tmp_path, monkeypatch):
     local = tmp_path / "org__model"
     shards = ["a-00001.safetensors", "a-00002.safetensors"]
     _component(local / "transformer", shards, shards[:1])  # the configs and the first shard: then it stopped
+    for whole in ("text_encoder", "vae"):  # (the folder counts as downloaded only with every component it loads)
+        _component(local / whole, [], ["model.safetensors"])
     calls = []
 
     def fake_snapshot(repo, local_dir, **kw):

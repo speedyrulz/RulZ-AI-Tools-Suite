@@ -789,6 +789,8 @@ class Trainer(RaceParallelMixin):
         self.kept: dict[int, list[int]] = {}  # id(model copy) -> blocks keeping their activations
         self.ema = None  # LoraEMA: the weight average saves, samples and probes use (lora_ema)
         self.resumed_ema = None  # its state from a resumed training state
+        self.resumed_alignment = None
+        self.resumed_id_loss = None
         self.resumed_controller = None  # the likeness controller's, from a resumed training state
         self.crash_save = None  # while training: saves the LoRA as it stands (run() calls it after an error)
         self._wn_logged: set[int] = set()  # configurations weight_noise has said its piece about
@@ -1601,6 +1603,9 @@ class Trainer(RaceParallelMixin):
             self.controller = self._make_controller(items)
             self._resume_body_strangers(step)
         self.id_loss = self._make_id_loss()
+        if self.id_loss is not None and self.resumed_id_loss is not None:
+            self.id_loss.rng.setstate(self.resumed_id_loss["rng"])
+            self.id_loss.n_eligible = self.resumed_id_loss["n_eligible"]
         if self.face_scorer is not None and self.face_detector is not None and self.face_detector is not self.face_scorer:
             # face_model antelopev2: buffalo_l's detector served the dataset analysis, the curriculum and the identity
             # loss's references. Not held for the whole run beside the R100 scorer (both on GPU 0 with face_provider
@@ -1918,11 +1923,33 @@ class Trainer(RaceParallelMixin):
             params, optimizer, scheduler = [], None, None
             params, optimizer, scheduler = self._finetune_rotate(cfg, at_step, carry)
 
+        phase = None
+        saved_lrs = None
+        scheduler_done = False
+
         def crash_save():
             """After an error: the LoRA as it stands, with a training state to go on from where the run can have one."""
             if compute_done > 0:
                 resumable = self.ft is None and self.race is None
-                self._emergency_save(injected, params, step, (optimizer, scheduler, gen, rng) if resumable else None)
+                # the step's commit window: inside optimizer.step() the weights and moments may be half-updated, so
+                # no state; once it returned, the step is finished here (lr restored, scheduler on) and saved as done
+                if phase == "in_step" and resumable:
+                    resumable = False
+                    states = sorted(p for p in self.job_dir.glob("state_*") if (p / "train_state.pt").is_file())
+                    log.warning("Optimizer step was interrupted; %s", f"resume from the last periodic state {states[-1]}"
+                                if states else "there is no periodic state to resume from")
+                if phase == "stepped" and resumable:
+                    if saved_lrs is not None:
+                        for g, lr0 in zip(optimizer.param_groups, saved_lrs):
+                            g["lr"] = lr0
+                    if not scheduler_done:
+                        try:
+                            scheduler.step()
+                        except Exception:  # noqa: BLE001
+                            log.exception("Could not advance the scheduler; no resumable crash state saved")
+                            resumable = False
+                self._emergency_save(injected, params, step, (optimizer, scheduler, gen, rng) if resumable else None,
+                                     state_step=step + 1 if phase == "stepped" else step)
 
         def probe_safely(job):
             return self._side_job(f"The probe at step {step}", job, False)
@@ -1947,6 +1974,7 @@ class Trainer(RaceParallelMixin):
             step_images = 0
             step_lr_mult = 1.0
             step_id: list[tuple] = []
+            id_loss_snapshot = (self.id_loss.rng.getstate(), self.id_loss.n_eligible) if self.id_loss else None
             if self.id_loss is not None:
                 self.id_ref = self.id_loss.pick_ref()  # one reference face per step
             retries0 = self._alloc_retries() if any(self.kept.values()) else None
@@ -2022,6 +2050,9 @@ class Trainer(RaceParallelMixin):
                 if not self._shrink_kept_blocks():
                     raise
                 retry_jobs = (per_rep, step_images)  # the same images, not the next ones from the iterator
+                if id_loss_snapshot is not None:
+                    self.id_loss.rng.setstate(id_loss_snapshot[0])
+                    self.id_loss.n_eligible = id_loss_snapshot[1]
                 free_cuda()
                 continue
             except RuntimeError as e:
@@ -2044,6 +2075,9 @@ class Trainer(RaceParallelMixin):
                     self.dp_quiet_steps = 0
                     self.sample_graphs = set()
                 retry_jobs = (per_rep, step_images)
+                if id_loss_snapshot is not None:
+                    self.id_loss.rng.setstate(id_loss_snapshot[0])
+                    self.id_loss.n_eligible = id_loss_snapshot[1]
                 free_cuda()
                 continue
             if self.dp is not None:  # (Keel scales each replica's sum by the step's band and counts its vote)
@@ -2054,6 +2088,8 @@ class Trainer(RaceParallelMixin):
                 optimizer.gather()                              # p.grad for the clip
             grad_norm = step_grad_norm(params, cfg.clip_norm)
             wn_stats = None  # weight_noise's norms, for the lines of this step that are logged
+            saved_lrs = None
+            scheduler_done = False
             if bad_gradients(params, grad_norm):  # the step counts, but nothing of it reaches the LoRA
                 if getattr(optimizer, "disarm", None) is not None:  # Keel: no step() to end its accumulation
                     optimizer.disarm()                              # (zero_grad arms it again)
@@ -2061,16 +2097,19 @@ class Trainer(RaceParallelMixin):
                 self._skip_bad_step(step + 1, self.bad_steps)
                 if not math.isfinite(accum_loss):  # (the chart and the running average stay readable)
                     accum_loss = losses[-1] if losses else 0.0
+                phase = "stepped"
             else:
                 self.bad_steps = 0
                 step_lr_mult *= self._clean_lr_scale(  # clean_share: half the lr on the lower-share epochs
                     cfg, step, self.batcher, cfg.batch_size * cfg.gradient_accumulation * n_dev)
                 step_lr_mult = limit_step_mult(cfg, step_lr_mult)
+                phase = "in_step"  # (from the lr scaling on: a state saved before the restore would keep the scaled lr)
                 if step_lr_mult != 1.0:  # true per-image lr: scale this step only (the scheduler restores it)
                     saved_lrs = [g["lr"] for g in optimizer.param_groups]
                     for g in optimizer.param_groups:
                         g["lr"] = g["lr"] * step_lr_mult
                 optimizer.step()
+                phase = "stepped"
                 if self.ft is not None and cfg.finetune_anchor > 0:  # bounded drift: toward the original weights
                     self.ft.pull_to_base(current_lr(optimizer, scheduler) * cfg.finetune_anchor)
                 if self.id_align_opt is not None and (cfg.id_align or cfg.body_align):
@@ -2078,16 +2117,19 @@ class Trainer(RaceParallelMixin):
                 if step_lr_mult != 1.0:
                     for g, lr0 in zip(optimizer.param_groups, saved_lrs):
                         g["lr"] = lr0
+                    saved_lrs = None
                 if self.ema is not None:
                     self.ema.update(step_images)
                 if cfg.weight_noise > 0:  # after the average, on the primary LoRA; sync_weights below copies it on
                     wn_stats = self._apply_weight_noise(cfg, injected, step, (step + 1) % 5 == 0 or compute_done == 0)
             scheduler.step()
+            scheduler_done = True
             if retries0 is not None:
                 self._ease_memory_pressure(retries0)
             if self.dp is not None:
                 self.dp.sync_weights()
             step += 1
+            phase = None
             compute_done += 1
             if self.act_offload and compute_done in (1, 3):  # step 1 may include the checkpoint calibration
                 log.info("Activation offload: %.2f GB of block inputs sent to RAM in step %d",
@@ -2563,6 +2605,20 @@ class Trainer(RaceParallelMixin):
         state_dir.mkdir(exist_ok=True)
         lora_mod.save_lora(injected, state_dir / "lora.safetensors", dtype=torch.float32, fmt=self.arch.lora_format)
         controller = getattr(self, "controller", None)
+        align_state = align_opt_state = align_layer = id_loss_state = None
+        try:
+            if getattr(self, "id_aligner", None) is not None:
+                align_state = self.id_aligner.state_dict()
+                align_opt_state = self.id_align_opt.state_dict() if self.id_align_opt is not None else None
+                align_layer = self.align_layer
+        except Exception:  # noqa: BLE001
+            log.exception("Could not save alignment state; it will start fresh on resume")
+            align_state = align_opt_state = align_layer = None
+        try:
+            if getattr(self, "id_loss", None) is not None:
+                id_loss_state = {"rng": self.id_loss.rng.getstate(), "n_eligible": self.id_loss.n_eligible}
+        except Exception:  # noqa: BLE001
+            log.exception("Could not save identity loss state; it will start fresh on resume")
         with atomic.writing(state_dir / "train_state.pt") as tmp:  # written last: a folder that has it is complete
             torch.save({
                 "step": step, "res_stage": self.res_stage, "optimizer": optimizer.state_dict(),
@@ -2574,6 +2630,8 @@ class Trainer(RaceParallelMixin):
                 "ema": self.ema.state_dict() if self.ema is not None else None,  # lora.safetensors: the raw weights
                 "dp_counts": self.balancer.counts if self.balancer is not None else None,
                 "controller": controller.resume_state() if controller is not None else None,
+                "id_aligner": align_state, "id_align_opt": align_opt_state, "align_layer": align_layer,
+                "id_loss": id_loss_state,
             }, tmp)
         log.info("Saved training state %s", state_dir)
         self.status.data["states"].append(str(state_dir))
@@ -2627,15 +2685,16 @@ class Trainer(RaceParallelMixin):
             raise RuntimeError(f"The gradients were not finite for {streak} steps in a row: the run is diverging. "
                                "Try a lower learning rate or another quantized backward")
 
-    def _emergency_save(self, injected, params, step: int, state: tuple | None = None) -> None:
+    def _emergency_save(self, injected, params, step: int, state: tuple | None = None,
+                        state_step: int | None = None) -> None:
         """The LoRA as it stands in a normal checkpoint file, and a training state to resume from when `state`
-        (optimizer, scheduler, generator, rng) is given."""
+        (optimizer, scheduler, generator, rng) is given, numbered state_step (default: step)."""
         if not all(bool(torch.isfinite(p).all()) for p in params):
             log.error("Nothing saved after the error: the LoRA holds non-finite weights at step %d", step)
             return
         log.info("Saved the LoRA of step %d after the error: %s", step, self.save(injected, step))
         if state is not None:
-            saved = self.save_state(step, injected, *state)
+            saved = self.save_state(step if state_step is None else state_step, injected, *state)
             if saved is not None:
                 log.info("To continue, resume from %s", saved)
 
@@ -2752,6 +2811,9 @@ class Trainer(RaceParallelMixin):
                 pass
         self.res_stage = int(st.get("res_stage", 0))
         self.resumed_ema = st.get("ema")  # None in states saved without an average (or by an older version)
+        self.resumed_alignment = (st.get("id_aligner"), st.get("id_align_opt"), st.get("align_layer"),
+                                  st.get("config") or {}) if st.get("id_aligner") is not None else None
+        self.resumed_id_loss = st.get("id_loss")
         self.resumed_dp_counts = st.get("dp_counts")
         self.resumed_controller = st.get("controller")
         return int(st["step"])
@@ -4491,6 +4553,8 @@ class Trainer(RaceParallelMixin):
         rows = [r[1] for r in self.race_rows] if self.race_rows is not None else [cfg]
         attn, align = any(c.attn_localize for c in rows), any(c.id_align or c.body_align for c in rows)
         if not (attn or align):
+            if self.race_rows is None and getattr(self, "resumed_alignment", None) is not None:
+                log.info("Alignment is off; saved projectors start fresh")
             if (any((effective_optimizer(c)[0] in KEEL and c.keel_face_gain > 0) or c.wants_parts() for c in rows)
                     and self.ft is None and not self.race_parallel):
                 for m, _, _ in self.replicas:
@@ -4535,6 +4599,7 @@ class Trainer(RaceParallelMixin):
         if align:
             if self.race_rows is None:
                 self.id_aligner, self.id_align_opt = self._make_id_aligner(cfg)
+                self._restore_alignment(cfg)
             dim = A.model_dim(model)
             for on, what, weight, out in ((any(c.id_align for c in rows), "face tokens", cfg.id_align_weight,
                                            "photo's ArcFace embedding", ),
@@ -4542,7 +4607,33 @@ class Trainer(RaceParallelMixin):
                                            cfg.body_align_weight, "photo's DINOv2 body-window embedding")):
                 if on:
                     log.info("Alignment: weight %g, the %s after block %d mapped onto each %s by a projector that is "
-                             "not saved", weight, what, self.align_layer, out)
+                             "saved in training states but not in the LoRA", weight, what, self.align_layer, out)
+
+    def _restore_alignment(self, cfg) -> None:
+        if getattr(self, "resumed_alignment", None) is None:
+            return
+        state, opt_state, layer, saved_cfg = self.resumed_alignment
+        if self.id_aligner is None:
+            log.info("Alignment is off; saved projectors start fresh")
+            return
+        if layer != self.align_layer or any(saved_cfg.get(k) != getattr(cfg, k)
+                                            for k in ("face_model", "id_align", "body_align")):
+            log.info("Alignment settings changed; projectors start fresh")
+            return
+        import copy
+
+        fresh = copy.deepcopy(self.id_aligner.state_dict())
+        try:
+            self.id_aligner.load_state_dict(state)
+        except Exception:  # noqa: BLE001
+            self.id_aligner.load_state_dict(fresh)
+            log.exception("Could not restore alignment projectors; starting fresh")
+            return
+        if opt_state is not None and self.id_align_opt is not None:
+            try:
+                self.id_align_opt.load_state_dict(opt_state)
+            except Exception:  # noqa: BLE001
+                log.exception("Could not restore alignment optimizer; starting it fresh")
 
     def _make_id_aligner(self, cfg):
         """(projectors, their AdamW) for face / body alignment, or (None, None)."""

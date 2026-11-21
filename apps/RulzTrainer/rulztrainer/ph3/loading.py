@@ -84,7 +84,7 @@ def resolve_model_dir(model_path: str, models_dir: str = "models") -> Path:
     if p.is_dir():
         return p.resolve()
     local = Path(models_dir) / path.replace("/", "__")
-    if component_ready(local / "transformer") and component_ready(local / "text_connector"):  # (else: resumed)
+    if all(component_ready(local / d) for d in ("transformer", "text_connector", "text_encoder", "vae")):  # (else: resumed)
         return local.resolve()
     from huggingface_hub import snapshot_download
 

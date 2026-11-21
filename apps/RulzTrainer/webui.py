@@ -19,6 +19,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -243,6 +244,11 @@ def reattach_job() -> bool:
     The pid only counts as the same job when its create time matches (pids get reused). Once this process's job has
     ended, a newer job in JOB_FILE (another WebUI on this install started it, from its queue) is picked up: this
     one's queue must not see "nothing runs" and start a second job on the same GPU."""
+    with _start_lock:  # a run being started sets its folder before its process: a page must not read JOB_FILE between
+        return _reattach_job()
+
+
+def _reattach_job() -> bool:
     global _proc, _adopted, _job_dir
     if _proc is not None or _adopted is not None:
         if _running():
@@ -564,6 +570,25 @@ async def pick_path(kind: str, initial: str = "", filetypes=None, native: bool =
     return await server_pick(kind, initial, filetypes)
 
 
+def keep_earlier_logs(job_dir: Path) -> str | None:
+    """A run that carries on its own job folder (resumes from one of its states) must not wipe the first segment's
+    train.log, console.log and status.json: rename each to the first free `<name>_segment<N>.<ext>` (the Monitor reads
+    only the plain names, so it shows the new segment). Returns why one could not be kept, else None."""
+    job_dir = Path(job_dir)
+    for stem, ext in (("train", ".log"), ("console", ".log"), ("status", ".json")):
+        src = job_dir / (stem + ext)
+        if not src.is_file():
+            continue
+        n = 1
+        while (job_dir / f"{stem}_segment{n}{ext}").exists():
+            n += 1
+        try:
+            src.rename(job_dir / f"{stem}_segment{n}{ext}")
+        except OSError as e:  # in use or locked: the start would write over it, so it does not start
+            return f"{src.name} could not be kept ({e}); close what holds it and start again"
+    return None
+
+
 def start_training(cfg: TrainConfig) -> str:
     with _start_lock:
         return _start_training(cfg)
@@ -573,7 +598,7 @@ def _start_training(cfg: TrainConfig, recovery_note: str | None = None) -> str:
     """Start a run. recovery_note: the start is out-of-memory recovery's (oom_recovery), and the new train.log opens
     with this note; any other start begins with no recovery tries."""
     global _proc, _adopted, _job_dir
-    from rulztrainer.runplan import check_state_paths
+    from rulztrainer.runplan import carries_on, check_state_paths
 
     try:
         check_state_paths(cfg)
@@ -599,17 +624,22 @@ def _start_training(cfg: TrainConfig, recovery_note: str | None = None) -> str:
         taken = job_name_refusal(cfg, _waiting_job_names())
         if taken:
             return f"Not started: {taken}"
-    _job_dir = cfg.job_dir()
-    _job_dir.mkdir(parents=True, exist_ok=True)
+    # the global _job_dir is set only once the process runs: a failed save or start leaves it on the earlier job
+    job_dir = cfg.job_dir()
+    job_dir.mkdir(parents=True, exist_ok=True)
     if recovery_note is None:
-        oom_recovery.reset(_job_dir)
-    cfg_path = _job_dir / "config.yaml"
+        oom_recovery.reset(job_dir)
+    cfg_path = job_dir / "config.yaml"
     cfg.save(cfg_path)
+    if recovery_note is None and carries_on(job_dir, cfg.resume_state):
+        kept = keep_earlier_logs(job_dir)  # the first segment's log, console and status stay next to the new ones
+        if kept is not None:
+            return f"Not started: {kept}"
     for stale in ("status.json", "STOP", "RACE_DROP", "RACE_PICK"):  # (a drop or pick asked of an earlier run)
-        p = _job_dir / stale
+        p = job_dir / stale
         if p.exists():
             p.unlink()
-    (_job_dir / "train.log").write_text(recovery_note or "", encoding="utf-8")
+    (job_dir / "train.log").write_text(recovery_note or "", encoding="utf-8")
     env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
     # detached from the WebUI (own process group / session, no console): closing or restarting the WebUI leaves the
     # job running, and the next WebUI reattaches to it through JOB_FILE
@@ -617,11 +647,11 @@ def _start_training(cfg: TrainConfig, recovery_note: str | None = None) -> str:
         detach = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
     else:
         detach = {"start_new_session": True}
-    with open(_job_dir / "console.log", "w", encoding="utf-8") as console:  # the job keeps its own handle
-        _proc = subprocess.Popen([sys.executable, "-m", "rulztrainer.train", "--config", str(cfg_path)],
-                                 cwd=str(ROOT), env=env, stdout=console, stderr=subprocess.STDOUT,
-                                 stdin=subprocess.DEVNULL, **detach)
-    _adopted = None
+    with open(job_dir / "console.log", "w", encoding="utf-8") as console:  # the job keeps its own handle
+        proc = subprocess.Popen([sys.executable, "-m", "rulztrainer.train", "--config", str(cfg_path)],
+                                cwd=str(ROOT), env=env, stdout=console, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, **detach)
+    _proc, _adopted, _job_dir = proc, None, job_dir
     _record_job(_proc.pid, _job_dir)
     return f"Started job '{cfg.job_name}' (pid {_proc.pid}). Config saved to {cfg_path}"
 
@@ -3936,11 +3966,42 @@ def _serve_compare_xlsx(name: str):
                         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
+DOWNLOAD_TMP_DIR = Path(tempfile.gettempdir()) / "rulz_trainer_downloads"  # built downloads (spreadsheets, zips)
+DOWNLOAD_TMP_MAX_AGE = 24 * 3600.0
+
+
+def download_tmp_file(suffix: str) -> str:
+    """A new, empty temporary file for a download, in a folder of its own that sweep_download_tmp() cleans."""
+    DOWNLOAD_TMP_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # a shared /tmp (Linux): a folder of that name that is a link or someone else's is not used
+    own = DOWNLOAD_TMP_DIR.is_dir() and not DOWNLOAD_TMP_DIR.is_symlink() and (
+        not hasattr(os, "getuid") or DOWNLOAD_TMP_DIR.stat().st_uid == os.getuid())
+    fd, tmp = tempfile.mkstemp(suffix=suffix, dir=DOWNLOAD_TMP_DIR if own else None)
+    os.close(fd)
+    return tmp
+
+
+def sweep_download_tmp(max_age: float = DOWNLOAD_TMP_MAX_AGE, folder: Path | None = None) -> int:
+    """Remove the files in the downloads folder older than max_age seconds (a download whose client went away before
+    the BackgroundTask ran leaves its file). Only files directly inside that folder; returns how many went."""
+    folder = DOWNLOAD_TMP_DIR if folder is None else Path(folder)
+    if not folder.is_dir() or folder.is_symlink() or (hasattr(os, "getuid") and folder.stat().st_uid != os.getuid()):
+        return 0
+    gone = 0
+    now = time.time()
+    for p in folder.iterdir():
+        try:
+            if p.is_file() and not p.is_symlink() and now - p.stat().st_mtime > max_age:
+                p.unlink()
+                gone += 1
+        except OSError:
+            pass
+    return gone
+
+
 @app.get("/rz-history-xlsx")
 def _serve_history_xlsx(run: str):
     """The likeness spreadsheet of a Previous Runs record, built from its saved raw probe scores."""
-    import tempfile
-
     from fastapi import HTTPException
     from fastapi.responses import FileResponse
     from starlette.background import BackgroundTask
@@ -3951,8 +4012,7 @@ def _serve_history_xlsx(run: str):
     if rec is None:
         raise HTTPException(status_code=404, detail="No such run in the history")
     # a temporary file of its own, removed once sent (two runs of one name exported at once never share one)
-    fd, tmp = tempfile.mkstemp(suffix=".xlsx")
-    os.close(fd)
+    tmp = download_tmp_file(".xlsx")
     try:
         likeness_export.export_run(rec, Path(tmp))
     except FileNotFoundError as e:
@@ -4025,7 +4085,6 @@ def _serve_job_zip(job: str, kind: str):
     """A zip of a job folder's (one with a status.json) LoRA files (kind "loras"), its logs and settings ("logs"),
     or its probe or sample images ("probes", "samples"), built now and deleted once sent. LoRAs and images are stored
     as they are (already compressed)."""
-    import tempfile
     import zipfile
 
     from fastapi import HTTPException
@@ -4038,8 +4097,7 @@ def _serve_job_zip(job: str, kind: str):
     files = [p for p, _ in job_loras(d)] if kind == "loras" else job_logs(d) if kind == "logs" else job_images(d, kind)
     if not files:
         raise HTTPException(status_code=404, detail="Nothing to pack")
-    fd, tmp = tempfile.mkstemp(suffix=".zip")
-    os.close(fd)
+    tmp = download_tmp_file(".zip")
     try:
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED if kind == "logs" else zipfile.ZIP_STORED) as z:
             for p in files:
@@ -4266,8 +4324,39 @@ def registered_datasets(root: Path | None = None) -> list[str]:
 
 
 def _save_registry(paths: list[str], root: Path) -> None:
+    """Write the list whole or not at all: a torn file reads as an empty list, and the next save would then drop
+    every folder that was on it."""
     root.mkdir(parents=True, exist_ok=True)
-    (root / DATASETS_REGISTRY).write_text(json.dumps({"external": paths}, indent=1), encoding="utf-8")
+    target = root / DATASETS_REGISTRY
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps({"external": paths}, indent=1), encoding="utf-8")
+        for attempt in range(6):  # on Windows a reader can briefly lock the target
+            try:
+                os.replace(tmp, target)
+                return
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _check_registry_readable(root: Path) -> None:
+    """Refuse to change a list file that exists but cannot be read: registered_datasets() would call it empty and the
+    save would overwrite the folders on it."""
+    target = root / DATASETS_REGISTRY
+    if not target.exists():
+        return
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+        ok = isinstance(data, dict)
+    except (OSError, ValueError):
+        ok = False
+    if not ok:
+        raise ValueError(f"The dataset list file {target} cannot be read, so it was not changed. Repair or delete "
+                         "it, then try again.")
 
 
 def register_dataset(path: str, root: Path | None = None) -> None:
@@ -4275,6 +4364,7 @@ def register_dataset(path: str, root: Path | None = None) -> None:
     root = DATASETS_ROOT if root is None else Path(root)
     if _same_path(path, root) or _inside(root, path):
         raise ValueError("That folder holds the datasets folder: pick one dataset inside it instead.")
+    _check_registry_readable(root)
     paths = registered_datasets(root)
     if _inside(path, root) or any(_same_path(path, p) for p in paths):
         return
@@ -4284,6 +4374,7 @@ def register_dataset(path: str, root: Path | None = None) -> None:
 def unregister_dataset(path: str, root: Path | None = None) -> None:
     """Take a folder off the dataset list; its files stay where they are."""
     root = DATASETS_ROOT if root is None else Path(root)
+    _check_registry_readable(root)
     paths = registered_datasets(root)
     keep = [p for p in paths if not _same_path(p, path)]
     if len(keep) != len(paths):
@@ -5187,6 +5278,12 @@ def build_dataset_tab(f: Form):
             ui.notify(f"Look scan failed: {e}", type="negative", multi_line=True)
             return
         timer.cancel()
+        if state["open"] != folder:  # another dataset was opened meanwhile: the scores were saved in the scanned one
+            look["busy"] = False
+            look_status()
+            ui.notify(f"Scanned {Path(folder).name}; its scores are saved there (you opened another dataset)",
+                      type="info")
+            return
         med, cut = lookfilter.fence(scores, kind)
         look.by_kind[kind].update(scores=scores, cutoff=cut, median=med, marks=set())
         look["busy"] = False
@@ -5361,7 +5458,11 @@ def build_dataset_tab(f: Form):
         if state["open"] is None:
             return
         gone = state["open"]
-        unregister_dataset(gone)
+        try:
+            unregister_dataset(gone)
+        except ValueError as e:
+            ui.notify(str(e), type="warning")
+            return
         picker.selected = [p for p in picker.selected if not _same_path(p, gone)]
         await close_dataset()
         ui.notify(f"{gone} is off the list; its files are untouched")
@@ -9319,7 +9420,33 @@ def maps_compare(entries: list[tuple[str, dict]], picture: int, kind: str, level
     return items, (max(tops) if tops else 1.0)
 
 
-def build_history_tab(charts: list):
+_history_import_started = False
+_history_import_lock = threading.Lock()
+_history_importing = threading.Lock()  # held while an import runs: the thread's and the Import button's never overlap
+
+
+def start_history_import(importer=None) -> bool:
+    """Import the runs from before the history existed (history.import_jobs) once per WebUI process, in a thread of
+    its own: it walks the whole output tree and parses every job, which stalled every page build. The Previous Runs
+    page notices the new files through history.signature() on its timer. False: it was started before."""
+    global _history_import_started
+    with _history_import_lock:
+        if _history_import_started:
+            return False
+        _history_import_started = True
+
+    def work():
+        try:
+            with _history_importing:
+                (importer or history.import_jobs)()
+        except Exception:  # noqa: BLE001
+            pass
+
+    threading.Thread(target=work, name="rulz-history-import", daemon=True).start()
+    return True
+
+
+def build_history_tab(charts: list, f: Form | None = None):
     """Previous Runs: the saved likeness history of every run (output/_history), any number of them ticked to overlay
     their charts."""
     state = {"runs": [], "view": [], "own": [], "sig": None, "picks": [], "captions": [], "shown": None,
@@ -9572,7 +9699,13 @@ def build_history_tab(charts: list):
                       type="warning", multi_line=True)
 
     def import_old():
-        n = history.import_jobs()
+        if not _history_importing.acquire(blocking=False):  # the start-up import is still going: it finds them too
+            ui.notify("The earlier runs are being imported already; they show up here when it is done", type="info")
+            return
+        try:
+            n = history.import_jobs()
+        finally:
+            _history_importing.release()
         v = sync_fleet(True)
         ui.notify(f"Imported {n} earlier run(s) from the output folder" + (f" and {v} from vast.ai" if v else "")
                   if n or v else
@@ -9818,13 +9951,16 @@ def build_history_tab(charts: list):
             return
         fw = float(cmp_fw.value if cmp_fw.value is not None else 70) / 100.0
         out = COMPARE_DIR / f"likeness_runs_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        # the body scorer's device is the Look scan's setting (Model settings: SAM 3 / NLF device)
+        has_device = f is not None and f.w.get("body_device") is not None
+        device = str(f.w["body_device"].value or "cpu") if has_device else "cuda:0"
         cmp_btn.disable()
         cmp_out.text = "Scoring..."
         _task_progress.update(text="Scoring sample folders...", frac=None, active=True)
         cmp_tick.active = True  # this tab has no progress bar of its own
         try:
             result = await run.io_bound(SF.score, lines(cmp_face.value), lines(cmp_body.value),
-                                        (cmp_base.value or "").strip().strip('"') or None, runs, "models", "cuda:0",
+                                        (cmp_base.value or "").strip().strip('"') or None, runs, "models", device,
                                         "cpu", True, "", set_progress)
             await run.io_bound(SF.export, result, out, fw)
         except (OSError, ValueError, RuntimeError) as e:
@@ -9879,10 +10015,7 @@ def build_history_tab(charts: list):
     for chart in (id_chart, probe_chart_h, sweep_chart):
         chart.options["tooltip"][":formatter"] = HISTORY_TOOLTIP
     charts.extend([id_chart, probe_chart_h, sweep_chart])
-    try:
-        history.import_jobs()  # the runs from before the history existed, once
-    except Exception:  # noqa: BLE001
-        pass
+    start_history_import()  # the runs from before the history existed: once per WebUI, off the page (4 s timer below)
     sync_fleet(True)  # the Fleet's vast.ai runs, once; reload() then follows the Fleet's changes
     reload(True)
     ui.timer(4.0, while_connected(reload))
@@ -15727,7 +15860,7 @@ def build_page(local: bool = True):
                 if not _running() and not log_state["console_shown"] and (st.get("error") or not st.get("done")):
                     cp = _job_dir / "console.log"
                     if cp.exists():
-                        tail = cp.read_text(encoding="utf-8", errors="replace").splitlines()[-30:]
+                        tail = tail_lines(cp, 30)
                         if tail:
                             log_view.push("--- console.log ---")
                             for line in tail:
@@ -16057,7 +16190,7 @@ def build_page(local: bool = True):
         # ------------------------------------------------------------ Previous Runs
         with ui.tab_panel(tab_history):
             with ui.column().classes("rz-page gap-4 rz-history"):
-                build_history_tab(charts)
+                build_history_tab(charts, f)
 
         # ------------------------------------------------------------ Fleet
         if tab_fleet is not None:
@@ -17252,6 +17385,7 @@ if __name__ in {"__main__", "__mp_main__"}:
         on_exit_signals(park)
 
     app.on_startup(lambda: threading.Thread(target=queue_loop, name="rulz-queue", daemon=True).start())
+    app.on_startup(sweep_download_tmp)  # downloads left by clients that went away mid-send
     # the memory plan's first count builds a model on the meta device, which spends seconds setting torch's meta
     # kernels up once: done here, off the page, so the wizard's first refresh does not stall
     app.on_startup(lambda: threading.Thread(target=adapter_extra_gb, args=(TrainConfig(),), name="rulz-memplan",
