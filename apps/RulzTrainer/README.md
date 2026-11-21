@@ -4837,6 +4837,11 @@ stay on the GPU.
   (it planned for the frozen model alone, and a LoKr run on a 16 GB card went past its memory). **These are counts
   of tensors, not measurements:** activations and DoRA's working memory are not in them, and no run here has
   compared the plan with a card's real peak. Out-of-memory recovery's own steps are unchanged.
+- **The estimate counts the 2 blocks in flight (4.1.1).** Block swap streams the block that runs and the next one
+  into the GPU, so swapping N blocks frees N - 2 blocks' weights at a step's peak, not N. The estimate (and MiniMax
+  H3's own count) gave every swapped block's weights back, so a card a little short got 1-2 swapped blocks that freed
+  nothing. It now plans 2 more than before; the plan from your own runs already counted them. After Fizgig found its
+  own planner making the same mistake. A count, not a measurement.
 - **The wizard plans from your own runs where it can (3.22.0).** Every finished run now leaves a row in a small
   local record (`output/_vram_measured.json`): the settings that decide memory and what the run measured. When the
   form's settings match a finished run of yours, the wizard picks the block swap count from that run instead of

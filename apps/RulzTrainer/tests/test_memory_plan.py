@@ -87,8 +87,8 @@ def test_an_unknown_model_adds_nothing_and_the_plan_is_unchanged():
             lokr = krea(network_type="lokr")
             assert runplan.target_shapes("krea2", tuple(lokr.resolved_lora_targets())) == ()
             assert runplan.adapter_extra_gb(lokr) == 0.0
-            # today's plan: int8 13.5 GB + the 4.5 GB allowance on a 16 GB card
-            n = math.ceil(28 * (13.5 + webui.STEP_HEADROOM_GB - 16.0) / 13.5)
+            # today's plan: int8 13.5 GB + the 4.5 GB allowance on a 16 GB card, plus the 2 blocks in flight
+            n = math.ceil(28 * (13.5 + webui.STEP_HEADROOM_GB - 16.0) / 13.5) + 2
             assert webui.block_swap_plan(lokr, 16.0, "int8") == (n, 13.5 * n / 28)
             assert webui.block_swap_plan(lokr, 16.0, "int8") == webui.block_swap_plan(krea(), 16.0, "int8")
             runplan.target_shapes.cache_clear()  # the bogus class's empty answer must not outlive the patch
@@ -135,3 +135,36 @@ def test_the_wizard_says_what_it_counted():
     assert swap > 0 and "LoKr (factor 8)" in reason and "GB more" in reason
     plain = webui.wizard_recommendations(krea(), "concept", [{"total": 24000}], None)["block_swap"]
     assert plain[0] == 0 and "GB more" not in plain[1]  # the wizard's rank-16 adamw8bit LoRA: nothing extra
+
+
+def test_the_two_blocks_in_flight_free_nothing():
+    """Block swap streams the running block and the next one into the GPU (measured.INFLIGHT_BLOCKS), so n swapped
+    blocks free n - 2 blocks' weights at a step's peak. A card a little short used to get 1 block, which freed
+    nothing (Fizgig b926d67c found its own planner doing the same)."""
+    import webui
+    from rulztrainer.measured import INFLIGHT_BLOCKS
+
+    assert INFLIGHT_BLOCKS == 2
+    per = 13.5 / 28  # Krea 2 int8, 28 blocks
+    short = 13.5 + webui.STEP_HEADROOM_GB - 0.1  # 0.1 GB short: one block's worth
+    swap, saved = webui.block_swap_plan(krea(), short, "int8", adapter_gb=0.0)
+    assert swap == 3 and saved == pytest.approx(3 * per)  # the GB is what the blocks hold in RAM
+    for vram in (16.0, 14.0, 12.0, 10.0):
+        n, _, tight = webui.block_swap_fit(krea(), vram, "int8", 0.0)
+        over = 13.5 + webui.STEP_HEADROOM_GB - vram
+        assert (n - INFLIGHT_BLOCKS) * per >= over - 1e-9 and not tight  # what is freed covers the shortfall
+        assert (n - INFLIGHT_BLOCKS - 1) * per < over  # and no more blocks than that
+    # all but 2 swapped still leaves too much: tight
+    n, _, tight = webui.block_swap_fit(krea(), 4.0, "int8", 0.0)
+    assert n == 26 and tight
+
+
+def test_h3_plans_room_for_the_two_blocks_in_flight():
+    """MiniMax H3's own count (50 blocks of 0.387 GB): the resident blocks are what the room holds minus the 2
+    streaming through it."""
+    import webui
+
+    vram = 24000 / 1024  # the wizard reads the card's MiB
+    one = webui.wizard_recommendations(TrainConfig(model_arch="minimax_h3"), "concept", [{"total": 24000}], None)
+    resident = vram - 4.5 - 1.6
+    assert one["block_swap"][0] == math.ceil(50 - resident / 0.387) + 2

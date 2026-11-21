@@ -104,7 +104,7 @@ python webui.py --port 7870
 
 Open http://127.0.0.1:7870.
 
-New to LoRA training? Start on the **Wizard** tab. It sets up a character / person LoRA in six short pages:
+New to LoRA training? Start on the **Wizard** tab. It sets up a character / person LoRA in seven short pages:
 
 1. **Start:** the job name, the trigger word, and what the likeness should cover (face focus, the recommended one;
    face and body; face only; *Advanced* adds body focus and body only).
@@ -114,12 +114,12 @@ New to LoRA training? Start on the **Wizard** tab. It sets up a character / pers
    references.
 4. **Training:** steps, learning rate and LoRA rank.
 5. **Samples & probes:** sample prompts, how often to draw previews, save a checkpoint and run a likeness check.
-6. **Extras & start:** *Do you want to use any experimental settings?* No (recommended) keeps the setup as it is and
+6. **Extras:** *Do you want to use any experimental settings?* No (recommended) keeps the setup as it is and
    switches every extra off; Yes lists them by group (adapter and optimizer, likeness boosters, noise levels, the
    configuration race). Each shows how well tested it is (*Tested by others*, *Small or mixed result*, *Only speed
    tested*, *Not tested yet*) and has a *What is this?* button: what it does, what testing found so far with the
-   numbers, and its cost and limits. A review with any problems found, *Save config*, *Add to queue* and *Start
-   training* follow.
+   numbers, and its cost and limits.
+7. **Review & start:** review any problems found, save the config, add it to the queue, or start training.
 
 The basics are filled in for you: the identity recipe (see [Identity training](#identity-training-what-each-step-teaches-character-loras))
 with LoRA rank 32 / alpha 32, adamw8bit at 1e-4, and recommendations worked out from your GPUs (memory) and your
@@ -4837,6 +4837,11 @@ stay on the GPU.
   (it planned for the frozen model alone, and a LoKr run on a 16 GB card went past its memory). **These are counts
   of tensors, not measurements:** activations and DoRA's working memory are not in them, and no run here has
   compared the plan with a card's real peak. Out-of-memory recovery's own steps are unchanged.
+- **The estimate counts the 2 blocks in flight (4.1.1).** Block swap streams the block that runs and the next one
+  into the GPU, so swapping N blocks frees N - 2 blocks' weights at a step's peak, not N. The estimate (and MiniMax
+  H3's own count) gave every swapped block's weights back, so a card a little short got 1-2 swapped blocks that freed
+  nothing. It now plans 2 more than before; the plan from your own runs already counted them. After Fizgig found its
+  own planner making the same mistake. A count, not a measurement.
 - **The wizard plans from your own runs where it can (3.22.0).** Every finished run now leaves a row in a small
   local record (`output/_vram_measured.json`): the settings that decide memory and what the run measured. When the
   form's settings match a finished run of yours, the wizard picks the block swap count from that run instead of

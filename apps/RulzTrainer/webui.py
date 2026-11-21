@@ -6204,7 +6204,14 @@ def block_swap_plan(cfg: TrainConfig, vram: float, quant: str, adapter_gb: float
 def block_swap_fit(cfg: TrainConfig, vram: float, quant: str,
                    adapter_gb: float | None = None) -> tuple[int, float, bool]:
     """block_swap_plan, plus whether the fit is tight: even the most blocks it may swap (all but 2) leave the model
-    and a step's memory over `vram`."""
+    and a step's memory over `vram`.
+
+    Swapping n blocks frees n - INFLIGHT_BLOCKS blocks' weights on the GPU, not n: block swap streams the block that
+    runs and the next one into the GPU (blockswap.BlockSwap max_inflight), so the first two swapped free nothing at a
+    step's peak (as rulztrainer.measured.fit counts them; Fizgig found its own planner making the same mistake). The
+    GB returned is still what the n blocks hold in system RAM."""
+    from rulztrainer.measured import INFLIGHT_BLOCKS
+
     fam = cfg.arch_name()
     quant = plan_quant(cfg, vram, quant)
     gb = MODEL_GB.get(fam, MODEL_GB["moss_image"]).get(quant, 10.0)
@@ -6213,8 +6220,9 @@ def block_swap_fit(cfg: TrainConfig, vram: float, quant: str,
     over = gb + STEP_HEADROOM_GB + extra - vram
     if over <= 0:
         return 0, 0.0, False
-    n = max(1, min(blocks - 2, math.ceil(blocks * over / gb)))
-    return n, gb * n / blocks, gb * n / blocks < over
+    per = gb / blocks
+    n = max(1, min(blocks - 2, math.ceil(over / per - 1e-9) + INFLIGHT_BLOCKS))
+    return n, per * n, per * max(0, n - INFLIGHT_BLOCKS) < over - 1e-9
 
 
 MODEL_NOTES = {
@@ -6922,7 +6930,9 @@ def h3_recommendations(cfg: TrainConfig, r: dict, goal: str | None, gpus: list[d
         picks = adapter_overrides(r)
         extra = adapter_extra_gb(cfg, picks)  # a bigger adapter than the default LoRA leaves fewer blocks resident
         resident = max(1.0, vram - 4.5 - 1.6 - extra)  # the step's memory and the non-block weights (refiner, heads)
-        swap = max(1, min(48, math.ceil(50 - resident / 0.387)))  # a pruned int8 block holds 0.387 GB
+        # a pruned int8 block holds 0.387 GB; the 2 swapped blocks streaming through the GPU take room too
+        # (rulztrainer.measured.INFLIGHT_BLOCKS), so the resident blocks are 2 fewer than the room holds
+        swap = max(1, min(48, math.ceil(50 - resident / 0.387 - 1e-9) + 2))
         counted = (f", counting {extra:.1f} GB more for {adapter_words(cfg, picks)} than a default rank-16 LoRA's"
                    if extra >= 0.1 else "")
         r["multi_gpu"] = ("off", "one GPU found")
