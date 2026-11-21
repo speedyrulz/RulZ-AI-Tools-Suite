@@ -486,6 +486,22 @@ def delete_runs(run_ids: list[str], root: Path = HISTORY_DIR) -> int:
     return n
 
 
+JOB_IMAGE_DIRS = ("samples", "probes")  # a job folder's picture folders: thousands of files, no job folders inside
+
+
+def status_files(output: Path) -> list[Path]:
+    """Every status.json under output, sorted. Like output.rglob("status.json"), but it does not walk the folders
+    that are not jobs (SCAN_DIRS) or, inside a job folder, its samples/ and probes/ pictures (one listing of those
+    outweighs everything else on a long-lived output tree)."""
+    found: list[Path] = []
+    for here, dirs, files in os.walk(output):
+        if "status.json" in files:
+            found.append(Path(here) / "status.json")
+            dirs[:] = [d for d in dirs if d not in JOB_IMAGE_DIRS]
+        dirs[:] = [d for d in dirs if not (Path(here) == output and d in SCAN_DIRS)]
+    return sorted(found)
+
+
 def import_jobs(output: Path | None = None, root: Path = HISTORY_DIR) -> int:
     """History for the job folders (output/**/status.json) from before the history existed: one run per folder whose
     job has no history yet and whose status.json holds likeness scores. A race run saved before the history kept each
@@ -503,7 +519,7 @@ def import_jobs(output: Path | None = None, root: Path = HISTORY_DIR) -> int:
         if "probe_images" not in r or "probe_raw" not in r or "sweeps" not in r or "maps" not in r:
             incomplete.setdefault(r["job"], []).append(r)
     added = 0
-    for status_path in sorted(output.rglob("status.json")) if output.is_dir() else []:
+    for status_path in status_files(output) if output.is_dir() else []:
         job_dir = status_path.parent
         if any(part in SCAN_DIRS for part in job_dir.relative_to(output).parts):
             continue
