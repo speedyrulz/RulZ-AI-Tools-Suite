@@ -125,7 +125,7 @@ SAMPLE_LORA_MODES = {"auto": "The model's sampling LoRA (downloaded; MOSS-Image 
 ADAPTER_MODES = {"auto":"The model's training adapter (downloaded; Qwen-Image 2.1)", "none": "None",
                  "file": "A LoRA file"}
 ADAPTER_MODES["auto"] = ("The model's training adapter (downloaded; Qwen-Image 2.1, MiniMax H3, P-H3-Image, "
-                         "MiniMax-H3-Image)")
+                         "MiniMax-H3-Image, Z-Image Turbo)")
 # MiniMax H3's Comfy-Org formats (h3/loading.py: the pruned files drop the ~13B AdaLN parameters)
 FILE_QUANT_LABELS.update({"pruned_int8_convrot": "pruned int8 ConvRot (21.0 GB, for 16 GB cards)",
                           "pruned_bf16": "pruned bf16 (40.2 GB)", "nvfp4_awq": "NVFP4 AWQ (15.7 GB)"})
@@ -3646,17 +3646,15 @@ def hint(text: str = "", warn: bool = False):
     return ui.label(text).classes("rz-hint" + (" rz-warn" if warn else ""))
 
 
-ALPHA_SCALE_TIP = ("Takes the learning rate as the rate at alpha = rank and trains at that rate x rank / alpha, with "
-                   "weight decay divided by the same factor, so a LoRA whose alpha differs from its rank acts like "
-                   "one at alpha = rank. With Adam-type optimizers lora_up's updates then match alpha = rank "
-                   "exactly, but lora_down starts from the same random values and moves further relative to them: "
-                   "close, not identical. Does nothing with Automagic, Keel or Hull, a fine-tune, LoKr, OFT or "
-                   "when alpha equals rank. Off: the learning rate is the rate the optimizer gets.")
+ALPHA_SCALE_TIP = ("Trains at the learning rate x rank / alpha (weight decay divided by the same factor), so a LoRA "
+                   "whose alpha differs from its rank acts like one at alpha = rank. Close to that, not identical, "
+                   "with Adam-type optimizers. Does nothing with Automagic, Keel or Hull, a fine-tune, LoKr, OFT, or "
+                   "when alpha equals rank. Off: the learning rate is used as set.")
 
 
-WEIGHT_NOISE_TIP = ("Adds small random noise to the LoRA weights after each step. Ported from ai-toolkit-perceptual, "
-                    "whose authors report better likeness and less overcooking on small datasets; not yet measured "
-                    "in RulZ. Try 0.0125 (relative). 0 = off.")
+WEIGHT_NOISE_TIP = ("Adds small random noise to the LoRA weights after each step. ai-toolkit-perceptual reports better "
+                    "likeness and less overcooking on small datasets; not measured in RulZ. Try 0.0125 (relative). "
+                    "0 = off.")
 WEIGHT_NOISE_MODE_TIP = ("Relative: the noise is sigma times each weight tensor's own size (RMS), so a LoRA-up that "
                          "has not learned yet gets none. Absolute: sigma as it is, on every tensor.")
 WEIGHT_NOISE_BOUND_TIP = ("After the noise, scales each weight tensor back to the norm it had before it, so the noise "
@@ -3680,6 +3678,77 @@ def sync_alpha_scale(cfg, boxes, why) -> None:
         (box.disable if reason else box.enable)()
     why.text = reason
     why.visible = bool(reason)
+
+
+def schedule_reason(cfg) -> str:
+    """Why the learning-rate schedule, warm-up and final share do nothing for this config (the Train tab greys them
+    with it), "" when they act. Automagic and Keel set their own rate: build_scheduler holds the factor at 1. Hull is
+    not in the list (its step follows the schedule), and an Automagic pick that isolation trains with AdamW
+    (effective_optimizer) follows it too."""
+    name = effective_optimizer(cfg)[0]
+    if name in AUTOMAGIC:
+        return "Automagic and Keel set their own learning rate, so the schedule and warm-up do nothing."
+    return ""
+
+
+def sync_schedule(cfg, boxes, why) -> None:
+    """Grey out the schedule, warm-up and final share controls where they do nothing and say why in `why`."""
+    reason = schedule_reason(cfg)
+    for box in boxes:
+        (box.disable if reason else box.enable)()
+    why.text = reason
+    why.visible = bool(reason)
+
+
+def steps_readout(steps, batch_size, accumulation, gpus, datasets, crops: bool = False) -> str:
+    """"About 6.5 epochs: 124 photos per epoch (repeats counted), 8 per step." from the run's step count and the
+    ticked datasets, [(images, repeats, per epoch)] ("per epoch" 0 = every image times its repeats). A step holds
+    batch size x gradient accumulation x GPUs (data parallel) pictures. "" when nothing can be counted; `crops` says
+    the automatic crops, which add training items, are not in the count."""
+    try:
+        steps, batch_size, accumulation, gpus = int(steps), int(batch_size), int(accumulation), max(1, int(gpus))
+    except (TypeError, ValueError):
+        return ""
+    per_epoch = 0
+    for images, repeats, cap in datasets:
+        n = int(images) * max(1, int(repeats or 1))
+        per_epoch += min(n, int(cap)) if int(cap or 0) > 0 else n
+    per_step = batch_size * accumulation * gpus
+    if steps <= 0 or per_step <= 0 or per_epoch <= 0:
+        return ""
+    epochs = steps * per_step / per_epoch
+    shown = f"{epochs:.0f}" if epochs >= 10 else f"{epochs:.1f}"
+    if shown == "1.0":
+        shown = "1"
+    return (f"About {shown} {'epoch' if shown == '1' else 'epochs'}: {per_epoch} photos per epoch (repeats counted), "
+            f"{per_step} per step" + ("; automatic crops are not counted." if crops else "."))
+
+
+BODY_SCORE_NOTES = {
+    "appearance": "A DINOv2 embedding of the body from the neck to mid-thigh, turned upright and cut out from the "
+                  "background, matched to the reference photos that show the same part of the body. It sees build, "
+                  "skin, hair and clothing, so vary the outfits.",
+    "anchored": "The same body window with its photographic look (colour grade, exposure, sharpness, grain) taken out, "
+                "embedded by SigLIP 2 and DINOv2 and scored as how far it has moved from the base model's people "
+                "(the step-0 probe's body renders) toward the references: 0 = the base model, 100 = the references' "
+                "mean.",
+    "proportions": "Skeleton ratios from the 2D pose on the flat picture. They shift with pose and camera angle more "
+                   "than people differ.",
+    "skeleton3d": "Bone-length ratios from the pose model's 3D landmarks, plus waist, hip and thigh widths where the "
+                  "person stands upright facing the camera.",
+    "smplx": "NLF fits the SMPL-X body model and measures it in its T-pose (bust, waist, hip, thigh, limb lengths over "
+             "the height). Needs photos down to the knees and NLF's file, downloaded by hand (noncommercial license).",
+    "smplx_ratio": "The same NLF fit as SMPL-X body shape: nine neck-to-knee measurements compared by log-ratio to the "
+                   "references' median.",
+}
+BODY_SCORE_SHARED = ("The proportion, 3D and SMPL-X scores ignore clothing and skin; each compares against the "
+                     "references' own spread.")
+
+
+def body_score_note(key) -> str:
+    """The description shown under the Body score select: the picked option's, plus the line the shape scores share."""
+    note = BODY_SCORE_NOTES.get(str(key), "")
+    return f"{note} {BODY_SCORE_SHARED}" if str(key) in ("proportions", "skeleton3d", "smplx", "smplx_ratio") else note
 
 
 def subhead(text: str):
@@ -4685,6 +4754,40 @@ class StepGallery:
                                         ui.label(scores).classes("rz-shot-sub")
 
 
+# the families whose caption is a same-name .json when there is one (archs.py caption_file); the others read the .txt
+JSON_CAPTION_ARCHS = frozenset({"fibo2", "ideogram4"})
+
+
+def caption_target(image, json_wins: bool) -> tuple[Path, bool]:
+    """The caption file the Dataset tab shows and saves for a picture, and whether it is JSON: the same file training
+    reads. With `json_wins` (the selected model is Ideogram 4 or FIBO 2.0) a same-name .json when there is one, else
+    the .txt; other models always read the .txt, so a .json beside it is left alone."""
+    image = Path(image)
+    j = image.with_suffix(".json")
+    return (j, True) if json_wins and j.is_file() else (image.with_suffix(".txt"), False)
+
+
+def json_caption_problem(text: str) -> str:
+    """"" when `text` is empty or valid JSON, else what is wrong with it, short (a caption box warns, never refuses)."""
+    if not (text or "").strip():
+        return ""
+    try:
+        json.loads(text)
+    except ValueError as e:
+        return str(e)
+    return ""
+
+
+def write_caption(cap: Path, is_json: bool, text: str) -> tuple[str, bool]:
+    """Writes a caption box's text to `cap` as typed (creating the file) and returns (status text, is a warning).
+    Invalid JSON in a .json caption is saved anyway with a warning, never refused. OSError goes to the caller."""
+    cap.write_text(text, encoding="utf-8")
+    problem = json_caption_problem(text) if is_json else ""
+    if problem:
+        return f"saved, but not valid JSON ({problem})", True
+    return ("saved" if text.strip() else "saved (empty)"), False
+
+
 def build_dataset_tab(f: Form):
     """The datasets as cards with a few thumbnails each, Create dataset and Add a folder; a dataset opened below to
     add images and captions (upload from this computer, or copy a folder on the machine running RulZ AI Trainer), edit
@@ -4772,36 +4875,40 @@ def build_dataset_tab(f: Form):
                  "go one at a time in 8 MB pieces: when the connection drops, the piece is sent again after a pause "
                  "and the files already sent stay, so keep the page open until it says Uploaded (on a phone the "
                  "screen is kept on meanwhile where the browser allows it). A file with the same name is replaced. "
-                 "Click a picture to see it full size. Captions are saved to the image's .txt file as you type. "
-                 "Face ref / Body ref pick the images that character LoRAs are scored against.")
+                 "Click a picture to see it full size. Captions are saved as you type, to the image's .txt file, or "
+                 "to its .json when one exists (Ideogram 4 and FIBO 2.0 train on a same-name .json instead of the "
+                 ".txt). Face ref / Body ref pick the images that character LoRAs are scored against.")
             hint("Ideogram 4 was trained on structured JSON captions. A same-name .json caption in its schema "
                  "(github.com/ideogram-oss/ideogram4, docs/prompting.md) wins over the .txt; a plain .txt caption is "
-                 "wrapped into the smallest valid JSON caption, and the trigger word goes into its subject (object) "
-                 "element. Long JSON captions can pass 1024 tokens: raise Max caption tokens (Train tab) to 2048, "
-                 "Ideogram's limit, so they are not cut. Each cached caption keeps 104 KB per token (13 text encoder "
-                 "layers): about 4 MB for a short wrapped caption, 17-110 MB for JSON captions of 165-1077 tokens "
-                 "like Ideogram's examples.")
-            hint("Community reports on Ideogram 4 captions (not tested in RulZ AI Trainer, and disputed): for one "
-                 "character several trainers got equal or better results with plain natural-language captions. JSON "
-                 "with correct boxes is what a multi-character LoRA needs, and a bad JSON caption hurts more than "
-                 "plain text. Boxes are [y_min, x_min, y_max, x_max] normalised 0-1000 whatever the training "
-                 "resolution, and vision captioners often swap x and y, so check them. Do not caption traits that "
-                 "should always appear (tattoos, a default outfit, hair or eye colour). In JSON, put the full "
-                 "caption and the trigger in high_level_description and only the trigger in the character element "
-                 "(a colour palette there shifts hair colour). Test the LoRA with prompts in the same style as the "
-                 "captions.")
+                 "wrapped into the smallest valid JSON caption, and the trigger word goes in front of the first "
+                 "object element's description, or into a new object element when there is none (a caption that "
+                 "already holds the trigger is left alone). Long JSON captions can pass 1024 tokens: set Max caption "
+                 "tokens (Train tab, Dataset section) to 2048, Ideogram's limit, so they are not cut. Each cached "
+                 "caption keeps 104 KiB per token (13 text encoder layers): about 4 MB for a short wrapped caption, "
+                 "and about 17 MB at 165 tokens or 110 MB at 1077, the lengths of Ideogram's examples.")
+            hint("Community reports on Ideogram 4 captions, not what this trainer does (not tested in RulZ AI "
+                 "Trainer, and disputed): for one character several trainers got equal or better results with plain "
+                 "natural-language captions. JSON with correct boxes is what a multi-character LoRA needs, and a bad "
+                 "JSON caption hurts more than plain text. Boxes are [y_min, x_min, y_max, x_max] integers 0-1000 "
+                 "whatever the training resolution, and vision captioners often swap x and y, so check them. Do not "
+                 "caption traits that should always appear (tattoos, a default outfit, hair or eye colour). Some "
+                 "trainers also put the full caption and the trigger in high_level_description and only the "
+                 "trigger in the character element (a colour palette there shifts hair colour); this trainer does "
+                 "not move the trigger there. Test the LoRA with prompts in the same style as the captions.")
         with section("Look consistency filter", "Find the pictures whose face drifts from the look you want",
                      "face_retouching_natural", open_=False):
-            hint("Tick Baseline on a few pictures below that nail the look (3 is a good number), then Scan: every "
-                 "picture's face is compared with theirs by the face model the likeness probes use, worst first. "
-                 "0.45 and up is a solid match, 0.30 to 0.45 the same person drifting, under 0.30 likely off-look or "
-                 "someone else. Auto-suggest marks the outliers (below the median minus 1.5 times the spread, never "
-                 "under 0.25). Move marked out puts them and their captions in excluded_by_look/ inside the dataset, "
-                 "which never trains; nothing is deleted, and Move all back restores them. The scores are saved with "
-                 "the dataset, for the Train tab's Warm up look outliers. Body outliers: the same with the body (neck to "
-                 "mid-thigh, cut out and turned upright, as the likeness probes score it) instead of the face, so a "
-                 "different build, skin, hair or outfit than your body baselines shows; pictures without that part of "
-                 "the body in the frame get no score. It runs on the Body score device (Identity similarity).")
+            hint("Tick Baseline on a few pictures below that nail the look (3 is a good number), then Scan, worst "
+                 "first. Face outliers use the likeness probes' ArcFace model: 0.45 and up is a solid match, 0.30 to "
+                 "0.45 the same person drifting, under 0.30 likely off-look or someone else. Auto-suggest marks faces "
+                 "under the median minus 1.5 times the interquartile range, never under 0.25, and needs 4 scored "
+                 "faces. Body outliers use DINOv2 on the neck-to-mid-thigh window (cut out, turned upright), so a "
+                 "different build, skin, hair or outfit shows. They have no 0.45 / 0.30 bands and no 0.25 floor: a "
+                 "picture is marked only when it falls under that scan's own fence. No face, or no body window in "
+                 "the frame, means no score. Move marked out puts the pictures and their captions in "
+                 "excluded_by_look/ inside the dataset, which never trains; nothing is deleted, and Move all back "
+                 "restores them. The scores are saved with the dataset, for the Train tab's Warm up look outliers "
+                 "(Per-image loss watch). The body scan runs on the SAM 3 / NLF device (Train tab, Identity "
+                 "similarity), even while that control is hidden.")
             ui.toggle({"face": "Face outliers", "body": "Body outliers"}, value="face",
                                   on_change=lambda e: look_set_kind(e.value)).props("no-caps dense")
             with ui.row().classes("w-full items-center gap-2"):
@@ -4857,11 +4964,11 @@ def build_dataset_tab(f: Form):
         (refs.add if on else refs.discard)(rel)
         f.w[key].value = "\n".join(sorted(refs))
 
-    def save_caption(path: Path, text: str, status_label):
-        cap = path.with_suffix(".txt")
+    def save_caption(cap: Path, is_json: bool, text: str, status_label):
+        """Saves to the file the box was loaded from (caption_target at render time), never a file chosen later."""
         try:
-            cap.write_text(text, encoding="utf-8")  # creates the file if it did not exist
-            status_label.text = "saved" if text.strip() else "saved (empty)"
+            status_label.text, warn = write_caption(cap, is_json, text)
+            status_label.classes(add="rz-warn") if warn else status_label.classes(remove="rz-warn")
         except OSError as e:
             status_label.text = f"error: {e}"
             ui.notify(f"Could not save {cap.name}: {e}", type="negative")
@@ -4919,10 +5026,12 @@ def build_dataset_tab(f: Form):
                        "healthy": "teal"}
         grid.style(f"grid-template-columns: repeat({columns.value}, minmax(0, 1fr))")
         grid.clear()
+        json_wins = preset_arch(f.w["model_preset"].value, f.w["model_path"].value) in JSON_CAPTION_ARCHS
         with grid:
             for img, thumb in zip(page_imgs, thumbs):
-                cap = img.with_suffix(".txt")
+                cap, is_json = caption_target(img, json_wins)
                 text = read_caption_text(cap) if cap.is_file() else ""
+                problem = json_caption_problem(text) if is_json else ""
                 with ui.card().tight().classes("w-full rz-thumb"):
                     ui.image(image_url(thumb)).props("fit=cover ratio=1").classes("w-full cursor-pointer") \
                         .on("click", lambda _, p=img: show_full(p)).tooltip("Click to view full size")
@@ -4949,9 +5058,13 @@ def build_dataset_tab(f: Form):
                                 word = "body" if kind == "body" else "look"
                                 ui.badge(f"no {kind}" if sc is None else f"{word} {sc:.2f}", color=LOOK_COLORS[vd]) \
                                     .props("dense").tooltip(f"Look consistency ({kind}): {vd}")
-                        status_label = ui.label("" if cap.is_file() else "no caption yet").classes("text-xs text-grey")
-                    ui.textarea(value=text, placeholder="type a caption; it is saved to the .txt automatically",
-                                on_change=lambda e, p=img, sl=status_label: save_caption(p, e.value, sl)) \
+                        status_label = ui.label(f"not valid JSON ({problem})" if problem else
+                                                "" if cap.is_file() else "no caption yet").classes("text-xs text-grey")
+                        if problem:
+                            status_label.classes(add="rz-warn")
+                    ui.textarea(value=text, label="JSON caption: Ideogram 4 and FIBO 2.0 train on this" if is_json
+                                else None, placeholder=f"type a caption; it is saved to the {cap.suffix} automatically",
+                                on_change=lambda e, c=cap, j=is_json, sl=status_label: save_caption(c, j, e.value, sl)) \
                         .props("dense outlined autogrow").classes("w-full px-2 pb-2 text-xs")
 
     # ---------------------------------------------------------------- look consistency filter
@@ -5263,6 +5376,19 @@ def build_dataset_tab(f: Form):
     ui.timer(0.1, refresh_cards, once=True)
 
 
+SAMPLES_SHOWN = 120  # sample pictures the grid draws, newest first
+
+
+def samples_info(count: int, folder, race: bool = False) -> str:
+    """The line under the Samples controls: how many pictures, which are shown when there are more than the grid
+    draws, and in a race that Columns does not apply."""
+    if not folder:
+        return "No job selected"
+    text = (f"Showing the {SAMPLES_SHOWN} newest of {count} samples in {folder}" if count > SAMPLES_SHOWN
+            else f"{count} samples in {folder}")
+    return text + (". Race: one row per generation; Columns is not used." if race else "")
+
+
 def build_samples_tab(f: Form):
     """Live grid of generated sample images for the current (or any) job folder."""
     state = {"files": [], "columns": None}
@@ -5275,6 +5401,7 @@ def build_samples_tab(f: Form):
             async def browse():
                 picked = await pick_path("dir", folder.value or str(ROOT / "output"), native=native)
                 if picked:
+                    follow.value = False
                     folder.value = _relative(picked)
                     state["files"] = []
 
@@ -5308,14 +5435,15 @@ def build_samples_tab(f: Form):
         state["files"] = sig
         state["columns"] = columns.value
         grid.style(f"grid-template-columns: repeat({columns.value}, minmax(0, 1fr))")
-        info.text = f"{len(files)} samples in {sd}" if sd else "No job selected"
         scores = face_scores_by_image(sd.parent if sd else None)
         names = race_names(sd.parent if sd else None)
+        info.text = samples_info(len(files), sd, bool(names))
+        columns.set_enabled(not names)  # a race shows one row per generation: the columns do not apply
         grid.clear()
         if names:  # a race: the same generation of every configuration side by side
             grid.style("grid-template-columns: minmax(0, 1fr)")
             with grid:
-                for step, rest, members in group_by_generation([str(p) for p in files[:120]], names):
+                for step, rest, members in group_by_generation([str(p) for p in files[:SAMPLES_SHOWN]], names):
                     ui.label(generation_label(step, rest)).classes("rz-subhead")
                     with ui.row().classes("w-full gap-3 no-wrap"):
                         for who, path in members:
@@ -5329,7 +5457,7 @@ def build_samples_tab(f: Form):
                                     .classes("text-xs px-2 py-1")
             return
         with grid:
-            for p in files[:120]:
+            for p in files[:SAMPLES_SHOWN]:
                 with ui.card().tight().classes("w-full rz-thumb"):
                     shown = clip_or_still(p)  # a video model's sample: its clip plays in place of the still
                     ui.image(image_url(shown)).props("fit=contain").classes("w-full h-64 rz-imgbg cursor-pointer") \
@@ -5394,7 +5522,7 @@ def build_maps_tab(f: Form):
 
     state = {"sig": None, "data": None, "view": None, "series": [], "top": 1.0, "pics": {}}
     with card():
-        hint("Turn on Training maps (Train tab, Likeness section) before a run. A few training pictures are checked before "
+        hint("Turn on Training maps (Train tab, Training maps section) before a run. A few training pictures are checked before "
              "training and about once an epoch at three fixed noise levels, so only the LoRA changes between "
              "captures. They only observe: training is the same with them on.")
         with fields():
@@ -6033,18 +6161,18 @@ MODEL_NOTES = {
     "FLUX-2-Klein-4B": ("Not for training", "The 4-step distilled FLUX.2 Klein 4B. Train on FLUX-2-Klein-4B-Base and "
                                             "set this as the sampling model: a Base LoRA runs on it at 4 steps, "
                                             "CFG 1."),
-    "Z-Image": ("", "Tongyi's Z-Image Base (6.15B), the checkpoint to train on, and the one to pick for a full "
-                    "fine-tune. Apache 2.0 and not gated. Comfy-Org's bf16 file is 12.3 GB, with the Qwen3-4B text "
-                    "encoder (8 GB) and the FLUX.1 VAE. Fizgig's measured peaks (rank 16, 1 MP, checkpointing, previews "
-                    "included): 17.2 GB bf16, 12.3 GB int8, 10.1 GB 4-bit: a 24 GB card trains bf16, 16 GB int8, "
-                    "12 GB int8 with block swap. Samples 25 steps at CFG 4. LoRAs load in ComfyUI. Never run on real "
-                    "weights here."),
+    "Z-Image": ("", "Tongyi's Z-Image Base (6.15B): train LoRAs on it, and pick it for a full fine-tune. Apache 2.0, "
+                    "not gated. Comfy-Org's bf16 file is 12.3 GB, plus the Qwen3-4B text encoder (8 GB) and the "
+                    "FLUX.1 VAE. Fizgig's measured peaks (rank 16, 1 MP, checkpointing, previews): 17.2 GB bf16, "
+                    "12.3 GB int8, 10.1 GB 4-bit. A 24 GB card trains bf16, 16 GB int8, 12 GB int8 with block swap. "
+                    "Samples 25 steps at CFG 4. LoRAs load in ComfyUI. Not yet run on the real model in RulZ AI "
+                    "Trainer."),
     "Z-Image-Turbo": ("", "Tongyi's Z-Image Turbo (6.15B), the 8-step distilled model. A LoRA trains on it with a "
-                          "training adapter on (default: Fizgig's, Apache 2.0, downloaded; ostris' v2 by file), which "
-                          "is off for samples and never saved; the LoRA then works on Turbo itself. Fizgig's A/B on a "
-                          "170-photo character set: no adapter 54.8 likeness, ostris v2 72.3, Fizgig's 78.1. A full "
-                          "fine-tune of Turbo loses its few-step behaviour: fine-tune Z-Image (Base). Apache 2.0, not "
-                          "gated. Samples 8 steps at CFG 1. Never run on real weights here."),
+                          "training adapter (default Fizgig's, downloaded; ostris' v2 by file) that is off for samples "
+                          "and never saved, so the LoRA works on Turbo itself. Fizgig's test on a 170-photo character "
+                          "set: no adapter 54.8 likeness, ostris v2 72.3, Fizgig's 78.1. A full fine-tune of Turbo "
+                          "loses its few-step behaviour: fine-tune Z-Image (Base). Apache 2.0, not gated. Samples 8 "
+                          "steps at CFG 1. Not yet run on the real model in RulZ AI Trainer."),
     "Ideogram-4": ("", "Ideogram 4 (9.3B), strong at typography and layout, trained on structured JSON captions "
                        "(plain captions work for one character, community reports). "
                        "Comfy-Org's single files (int8, 9.6 GB, with the 9.4 GB Qwen3-VL-8B text encoder) train on "
@@ -6103,6 +6231,30 @@ def zimage_variant_of(variant: str, model_path: str) -> str:
     return "turbo" if "turbo" in name and not de else "base"
 
 
+def turbo_lora_applies(cfg: TrainConfig) -> bool:
+    """A turbo LoRA is attached for samples and probes: a file of the user's own, or "auto" for a family that has one
+    (ARCH_TURBO; the trainer downloads it). "auto" on a family without one (Z-Image, FLUX 3 Klein, FLUX.2 Klein 4B...)
+    attaches nothing."""
+    if not cfg.turbo_lora:
+        return False
+    return cfg.turbo_lora != "auto" or cfg.arch_name() in ARCH_TURBO
+
+
+def epochs_reason(steps: int, per_epoch: float, aim: int, per_step: int = 1) -> str:
+    """The steps reason's epoch count, from the steps that are really set (they are kept within 1000-4000)."""
+    epochs = steps * per_step / per_epoch if per_epoch else float(aim)
+    text = f"about {epochs:.0f} epochs" + (f" at {per_step} photos per step" if per_step > 1 else "")
+    if per_epoch and per_epoch * aim > steps * 1.05:  # the step count aims at `aim` epochs of one photo per step
+        text += f" (capped at {steps} steps)"
+    elif per_epoch and per_epoch * aim < steps * 0.95:
+        text += f" (at least {steps} steps)"
+    return text
+
+
+# Fizgig's Z-Image fine-tune rate: the wizard recommends it, so the start check does not warn about it
+ZIMAGE_FINETUNE_LR = 5e-5
+
+
 def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict], data: dict | None,
                            focus: str = "face_focus") -> dict[str, tuple]:
     """Recommended (value, reason) per setting key, from the goal (and a character's focus, a key of
@@ -6143,7 +6295,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     if len(gpus) >= 2 and r["multi_gpu"][0] == "data_parallel":
         r["dp_balance"] = ("auto", "measures the cards and splits each step's images by speed, so the faster one "
                                    "does not wait; the images per step stay the same")
-    elif gpus:
+    if len(gpus) == 1:
         r["multi_gpu"] = ("off", "one GPU found")
     if sdxl:
         r["transformer_quant"] = ("auto", "SDXL's 2.6B UNet (about 5 GB) trains in bf16 as it is; int8 or int8_convrot "
@@ -6199,8 +6351,8 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         r["text_encoder_quant"] = ("auto", "Qwen3-8B (bf16 15 GB) runs as it is from 19.5 GB, else int8 ConvRot (half)")
     r["gradient_checkpointing"] = (True, "saves most of the activation memory for a modest slowdown")
     r["checkpoint_keep_blocks"] = (-1, "measured at the start: as many blocks as fit skip the recompute")
-    r["compile_model"] = ("auto", "measured 26% (MOSS-Image) and 12% (Krea 2) faster per step after a warm-up of "
-                                  "under a minute; auto skips it for short test runs")
+    r["compile_model"] = ("auto", "measured on MOSS-Image (26% faster per step) and Krea 2 (12%), after a warm-up "
+                                  "of under a minute; other models are not measured. Auto skips it for short test runs")
     plan_swap = vram is not None and cfg.multi_gpu == "off" and not cfg.finetune and not sdxl
     if sdxl:
         r["block_swap"] = (0, "SDXL's UNet (about 5 GB) fits any card that trains it; block swap is not available")
@@ -6288,15 +6440,20 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
             per_epoch = sum(min(counts.get(sp.path, 0) * sp.repeats * (1 + crops), sp.samples) if sp.samples > 0
                             else counts.get(sp.path, 0) * sp.repeats * (1 + crops)
                             for sp in cfg.dataset_specs() if sp.path in counts)
+        # photos per step as the trainer counts an epoch (batch 1, the wizard's recommendation, x accumulation x DP)
+        per_step = max(1, int(cfg.gradient_accumulation or 1)) * (
+            len(gpus) if r.get("multi_gpu", ("off",))[0] == "data_parallel" else 1)
         steps = int(min(4000, max(1000, round(per_epoch * 100, -2))))
-        r["steps"] = (steps, f"about 100 epochs: {n} images" + (f" x repeats = {items}" if items != n else "")
+        r["steps"] = (steps, epochs_reason(steps, per_epoch, 100, per_step) + f": {n} images"
+                             + (f" x repeats = {items}" if items != n else "")
                              + (f", plus about {int(items * crops)} close-up crops" if crops else "")
                              + ("; the likeness probes can stop it earlier" if character else ""))
     else:
         r["steps"] = (2000, "a good start; check your photos (Photos page) for a number that fits it")
     if klein and n:
-        r["steps"] = (int(min(4000, max(1000, round(per_epoch * 200, -2)))),
-                      f"BFL's FLUX 3 Klein recipe: 4000 steps for 20 images, about 200 epochs ({n} images here)")
+        steps = int(min(4000, max(1000, round(per_epoch * 200, -2))))
+        r["steps"] = (steps, "BFL's FLUX 3 Klein recipe: 4000 steps for 20 images, about 200 epochs; here "
+                             f"{epochs_reason(steps, per_epoch, 200, per_step)} ({n} images)")
     if ideo_character:  # about 200 steps per picture (repeats counted), 3000 to 8000 in all
         if n:
             r["steps"] = (int(min(8000, max(3000, round(items * 200, -2)))),
@@ -6311,7 +6468,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         r["learning_rate"] = (1e-5, "a full fine-tune needs about a tenth of a LoRA's rate (Fizgig's measured 1e-5)")
         r["optimizer"] = ("adafactor", "Fizgig's measured optimizer for a fine-tune: a much smaller state than AdamW")
         if zimage:
-            r["learning_rate"] = (5e-5, "Fizgig's Z-Image fine-tune: 1e-5 changed nothing, 1e-4 was strong; Z-Image's "
+            r["learning_rate"] = (ZIMAGE_FINETUNE_LR, "Fizgig's Z-Image fine-tune: 1e-5 changed nothing, 1e-4 was strong; Z-Image's "
                                         "weights are about three times Qwen-Image's in magnitude" + zi_note)
             r["optimizer"] = ("adafactor", "Adafactor, as Fizgig fine-tunes Z-Image: a much smaller state than AdamW"
                               + (". Train Z-Image (Base) for a fine-tune: a fine-tuned Turbo loses its 8-step "
@@ -6546,7 +6703,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                                       "report). Only acts with guidance above 1, i.e. without the turbo LoRA")
     if character:
         r["probe_every"] = (25, "frequent quick checks give the best-checkpoint and early-stop decisions enough points")
-        if (cfg.turbo_lora and not (klein and cfg.turbo_lora == "auto")) or cfg.samples_on_distilled_model():
+        if turbo_lora_applies(cfg) or cfg.samples_on_distilled_model():
             r["probe_steps"] = (r["sample_steps"][0], "fast probes with the turbo model" if cfg.samples_on_distilled_model()
                                 else "fast probes with the turbo LoRA")
             r["probe_cfg"] = (1.0, "turbo models sample without guidance")
@@ -6849,7 +7006,9 @@ def start_warnings(cfg: TrainConfig) -> list[str]:
     kind = "finetune" if cfg.finetune else "lora" if cfg.network_type == "lora" else None
     if kind and cfg.optimizer not in AUTOMAGIC and cfg.learning_rate > 0:
         lo, hi = LR_USUAL[kind]
-        if not lo / 3 <= cfg.learning_rate <= hi * 3:
+        if cfg.finetune and cfg.arch_name() == "zimage" and abs(cfg.learning_rate - ZIMAGE_FINETUNE_LR) < 1e-12:
+            pass  # the wizard's own Z-Image fine-tune rate (Fizgig's), not a mistake
+        elif not lo / 3 <= cfg.learning_rate <= hi * 3:
             usual = f"{lo:g}" if lo == hi else f"{lo:g} to {hi:g}"
             out.append(f"Learning rate {cfg.learning_rate:g} is well outside the usual {usual} for "
                        f"{'a full fine-tune' if cfg.finetune else 'a LoRA'}: "
@@ -6940,7 +7099,7 @@ def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus:
         out.append(("info", f"Z-Image is Apache 2.0 and not gated: no Hugging Face login is needed for Tongyi-MAI's "
                             f"repos or Comfy-Org's z_image files. Trained as {variant}"
                             + (" (De-Turbo is the un-distilled Turbo and is trained as Base)" if deturbo else "")
-                            + ". Never run on real weights here: check the first samples."))
+                            + ". Not yet run on the real model in RulZ AI Trainer: check the first samples."))
         if variant == "turbo" and cfg.finetune:
             out.append(("warning", "A full fine-tune of Z-Image Turbo loses its few-step behaviour (its 8-step samples "
                                    "degrade), and RulZ AI Trainer leaves the training adapter off for a fine-tune "
@@ -6968,8 +7127,9 @@ def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus:
         elif character_focus(cfg) != "body_only" and not cfg.face_refs:
             out.append(("info", "This focus scores the face, but there are no face references: the face probe goes "
                                 "unscored (Photos page, Advanced)."))
-        elif (cfg.probe_every > 0 and cfg.probe_steps <= 10
-              and not (cfg.turbo_lora or cfg.samples_on_distilled_model())):
+    if goal == "character" or cfg.preset == "identity":
+        if (cfg.probe_every > 0 and cfg.probe_steps <= 10
+                and not (turbo_lora_applies(cfg) or cfg.samples_on_distilled_model())):
             out.append(("warning", f"Probes render in {cfg.probe_steps} steps without a turbo LoRA, so they come out "
                                    "unfinished and their likeness scores mean little. Set a turbo LoRA or raise the "
                                    "probe steps (Samples & probes page, Advanced)."))
@@ -7078,7 +7238,7 @@ EVIDENCE = {
 }
 EXPERIMENT_GROUPS = ("Adapter and optimizer", "Likeness boosters", "How noise levels are trained",
                      "Compare setups")
-# The experimental extras on the wizard's last page. key: the form key; off: its value with the extra off (set again
+# The experimental extras on the wizard's Extras page. key: the form key; off: its value with the extra off (set again
 # when the user answers No); control: switch | select (options, or None for the form's own) | number | text; evidence:
 # a key of EVIDENCE; what / tested / cost: the explanation dialog (from the README's measurements, with its numbers)
 EXPERIMENTS = [
@@ -7174,8 +7334,9 @@ EXPERIMENTS = [
                "held-out FaceNet, the body fell to 8.7, and the guard switched it off at step 2000. An earlier short "
                "test only showed the loss falling.",
      "cost": "Peak memory 8.0 GB against 6.05 GB and about 7% slower steps. With the ArcFace backend the probes' own "
-             "scorer becomes the training target (the FaceNet backend avoids that). Needs face references. Not in a "
-             "parallel race."},
+             "scorer becomes the training target, so the probes add AdaFace as a held-out second score (face gold: "
+             "auto); the FaceNet backend leaves ArcFace as the judge. Needs face references. Not in a parallel "
+             "race."},
     {"key": "attn_localize", "group": "Likeness boosters", "title": "Trigger attention on the subject", "off": False,
      "control": "switch", "evidence": "mixed",
      "short": "Ties the trigger word to the person, not the background.",
@@ -7193,8 +7354,8 @@ EXPERIMENTS = [
              "that photo's ArcFace identity, giving identity feedback at every noise level. Training-only.",
      "tested": "No gain: 29.3 combined and 45.0 FaceNet on one seed of one small Krea 2 set, below its own base "
                "(37.1) and about level with plain overall.",
-     "cost": "Trains against ArcFace, so the FaceNet second scorer is switched on to keep the scores honest. First GPU "
-             "only. Not in a full fine-tune or a parallel race."},
+     "cost": "Trains against ArcFace, so the probes add AdaFace as a held-out second score (face gold: auto) to keep "
+             "the scores honest. First GPU only. Not in a full fine-tune or a parallel race."},
     {"key": "body_align", "group": "Likeness boosters", "title": "Body alignment", "off": False, "control": "switch",
      "evidence": "mixed", "when": lambda wz: wz.has_body(),
      "short": "The same for the build: the person's tokens carry their body.",
@@ -7290,7 +7451,10 @@ EXPERIMENTS = [
     {"key": "region_class_weights", "group": "Likeness boosters", "title": "Region class weights", "off": "",
      "control": "text", "hint": "empty = off; face=3, hair=1.5, skin=1.5, clothes=0.5, background=0.3",
      "evidence": "worse",
-     "short": "One fixed loss weight each for the face, hair, skin, clothes and background.",
+     "when": lambda wz: not wz.w["region_weights"].value or bool((wz.w["region_class_weights"].value or "").strip()),
+     "short": "One fixed loss weight each for the face, hair, skin, clothes and background. Not together with "
+              "Region-weighted loss: this extra only shows while that is off (the recipe has it on; switch it off on "
+              "the Train tab).",
      "what": "Weights the training loss by what each part of a picture shows, for the whole run: the picture is "
              "split into face, hair, skin, clothes and background, and each takes the weight given here (1 when "
              "left out, 0 to mask it out), rescaled to mean 1 per picture. The plain alternative to region steering.",
@@ -7342,17 +7506,73 @@ EXPERIMENTS = [
 ]
 
 
+def uncaptioned_text(count: int, trigger: str) -> str:
+    """The photos page's note about photos without a caption: what they train on, as start_warnings says it."""
+    what = "the trigger word alone" if trigger else "an empty prompt"
+    return (f"{count} photos have no caption yet. They train on {what}, which works for a quick character LoRA; "
+            "captions give a more flexible one.")
+
+
+def model_review_text(cfg: TrainConfig) -> str:
+    """The review's Model row: the model by its preset name (its files' name when you picked your own file) and where
+    its files come from."""
+    preset = next((k for k, v in MODEL_PRESETS.items() if v == cfg.model_path), cfg.model_path)
+    if cfg.model_source != "files":
+        return f"{preset} (Hugging Face)"
+    if cfg.transformer_file:
+        return f"{Path(cfg.transformer_file).name} (your file)"
+    return f"{preset} (single files, downloaded on start)"
+
+
+def likeness_review_text(cfg: TrainConfig, focus: str) -> str:
+    """The review's Likeness row: the focus, which references the checks use (the lines of the reference boxes can be
+    folders, so they are not counted as photos), and how often the probes run."""
+    refs = " and ".join(([f"face"] if focus != "body_only" else []) + ([f"body"] if focus != "face_only" else []))
+    return (f"{CHARACTER_FOCUS[focus][1].lower()}: references from your photos ({refs}), likeness check every "
+            f"{cfg.probe_every} steps")
+
+
+def keep_note_text(keep: int, ema: float) -> str:
+    """The Samples page's one-line note on what the wizard sets without a control (Advanced changes both)."""
+    kept = f"Keeps the newest {keep} checkpoints" if keep > 0 else "Keeps every checkpoint"
+    average = (f"; saves, samples and probes use a weight average of the LoRA (EMA {ema:g})" if ema > 0
+               else "; no weight average")
+    return f"{kept}{average}. Advanced to change."
+
+
+def default_save_path(current: str, typed: bool, job_name: str) -> str:
+    """The wizard's "Save as" path: the job's own default (configs/<job>.yaml) while the field is empty or was not
+    typed by the user, so renaming the job moves it; a path the user typed stays, whatever the job is renamed to."""
+    current = (current or "").strip()
+    return current if typed and current else f"configs/{job_name}.yaml"
+
+
+def model_fit_text(family: str, vram_gb: float) -> str | None:
+    """The badge on a model card: whether the family's frozen weights (MODEL_GB, plus the step allowance
+    STEP_HEADROOM_GB) fit one card of vram_gb. Fitting in int8 (or bf16, which is larger) counts as fitting; nvfp4
+    alone is slower, so it is named; None where MODEL_GB has no row for the family."""
+    sizes = MODEL_GB.get(family)
+    if not sizes or not vram_gb:
+        return None
+    if sizes["int8"] + STEP_HEADROOM_GB <= vram_gb:
+        return "Fits your GPU"
+    if sizes["nvfp4"] + STEP_HEADROOM_GB <= vram_gb:
+        return "Fits in 4-bit"
+    return "Needs block swap"
+
+
 class Wizard:
-    """Guided setup on its own tab for a character / person LoRA: six short pages with the basics filled in, every
-    other setting behind the Advanced switch, and the experimental extras offered on the last page, each with what it
-    does and what testing found.
+    """Guided setup on its own tab for a character / person LoRA: seven short pages with the basics filled in, every
+    other setting behind the Advanced switch, the experimental extras offered on the sixth page, each with what it
+    does and what testing found, and a last page that reviews the run and starts it.
 
     Its controls are bound to the full form's widgets (Train tab), so both views edit the same settings and a run
     started from either is the same run."""
 
     STEPS = (("start", "Start", "flag"), ("model", "Model", "model_training"), ("dataset", "Photos", "photo_library"),
              ("training", "Training", "school"), ("samples", "Samples & probes", "image"),
-             ("extras", "Extras & start", "rocket_launch"))
+             ("extras", "Extras", "science"), ("review", "Review & start", "rocket_launch"))
+    LAST_STEP = STEPS[-1][0]
 
     def __init__(self, f: Form, gpus: list[str], start, goto, enqueue=None):
         self.f, self.w = f, f.w
@@ -7372,6 +7592,7 @@ class Wizard:
         self.rec_rows: list[tuple] = []
         self.focus_cards: dict[str, ui.card] = {}
         self.model_cards: dict[str, ui.card] = {}
+        self.model_fit: dict[str, ui.label] = {}  # each model card's "fits your GPU" badge
         self.extras_cards: dict[bool, ui.card] = {}
         self.steps: dict[str, ui.step] = {}
         self.set_up = False  # the identity recipe and the wizard's basics were put in place this session
@@ -7386,8 +7607,35 @@ class Wizard:
         self.race_keys: list[str] = ["learning_rate"]
         self.racer_vals: list[dict] = []
         self.racers_loaded = False  # the Train tab's race rows were read in once
+        self.review_task = None  # the pending (debounced) re-render of the review on the last page
+        self.last_save_path = ""  # the "Save as" path the wizard itself last put in the field
+        self.save_path_typed = False  # the user typed their own "Save as" path: it no longer follows the job name
 
     # ------------------------------------------------------------ building blocks
+
+    def on_save_path_change(self, e):
+        """A "Save as" change that is not the wizard's own default (or an emptied field) is the user's path."""
+        value = (e.value or "").strip()
+        self.save_path_typed = bool(value) and value != self.last_save_path
+
+    async def start_checked(self):
+        """Start, but only when the review of the current form has no error (the button can be clicked before a
+        pending review re-render has disabled it)."""
+        try:
+            cfg = self.f.to_config()
+        except (TypeError, ValueError) as e:
+            ui.notify(f"A setting is invalid: {e}", type="negative")
+            return
+        ds_paths = [sp.path for sp in cfg.dataset_specs() if sp.path]
+        data = await run.io_bound(datasets_summary, ds_paths)
+        errors = [text for level, text in review_issues(cfg, self.goal, data, len(self.gpus)) if level == "error"]
+        if errors:
+            ui.notify(f"Not started: {errors[0]}", type="negative", multi_line=True)
+            await self.render_review()
+            return
+        result = self.start()
+        if asyncio.iscoroutine(result):
+            await result
 
     def bind(self, widget, key: str):
         """Bind a wizard control to the form widget `key` and keep the recommendations current."""
@@ -7448,7 +7696,12 @@ class Wizard:
     def rec_row(self, key: str):
         with ui.row().classes("rz-rec items-start gap-2 no-wrap") as row:
             icon = ui.icon("lightbulb").classes("mt-[2px] shrink-0")
-            label = ui.label("").classes("min-w-0")
+            # long reasons show two lines until clicked (the same click-to-expand as the Train tab's descriptions)
+            label = ui.label("").classes("min-w-0").style(
+                "display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; "
+                "cursor: pointer") \
+                .on("click", js_handler="(e) => { const s = e.currentTarget.style; "
+                                        "s.display = s.display === 'block' ? '-webkit-box' : 'block'; }")
             btn = ui.button("Use", on_click=lambda: self.apply([key]), color=None) \
                 .props("outline dense size=sm no-caps").classes("shrink-0 px-2") \
                 .tooltip("Use the recommended value")
@@ -7457,7 +7710,7 @@ class Wizard:
     def apply_bar(self, keys: list[str]):
         with ui.row().classes("rz-apply w-full items-center gap-3"):
             ui.icon("auto_awesome").classes("text-xl").style("color: var(--rz-red-bright)")
-            ui.label("Not sure? Take every recommendation on this page.").classes("text-sm")
+            ui.label("Not sure? Take every recommendation shown on this page.").classes("text-sm")
             ui.space()
             ui.button("Apply recommended", icon="done_all", on_click=lambda: self.apply(keys)).props("unelevated")
 
@@ -7477,6 +7730,15 @@ class Wizard:
         i = names.index(cur) if cur in names else 0
         self.stepper.value = names[max(0, min(len(names) - 1, i + d))]
 
+    def move_to(self, name: str):
+        if name in self.steps:
+            self.stepper.value = name
+
+    def on_last_page(self) -> bool:
+        value = getattr(getattr(self, "stepper", None), "value", None)
+        name = value if isinstance(value, str) else getattr(value, "props", {}).get("name")
+        return name == self.LAST_STEP
+
     def heading(self, title: str, text: str):
         ui.label(title).classes("rz-step-title")
         hint(text)
@@ -7495,6 +7757,22 @@ class Wizard:
     def is_lora(self) -> bool:
         return not self.w["finetune"].value and self.w["network_type"].value == "lora"
 
+    def schedule_review(self):
+        """On the last page the review follows every change, a moment after the last one."""
+        if not self.on_last_page() or not hasattr(self, "review_box"):
+            return
+        task = self.review_task
+        if task is not None and not task.done():
+            task.cancel()
+        if hasattr(self, "start_btn"):
+            self.start_btn.set_enabled(False)  # until the review of this change has run
+
+        async def later():
+            await asyncio.sleep(0.5)
+            await self.render_review()
+
+        self.review_task = background_tasks.create(later(), name="wizard review")
+
     def refresh(self):
         try:
             cfg = self.f.to_config()
@@ -7504,6 +7782,7 @@ class Wizard:
             self.focus = character_focus(cfg)
         self.mark_focus()
         self.update_visibility()
+        self.schedule_review()
         if self.racing():
             self.estimate_race()
             self.check_race()
@@ -7528,6 +7807,8 @@ class Wizard:
             icon.name = "check_circle" if same else "lightbulb"
             btn.visible = not same
         self.mark_extras()
+        if hasattr(self, "keep_note"):
+            self.keep_note.text = keep_note_text(int(cfg.keep_checkpoints or 0), float(cfg.lora_ema or 0))
         if hasattr(self, "alpha_note"):
             rec = self.recs.get("learning_rate")
             note = alpha_lr_note(cfg, rec[0] if rec else None)
@@ -7625,15 +7906,17 @@ class Wizard:
                 with ui.row().classes("w-full items-center gap-4"):
                     with ui.column().classes("gap-1 flex-1 min-w-[16rem]"):
                         ui.label("Character / person LoRA wizard").classes("rz-title")
-                        hint("Six short pages with the basics already filled in for you. Advanced shows every "
-                             "setting on every page; the last page offers the experimental extras. These are the "
-                             "same settings as the Train tab's, which has every option.")
+                        hint("Seven short pages with the basics filled in. Advanced shows every setting on every "
+                             "page. These are the same settings as the Train tab's.")
                     self.adv_switch = ui.switch("Advanced", value=self.adv, on_change=lambda e: self.set_adv(e.value)) \
                         .tooltip("Show every setting on every page (for experienced users)")
                     ui.button("Reset", icon="restart_alt", on_click=self.reset).props("flat") \
                         .tooltip("Put the recommended setup back: the identity recipe, rank 32, adamw8bit at 1e-4, "
                                  "experimental extras off")
                     ui.button("All settings", icon="tune", on_click=lambda: self.goto("Train")).props("outline")
+                    ui.button("Review & start", icon="fact_check", on_click=lambda: self.move_to(self.LAST_STEP),
+                              color=None).props("flat no-caps").tooltip("Jump to the last page: what the run will do, "
+                                                                        "and any problem to fix first")
             with ui.stepper(on_value_change=self.on_step).props("header-nav alternative-labels animated flat") \
                     .classes("rz-stepper w-full") as self.stepper:
                 for name, title, icon in self.STEPS:
@@ -7643,6 +7926,7 @@ class Wizard:
         self.w["preset_toggle"].on_value_change(lambda _: self.refresh())
         self.w["model_preset"].on_value_change(lambda _: (self.mark_model(), self.refresh(), self.follow_model_auto()))
         self.w["race"].on_value_change(lambda _: (self.mark_race(), self.refresh()))
+        self.w["region_weights"].on_value_change(lambda _: self.update_visibility())  # hides Region class weights
         self.mark_model()
         self.mark_race()
         self.refresh()
@@ -7666,6 +7950,8 @@ class Wizard:
             self.load_racers()
             self.rebuild_racers()  # the base setup may have changed on the earlier pages
             self.estimate_race()
+        if name == self.LAST_STEP:
+            self.load_racers()  # a jump from an earlier page skips the extras page
             await self.render_review()
 
     # ---- 1 start
@@ -7674,12 +7960,18 @@ class Wizard:
                                                "trigger word is in the prompt. Give the run a name and a trigger "
                                                "word, and pick what the likeness should cover.")
         with self.setting(None, "Job name", "The name of this run. The LoRA files are saved in output/<job name>/."):
-            self.bind(ui.input("Job name"), "job_name").classes("w-full")
+            self.bind(ui.input("Job name"), "job_name").classes("w-full") \
+                .on("keydown.enter", lambda _: self.move(1))
+            self.job_note = hint("", warn=True)  # why the name cannot be used, as soon as it is typed
+            self.job_note.visible = False
+            self.w["job_name"].on_value_change(lambda _: self.job_name_changed())
         with self.setting(None, "Trigger word",
                           "A word you put in your prompts to call the person up, added to the front of every caption. "
-                          "Pick one the model does not know, such as 'zxq woman'. Leave it empty if your captions "
-                          "already have one."):
-            self.bind(ui.input("Trigger word"), "trigger_word").classes("w-full")
+                          "Pick one the model does not know, such as 'zxq woman'. Leave it empty only if your "
+                          "captions already contain one; then put that word in the sample and probe prompts yourself. "
+                          "Without a trigger word, LoRA Isolation is off."):
+            self.bind(ui.input("Trigger word"), "trigger_word").classes("w-full") \
+                .on("keydown.enter", lambda _: self.move(1))
             self.w["trigger_word"].on_value_change(lambda _: self.trigger_changed())
         with self.setting(None, "Trigger word on Ideogram 4",
                           "Community reports: a plain 'woman' or 'man' (or the person's real name) works better than "
@@ -7705,6 +7997,15 @@ class Wizard:
                 self.focus_cards[key] = c
         self.show_when(hint("Advanced also offers body focus and body only."), lambda: not self.adv)
         self.nav(back=False)
+
+    def job_name_changed(self):
+        """Say under the field, as the name is typed, why Start would refuse it (its folder holds an earlier run)."""
+        try:
+            why = job_name_refusal(self.f.to_config(), _waiting_job_names())
+        except (TypeError, ValueError, OSError):
+            why = None  # a field is mid-edit: nothing to say yet
+        self.job_note.text = why or ""
+        self.job_note.visible = bool(why)
 
     def trigger_changed(self):
         """The probe prompts name the subject: follow a new trigger word while they are the recipe's own."""
@@ -7754,6 +8055,10 @@ class Wizard:
                         ui.label(name).classes("rz-setting-title")
                         if badge:
                             ui.label(badge).classes("rz-badge" + ("" if badge == "Recommended" else " muted"))
+                        if name != CUSTOM and badge != "Not for training":
+                            fit = ui.label("").classes("rz-badge muted")  # filled in once the GPUs are known
+                            fit.visible = False
+                            self.model_fit[name] = fit
                         ui.space()
                         ui.icon("check_circle").classes("rz-check")
                     ui.label(text).classes("rz-hint")
@@ -7778,7 +8083,7 @@ class Wizard:
             status = hint("")
 
             async def download():
-                status.text = "Downloading / verifying... (about 30 GB on the first download)"
+                status.text = "Downloading / verifying..."
                 status.text = await run.io_bound(download_model, self.f.to_config().model_path)
 
             ui.button("Download / verify", icon="download", on_click=download).props("outline")
@@ -7832,6 +8137,14 @@ class Wizard:
         for name, c in self.model_cards.items():
             c.classes(add="selected") if name == self.w["model_preset"].value else c.classes(remove="selected")
 
+    def mark_model_fit(self):
+        """Each model card says whether the model fits the largest GPU found (nothing without a GPU)."""
+        vram = max((g["total"] for g in self.smi), default=0) / 1024
+        for name, fit in self.model_fit.items():
+            text = model_fit_text(preset_arch(name), vram) if vram else None
+            fit.text = text or ""
+            fit.visible = bool(text)
+
     # ---- 3 photos
     def step_dataset(self):
         self.heading("Your photos", "15-50 sharp photos of the person, from different days, angles and distances, "
@@ -7851,6 +8164,13 @@ class Wizard:
             with ui.row().classes("gap-2"):
                 ui.button("Check my photos", icon="search", on_click=self.scan).props("unelevated")
                 ui.button("Dataset tab", icon="photo_library", on_click=lambda: self.goto("Dataset")).props("flat")
+        with ui.row().classes("w-full items-center gap-3 no-wrap") as no_data:
+            ui.label("No datasets yet: make one on the Dataset tab (New), then come back.") \
+                .classes("rz-banner info flex-1")
+            ui.button("Go to the Dataset tab", icon="photo_library", on_click=lambda: self.goto("Dataset"),
+                      color=None).props("flat no-caps").classes("shrink-0")
+        self.show_when(no_data, lambda: not picker.paths())
+        picker.listeners.append(self.update_visibility)
         self.scan_box = ui.column().classes("w-full gap-3")
         with self.setting(None, "Captions",
                           "Optional. Describe what should stay changeable: clothes, background, pose, lighting. Do not "
@@ -7861,17 +8181,15 @@ class Wizard:
         self.show_when(refs_note, lambda: not self.adv)
         with self.setting(None, "Ideogram 4 captions",
                           "Ideogram 4 was trained on structured JSON captions, but for one character several trainers "
-                          "report equal or better results with plain natural-language captions (community reports, "
-                          "not tested here). JSON with correct boxes is what a multi-character LoRA needs; a bad JSON "
-                          "caption hurts more than plain text. A same-name .json caption (Ideogram's prompting guide) "
-                          "wins over the .txt; a plain .txt caption is wrapped into the smallest valid JSON caption, "
-                          "with the trigger word in its subject element. Boxes are [y_min, x_min, y_max, x_max] "
-                          "normalised 0-1000 whatever the resolution, and vision captioners often swap x and y. Do "
-                          "not caption traits that should always appear (tattoos, a default outfit, hair or eye "
-                          "colour). In JSON: the full caption and the trigger in high_level_description, only the "
-                          "trigger in the character element (a colour palette there shifts hair colour). Test with "
-                          "prompts in the caption style. JSON captions can be long: Max caption tokens 2048 keeps "
-                          "them whole.",
+                          "report equal or better results from plain captions (community reports, not tested here). "
+                          "JSON with correct boxes is for multi-character LoRAs; a bad JSON caption hurts more than "
+                          "plain text. A same-name .json caption (Ideogram's prompting guide) wins over the .txt; a "
+                          ".txt becomes the high_level_description of the smallest valid JSON caption. Boxes are [y_min, x_min, y_max, x_max], normalised 0-1000 at any resolution; "
+                          "vision captioners often swap x and y. Do not caption traits that should always appear "
+                          "(tattoos, a default outfit, hair or eye colour). The trainer puts the trigger in front of "
+                          "the first object element's description, or adds one; some trainers put it in "
+                          "high_level_description instead (community reports). Test with prompts in the caption style. For long JSON "
+                          "captions set Max caption tokens to 2048.",
                           show_if=("model_preset",
                                    lambda p: preset_arch(p, self.w["model_path"].value) == "ideogram4")):
             pass
@@ -7959,12 +8277,11 @@ class Wizard:
                 if not n:
                     ui.label("No photos in these datasets yet. Add them on the Dataset tab (upload them, or copy a "
                              "folder), then check again.").classes("rz-banner warning")
-                elif n < 10:
+                elif n < 15:
                     ui.label(f"Only {n} photos: 15 or more, from different days and angles, give a much steadier "
                              "likeness.").classes("rz-banner warning")
                 elif cap < n:
-                    ui.label(f"{n - cap} photos have no caption yet. They train on the trigger word alone, which works "
-                             "for a quick character LoRA; captions give a more flexible one.") \
+                    ui.label(uncaptioned_text(n - cap, (self.w["trigger_word"].value or "").strip())) \
                         .classes("rz-banner info")
                 if thumbs:
                     with ui.row().classes("w-full gap-2"):
@@ -7993,6 +8310,7 @@ class Wizard:
         with self.gpu_box:
             if not self.smi:
                 hint("No NVIDIA GPU found with nvidia-smi. The recommendations below assume a 16 GB+ card.", warn=True)
+            self.mark_model_fit()
             for g in self.smi:
                 with ui.column().classes("rz-tile gap-0"):
                     ui.label(f"GPU {g['index']}").classes("rz-tile-label")
@@ -8004,27 +8322,29 @@ class Wizard:
         self.heading("How to train", "How long and how strongly to train. The values here are a good start for most "
                                      "people; the likeness probes keep the best checkpoint either way.")
         with self.setting("steps", "Training steps",
-                          "Each step trains on one photo. Too few and the LoRA is weak; too many and it starts copying "
-                          "the photos. Checkpoints are saved along the way and the best one is kept, so a few too many "
-                          "is safe."):
+                          "Each step trains on one photo at the default batch size of 1. Too few steps give a weak "
+                          "LoRA; too many make it copy the photos. The best checkpoint is kept, so a few too many is "
+                          "safe."):
             self.bind(ui.number("Steps", min=1, precision=0), "steps").classes("w-full")
         with self.setting(None, "Learning rate",
-                          "How big each update is. 1e-4 (0.0001) is the wizard's default. Too high gives burnt, noisy "
-                          "samples; too low learns slowly."):
+                          "How big each update is. Too high gives burnt, noisy samples; too low learns slowly. The "
+                          "recommendation under the field shows the rate for your model."):
             self.bind(ui.number("Learning rate", format="%.1e", step=1e-5, min=0), "learning_rate").classes("w-full")
+            self.rec_row("learning_rate")  # here, not through setting(): its family mirror would re-enable the box below
             self.alpha_note = hint("")  # shown only while alpha differs from rank: what the rate acts like at alpha = rank
             self.alpha_note.visible = False
             self.alpha_scale_box = self.bind(ui.checkbox("Scale LR to alpha = rank"), "lr_alpha_scale") \
                 .tooltip(ALPHA_SCALE_TIP)
             self.alpha_scale_why = hint("")  # why the checkbox is greyed out
             self.alpha_scale_why.visible = False
-        with self.setting(None, "LoRA rank",
-                          "The size of the LoRA. 32 (the default) has room for a face's detail; higher mostly adds file "
-                          "size and copies the photos more easily. Alpha follows the rank unless you set it under "
-                          "Advanced.", when=self.is_lora):
+        with self.setting("lora_rank", "LoRA rank",
+                          "The LoRA's size. A bigger rank leaves room for a face's detail; higher mostly adds file "
+                          "size and copies the photos more easily. The wizard starts at 32; the recommendation below shows "
+                          "your model's own. Alpha follows the rank unless you change it under Advanced.",
+                          when=self.is_lora):
             rank = self.bind(ui.number("Rank", min=1, max=256, precision=0), "lora_rank").classes("w-full")
             rank.on_value_change(lambda e: self.follow_rank(e.value))
-        with self.setting(None, "LoRA alpha",
+        with self.setting("lora_alpha", "LoRA alpha",
                           "Scales the LoRA's effect (alpha / rank). Equal to the rank is the safe default.",
                           when=self.is_lora, adv=True):
             self.bind(ui.number("Alpha", min=0), "lora_alpha").classes("w-full")
@@ -8062,8 +8382,10 @@ class Wizard:
             self.gpu_box = ui.row().classes("w-full gap-3")
             with self.gpu_box:
                 ui.spinner(size="sm")
-            self.apply_bar(["multi_gpu", "dp_balance", "transformer_quant", "text_encoder_quant",
-                            "gradient_checkpointing", "checkpoint_keep_blocks", "block_swap", "compile_model"])
+            self.apply_bar(["steps", "learning_rate", "lora_rank", "lora_alpha", "adapter_mode",
+                            "target_text_fusion", "target_attn_gate", "multi_gpu", "dp_balance", "transformer_quant",
+                            "text_encoder_quant", "gradient_checkpointing", "checkpoint_keep_blocks", "block_swap",
+                            "compile_model"])
         self.hardware_settings()
         self.nav()
 
@@ -8129,6 +8451,8 @@ class Wizard:
         self.heading("Samples and likeness checks", "Preview pictures show how training is going, and quick likeness "
                                                     "checks (probes) score each checkpoint against your photos, keep "
                                                     "the best one and stop when it no longer improves.")
+        self.keep_note = hint("")  # the two settings made without a control here (Advanced has them)
+        self.show_when(self.keep_note, lambda: not self.adv)
         with self.setting(None, "Sample prompts",
                           "One prompt per line, drawn at every sample step with a fixed seed, so the pictures compare "
                           "over time. Use your trigger word and vary the scene to see that the person carries over to "
@@ -8147,8 +8471,8 @@ class Wizard:
                           "A quick, small headshot (and full-body shot) every N steps, scored against your photos. "
                           "Frequent checks pick the best checkpoint more precisely; each takes a few seconds."):
             self.bind(ui.number("Probe every", min=0, precision=0, suffix="steps"), "probe_every").classes("w-full")
-        adv_keys = ["sample_model_path", "keep_checkpoints", "sample_steps", "sample_cfg", "probe_steps", "probe_cfg",
-                    "probe_face_prompt", "probe_body_prompt"]
+        adv_keys = ["sample_every", "save_every", "probe_every", "sample_model_path", "keep_checkpoints", "turbo_mode",
+                    "sample_steps", "sample_cfg", "probe_steps", "probe_cfg", "probe_face_prompt", "probe_body_prompt"]
         with ui.column().classes("w-full") as bar:
             self.apply_bar(adv_keys)
         self.show_when(bar, None, adv=True)
@@ -8175,13 +8499,14 @@ class Wizard:
                           "Raw: Turbo needs 8 steps without guidance where Raw needs 28 or more with it. Empty = "
                           "preview on Raw.", show_if=is_krea, adv=True):
             self.bind(ui.input("Sampling model (repo id or folder)"), "sample_model_path").classes("w-full")
-        with self.setting(None, "Turbo LoRA",
+        with self.setting("turbo_mode", "Turbo LoRA",
                           "A step-distilled LoRA used only while rendering samples and probes, never in training: "
-                          "previews take seconds. The model's own is downloaded (MOSS-Image: 12 steps at CFG 1; Krea 2, "
-                          "Qwen-Image 2.1, Ideogram 4 and MiniMax H3: 8; FIBO 2.0: 4; the Kleins have none) and the "
-                          "steps and guidance below follow it. A new Ideogram 4 setup starts with none: community "
-                          "reports say its turbo LoRA at CFG 1 wrecks character LoRAs.",
-                          adv=True, form_key="turbo_mode"):
+                          "previews take seconds. The model's own is downloaded, all at CFG 1: MOSS-Image 12 steps; "
+                          "Krea 2, Qwen-Image 2.1, Ideogram 4, MiniMax H3 and SDXL (DMD2) 8; FIBO 2.0 and FLUX.2 "
+                          "Klein 9B 4. FLUX 3 Klein, FLUX.2 Klein 4B and Z-Image have none. The steps and guidance "
+                          "below follow it. A new Ideogram 4 setup starts with none: community reports say its turbo "
+                          "LoRA at CFG 1 wrecks character LoRAs.",
+                          adv=True):
             self.bind(ui.select(TURBO_MODES, label="Turbo LoRA"), "turbo_mode").classes("w-full")
             self.bind(path_field("Turbo LoRA file", "file", width="w-full"), "turbo_lora") \
                 .parent_slot.parent.bind_visibility_from(self.w["turbo_mode"], "value", lambda x: x == "file")
@@ -8203,11 +8528,9 @@ class Wizard:
         if replaced:
             ui.notify("Replaced the sample prompts with suggestions")
 
-    # ---- 6 extras and start
+    # ---- 6 extras
     def step_extras(self):
-        self.heading("Extras and start", "The run is ready. Experimental settings are optional extras that might help "
-                                         "the likeness but are not part of the recipe yet; most have not been "
-                                         "measured. You can skip them.")
+        self.heading("Extras", "Experimental settings are optional and mostly unmeasured. Skip them for a first LoRA.")
         ui.label("Do you want to use any experimental settings?").classes("rz-setting-title")
         with ui.element("div").classes("rz-choices"):
             for answer, icon, title, text in (
@@ -8230,17 +8553,24 @@ class Wizard:
         self.extras_box.visible = False
         with self.extras_box:
             self.build_experiments()
-        ui.label("Review").classes("rz-step-title pt-4")
+        self.nav()
+
+    # ---- 7 review and start
+    def step_review(self):
+        self.heading("Review and start", "Problems first, then your photos and steps, the model and GPU, and the "
+                                         "rest. This page follows every change you make.")
         self.review_box = ui.column().classes("w-full gap-3")
         with ui.row().classes("w-full items-center gap-3 pt-2"):
-            self.cfg_path = ui.input("Save as", value="").classes("w-80 max-w-full")
+            self.cfg_path = ui.input("Save as", value="", on_change=self.on_save_path_change) \
+                .classes("w-80 max-w-full")
             ui.button("Save config", icon="save", on_click=self.save).props("outline")
             ui.space()
             if self.enqueue is not None:
                 ui.button("Add to queue", icon="playlist_add", on_click=self.enqueue).props("outline size=lg") \
                     .tooltip("Start this run after the current one (and any queued before it) is done")
             self.start_btn = ui.button("Start the race" if self.racing() else "Start training", icon="play_arrow",
-                                       on_click=self.start).props("unelevated size=lg")
+                                       on_click=self.start_checked).props("unelevated size=lg")
+            self.start_btn.set_enabled(False)  # the review turns it on once it has run with no error
         with ui.stepper_navigation():
             ui.button("Back", icon="arrow_back", on_click=lambda: self.move(-1)).props("flat")
 
@@ -8584,29 +8914,32 @@ class Wizard:
         ui.notify(f"Saved {path}", type="positive")
 
     async def render_review(self):
+        if not hasattr(self, "review_box"):
+            return
         try:
             cfg = self.f.to_config()
         except (TypeError, ValueError) as e:
             self.review_box.clear()
             with self.review_box:
                 ui.label(f"A setting is invalid: {e}").classes("rz-banner error")
+            self.start_btn.set_enabled(False)
             return
         ds_paths = [sp.path for sp in cfg.dataset_specs() if sp.path]
         if self.data is None or self.data.get("folder") != "|".join(ds_paths):
             self.data = await run.io_bound(datasets_summary, ds_paths)
-        if not self.cfg_path.value:
-            self.cfg_path.value = f"configs/{cfg.job_name}.yaml"
+        # the job's default path follows a renamed job; a path typed there stays
+        path = default_save_path(self.cfg_path.value, self.save_path_typed, cfg.job_name)
+        self.last_save_path = f"configs/{cfg.job_name}.yaml"  # set first: on_save_path_change compares with it
+        if path != self.cfg_path.value:
+            self.cfg_path.value = path
         issues = review_issues(cfg, self.goal, self.data, len(self.gpus))
+        self.start_btn.set_enabled(not any(level == "error" for level, _ in issues))  # Add to queue stays
         data = self.data or {}
         multi = {"off": f"single GPU ({cfg.device})", "data_parallel": f"data parallel on {cfg.devices}",
                  "model_split": f"model split over {cfg.devices}"}.get(cfg.multi_gpu, cfg.multi_gpu)
-        model = (Path(cfg.transformer_file).name or "Hugging Face model") if cfg.model_source == "files" \
-            else next((k for k, v in MODEL_PRESETS.items() if v == cfg.model_path), cfg.model_path)
         rows = [
             ("Job", f"{cfg.job_name}  ->  {_relative(str(cfg.job_dir()))}/"),
-            ("Model", f"{model} ({'single files' if cfg.model_source == 'files' else 'Hugging Face'})"),
-            ("GPUs", f"{multi}; model quant {cfg.transformer_quant}, text encoder quant {cfg.text_encoder_quant}"),
-            ("Datasets" if len(ds_paths) > 1 else "Dataset", datasets_line(cfg, data)),
+            ("Datasets" if len(ds_paths) > 1 else "Dataset", datasets_line(cfg, data)),  # photos and steps first
             ("Trigger word", cfg.trigger_word or "(none)"),
             ("Resolution", ", ".join(f"{mp:g} MP" for mp in cfg.resolutions)
              + (" (datasets with their own: those)" if any(sp.resolutions for sp in cfg.dataset_specs()) else "")),
@@ -8617,17 +8950,16 @@ class Wizard:
                              if trained_optimizer(cfg)[1] != effective_optimizer(cfg)[1] else
                              f" (acts like lr {lr_at_alpha_rank(cfg):.1e} at alpha = rank)")
                             if alpha_differs(cfg) and lr_at_alpha_rank(cfg) is not None else "")),
+            # the model and the GPU, then the rest
+            ("Model", model_review_text(cfg)),
+            ("GPUs", f"{multi}; model quant {cfg.transformer_quant}, text encoder quant {cfg.text_encoder_quant}"),
+            *extra_review_rows(cfg),
             ("Experimental", ", ".join(ex["title"] for ex in EXPERIMENTS if self.experiment_on(ex)) or "none"),
             ("Saving", f"every {cfg.save_every} steps; samples every {cfg.sample_every} steps "
                        f"({len(cfg.sample_prompts)} prompts)"),
         ]
-        rows[len(rows) - 1:len(rows) - 1] = extra_review_rows(cfg)  # before "Saving"
         if cfg.preset == "identity":
-            focus = character_focus(cfg)
-            refs = ([f"{len(cfg.face_refs)} face"] if focus != "body_only" else []) + \
-                   ([f"{len(cfg.body_refs)} body"] if focus != "face_only" else [])
-            rows.append(("Likeness", f"{CHARACTER_FOCUS[focus][1].lower()}: {' / '.join(refs)} reference entries, "
-                                     f"probes every {cfg.probe_every} steps"))
+            rows.append(("Likeness", likeness_review_text(cfg, character_focus(cfg))))
         self.review_box.clear()
         with self.review_box:
             if not issues:
@@ -10343,6 +10675,19 @@ def fleet_spark(series: dict | None) -> dict:
                         "lineStyle": {"width": 1.5, "color": "#60A5FA"}, "itemStyle": {"color": "#60A5FA"}}]}
 
 
+async def confirm_clear_queue(detail: str) -> bool:
+    """Ask before a queue is emptied (the style of the Reset dialog); True when the user confirms."""
+    with ui.dialog() as dlg, ui.card().classes("w-[28rem] max-w-full"):
+        ui.label("Remove every waiting run?").classes("text-base font-medium")
+        ui.label(detail).classes("rz-hint")
+        with ui.row().classes("w-full justify-end gap-2"):
+            ui.button("Cancel", on_click=lambda: dlg.submit(False)).props("flat")
+            ui.button("Remove them", icon="clear_all", on_click=lambda: dlg.submit(True)).props("flat")
+    go = await dlg
+    dlg.delete()
+    return bool(go)
+
+
 def build_fleet_tab(form_config=None, charts: list | None = None):
     """Fleet: every vast.ai instance's run on one page, a queue whose next run goes to the first idle instance,
     the download rules, the watches, and every run on record. All of it is scripts/vast/rulz_fleet.py's Fleet;
@@ -10911,7 +11256,11 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
             ui.space()
             queue_pause = ui.button("", color=None, on_click=lambda: act(
                 fl.queue_edit, "resume" if fl.read()["queue"]["paused"] else "pause")).props("outline dense no-caps")
-            ui.button("Clear queue", icon="clear_all", color=None, on_click=lambda: act(fl.queue_edit, "clear")) \
+            async def clear_fleet_queue():
+                if await confirm_clear_queue("Runs already sent to an instance keep going."):
+                    await act(fl.queue_edit, "clear")
+
+            ui.button("Clear queue", icon="clear_all", color=None, on_click=clear_fleet_queue) \
                 .props("flat dense no-caps")
         hint("The first waiting run goes to the first instance that has nothing running and nothing waiting in its "
              "own queue; when an instance finishes its run, it takes the next one. A run an instance refuses (its "
@@ -11047,7 +11396,7 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
             dl_every = ui.number("Seconds between downloads during a run", value=300, min=30, step=30, precision=0,
                                  on_change=lambda e: e.value and int(e.value) != state["dl"].get("every") and
                                  fl.set_download({}, every=int(e.value))).classes("w-72")
-        hint("A LoRA is about 230 MB and a run keeps many: Every LoRA / checkpoint while it runs fills this "
+        hint("A run keeps many checkpoints: Every LoRA / checkpoint while it runs fills this "
              "computer's disk quickly. Best LoRA is the <job>_best file alone.")
 
     def draw_downloads(view: dict) -> None:
@@ -11841,9 +12190,14 @@ def build_page(local: bool = True):
                             ui.button("Open the wizard", icon="auto_awesome", on_click=lambda: goto("Wizard")) \
                                 .props("outline")
                         with fields():
-                            w["job_name"] = ui.input("Job name", value=d.job_name).classes("w-56")
-                            path_input(f, "output_dir", "Output folder", "dir", d.output_dir, "w-64")
-                            w["seed"] = ui.number("Seed", value=d.seed, precision=0).classes("w-32")
+                            w["job_name"] = ui.input("Job name", value=d.job_name).classes("w-56") \
+                                .tooltip("Names the run. Its files are saved in the output folder, in a folder of "
+                                         "this name; the LoRA is <job name>.safetensors.")
+                            path_input(f, "output_dir", "Output folder", "dir", d.output_dir, "w-64") \
+                                .tooltip("Where runs are saved: one folder per job name.")
+                            w["seed"] = ui.number("Seed", value=d.seed, precision=0).classes("w-32") \
+                                .tooltip("Seeds the run's random draws: the LoRA's starting weights, the order of the "
+                                         "pictures and the noise.")
                             preset_state = {"snapshot": None, "applying": False}
 
                             def on_preset_toggle(e):
@@ -11925,7 +12279,9 @@ def build_page(local: bool = True):
                             native_cfg = _native_dialogs
                             ui.button(icon="description", on_click=browse_cfg).props("flat dense round") \
                                 .tooltip(BROWSE_TIP[native_cfg])
-                            ui.button("Load", icon="file_open", on_click=on_load).props("flat")
+                            ui.button("Load", icon="file_open", on_click=on_load).props("flat") \
+                                .tooltip("Fills the form from the file. Options missing from the file are added to "
+                                         "it with their defaults (not to configs/example.yaml).")
                             ui.button("Save", icon="save", on_click=on_save).props("flat")
 
                             def on_download_config():
@@ -12009,15 +12365,14 @@ def build_page(local: bool = True):
                                                       lambda p: preset_arch(p, w["model_path"].value) in VIDEO_ARCHS) \
                                 .tooltip("What the dataset holds, for a video model. Video only: clips train every "
                                          "LoRA layer. Photos only: pictures train the feed-forward layers of every "
-                                         "block and leave the attention, which carries motion, alone (adamanthy's "
-                                         "image-only recipe for MiniMax H3). Photos + video: clips train every "
-                                         "layer, batches of photos the feed-forward layers only (his mixed recipe, "
-                                         "experimental). Sets the clip frames, LoRA layers and blocks below.")
+                                         "block and leave the attention, which carries motion, alone. Photos + "
+                                         "video: clips train every layer, batches of photos the feed-forward layers "
+                                         "only (experimental). Sets the clip frames, LoRA layers and blocks below.")
                             f.extras["video_data_preset"] = data_menu
                             data_menu.on_value_change(lambda e: f.apply_video_data_preset(e.value))
                             with ui.row().bind_visibility_from(w["model_source"], "value", lambda x: x == HF_SOURCE):
                                 async def on_download():
-                                    dl_status.text = "Downloading / verifying... (about 30 GB on first download)"
+                                    dl_status.text = "Downloading / verifying... (the first download can be tens of GB)"
                                     cfg = f.to_config()
                                     dl_status.text = await run.io_bound(download_model, cfg.model_path)
 
@@ -12046,30 +12401,29 @@ def build_page(local: bool = True):
                                     .props("outline").tooltip("Training downloads them on start anyway; this does it "
                                                               "now (Hugging Face's cache keeps them for later runs)")
                             files_status = hint("")
-                            hint("The model picked above comes as single files from Comfy-Org's ComfyUI repackages "
-                                 "(Comfy-Org/MOSS-Image, Comfy-Org/Krea-2, Comfy-Org/Fibo-2.0, Comfy-Org/Qwen-Image-2.1, "
-                                 "Comfy-Org/Ideogram-4 (its int8 / bf16 text encoder from Qwen-Image 2.1's: the same "
-                                 "model); FLUX 3 Klein: BFL's own black-forest-labs/flux-3-image-klein-comfy; "
-                                 "FLUX.2 Klein: BFL's fp8 or bf16 file with Comfy-Org/Flux-2-Klein-9B's text encoder "
-                                 "and VAE), "
-                                 "downloaded on the first "
-                                 "run. To use files you already have, set them below: anything left empty is "
-                                 "downloaded.")
+                            hint("A file left empty is downloaded on the first run, from Comfy-Org's ComfyUI repackages "
+                                 "(MOSS-Image, Krea 2, FIBO 2.0, Qwen-Image 2.1, Ideogram 4, MiniMax H3 and "
+                                 "H3-Image, Z-Image, FLUX.2 Klein 4B). Exceptions: FLUX 3 Klein comes from "
+                                 "black-forest-labs/flux-3-image-klein-comfy (gated); FLUX.2 Klein 9B's diffusion "
+                                 "file from BFL (gated), its text encoder and VAE from Comfy-Org; P-H3-Image from "
+                                 "PrunaAI; SDXL is one stabilityai checkpoint; PAN 2 has none (make them with "
+                                 "scripts/pan2/convert_pan2.py). To use files you already have, set them below.")
                             path_input(f, "transformer_file", "Diffusion model file (optional)", "file", "",
                                        "w-[40rem]").tooltip("Empty: downloaded in the format picked above. SDXL: "
                                                             "its one all-in-one .safetensors checkpoint "
                                                             "(Comfy-Org has no SDXL files to download).")
                             path_input(f, "text_encoder_file", "Text encoder file (optional)", "file", "",
-                                       "w-[40rem]").tooltip("Empty: downloaded. Qwen3.5-9B for MOSS-Image; Qwen3-VL-4B "
-                                                            "for Krea 2, FIBO 2.0 and FLUX 3 Klein; Qwen3-8B for "
-                                                            "FLUX.2 Klein; Qwen3-VL-8B for "
-                                                            "Qwen-Image 2.1 and Ideogram 4; Qwen3-VL-32B for MiniMax "
-                                                            "H3 and MiniMax-H3-Image. SDXL: empty = the checkpoint's own.")
+                                       "w-[40rem]").tooltip("Empty: downloaded. Qwen3.5-9B: MOSS-Image. Qwen3-VL-4B: "
+                                                            "Krea 2, FIBO 2.0, FLUX 3 Klein, P-H3-Image. Qwen3-VL-8B: "
+                                                            "Qwen-Image 2.1, Ideogram 4. Qwen3-8B: FLUX.2 Klein 9B. "
+                                                            "Qwen3-4B: Klein 4B, Z-Image. Qwen3-VL-32B: MiniMax H3 and "
+                                                            "H3-Image. SDXL: the checkpoint's own.")
                             path_input(f, "vae_file", "VAE file (optional)", "file", "", "w-[40rem]") \
-                                .tooltip("Empty: downloaded. Flux2's for MOSS-Image, FIBO 2.0, both Kleins and "
-                                         "Ideogram 4; Qwen-Image's for Krea 2; its own for Qwen-Image 2.1; the video "
-                                         "VAE for MiniMax H3; its own image VAE for MiniMax-H3-Image; the FLUX.1 VAE (ae.safetensors) for Z-Image. SDXL: empty = the checkpoint's "
-                                         "own (nothing is downloaded for SDXL).")
+                                .tooltip("Empty: downloaded. Flux2 VAE: FIBO 2.0, FLUX 3 Klein, both FLUX.2 Kleins, "
+                                         "Ideogram 4 (MOSS-Image: its small variant). Qwen-Image VAE: Krea 2. "
+                                         "FLUX.1 VAE (ae.safetensors): Z-Image. Qwen-Image 2.1, MiniMax H3, H3-Image "
+                                         "and P-H3-Image: their own. SDXL: the checkpoint's own (nothing is "
+                                         "downloaded).")
                             path_input(f, "tokenizer_path", "Tokenizer folder (optional)", "dir", "", "w-[40rem]") \
                                 .tooltip("Empty: downloaded with the model.")
                         with fields().bind_visibility_from(
@@ -12078,11 +12432,10 @@ def build_page(local: bool = True):
                                 {"auto": "auto (from the model name)", "base": "Base", "turbo": "Turbo"},
                                 value=getattr(d, "zimage_variant", "auto"), label="Z-Image variant") \
                                 .classes("w-72") \
-                                .tooltip("Which Z-Image checkpoint this is. It sets the training adapter (Turbo only), "
-                                         "the sample steps and CFG (Turbo 8 at 1, Base 25 at 4 with a negative prompt) "
-                                         "and the fine-tune warning. auto reads the model name: Turbo in it, and not "
-                                         "De-Turbo (the un-distilled Turbo, trained as Base), means Turbo. Set it by "
-                                         "hand for a file whose name does not say.")
+                                .tooltip("Base or Turbo. It sets the training adapter (Turbo only), the sample steps "
+                                         "and CFG, and the fine-tune warning. auto reads the model name: Turbo in "
+                                         "it, but not De-Turbo (trained as Base). Set it by hand when the file name "
+                                         "does not say.")
                             zimage_resolved = ui.label().classes("text-sm opacity-70")
 
                             def show_zimage_variant(_=None):
@@ -12135,7 +12488,8 @@ def build_page(local: bool = True):
                                 .bind_visibility_from(w["multi_gpu"], "value", lambda x: x == "off")
                             w["devices"] = ui.input("Devices (first = primary)",
                                                     value=",".join(gpus[:2]) if len(gpus) > 1 else d.devices) \
-                                .classes("w-56").bind_visibility_from(w["multi_gpu"], "value", lambda x: x != "off")
+                                .classes("w-56").bind_visibility_from(w["multi_gpu"], "value", lambda x: x != "off") \
+                                .tooltip("The GPUs to use, comma separated (cuda:0,cuda:1). The first is the primary.")
                             w["split_plan"] = ui.input("Split plan (empty = auto-balance)", value=d.split_plan) \
                                 .classes("w-80").props('placeholder="cuda:0=0-25;cuda:1=26-41"') \
                                 .bind_visibility_from(w["multi_gpu"], "value", lambda x: x == "model_split") \
@@ -12164,11 +12518,15 @@ def build_page(local: bool = True):
                                          "of 1+1), so a step holds more images: lower the steps to match."))
                         with fields():
                             w["transformer_quant"] = ui.select(QUANTS, value="auto", label="Diffusion model quant") \
-                                .classes("w-48").tooltip("auto keeps the file's format; int8/int8_convrot/nvfp4 "
-                                                         "quantize on load")
+                                .classes("w-48").tooltip("auto keeps the file's format. none reads it up to bf16. "
+                                                         "int8, int8_convrot and nvfp4 quantize on load.")
                             w["text_encoder_quant"] = ui.select(QUANTS, value="auto", label="Text encoder quant") \
-                                .classes("w-48")
-                            w["gradient_checkpointing"] = ui.switch("Gradient checkpointing", value=True)
+                                .classes("w-48").tooltip("The same choices for the text encoder. auto keeps the "
+                                                         "file's format.")
+                            w["gradient_checkpointing"] = ui.switch("Gradient checkpointing", value=True) \
+                                .tooltip("Runs each block's forward a second time during the backward pass so its "
+                                         "activations need not be kept: much less memory for more compute. Leave it "
+                                         "on unless memory is plentiful.")
                             w["checkpoint_keep_blocks"] = ui.number("Blocks kept without recompute (-1 = auto)",
                                                                     value=d.checkpoint_keep_blocks, min=-1,
                                                                     precision=0).classes("w-64") \
@@ -12192,24 +12550,24 @@ def build_page(local: bool = True):
                                                                 value=d.block_swap_compile) \
                                 .bind_visibility_from(w["multi_gpu"], "value", lambda x: x == "off") \
                                 .tooltip("torch.compile the blocks even with block swap: each block's forward is "
-                                         "compiled and the swap's streaming runs outside it (OneTrainer compiles its "
-                                         "offloaded blocks this way). Could bring compile's 12-26% to runs that swap; "
-                                         "untested in RulZ AI Trainer, so compare the step time and the compile report "
+                                         "compiled and the swap's streaming runs outside it. Experimental and "
+                                         "untested in RulZ AI Trainer: compare the step time and the compile report "
                                          "with a run without it.")
                             w["activation_offload"] = ui.switch("Activation offloading (experimental)",
                                                                 value=d.activation_offload) \
                                 .bind_visibility_from(w["gradient_checkpointing"], "value") \
-                                .tooltip("Checkpointed blocks keep their inputs for the backward on the GPU: about "
-                                         "tokens x hidden x 2 bytes each, 0.8 GB over H3's 50 blocks at 1 MP "
-                                         "(estimate). This sends them to RAM during the forward and streams them "
-                                         "back ahead of each block's recomputation, so more blocks can keep their "
-                                         "activations or fewer need swapping, for extra PCIe traffic. Untested in "
-                                         "RulZ AI Trainer.")
+                                .tooltip("Checkpointed blocks keep their inputs for the backward on the GPU. This "
+                                         "sends them to RAM during the forward and streams them back ahead of each "
+                                         "block's recomputation, so more blocks can keep their activations or fewer "
+                                         "need swapping, for extra PCIe traffic. Experimental and untested in RulZ "
+                                         "AI Trainer.")
                         with advanced():
                             with fields():
                                 w["text_encoder_device"] = ui.select(["auto"] + gpus + ["cpu"], value="auto",
                                                                      label="Text encoder device (caching)") \
-                                    .classes("w-56")
+                                    .classes("w-56") \
+                                    .tooltip("Where the text encoder runs while the captions are cached. auto splits "
+                                             "it across the GPUs and the CPU as needed.")
                                 w["compile_model"] = ui.select(COMPILE_CHOICES, value=d.compile_model,
                                                                label="Compile model (torch.compile)").classes("w-72") \
                                     .tooltip("Fuses the work between the matrix multiplies into fewer GPU kernels. "
@@ -12224,10 +12582,17 @@ def build_page(local: bool = True):
                                         "compiling (a fresh vast.ai rental: put a file a rental made, its name ends "
                                         "in -linux.bin, in your model bucket's .rulz_compile folder). auto: "
                                         "<models folder>/.rulz_compile; a folder; or off.")
+                                w["oom_retries"] = ui.number("Out-of-memory retries (0 = off)", value=d.oom_retries,
+                                                             min=0, precision=0).classes("w-60") \
+                                    .tooltip("When a run ends because GPU or system memory ran out, the WebUI starts "
+                                             "it again by itself, before the next queued run: from its newest "
+                                             "training state, first on the same settings, then one step lighter "
+                                             "(checkpointing, kept blocks, block swap) if it runs out again at about "
+                                             "the same point. This many tries a run at most.")
                             with fields():
                                 w["int8_matmul"] = ui.select({True: "W8A8 int8 matmul (fast)",
                                                               False: "dequantize to bf16 (slow)"},
-                                                             value=True, label="int8 layers compute").classes("w-72") \
+                                                             value=d.int8_matmul, label="int8 layers compute").classes("w-72") \
                                     .tooltip("int8 / int8_convrot layers only. W8A8 quantizes the activations per "
                                              "token to int8 and multiplies them with the stored int8 weight "
                                              "(torch._int_mm), so the weight is never dequantized: about 1.2-1.5x "
@@ -12263,17 +12628,17 @@ def build_page(local: bool = True):
                                              "9% faster per step, LoRA gradients at cosine 0.93-0.99 to the exact "
                                              "ones, same loss over 20 steps. Noisier gradients: compare samples before "
                                              "a final run.")
-                                w["attention_backend"] = ui.select({"auto": "auto (cuDNN on RTX 50, else PyTorch's pick)",
+                                w["attention_backend"] = ui.select({"auto": "auto (cuDNN on RTX 40 and 50, else "
+                                                                            "PyTorch's pick)",
                                                                     "torch": "PyTorch picks", "cudnn": "cuDNN",
                                                                     "flash": "flash", "efficient": "memory-efficient",
                                                                     "math": "math (slow, exact)"},
                                                                    value=d.attention_backend, label="Attention kernel") \
                                     .classes("w-72") \
-                                    .tooltip("The attention kernel of the DiT blocks. cuDNN ran Krea 2 steps 15-22% "
-                                             "faster on an RTX 5060 Ti at the same loss, so auto puts it first on "
-                                             "Blackwell GPUs (RTX 50, B200) and lets PyTorch pick elsewhere. The other "
-                                             "kernels stay enabled behind the chosen one: a call it cannot take runs on "
-                                             "the next.")
+                                    .tooltip("The attention kernel of the DiT blocks. auto puts cuDNN first on RTX 40 "
+                                             "and RTX 50 cards (and B200), where it measured 5-22% faster per step, "
+                                             "and lets PyTorch pick elsewhere. The other kernels stay enabled behind "
+                                             "the chosen one: a call it cannot take runs on the next.")
 
                     # ---- Dataset
                     with sections.section("Basics", "Dataset", "Images, captions and resolution", "photo_library"):
@@ -12286,10 +12651,15 @@ def build_page(local: bool = True):
                         w["datasets"].value = [{"path": sp.path} for sp in d.dataset_specs() if Path(sp.path).is_dir()]
                         ds_native = _native_dialogs
 
+                        ds_counts: dict = {}  # path -> (images, captioned), for the Steps readout
+
                         async def refresh_datasets():
                             picker = w["datasets"]
                             picker.refresh(await run.io_bound(known_datasets, picker.selected))
-                            picker.set_counts(await run.io_bound(dataset_counts, picker.paths()))
+                            counts = await run.io_bound(dataset_counts, picker.paths())
+                            picker.set_counts(counts)
+                            ds_counts.update(counts)
+                            show_steps_note()
 
                         async def add_dataset_folder():
                             picked = await pick_path("dir", "", native=ds_native)
@@ -12353,8 +12723,14 @@ def build_page(local: bool = True):
                                                                    "stopping", value=d.step_up_stop_patience, min=1,
                                                                    precision=0).classes("w-96")
                         with fields():
-                            w["enable_buckets"] = ui.switch("Aspect-ratio buckets", value=True)
-                            w["flip_augment"] = ui.switch("Horizontal flip augment", value=False)
+                            w["enable_buckets"] = ui.switch("Aspect-ratio buckets", value=True) \
+                                .tooltip("On: each picture trains at the size nearest its own shape, at about the "
+                                         "resolution's pixel count; a centre crop trims the rest. Off: every picture "
+                                         "is centre-cropped to a square.")
+                            w["flip_augment"] = ui.switch("Horizontal flip augment", value=False) \
+                                .tooltip("Mirrors each picture half the time, from a second cached latent (the cache "
+                                         "doubles). Leave it off when the subject has a one-sided mark such as a mole "
+                                         "or tattoo.")
                             w["folder_repeats"] = ui.switch("Repeats from folder names", value=d.folder_repeats)                                 .tooltip("kohya style: a picture inside a sub-folder named like 10_portraits trains "
                                          "10 times per epoch, times its dataset's own repeats. The nearest folder "
                                          "named that way below the dataset's folder counts (the dataset folder "
@@ -12387,7 +12763,10 @@ def build_page(local: bool = True):
                         with advanced("Captions and cache"):
                             with fields():
                                 w["caption_dropout"] = ui.number("Caption dropout", value=d.caption_dropout, min=0,
-                                                                 max=0.5, step=0.01).classes("w-36")
+                                                                 max=0.5, step=0.01).classes("w-36") \
+                                    .tooltip("The chance, 0 to 0.5 (default 0.05), that a picture trains with its "
+                                             "caption dropped, so the model also learns without a prompt. What a "
+                                             "dropped caption becomes is set by the switch below.")
                                 w["caption_dropout_keep_trigger"] = ui.switch("Dropped captions keep the trigger word",
                                                                               value=d.caption_dropout_keep_trigger) \
                                     .tooltip("A dropped caption becomes the trigger word alone instead of the empty "
@@ -12400,13 +12779,18 @@ def build_page(local: bool = True):
                                 w["max_token_length"] = ui.number("Max caption tokens", value=d.max_token_length,
                                                                   min=64, max=4096, step=64, precision=0) \
                                     .classes("w-40")
-                                w["recache"] = ui.switch("Force re-cache", value=False)
+                                w["recache"] = ui.switch("Force re-cache", value=False) \
+                                    .tooltip("Rebuilds every cache (latents, text embeddings, face and body analysis, "
+                                             "region maps) instead of reusing what is on disk. Slow: use it only when "
+                                             "a cache looks wrong.")
                         subhead("Automatic crops (character LoRAs)")
                         with fields():
                             w["crop_augment"] = ui.select(["none", "face", "face+bust"], value=d.crop_augment,
                                                           label="Auto crops").classes("w-48") \
-                                .tooltip("Adds a face crop and/or a bust crop of every image with a detected face as "
-                                         "extra training items, with templated captions. Needs insightface.")
+                                .tooltip("Adds a face crop and/or a bust crop of each picture with a clearly detected "
+                                         "face as extra training items, with templated captions. A crop is skipped "
+                                         "when it would be upscaled or would cover most of the picture. Needs "
+                                         "insightface.")
 
                             async def on_crop_preview():
                                 crop_info.text = "Working..."
@@ -12434,40 +12818,106 @@ def build_page(local: bool = True):
                             with fields():
                                 w["crop_augment_min_px"] = ui.number("Min crop px (0 = resolution)",
                                                                      value=d.crop_augment_min_px, precision=0) \
-                                    .classes("w-48")
+                                    .classes("w-48") \
+                                    .tooltip("The smallest crop side, in pixels of the original picture. 0 uses the "
+                                             "training resolution, so a crop is never upscaled.")
                                 w["crop_face_scale"] = ui.number("Face crop x face size", value=d.crop_face_scale,
-                                                                 step=0.5).classes("w-44")
+                                                                 step=0.5).classes("w-44") \
+                                    .tooltip("The face crop's side as a multiple of the face box's longer side "
+                                             "(default 2.5).")
                                 w["crop_bust_scale"] = ui.number("Bust crop x face size", value=d.crop_bust_scale,
-                                                                 step=0.5).classes("w-44")
+                                                                 step=0.5).classes("w-44") \
+                                    .tooltip("The bust crop's side as a multiple of the face box's longer side, "
+                                             "centred below the face (default 5).")
                                 w["crop_augment_weight"] = ui.number("Crop sampling weight",
                                                                      value=d.crop_augment_weight, step=0.1) \
-                                    .classes("w-44")
+                                    .classes("w-44") \
+                                    .tooltip("How often the crops are drawn against the full pictures: 1 is the "
+                                             "same, 0.5 half as often.")
                             with fields():
                                 w["crop_face_caption"] = ui.input("Face crop caption ({caption}, {raw}, {trigger})",
-                                                                  value=d.crop_face_caption).classes("w-96 max-w-full")
+                                                                  value=d.crop_face_caption).classes("w-96 max-w-full") \
+                                    .tooltip("{caption} is the picture's caption, {raw} the same without the trigger "
+                                             "word, {trigger} the trigger word.")
                                 w["crop_bust_caption"] = ui.input("Bust crop caption", value=d.crop_bust_caption) \
-                                    .classes("w-96 max-w-full")
+                                    .classes("w-96 max-w-full") \
+                                    .tooltip("The same placeholders as the face crop caption.")
                                 w["crop_skip_face_frac"] = ui.number("Skip face crop if face > frac",
                                                                      value=d.crop_skip_face_frac, step=0.05) \
-                                    .classes("w-52")
+                                    .classes("w-52") \
+                                    .tooltip("No face crop when the face already covers more than this share of the "
+                                             "picture (default 0.15): it is a close-up.")
                                 w["crop_skip_cover"] = ui.number("Skip crop covering > frac",
-                                                                 value=d.crop_skip_cover, step=0.05).classes("w-52")
+                                                                 value=d.crop_skip_cover, step=0.05).classes("w-52") \
+                                    .tooltip("No crop that would cover more than this share of the picture (default "
+                                             "0.7): it would repeat the picture.")
                         crop_info = hint("")
                         crop_row = ui.row().classes("w-full gap-2")
 
                     # ---- LoRA
                     with sections.section("Basics", "LoRA", "Adapter size, layers and blocks", "hub"):
                         with fields():
+                            w["network_type"] = ui.select({"lora": "LoRA", "lokr": "LoKr", "oft": "OFT"},
+                                                          value=d.network_type, label="Adapter").classes("w-28") \
+                                .tooltip("LoRA: a rank-r pair per layer (rank, alpha). LoKr: a Kronecker pair, about "
+                                         "1/64 of the weights at factor 8, which gave the highest likeness and more "
+                                         "natural skin in Fizgig's tests, at ~20% slower steps. OFT: rotates each "
+                                         "layer's output channels in blocks instead of adding to the weights, which "
+                                         "keeps the base model's structure. LoKr and OFT are LyCORIS files that load "
+                                         "in ComfyUI; diffusers has no loader for them. Rank, alpha and LoRA+ are "
+                                         "LoRA-only.")
+                            w["lora_rank"] = ui.number("Rank", value=d.lora_rank, min=1, max=256, precision=0) \
+                                .classes("w-28") \
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "lora")
+                            w["lora_alpha"] = ui.number("Alpha", value=d.lora_alpha).classes("w-28") \
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "lora") \
+                                .tooltip("Scales the LoRA's output by alpha / rank, so alpha equal to rank is a scale "
+                                         "of 1. LoKr and OFT do not use it.")
+                            w["oft_block_size"] = ui.number("OFT block size", value=d.oft_block_size, min=2, max=256,
+                                                            precision=0).classes("w-36") \
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "oft") \
+                                .tooltip("Each layer's output channels are rotated in blocks of this size (the "
+                                         "largest divisor of the layer's outputs up to it). Larger blocks rotate more "
+                                         "channels together: more freedom and weights (32: about as many as a rank "
+                                         "16 LoRA on a square layer).")
+                            w["oft_constraint"] = ui.number("OFT constraint (0 = off)", value=d.oft_constraint, min=0,
+                                                            step=0.01).classes("w-48") \
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "oft") \
+                                .tooltip("COFT: caps how far each layer may rotate away from the base model (the "
+                                         "norm of its rotation generator), saved as the file's alpha, which ComfyUI "
+                                         "applies the same way. 0 = no cap.")
+                            w["oft_scaled_lr"] = ui.checkbox("Scaled OFT lr (experimental)", value=d.oft_scaled_lr) \
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "oft") \
+                                .tooltip("An lr per block size, so every block size moves about as far per step as "
+                                         "a block of 32 (OneTrainer's Scaled OFT). Off, a block of 64 steps about "
+                                         "twice as far as one of 16 at the same lr, which skews a race of block "
+                                         "sizes. Block 32 is unchanged. Untested in RulZ AI Trainer.")
+                            w["lokr_factor"] = ui.number("LoKr factor", value=d.lokr_factor, min=1, max=64,
+                                                         precision=0).classes("w-32") \
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "lokr") \
+                                .tooltip("w1 is [a, b] with a and b the largest divisors of each layer's output / "
+                                         "input size that are <= the factor; w2 holds the rest. Lower = more "
+                                         "capacity and bigger files (8: ~400 MB on a 12B model, 16: ~100 MB). "
+                                         "Fizgig found no quality gain above 8.")
+                            w["dora"] = ui.switch("DoRA", value=d.dora) \
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x != "oft") \
+                                .tooltip("Weight-decomposed LoRA / LoKr: each layer's weight is split into a "
+                                         "direction (the adapter changes it) and a magnitude per input channel that "
+                                         "trains on its own. Saved as dora_scale keys that ComfyUI applies; "
+                                         "diffusers cannot read them. Each step also computes the layer's norm from "
+                                         "its full weight: steps about 40% slower (Krea 2).")
+                            w["lora_plus_ratio"] = ui.number("LoRA+ ratio (0 = off, 16 = paper)",
+                                                             value=d.lora_plus_ratio, step=1).classes("w-60") \
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "lora") \
+                                .tooltip("lora_up learns at the learning rate x this ratio, which converges faster. "
+                                         "LoRA only; Automagic, Keel and Hull ignore it.")
+                        with fields():
                             w["finetune"] = ui.switch("Fine-tune the whole model, then extract a LoRA",
                                                       value=d.finetune).tooltip(
-                                "Trains the target layers' own weights instead of an adapter (no rank bottleneck), "
-                                "by rotation: the model stays as loaded (int8 / nvfp4 / bf16), one window of layers "
-                                "at a time is held in fp32 and trained for N epochs, then written back as a bf16 "
-                                "delta in RAM and re-quantized. Saves extract a LoRA of the chosen rank from the "
-                                "deltas, at cycle boundaries. Fizgig measured: an extracted LoRA beat one trained at "
-                                "the same rank; rank 64 matched the full checkpoint. Needs a low learning rate "
-                                "(1e-5) and a long run; not with a race, data parallel, torch.compile, the weight "
-                                "average or the region prior.")
+                                "Trains the target layers' own weights instead of an adapter. One window of layers at "
+                                "a time is held in fp32 and trained for a few epochs, then written back; saves "
+                                "extract a LoRA of the chosen rank from the changes. Needs a much lower learning "
+                                "rate (1e-5) and a long run.")
                         with fields() as ft_fields:
                             w["finetune_rotate_epochs"] = ui.number("Epochs per window", value=d.finetune_rotate_epochs,
                                                                     min=0.05, step=0.5).classes("w-40") \
@@ -12507,9 +12957,12 @@ def build_page(local: bool = True):
                             if not e.value:
                                 ft_hint.text = ""
                                 return
-                            ft_hint.text = ("Rank, alpha, the adapter kind, LoRA+ and dropout do not apply to a "
-                                            "fine-tune; the target layers and blocks do. A fine-tune wants a much "
-                                            "lower learning rate than a LoRA.")
+                            ft_hint.text = ("Rank, alpha, the adapter kind and LoRA+ do not apply to a fine-tune; "
+                                            "the target layers and blocks do. It wants a much lower learning rate "
+                                            "than a LoRA. Refused at the start, among others: a race, data parallel, "
+                                            "Resume from LoRA weights, the region prior, LoRA Isolation, DoRA, block "
+                                            "swap, a regularisation folder and reward steps. torch.compile is turned "
+                                            "off and the weight average is not kept.")
                             if float(w["learning_rate"].value or 0) > 5e-5:
                                 w["learning_rate"].value = 1e-5
                                 w["optimizer"].value = "adafactor"
@@ -12518,74 +12971,13 @@ def build_page(local: bool = True):
 
                         w["finetune"].on_value_change(on_finetune)
                         with fields():
-                            w["network_type"] = ui.select({"lora": "LoRA", "lokr": "LoKr", "oft": "OFT"},
-                                                          value=d.network_type, label="Adapter").classes("w-28") \
-                                .tooltip("LoRA: a rank-r pair per layer (rank, alpha). LoKr: a Kronecker pair, w1 "
-                                         "up to factor x factor and w2 the rest (about 1/64 of the weights at "
-                                         "factor 8, Fizgig's measured default: its highest likeness, more natural "
-                                         "skin, ~20% slower steps). OFT: rotates each layer's output channels in "
-                                         "blocks instead of adding to the weights, which keeps the base model's "
-                                         "structure; the OFT paper found it held a subject's identity better than "
-                                         "LoRA and stayed stable in long runs. LoKr and OFT are LyCORIS files that "
-                                         "load in ComfyUI (Krea 2 included); diffusers has no loader for them. Rank, "
-                                         "alpha, LoRA+ and dropout are LoRA-only.")
-                            w["lora_rank"] = ui.number("Rank", value=d.lora_rank, min=1, max=256, precision=0) \
-                                .classes("w-28") \
-                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "lora")
-                            w["lora_alpha"] = ui.number("Alpha", value=d.lora_alpha).classes("w-28") \
-                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "lora")
-                            w["oft_block_size"] = ui.number("OFT block size", value=d.oft_block_size, min=2, max=256,
-                                                            precision=0).classes("w-36") \
-                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "oft") \
-                                .tooltip("Each layer's output channels are rotated in blocks of this size (the "
-                                         "largest divisor of the layer's outputs up to it). Larger blocks rotate more "
-                                         "channels together: more freedom and weights (32: about as many as a rank "
-                                         "16 LoRA on a square layer).")
-                            w["oft_constraint"] = ui.number("OFT constraint (0 = off)", value=d.oft_constraint, min=0,
-                                                            step=0.01).classes("w-48") \
-                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "oft") \
-                                .tooltip("COFT: caps how far each layer may rotate away from the base model (the "
-                                         "norm of its rotation generator), saved as the file's alpha, which ComfyUI "
-                                         "applies the same way. 0 = no cap.")
-                            w["oft_scaled_lr"] = ui.checkbox("Scaled OFT lr (experimental)", value=d.oft_scaled_lr) \
-                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "oft") \
-                                .tooltip("An lr per block size, so every block size moves about as far per step as "
-                                         "a block of 32 (OneTrainer's Scaled OFT). Off, a block of 64 steps about "
-                                         "twice as far as one of 16 at the same lr, which skews a race of block "
-                                         "sizes. Block 32 is unchanged. Untested in RulZ AI Trainer.")
-                            w["lokr_factor"] = ui.number("LoKr factor", value=d.lokr_factor, min=1, max=64,
-                                                         precision=0).classes("w-32") \
-                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "lokr") \
-                                .tooltip("w1 is [a, b] with a and b the largest divisors of each layer's output / "
-                                         "input size that are <= the factor; w2 holds the rest. Lower = more "
-                                         "capacity and bigger files (8: ~400 MB on a 12B model, 16: ~100 MB). "
-                                         "Fizgig found no quality gain above 8.")
-                            w["dora"] = ui.switch("DoRA", value=d.dora) \
-                                .bind_visibility_from(w["network_type"], "value", lambda x: x != "oft") \
-                                .tooltip("Weight-decomposed LoRA / LoKr: each layer's weight is split into a "
-                                         "direction (the adapter changes it) and a magnitude per input channel that "
-                                         "trains on its own. Saved as dora_scale keys that ComfyUI applies; "
-                                         "diffusers cannot read them. Each step also computes the layer's norm from "
-                                         "its full weight: steps about 40% slower (Krea 2).")
-                            w["lora_plus_ratio"] = ui.number("LoRA+ ratio (0 = off, 16 = paper)",
-                                                             value=d.lora_plus_ratio, step=1).classes("w-60") \
-                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "lora") \
-                                .tooltip("lora_up learns at lr x ratio (faster convergence); ignored by automagic3/4")
-                            w["lora_save_dtype"] = ui.select(["bf16", "fp16", "fp32"], value=d.lora_save_dtype,
-                                                             label="Save LoRA as").classes("w-36")
-                        with fields():
                             w["adapter_mode"] = ui.select(ADAPTER_MODES, value="auto", label="Training adapter") \
                                 .classes("w-96") \
-                                .tooltip("A LoRA that stays on while your LoRA trains and off for samples and probes, "
-                                         "never saved into it, so your LoRA works on the plain model. Qwen-Image "
-                                         "2.1's is Fizgig's (downloaded, 80 MB): without one its LoRAs collapse "
-                                         "into texture or wobble part-way (likeness 77 with it, 56 without). "
-                                         "MiniMax H3's are ostris' v3 adapters, one for FL2VA and one for "
-                                         "Ref2VA (0.31 GB each), P-H3-Image's and MiniMax-H3-Image's are ostris' "
-                                         "adapters for them (0.16 GB each). Z-Image Turbo's default is Fizgig's (70 MB; ostris' v2 "
-                                         "works as a file); Z-Image Base uses none. The other models have none of "
-                                         "their own; a file "
-                                         "works on any.")
+                                .tooltip("A LoRA that stays on while your LoRA trains and is off for samples and "
+                                         "probes, never saved into yours, so yours works on the plain model. auto "
+                                         "downloads the model's own: Qwen-Image 2.1, MiniMax H3, P-H3-Image, "
+                                         "MiniMax-H3-Image and Z-Image Turbo have one; Z-Image Base and the other "
+                                         "models use none. A file works on any model.")
                             path_input(f, "training_adapter", "Training adapter file", "file", "", "w-[30rem]")
                             f.w["training_adapter"].parent_slot.parent.bind_visibility_from(w["adapter_mode"], "value",
                                                                                             lambda x: x == "file")
@@ -12710,13 +13102,6 @@ def build_page(local: bool = True):
                                     .classes("w-80")
                                 w["keep_states"] = ui.number("States to keep (rolling, 0 = all)", value=d.keep_states,
                                                              precision=0).classes("w-60")
-                                w["oom_retries"] = ui.number("Out-of-memory retries (0 = off)", value=d.oom_retries,
-                                                             min=0, precision=0).classes("w-60") \
-                                    .tooltip("When a run ends because GPU or system memory ran out, the WebUI starts "
-                                             "it again by itself, before the next queued run: from its newest "
-                                             "training state, first on the same settings, then one step lighter "
-                                             "(checkpointing, kept blocks, block swap) if it runs out again at about "
-                                             "the same point. This many tries a run at most")
                             path_input(f, "resume_state", "Resume from training state folder (state_XXXXXX, optional)",
                                        "dir", "", "w-[40rem]")
 
@@ -12724,33 +13109,39 @@ def build_page(local: bool = True):
                     with sections.section("Basics", "Optimization", "Steps, learning rate, optimizer and timesteps",
                                           "speed"):
                         with fields():
-                            w["steps"] = ui.number("Steps", value=d.steps, precision=0).classes("w-28")
-                            w["batch_size"] = ui.number("Batch size", value=d.batch_size, precision=0).classes("w-28")
+                            w["steps"] = ui.number("Steps", value=d.steps, precision=0).classes("w-28") \
+                                .tooltip("How many training steps the run takes. One step trains Batch size x Grad "
+                                         "accumulation pictures (times the GPUs in data parallel).")
+                            w["batch_size"] = ui.number("Batch size", value=d.batch_size, precision=0).classes("w-28") \
+                                .tooltip("Pictures trained in one pass of the model. More uses more memory; with Grad "
+                                         "accumulation, one step holds Batch size x Grad accumulation pictures.")
                             w["learning_rate"] = ui.number("Learning rate", value=d.learning_rate, format="%.2e",
-                                                           step=1e-5).classes("w-36")
+                                                           step=1e-5).classes("w-36") \
+                                .tooltip("How far each step moves the LoRA. Automagic and Keel only start from it and "
+                                         "tune their own; Hull uses its own step instead (Hull step).")
                             w["optimizer"] = ui.select(list(OPTIMIZERS), value="adamw8bit", label="Optimizer") \
-                                .classes("w-40")
+                                .classes("w-40") \
+                                .tooltip("adamw and adamw8bit (8-bit state, less memory) are the standard; adafactor is "
+                                         "what a fine-tune uses. automagic3, automagic4 and the keel family tune "
+                                         "their own learning rate; hull moves each layer by a share of its own weight.")
                             # a family rule can hang on the optimizer (SDXL's Keel face gain): check them again
                             w["optimizer"].on_value_change(
                                 lambda _: None if getattr(f, "family_released", False) else f.apply_family_support())
                             w["lr_scheduler"] = ui.select(list(LR_SCHEDULERS), value=d.lr_scheduler,
                                                           label="LR schedule").classes("w-40") \
                                 .tooltip("constant keeps the rate. cosine, linear and rex fall from the rate toward the "
-                                         "final share, reaching it at the end of the run (the last update is a "
-                                         "step short of it; rex stays higher for longer, then drops "
-                                         "fast; Chen et al. 2021). cosine_restarts runs the cosine fall several "
-                                         "times, jumping back to the full rate each time. Automagic and Keel "
-                                         "ignore the schedule.")
+                                         "final share, reaching it at the end of the run (rex stays higher for "
+                                         "longer, then drops fast). cosine_restarts runs the cosine fall several "
+                                         "times, jumping back to the full rate each time.")
                             w["warmup_steps"] = ui.number("Warmup steps", value=d.warmup_steps, precision=0) \
                                 .classes("w-32") \
-                                .tooltip("Steps the rate climbs from near 0 to its full value. Ignored when the "
-                                         "warm-up share is above 0.")
+                                .tooltip("Steps the rate climbs from near 0 to its full value. Used only when the "
+                                         "warm-up share is 0.")
                             w["warmup_fraction"] = ui.number("Warm-up share (0 = use steps)",
                                                              value=d.warmup_fraction, min=0, max=0.5, step=0.01) \
                                 .classes("w-48") \
                                 .tooltip("0 to 0.5. Above 0, the warm-up is this share of the Steps (0.05 of 2000 "
-                                         "is 100 steps) and replaces Warmup steps. A Warmup steps value like 1 is "
-                                         "one step, never 100%.")
+                                         "is 100 steps) and replaces Warmup steps.")
                             w["lr_min_factor"] = ui.number("Final lr share", value=d.lr_min_factor, min=0, max=1,
                                                            step=0.05).classes("w-32") \
                                 .bind_visibility_from(w["lr_scheduler"], "value", lambda x: x != "constant") \
@@ -12761,6 +13152,42 @@ def build_page(local: bool = True):
                                 .bind_visibility_from(w["lr_scheduler"], "value", lambda x: x == "cosine_restarts") \
                                 .tooltip("cosine_restarts: how many cosine falls the steps after the warm-up are "
                                          "split into; each starts again at the full rate.")
+                        steps_note = hint("")  # the epochs the steps come to, from the ticked datasets' counts
+                        steps_note.visible = False
+                        schedule_why = hint("")  # why the schedule, warm-up and final share are greyed out
+                        schedule_why.visible = False
+
+                        def show_steps_note(_=None):
+                            picker, entries = w["datasets"], []
+                            for r in picker.rows.values():
+                                if not r["use"].value:
+                                    continue
+                                counted = ds_counts.get(r["path"])
+                                if counted is None:  # a ticked dataset not counted yet: the readout waits
+                                    entries = []
+                                    break
+                                entries.append((counted[0], r["rep"].value or 1, r["smp"].value or 0))
+                            gpus_in_use = (len([x for x in str(w["devices"].value or "").split(",") if x.strip()])
+                                           if w["multi_gpu"].value == "data_parallel" else 1)
+                            text = steps_readout(w["steps"].value, w["batch_size"].value,
+                                                 w["gradient_accumulation"].value, gpus_in_use, entries,
+                                                 crops=(w["crop_augment"].value or "none") != "none") \
+                                if entries else ""
+                            steps_note.text = text
+                            steps_note.visible = bool(text)
+
+                        def show_schedule_why(_=None):
+                            try:
+                                lr = float(w["learning_rate"].value or 0)
+                            except (TypeError, ValueError):
+                                lr = 0.0
+                            sync_schedule(SimpleNamespace(
+                                optimizer=w["optimizer"].value or "adamw", learning_rate=lr,
+                                isolation=bool(w["isolation"].value) if "isolation" in w else False,
+                                dop_weight=float(w["dop_weight"].value or 0) if "dop_weight" in w else 0.0),
+                                [w["lr_scheduler"], w["warmup_steps"], w["warmup_fraction"], w["lr_min_factor"],
+                                 w["lr_cycles"]], schedule_why)
+
                         alpha_note = hint("")  # only while a LoRA's alpha differs from its rank
                         alpha_note.visible = False
                         w["lr_alpha_scale"] = ui.checkbox("Scale LR to alpha = rank", value=d.lr_alpha_scale) \
@@ -12823,25 +13250,27 @@ def build_page(local: bool = True):
                                          "it off unless you are testing it. Body parts finds skin, hair and clothes in "
                                          "each photo and pushes the update harder on body skin and the body's outline. "
                                          "The face keeps its own share. It scans the photos once, turns torch.compile "
-                                         "off, and refuses flip augmentation and region-weighted loss.")
+                                         "off, and refuses flip augmentation, region-weighted loss and data "
+                                         "parallel.")
                             w["hull_gain_body"] = ui.number("Hull body gain", value=d.hull_gain_body, min=0.5, max=2,
                                                             step=0.1).classes("w-32") \
                                 .bind_visibility_from(w["hull_regions"], "value", lambda x: x == "parts") \
                                 .tooltip("How much harder body cells push the update. 1 changes nothing.")
                         with ui.column().classes("w-full gap-2").bind_visibility_from(
                                 w["optimizer"], "value", lambda x: x in AUTOMAGIC):
-                            hint("Automagic tunes its own learning rate (the learning rate above is its start); LR "
-                                 "schedule and warmup are ignored. Automagic 4 also caps the step of the most "
-                                 "sensitive weights and its rate holds on noise instead of drifting up. Keel is "
-                                 "Automagic 4 plus the LoRA gauge preconditioner and the cautious mask below. "
-                                 "keel3 / keel3_fb put Keel on Automagic 3 instead: no sensitivity cap, no Vote "
-                                 "or Max lr change setting below (never run on a real model). "
-                                 "Keel, from real tests: use one lr for every layer; the Max lr made no measurable "
-                                 "difference from 3e-4 to 1e-3; and 1000 steps was not yet enough, so plan on more. "
-                                 "The other Keel settings are not measured yet (docs/keel-test-results.md).")
+                            hint("Automagic tunes its own learning rate: the learning rate above is its start, and the "
+                                 "schedule and warm-up are ignored. Automagic 4 also caps the step of the most "
+                                 "sensitive weights. Keel is Automagic 4 plus a LoRA preconditioner, a cautious "
+                                 "mask, noise bands and a consensus gate. keel3 and keel3_fb use Automagic 3's "
+                                 "controller instead (no sensitivity cap, no Vote or Max lr change; never run on a "
+                                 "real model). From real tests: use one lr for every layer; Max lr made no "
+                                 "difference from 3e-4 to 1e-3; 1000 steps was not yet enough. The other Keel "
+                                 "settings below are not measured yet: race them (docs/keel-test-results.md).")
                             with fields():
                                 w["automagic_min_lr"] = ui.number("Min lr", value=d.automagic_min_lr, format="%.1e") \
-                                    .classes("w-32")
+                                    .classes("w-32") \
+                                    .tooltip("The floor of the self-tuned rate. When it is not below the learning "
+                                             "rate, a fifth of the learning rate is the floor.")
                                 w["automagic_max_lr"] = ui.number("Max lr", value=d.automagic_max_lr, format="%.1e") \
                                     .classes("w-32") \
                                     .tooltip("The ceiling of the self-tuned rate. Keel climbs to the default 1e-3 by "
@@ -12909,13 +13338,10 @@ def build_page(local: bool = True):
                                              "normalisation needs, and what makes the micro-batches comparable.")
                                 w["keel_bands"] = ui.number("Noise bands", value=d.keel_bands, min=1, max=64,
                                                             precision=0).classes("w-32") \
-                                    .tooltip("Bands over the noise level (logit sigma from -4 to 4, so sigma 0.02 to "
-                                             "0.98 in 8 bands). Each weight tensor keeps the gradient power it sees "
-                                             "per band, and a step's gradient enters the optimizer at the tensor's "
-                                             "overall scale whatever its band, so the quiet bands (where the face "
-                                             "forms) are not drowned by the loud ones. 1 = off. Needs paired sigma "
-                                             "or one micro-batch per step; the per-band imbalance is logged every "
-                                             "250 steps.")
+                                    .tooltip("Splits the noise level (logit sigma -4 to 4) into this many bands. Each "
+                                             "weight tensor keeps the gradient power it sees per band, so the quiet "
+                                             "bands, where the face forms, are not drowned by the loud ones. 1 = "
+                                             "off; the default is 8. Needs paired sigma or one micro-batch per step.")
                                 w["keel_band_weights"] = ui.input("Band weights", value=d.keel_band_weights,
                                                                   placeholder="flat").classes("w-56") \
                                     .tooltip("A multiplier on the step's update per band: empty = 1 everywhere, "
@@ -12924,13 +13350,11 @@ def build_page(local: bool = True):
                                              "0.82, for keel_fb / keel3_fb), or one number per band, comma-separated.")
                                 w["keel_consensus"] = ui.number("Consensus gate", value=d.keel_consensus, min=0, max=1,
                                                                 step=0.1, format="%.2f").classes("w-32") \
-                                    .tooltip("Cross-photo consensus (the AND-mask, ICLR 2021): each weight's update "
-                                             "is scaled by (1 - c) + c x (agreement share)^power, the share being "
-                                             "how many of the step's gradients (micro-batches, the DOP pass) agree "
-                                             "on its sign, so what every photo shares (the face) moves and what "
-                                             "varies between them (outfit, background, light) moves less. 0 = off, "
-                                             "1 = only unanimous elements move. Needs gradient accumulation of 2 or "
-                                             "more; paired sigma keeps the noise level out of the disagreement.")
+                                    .tooltip("Scales each weight's update by how many of the step's gradients agree on "
+                                             "its sign, so what every photo shares (the face) moves and what varies "
+                                             "(outfit, background, light) moves less. 0 = off, 1 = only unanimous "
+                                             "elements move; the default is 0.5. Needs gradient accumulation of 2 or "
+                                             "more.")
                                 w["keel_consensus_power"] = ui.number("Consensus power", value=d.keel_consensus_power,
                                                                       min=0.1, max=8, step=0.5, format="%.1f") \
                                     .classes("w-32") \
@@ -12942,19 +13366,15 @@ def build_page(local: bool = True):
                                                                       "magnitude": "magnitude: votes weighted by size"},
                                                                      value=d.keel_consensus_mode,
                                                                      label="Consensus vote").classes("w-72") \
-                                    .tooltip("How the step's gradients vote on an element. sign: each micro-batch "
-                                             "one vote (1 byte per weight for the step). magnitude: each weighted by "
-                                             "the size of its gradient (the sum's size over the sum of the sizes), so "
-                                             "a photo that says little about a weight (a face crop, for the weights "
-                                             "serving the body) barely votes instead of casting a random one (4 "
-                                             "bytes per weight for the step).")
+                                    .tooltip("How the step's gradients vote on an element. sign: one vote per "
+                                             "micro-batch. magnitude: votes weighted by gradient size, so a photo "
+                                             "that says little about a weight barely votes (it stores 4 bytes per "
+                                             "weight for the step against sign's 1).")
                                 w["keel_lookahead"] = ui.switch("Lookahead", value=d.keel_lookahead) \
-                                    .tooltip("Probe-gated lookahead: the weights that scored a new best likeness "
-                                             "(by the noise band) become the anchor; after the grace probes without "
-                                             "a gain the weights are pulled part of the way back toward the anchor "
-                                             "and the learning rate is cut, so a run that wanders off its best is "
-                                             "damped to it. Needs likeness probes (face refs). Not measured yet: leave it "
-                                             "off, and race it as its own row.")
+                                    .tooltip("The weights that scored a new best likeness become an anchor; after the "
+                                             "grace probes without a gain the weights are pulled part of the way "
+                                             "back toward it and the learning rate is cut. Needs likeness probes "
+                                             "(face refs). Off by default.")
                                 w["keel_lookahead_pullback"] = ui.number("Pull-back", value=d.keel_lookahead_pullback,
                                                                          min=0.05, max=1, step=0.05, format="%.2f") \
                                     .classes("w-32") \
@@ -12969,12 +13389,10 @@ def build_page(local: bool = True):
                                              "pull or an accept.")
                                 w["keel_face_gain"] = ui.number("Face gain", value=d.keel_face_gain, min=0, max=4,
                                                                 step=0.25, format="%.2f").classes("w-32") \
-                                    .tooltip("Face-token gain: each LoRA pair's step is scaled by (the share of its "
-                                             "gradient that comes from the face's tokens / the median pair's share) "
-                                             "to this power, so the weights serving the face move more and the "
-                                             "background's less. Needs region maps with faces (face detection). "
-                                             "0 = off; not measured yet, so race it at 0.5 and 1. keel_fb / keel3_fb measure the "
-                                             "body's tokens too (Body weight).")
+                                    .tooltip("Scales each LoRA pair's step by how much of its gradient comes from the "
+                                             "face's tokens, so the weights serving the face move more and the "
+                                             "background's less. Needs region maps with faces. 0 = off; try 0.5. "
+                                             "keel_fb and keel3_fb measure the body's tokens too (Body weight).")
                                 w["keel_face_gain_max"] = ui.number("Face gain limit", value=d.keel_face_gain_max,
                                                                     min=1, max=10, step=0.5, format="%.1f") \
                                     .classes("w-32").tooltip("The gain stays within [1 / limit, limit].")
@@ -12986,27 +13404,23 @@ def build_page(local: bool = True):
                             with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x in KEEL_FB):
                                 w["keel_body_weight"] = ui.number("Body weight", value=d.keel_body_weight, min=0, max=4,
                                                                   step=0.25, format="%.2f").classes("w-32") \
-                                    .tooltip("keel_fb / keel3_fb: the body tokens' weight against the face's in the token gain "
-                                             "(the person's cells outside the face box, from the person masks). Each "
-                                             "region's share is measured against its own median pair and the two are "
-                                             "combined as a weighted geometric mean, so a step of person-only photos "
-                                             "moves the gain by the body alone and face crops by the face alone. 1 = "
-                                             "equal; 0 = face only. Needs Face gain above 0 (off by default: then "
-                                             "the _fb names differ from their plain versions by the consensus vote alone). Set the probes' "
-                                             "face and body weights equal too. Not measured yet: race keel_fb / keel3_fb against "
-                                             "keel with gradient accumulation of 2 or more, or the two are alike.")
+                                    .tooltip("keel_fb and keel3_fb: the body tokens' weight against the face's in the token "
+                                             "gain. 1 = equal (the default); 0 = face only. Needs Face gain above 0; "
+                                             "without it the _fb names differ from their plain versions by the "
+                                             "consensus vote alone. Set the probes' face and body weights equal too.")
                         with advanced("Timesteps, loss weighting and gradients"):
                             with fields():
                                 w["gradient_accumulation"] = ui.number("Grad accumulation",
                                                                        value=d.gradient_accumulation,
                                                                        precision=0).classes("w-40")
                                 w["max_grad_norm"] = ui.number("Max grad norm (0 = off)", value=d.max_grad_norm) \
-                                    .classes("w-44")
+                                    .classes("w-44") \
+                                    .tooltip("A step's gradients are scaled down when their combined size is above "
+                                             "this (the default is 1). 0 turns the clip off. Hull ignores it.")
                                 w["weight_decay"] = ui.number("Weight decay", value=d.weight_decay, format="%.1e",
                                                               step=1e-5, min=0).classes("w-36") \
-                                    .tooltip("AdamW-style decay of the trained weights (the trainer's default 0.01). "
-                                             "The MOSS-Image wizard uses 1e-4: its users ran 5e-5 to 2e-4. A fine-tune "
-                                             "and some optimizers (Automagic, Hull) ignore it.")
+                                    .tooltip("Decay of the trained weights. Hull ignores it. A full fine-tune uses "
+                                             "Pull toward the original instead.")
                                 w["loss_weighting"] = ui.select(["none", "min_snr", "sigma_sqrt"], value="none",
                                                                 label="Loss weighting").classes("w-40")
                                 w["loss_type"] = ui.select(["mse", "band"], value=d.loss_type, label="Loss type")                                     .classes("w-32")                                     .tooltip("mse: the plain loss. band (experimental, from AI-Toolkit): splits each "
@@ -13020,12 +13434,12 @@ def build_page(local: bool = True):
                                                                     "content", "style", "logsnr", "reference"],
                                                                    value=d.timestep_sampling,
                                                                    label="Timestep sampling").classes("w-44") \
-                                    .tooltip("identity: logit-normal mean -0.5 (detail/low noise). content: sigma = u^p "
-                                             "toward low noise (ai-toolkit style). style: mirror toward high noise. "
-                                             "reference: the model family's own training recipe (Bria's for FIBO 2.0, "
-                                             "the MOSS-Image report's for MOSS). logsnr: the style-friendly sampler "
-                                             "(log-SNR ~ N(mean, std), mean -6: mostly very noisy steps, where style is "
-                                             "learned; for style LoRAs).")
+                                    .tooltip("How noise levels are drawn for training. logit_normal (default): a bell "
+                                             "curve that favours the middle levels, set by Logit mean and std. "
+                                             "sigmoid: the same with a single scale. uniform: every level equally. "
+                                             "identity: a bell centred on low noise (detail). content: toward low "
+                                             "noise; style: toward high. logsnr: mostly very noisy steps, for style "
+                                             "LoRAs. reference: the model family's own recipe.")
                                 w["logsnr_mean"] = ui.number("Log-SNR mean", value=d.logsnr_mean, step=0.5) \
                                     .classes("w-32").bind_visibility_from(w["timestep_sampling"], "value",
                                                                           lambda x: x == "logsnr")
@@ -13036,9 +13450,13 @@ def build_page(local: bool = True):
                                     .classes("w-32").bind_visibility_from(w["timestep_sampling"], "value",
                                                                           lambda x: x in ("content", "style"))
                                 w["sigma_min"] = ui.number("Sigma min", value=d.sigma_min, min=0, max=1, step=0.05) \
-                                    .classes("w-28")
+                                    .classes("w-28") \
+                                    .tooltip("The lowest noise level trained on, 0 to 1 (0 = a clean picture; the "
+                                             "default). The drawn levels are rescaled into min to max.")
                                 w["sigma_max"] = ui.number("Sigma max", value=d.sigma_max, min=0, max=1, step=0.05) \
-                                    .classes("w-28")
+                                    .classes("w-28") \
+                                    .tooltip("The highest noise level trained on, 0 to 1 (1 = pure noise; the "
+                                             "default). The drawn levels are rescaled into min to max.")
                                 w["sigmoid_scale"] = ui.number("Sigmoid scale", value=d.sigmoid_scale).classes("w-32") \
                                     .bind_visibility_from(w["timestep_sampling"], "value", lambda x: x == "sigmoid")
                                 w["logit_mean"] = ui.number("Logit mean", value=d.logit_mean).classes("w-32") \
@@ -13070,24 +13488,21 @@ def build_page(local: bool = True):
                                     .classes("w-64").tooltip(
                                         "The share of training steps at the clean end (noise below half), where faces "
                                         "and fine detail are refined; the sampling curve above is moved to hit it. "
-                                        "40 = 40% all run. 75:5:40 = 75% for 5 epochs, then 40%. A list with "
-                                        "commas gives each epoch its own share, the last held: 16.67,75,33.33,75,50,75. "
-                                        "60:7:30:8:3 = "
-                                        "Fizgig's MOSS-Image Slide: 60% until epoch 7, 30% at epoch 8, then 60% with "
-                                        "every 3rd epoch at 30%, at half the learning rate. A full fine-tune counts "
-                                        "rotations instead of epochs (Slide FT: 11:4:30:8:2). MiniMax-H3-Image "
-                                        "trains at 6 fixed noise levels only: there it is the share of steps at the "
-                                        "last one (0.232).")
+                                        "40 = 40% all run. 75:5:40 = 75% for 5 epochs, then 40%. Commas give each "
+                                        "epoch its own share, the last held: 16.67,75,33.33,75,50,75. A full "
+                                        "fine-tune counts rotations, not epochs. MiniMax-H3-Image: the share at its "
+                                        "last fixed noise level. The buttons fill in presets.")
                                 ui.button("Slide", on_click=lambda: w["clean_share"].set_value(CLEAN_SLIDE)) \
-                                    .props("flat dense").tooltip("Fizgig's MOSS-Image LoRA default until 8 November "
-                                                                 "2026, 60:7:30:8:3 (measured on AdamW)")
+                                    .props("flat dense").tooltip("Fizgig's MOSS-Image Slide, 60:7:30:8:3: 60% until "
+                                                                 "epoch 7, 30% at epoch 8, then 60% with every 3rd "
+                                                                 "epoch at 30%, at half the learning rate. Measured "
+                                                                 "on AdamW.")
                                 ui.button("Slide Muon",
                                           on_click=lambda: w["clean_share"].set_value(CLEAN_SLIDE_MUON)) \
                                     .props("flat dense").tooltip(
-                                        "Fizgig's MOSS-Image LoRA default since 10 November 2026, 11:7:40:8:3: 11% "
-                                        "until epoch 7, 40% from epoch 8, every 3rd epoch at 11% at half the learning "
-                                        "rate. Tuned for Muon, together with a face boost RulZ AI Trainer does not have; "
-                                        "not measured here")
+                                        "Fizgig's Slide for Muon, 11:7:40:8:3: 11% until epoch 7, 40% from epoch 8, "
+                                        "every 3rd epoch at 11% at half the learning rate. Made together with a face "
+                                        "boost RulZ AI Trainer does not have; not measured here.")
                                 ui.button("Slide FT", on_click=lambda: w["clean_share"].set_value(CLEAN_SLIDE_FT)) \
                                     .props("flat dense").tooltip("Fizgig's MOSS-Image full fine-tune default, "
                                                                  "11:4:30:8:2 (rotations)")
@@ -13127,6 +13542,38 @@ def build_page(local: bool = True):
                                             "content_power", "sigma_min", "sigma_max", "timestep_shift",
                                             "resolution_shift", "clean_share"):
                                     w[key].on_value_change(clean_hint_update)
+                            with fields():
+                                w["weight_noise"] = ui.number("Weight noise sigma (0 = off)", value=d.weight_noise,
+                                                              min=0, max=0.1, step=0.0025, format="%.4f") \
+                                    .classes("w-56").tooltip(WEIGHT_NOISE_TIP)
+                                w["weight_noise_mode"] = ui.select({"relative": "Relative", "absolute": "Absolute"},
+                                                                   value=d.weight_noise_mode,
+                                                                   label="Weight noise mode") \
+                                    .classes("w-44").tooltip(WEIGHT_NOISE_MODE_TIP)
+                                w["weight_noise_bound_norm"] = ui.checkbox("Keep weight norm",
+                                                                           value=d.weight_noise_bound_norm) \
+                                    .tooltip(WEIGHT_NOISE_BOUND_TIP)
+                            weight_noise_why = hint("")  # why the weight noise controls are greyed out
+                            weight_noise_why.visible = False
+
+                            def show_weight_noise(_=None):
+                                sync_weight_noise(SimpleNamespace(finetune=bool(w["finetune"].value),
+                                                                  network_type=w["network_type"].value),
+                                                  [w["weight_noise"], w["weight_noise_mode"],
+                                                   w["weight_noise_bound_norm"]], weight_noise_why)
+
+                            for key in ("network_type", "finetune"):
+                                w[key].on_value_change(show_weight_noise)
+                            show_weight_noise()
+                        # the readout under Steps and the greying of the schedule follow what they read
+                        for key in ("steps", "batch_size", "gradient_accumulation", "multi_gpu", "devices",
+                                    "crop_augment"):
+                            w[key].on_value_change(show_steps_note)
+                        w["datasets"].tick_listeners.append(show_steps_note)
+                        for key in ("optimizer", "learning_rate"):
+                            w[key].on_value_change(show_schedule_why)
+                        show_schedule_why()
+                        show_steps_note()
 
                     # ---- Saving & samples
                     with sections.section("Basics", "Saving & samples", "Checkpoints and preview images", "save"):
@@ -13138,49 +13585,36 @@ def build_page(local: bool = True):
                                 "every probe step, every changed setting, captions and the log's warnings. Takes about "
                                 "half a minute at the end. Previous Runs makes the same for an earlier run.")
                             w["save_every"] = ui.number("Save every N steps", value=d.save_every, precision=0) \
-                                .classes("w-44")
+                                .classes("w-44") \
+                                .tooltip("Saves a checkpoint every this many steps. 0 saves the final file only.")
                             w["keep_checkpoints"] = ui.number("Checkpoints to keep (0 = all)",
                                                               value=d.keep_checkpoints, min=0, precision=0) \
                                 .classes("w-56").tooltip(
                                     "Keeps only this many of the step checkpoints (the LoRA / LoKr files saved every "
                                     "N steps); each new one deletes the oldest. The final file, the best-likeness "
                                     "file and the race's dropped files are never deleted. 0 keeps every one.")
+                            w["lora_save_dtype"] = ui.select(["bf16", "fp16", "fp32"], value=d.lora_save_dtype,
+                                                             label="Save LoRA as").classes("w-36") \
+                                .tooltip("The number format of the saved LoRA files.")
                             w["sample_every"] = ui.number("Sample every N steps (0 = off)", value=d.sample_every,
-                                                          precision=0).classes("w-60")
+                                                          precision=0).classes("w-60") \
+                                .tooltip("Renders the sample prompts every this many steps. 0 renders none during "
+                                         "the run; with sample prompts set, the final samples are still made at the "
+                                         "end.")
                             w["lora_ema"] = ui.number("Weight average decay (0 = off)", value=d.lora_ema, min=0,
                                                       max=0.999, step=0.005, format="%.3f").classes("w-56") \
                                 .tooltip("Checkpoints, samples and likeness probes use a running average of the LoRA "
                                          "over about the last 1 / (1 - decay) images (50 at 0.98); training goes on "
                                          "with the raw weights. Fizgig measured 0.98 at +5 likeness points late in a "
                                          "run with half the swing between checkpoints; 0.995 lagged behind.")
-                            w["weight_noise"] = ui.number("Weight noise sigma (0 = off)", value=d.weight_noise, min=0,
-                                                          max=0.1, step=0.0025, format="%.4f").classes("w-56") \
-                                .tooltip(WEIGHT_NOISE_TIP)
-                            w["weight_noise_mode"] = ui.select({"relative": "Relative", "absolute": "Absolute"},
-                                                               value=d.weight_noise_mode, label="Weight noise mode") \
-                                .classes("w-44").tooltip(WEIGHT_NOISE_MODE_TIP)
-                            w["weight_noise_bound_norm"] = ui.checkbox("Keep weight norm",
-                                                                       value=d.weight_noise_bound_norm) \
-                                .tooltip(WEIGHT_NOISE_BOUND_TIP)
-                        weight_noise_why = hint("")  # why the weight noise controls are greyed out
-                        weight_noise_why.visible = False
-
-                        def show_weight_noise(_=None):
-                            sync_weight_noise(SimpleNamespace(finetune=bool(w["finetune"].value),
-                                                              network_type=w["network_type"].value),
-                                              [w["weight_noise"], w["weight_noise_mode"],
-                                               w["weight_noise_bound_norm"]], weight_noise_why)
-
-                        for key in ("network_type", "finetune"):
-                            w[key].on_value_change(show_weight_noise)
-                        show_weight_noise()
                         w["sample_prompts"] = ui.textarea("Sample prompts (one per line; empty = no samples)") \
                             .classes("w-full")
                         with fields():
                             aspect0, mp0 = size_aspect(d.sample_width, d.sample_height)
-                            w["sample_aspect"] = ui.select(SAMPLE_ASPECTS, value=aspect0, label="Aspect ratio") \
-                                .classes("w-44")
-                            w["sample_mp"] = ui.select(MP_OPTIONS, value=mp0, label="Resolution").classes("w-44")
+                            w["sample_aspect"] = ui.select(SAMPLE_ASPECTS, value=aspect0, label="Sample aspect ratio") \
+                                .classes("w-52")
+                            w["sample_mp"] = ui.select(MP_OPTIONS, value=mp0, label="Sample resolution") \
+                                .classes("w-52")
                             size_label = ui.label("").classes("rz-hint self-center")
 
                             def show_size(_=None):
@@ -13195,13 +13629,11 @@ def build_page(local: bool = True):
                             show_size()
                         with fields():
                             w["turbo_mode"] = ui.select(TURBO_MODES, value="auto", label="Turbo LoRA").classes("w-80") \
-                                .tooltip("A step-distilled LoRA used only while rendering samples and probes, never "
-                                         "in training. The model's own: MOSS-Image lodestones' 8-step DMD LoRA (12 "
-                                         "steps, CFG 1, shift 5), Krea 2 and Qwen-Image 2.1 Comfy-Org's Turbo LoRAs "
-                                         "(8 steps, CFG 1), FIBO 2.0 Comfy-Org's Turbo LoRA (4 steps, CFG 1), "
-                                         "Ideogram 4 ostris' TurboTime LoRA (8 steps, CFG 1; a new Ideogram 4 setup "
-                                         "starts with none), MiniMax H3 "
-                                         "lightx2v's FL2VA Turbo 8-step LoRA (8 steps, CFG 1).")
+                                .tooltip("A step-distilled LoRA used only to render samples and probes, never in "
+                                         "training. auto downloads the model's own, at CFG 1: MOSS-Image 12 steps; "
+                                         "Krea 2, Qwen-Image 2.1, MiniMax H3, SDXL and Ideogram 4 (a new setup starts "
+                                         "with none) 8 steps; FIBO 2.0 and FLUX.2 Klein 9B 4 steps. The other models "
+                                         "have none.")
                             path_input(f, "turbo_lora", "Turbo / step-distill LoRA file", "file", "", "w-[30rem]")
                             f.w["turbo_lora"].parent_slot.parent.bind_visibility_from(w["turbo_mode"], "value",
                                                                                       lambda x: x == "file")
@@ -13219,11 +13651,12 @@ def build_page(local: bool = True):
 
                             w["turbo_mode"].on_value_change(on_turbo_mode)
                         with fields():
-                            w["sample_steps"] = ui.number("Steps", value=d.sample_steps, precision=0).classes("w-28")
-                            w["sample_cfg"] = ui.number("CFG", value=d.sample_cfg).classes("w-28")
+                            w["sample_steps"] = ui.number("Sample steps", value=d.sample_steps, precision=0) \
+                                .classes("w-32")
+                            w["sample_cfg"] = ui.number("Sample CFG", value=d.sample_cfg).classes("w-32")
                             w["sample_shift"] = ui.number("Shift", value=d.sample_shift).classes("w-28") \
-                                .tooltip("MOSS-Image only (5); the other models take their shift from the image size "
-                                         "(FLUX 3 Klein's is fixed at 6.93)")
+                                .tooltip("Read by MOSS-Image only (default 5). Other models set their own: FLUX 3 "
+                                         "Klein 6.93 and Z-Image 3, fixed; Krea 2 and FIBO 2.0 follow the image size.")
                             w["sample_skip_layer"] = ui.number("Skip layer", value=d.sample_skip_layer, precision=0) \
                                 .classes("w-28") \
                                 .tooltip("MOSS-Image only: the layer skipped in the negative branch of the guided "
@@ -13292,7 +13725,7 @@ def build_page(local: bool = True):
                             lambda p: preset_arch(p, w["model_path"].value) == "minimax_h3_image")
                         hint("MOSS-Image: lodestones' turbo LoRA renders 12 steps at CFG 1 on Base. Fizgig found it "
                              "can understate likeness: judge a run's likeness on full-quality samples (Turbo LoRA: "
-                             "none, 20 steps, CFG 3). Training on Base, the samples also carry Kijai's SFT LoRA "
+                             "none, 25 steps, CFG 3.5). Training on Base, the samples also carry Kijai's SFT LoRA "
                              "(Sampling LoRA: auto, under Seeds, negative prompt and sampling models)."
                              ).bind_visibility_from(
                             w["model_preset"], "value", lambda p: preset_arch(p, w["model_path"].value) == "moss_image")
@@ -13386,7 +13819,9 @@ def build_page(local: bool = True):
                             w["face_provider"] = ui.select(["cpu", "cuda"], value=d.face_provider,
                                                            label="Face model device").classes("w-40")
                             w["face_det_size"] = ui.number("Detector size", value=d.face_det_size, precision=0) \
-                                .classes("w-32")
+                                .classes("w-32") \
+                                .tooltip("The face detector's input size in pixels (a square): every picture is "
+                                         "scaled to it first. The default is 640.")
                             w["face_model"] = ui.select({"buffalo_l": "ArcFace R50 (buffalo_l)",
                                                          "antelopev2": "ArcFace R100 (antelopev2)"},
                                                         value=d.face_model, label="Face score model") \
@@ -13435,29 +13870,7 @@ def build_page(local: bool = True):
                                                          "skeleton3d": "proportions 3D (skeleton + silhouette)",
                                                          "smplx": "SMPL-X body shape (NLF)",
                                                          "smplx_ratio": "SMPL-X proportions, log-ratio (NLF)"},
-                                                        value=d.body_score, label="Body score").classes("w-64") \
-                                .tooltip("appearance: a DINOv2 embedding of the body from the neck to mid-thigh, "
-                                         "turned upright and cut out from the background, best match against the "
-                                         "reference photos that show the same part of the body (build, skin, hair; "
-                                         "clothing and nudity too, so vary the outfits). anchored: the same body "
-                                         "window with its photographic look (colour grade, exposure, sharpness, "
-                                         "grain) taken out, embedded by SigLIP 2 and DINOv2, scored as how far it "
-                                         "has moved from the base model's people (the step-0 probe's body renders, "
-                                         "8 seeds) toward the references: 0 = the base model, 100 = the references' "
-                                         "mean. On a five-run comparison it told trained samples from the base model "
-                                         "where the best match ranked the person's own photos below the base "
-                                         "model's. proportions (2D): skeleton "
-                                         "ratios on the flat picture, which shift with pose and camera angle more "
-                                         "than people differ. proportions 3D: bone-length ratios from the pose "
-                                         "model's 3D landmarks (the same bent or straight), plus waist, hip and thigh "
-                                         "widths where the person stands upright facing the camera. SMPL-X: NLF fits "
-                                         "the SMPL-X body model and measures it in its T-pose (bust, waist, hip, "
-                                         "thigh, limb lengths over the height); needs photos down to the knees and "
-                                         "NLF's file, downloaded by hand (noncommercial license). SMPL-X "
-                                         "proportions: the same NLF fit, nine neck-to-knee measurements compared by "
-                                         "log-ratio to the references' median (on one test set it showed training "
-                                         "progress about 1.5x as clearly as SMPL-X body shape). The last four "
-                                         "ignore clothing and skin; each compares against the references' own spread.")
+                                                        value=d.body_score, label="Body score").classes("w-64")
                             w["nlf_model"] = ui.input("NLF model (file or folder; empty = models/nlf)",
                                                       value=d.nlf_model).classes("w-72") \
                                 .tooltip("SMPL-X needs NLF (noncommercial research license, not downloaded for you): "
@@ -13502,6 +13915,9 @@ def build_page(local: bool = True):
 
                             ui.button("Check body references", icon="accessibility_new", on_click=on_body_preview) \
                                 .props("outline")
+                        body_score_text = hint(body_score_note(d.body_score))  # what the picked Body score measures
+                        w["body_score"].on_value_change(
+                            lambda e: setattr(body_score_text, "text", body_score_note(e.value)))
                         body_info = hint("")
                         with fields():
                             w["face_weight"] = ui.number("Face weight (combined score)", value=d.face_weight,
@@ -13551,9 +13967,13 @@ def build_page(local: bool = True):
                         with advanced():
                             with fields():
                                 w["face_margin"] = ui.number("Face box margin", value=d.face_margin, step=0.05) \
-                                    .classes("w-36")
+                                    .classes("w-36") \
+                                    .tooltip("How far the face box is widened on each side, as a share of its own "
+                                             "width and height (0.25 = 25%).")
                                 w["region_feather_cells"] = ui.number("Feather (cells)", value=d.region_feather_cells,
-                                                                      precision=0).classes("w-32")
+                                                                      precision=0).classes("w-32") \
+                                    .tooltip("Passes of 3 x 3 averaging that soften the edges of the weight map, in "
+                                             "cells (16 px). 0 = hard edges.")
                                 w["region_prior_weight"] = ui.number("Background prior weight (0 = off; +35% step "
                                                                      "time)", value=d.region_prior_weight, step=0.1) \
                                     .classes("w-96 max-w-full") \
@@ -13565,11 +13985,12 @@ def build_page(local: bool = True):
                             with fields():
                                 w["attn_localize"] = ui.switch("Keep the trigger's attention on the subject",
                                                                value=d.attn_localize).tooltip(
-                                    "Attention localization: in a few attention layers, reads how much of each image "
-                                    "token's attention to the caption goes to the trigger word, and penalizes the part "
-                                    "of that map outside the person (the region maps' person mask and face box). Ties "
-                                    "the identity to the trigger and keeps it off the background and other people. "
-                                    "Needs a trigger word. FIBO 2.0 reads it in its injection blocks.")
+                                    "Experimental. In a few attention layers, reads how much of each image token's "
+                                    "attention to the caption goes to the trigger word and adds a penalty on the part "
+                                    "of that map outside the person (the region maps' person mask and face box). "
+                                    "The aim is to tie the identity to the trigger and keep it off the background; "
+                                    "no result is guaranteed. Needs a trigger word. FIBO 2.0 reads it in its "
+                                    "injection blocks.")
                                 w["attn_localize_weight"] = ui.number("Weight", value=d.attn_localize_weight, min=0,
                                                                       step=0.01).classes("w-28")
                                 w["attn_localize_layers"] = ui.input("Blocks (empty = auto)",
@@ -13617,15 +14038,21 @@ def build_page(local: bool = True):
                                 w["id_loss_backend"] = ui.select(["arcface", "facenet"], value=d.id_loss_backend,
                                                                  label="Backend").classes("w-36")
                                 w["id_loss_sigma_max"] = ui.number("Max sigma", value=d.id_loss_sigma_max, min=0,
-                                                                   max=1, step=0.05).classes("w-28")
+                                                                   max=1, step=0.05).classes("w-28") \
+                                    .tooltip("The highest noise level (0 to 1) the identity loss applies at; "
+                                             "noisier samples skip it. The default is 0.35.")
                                 w["id_loss_every"] = ui.number("Every k-th eligible", value=d.id_loss_every, min=1,
-                                                               precision=0).classes("w-40")
+                                                               precision=0).classes("w-40") \
+                                    .tooltip("The loss is applied to every k-th eligible sample: 1 = all of them.")
                                 w["id_loss_min_face_cells"] = ui.number("Min face (cells)",
                                                                         value=d.id_loss_min_face_cells, min=1,
-                                                                        precision=0).classes("w-36")
+                                                                        precision=0).classes("w-36") \
+                                    .tooltip("Faces whose box is smaller than this many latent cells (16 px each) on "
+                                             "its short side are skipped.")
                                 w["id_loss_margin_cells"] = ui.number("Crop margin (cells)",
                                                                       value=d.id_loss_margin_cells, min=0,
-                                                                      precision=0).classes("w-40")
+                                                                      precision=0).classes("w-40") \
+                                    .tooltip("Latent cells (16 px each) of context decoded around the face box.")
                                 w["id_loss_random_ref"] = ui.switch("Random reference per step",
                                                                     value=d.id_loss_random_ref)
 
@@ -13636,8 +14063,9 @@ def build_page(local: bool = True):
                              "classes it as easy / healthy / suspect / stuck / exhausted. Per-image LR then throttles "
                              "stuck images (x0.5, then x0.25), eases exhausted ones (x0.6) and can exclude images "
                              "that stay stuck. Stuck means an outlier of the dataset, not just one of its harder "
-                             "pictures. A true per-image learning rate needs batch size 1 (otherwise per-sample "
-                             "loss weights). Not available with automagic3 or automagic4.")
+                             "pictures. A true per-image learning rate needs batch size 1, grad accumulation 1 and "
+                             "one GPU; otherwise it scales each image's loss instead. With Automagic and Keel the "
+                             "watch only observes.")
                         with fields():
                             w["loss_watch"] = ui.switch("Loss watch (observe)", value=d.loss_watch)
                             w["per_image_lr"] = ui.switch("Per-image learning rate (act on verdicts)",
@@ -13645,34 +14073,28 @@ def build_page(local: bool = True):
                             w["loss_watch_exclude_after"] = ui.number("Exclude after N epochs at lowest throttle "
                                                                       "(0 = never)", value=d.loss_watch_exclude_after,
                                                                       precision=0).classes("w-96 max-w-full")
+                        subhead("Region loss watch and steering")
                         with fields():
                             w["region_watch"] = ui.switch("Region watch (observe)", value=d.region_watch).tooltip(
-                                "Splits every training step's loss by the picture's face, hair, skin, clothes and "
-                                "background, and reports once an epoch how much of each region's starting error is "
-                                "gone, and per picture whether its background or clothes are being learned faster "
-                                "than its subject. Costs no extra model calls; changes nothing about training. Needs "
-                                "MediaPipe for the parts maps (built once, before training). Not in a configuration "
-                                "race. On its first real runs it added no time to a step. Its numbers jump from "
-                                "epoch to epoch: read the sweeps before acting on them.")
+                                "Splits each step's loss by the picture's face, hair, skin, clothes and background "
+                                "and reports once an epoch how much of each region's starting error is gone, per "
+                                "picture too. No extra model calls; training is unchanged. Needs MediaPipe (parts "
+                                "maps, built once). Not in a race. The numbers are noisy: read the sweeps before "
+                                "acting on them.")
                             w["region_class_weights"] = ui.input(
                                 "Region class weights (experimental)", value=d.region_class_weights,
                                 placeholder="face=3, hair=1.5, skin=1.5, clothes=0.5, background=0.3") \
                                 .classes("w-[32rem] max-w-full").tooltip(
-                                "One fixed loss weight per region for the whole run, from the same parts maps: face, "
-                                "hair, skin, clothes, background. A region left out stays at 1, 0 masks one out, and "
-                                "the weights are rescaled to mean 1 per picture. Empty = off. The plain alternative "
-                                "to region steering, and the one to compare it against. Not together with the "
-                                "region-weighted loss (face / person / background) or Hull's region gains. Measured "
-                                "once on Qwen-Image 2.1 with the example weights: the training faces were learned "
-                                "faster and held-out faces ended worse.")
+                                "One fixed loss weight per region for the whole run: face, hair, skin, clothes, "
+                                "background. A region left out stays at 1, 0 masks it out, and the weights are "
+                                "rescaled to mean 1 per picture. Empty = off. Not with the region-weighted loss or "
+                                "Hull's region gains.")
                         with fields():
                             w["region_steer"] = ui.switch("Region steering (experimental)",
                                                           value=d.region_steer).tooltip(
                                 "Acts on the region watch (and turns it on): once an epoch it moves loss weights a "
-                                "step, by the rules beside it. Each rule is off at 0. What is taken from a region "
-                                "goes to the rest of that picture. Works with every optimizer; not in a race. "
-                                "Measured once on Qwen-Image 2.1 at its defaults: no difference from the plain run. "
-                                "No benefit is claimed.")
+                                "step, by the rules beside it; each rule is off at 0. What is taken from a region "
+                                "goes to the rest of that picture. Not in a race. No benefit shown yet.")
                             w["region_steer_regions"] = ui.select(
                                 {"background,clothes": "background and clothes", "background": "background only",
                                  "clothes": "clothes only"}, label="May be turned down",
@@ -13743,16 +14165,12 @@ def build_page(local: bool = True):
                             w["region_sweep_every"] = ui.number("Region sweep every N epochs (0 = off)",
                                                                 value=d.region_sweep_every, min=0, precision=0) \
                                 .classes("w-72").tooltip(
-                                "Experimental. Runs the model again on the training "
-                                "pictures at three fixed noise levels with fixed noise, so a picture's learned share "
-                                "is measured against its own first sweep: a clean reading where the region watch's "
-                                "is a noisy one. 3 forward passes per picture per sweep, so sweeping every picture "
-                                "every epoch about doubles the training time; the first sweep always takes all of "
-                                "them. In a race each configuration gets its own sweep: report only there, they "
-                                "never stop the run or save a held-out best. Not with the resolution step-up. "
-                                "Cheaper: Pictures per sweep 8 (all held-out photos are still swept every time, "
-                                "8 training pictures in turn), a sweep every 2 or 4 epochs, or Region sweeps on "
-                                "the second GPU (plain runs, below).")
+                                "Experimental. Runs the model again on the training pictures at three fixed noise "
+                                "levels with fixed noise, so a picture's learned share is measured against its own "
+                                "first sweep: a cleaner reading than the region watch's. 3 forward passes per "
+                                "picture per sweep, so sweeping every picture every epoch about doubles the "
+                                "training time; the first sweep always takes all of them. In a race the sweeps "
+                                "only report. Not with the resolution step-up.")
                             w["region_sweep_pictures"] = ui.number("Pictures per sweep (0 = all, -1 = held-out only)",
                                                                    value=d.region_sweep_pictures, min=-1,
                                                                    precision=0).classes("w-80").tooltip(
@@ -13868,9 +14286,13 @@ def build_page(local: bool = True):
                                                             value=d.isolation_kind, label="Kind (one dataset)") \
                                 .classes("w-44")
                             w["dop_weight"] = ui.number("DOP weight", value=d.dop_weight, min=0, step=0.5) \
-                                .classes("w-32")
+                                .classes("w-32") \
+                                .tooltip("The weight of the trigger-free pass that holds the model to its own "
+                                         "prediction without your LoRA (the default is 2). 0 turns it off.")
                             w["dop_every"] = ui.number("DOP every N steps", value=d.dop_every, min=1, precision=0) \
-                                .classes("w-40")
+                                .classes("w-40") \
+                                .tooltip("The trigger-free pass runs every this many steps (the default is 2: every "
+                                         "other step).")
                             w["isolation_pairs"] = ui.number("Side-by-sides per person", value=d.isolation_pairs,
                                                              min=0, precision=0).classes("w-48")
                             w["isolation_pair_weight"] = ui.number("Their weight", value=d.isolation_pair_weight,
@@ -13881,6 +14303,7 @@ def build_page(local: bool = True):
                         iso_fields.bind_visibility_from(w["isolation"], "value")
                         for key in ("isolation", "dop_weight"):  # (isolation trains Automagic / Keel with AdamW)
                             w[key].on_value_change(show_alpha_note)
+                            w[key].on_value_change(show_schedule_why)
 
                     # ---- Regularisation dataset
                     with sections.section("Likeness", "Regularisation dataset",
@@ -14103,11 +14526,11 @@ def build_page(local: bool = True):
                         subhead("Controller actions")
                         with fields():
                             w["likeness_normalize"] = ui.switch("Normalize face and body scores", value=d.likeness_normalize) \
-                                .tooltip("Score each on one scale first: 0 = what a stranger scores (the step-0 probe), "
-                                         "100 = what your references score against each other (both scales are "
-                                         "stretched, see their span and curve). Raw, a body score "
-                                         "moves ~10 points over a run and a face score ~60, so the combined score, "
-                                         "the curriculum and the noise band would follow the face alone.")
+                                .tooltip("Puts face and body on one scale: 0 = what a stranger scores (the step-0 probe), "
+                                         "100 = what your references score against each other. Raw, the face score "
+                                         "moves much further than the body's, so the combined score, the curriculum "
+                                         "and the noise band would follow the face alone. The span and curve below "
+                                         "stretch both scales.")
                             w["face_scale_span"] = ui.number("Face scale span", value=d.face_scale_span, min=1,
                                                              step=0.05, format="%.2f").classes("w-36") \
                                 .bind_visibility_from(w["likeness_normalize"], "value") \
@@ -14188,12 +14611,12 @@ def build_page(local: bool = True):
                                                         "off": "off", "adaface": "AdaFace, always",
                                                         "facenet": "FaceNet, always"}, value=d.face_gold,
                                                        label="Gold face scorer").classes("w-72") \
-                                .tooltip("A second face recognizer (AdaFace ViT, about 460 MB, downloaded once; or "
-                                         "FaceNet, the one before 3.14.0, about 110 MB) scores every probe face too. Nothing trains on it, so it can judge a run that "
-                                         "trains against the probes' own ArcFace: the reward stage, the identity loss "
-                                         "on its arcface backend, identity alignment. Those can raise the ArcFace score "
-                                         "without the face looking more like the person. auto turns it on for them "
-                                         "(and for the probe noise check); the Monitor draws it as a dashed line.")
+                                .tooltip("A second face recognizer, AdaFace or FaceNet (downloaded once), scores every "
+                                         "probe face too. Nothing trains on it, so it can judge a run that trains "
+                                         "against the probes' own ArcFace: the reward stage, the identity loss on "
+                                         "its arcface backend, identity alignment. auto uses AdaFace for those and "
+                                         "for the probe noise check. FaceNet cannot judge when the identity loss "
+                                         "trains on FaceNet. The Monitor draws it as a dashed line.")
                             w["face_gold_select"] = ui.switch("Best checkpoint, early stop and race follow it",
                                                               value=d.face_gold_select) \
                                 .bind_visibility_from(w["face_gold"], "value", backward=lambda m: m != "off") \
@@ -14383,23 +14806,23 @@ def build_page(local: bool = True):
                              "them have been probed (a round), the one with the lowest smoothed likeness score is "
                              "dropped; the last one left trains until Steps, which counts its own steps, so the race "
                              "adds the others' steps on top. They all start from the same LoRA initialisation and see "
-                             "the same images and noise. A configuration changes only what its row lists; everything "
-                             "else on this page is shared. Needs the likeness probes above. Relay instead: nobody is "
-                             "dropped, and after each round every configuration continues from that round's winner "
-                             "(Add seed racers for the best of several seeds at every probe).")
+                             "the same images and noise, unless rows set different seeds. A configuration changes "
+                             "only what its row lists; everything else on this page is shared. Needs the likeness "
+                             "probes above. Relay instead: nobody is dropped, and after each round every "
+                             "configuration continues from that round's winner (Add seed racers for the best of "
+                             "several seeds at every probe). In a relay the last round's winner is the run's LoRA, "
+                             "the others are saved as _final files, and the best checkpoint any of them reached is "
+                             "<job>_best.")
                         with fields():
                             w["race"] = ui.switch("Race these configurations", value=d.race)
                             w["race_follow"] = ui.switch("Relay: everyone continues from the round's winner",
                                                          value=d.race_follow) \
                                 .tooltip("Nobody is dropped. After each round (every configuration probed once) the "
-                                         "others take over the winner's LoRA: its weights, optimizer state, weight "
-                                         "average and likeness history, keeping their own settings, seed, image order "
-                                         "and noise. With seed racers that is the best of several random paths at "
-                                         "every probe, instead of whole runs on different seeds. Every configuration "
-                                         "trains all the steps (one run's cost each); the last round's winner is the "
-                                         "run's LoRA, the others are saved as _final files, and the best checkpoint "
-                                         "any of them reached is <job>_best. The rows must share the LoRA's shape (no "
-                                         "rank, alpha, layer or network type rows); not with one configuration per GPU.")
+                                         "others take over the winner's LoRA, optimizer state, weight average and "
+                                         "likeness history, keeping their own settings, seed, image order and "
+                                         "noise. Every configuration trains all the steps (one run's cost each). The "
+                                         "rows must share the LoRA's shape (no rank, alpha, layer or network type "
+                                         "rows); not with one configuration per GPU.")
                             w["race_pick"] = ui.switch("Pick the leader yourself after each round",
                                                        value=d.race_pick) \
                                 .tooltip("Relay only. After each round the run waits while you look at the round's "
@@ -14603,7 +15026,10 @@ def build_page(local: bool = True):
                                 .tooltip("The average of three rank-16 LoRAs has rank up to 48. 0 keeps it exactly "
                                          "(LoRA files only); a rank keeps the directions they share and drops the rest.")
                             w["soup_strengths"] = ui.input("Strengths to try", value=d.soup_strengths) \
-                                .classes("w-48")
+                                .classes("w-48") \
+                                .tooltip("Numbers above 0, separated by commas, like the default 1.0, 1.15, 1.3; "
+                                         "1.0 is always tried. An average is weaker than its parts, so a higher "
+                                         "strength can make up for it. Average now always uses 1.")
                         soup_info = ui.label("").classes("text-sm")
 
                         async def soup_now():
@@ -14626,11 +15052,10 @@ def build_page(local: bool = True):
                             ui.button("Average now (strength 1, no probes)", icon="blender",
                                       on_click=soup_now).props("outline")
                             w["soup_run"] = ui.switch("Pick the soup with the probes when I press Start") \
-                                .tooltip("Start then trains nothing: it probes each file alone (the best also at "
-                                         "every strength), then adds the others best-first, keeping each only if the "
-                                         "soup's probe score does not drop: the greedy soup. Saves "
-                                         "<job>_soup.safetensors and soup/soup.json. Uses this page's model, "
-                                         "references and probe settings; more probe seeds give a steadier choice.")
+                                .tooltip("Start then trains nothing. It probes each file alone, adds the others "
+                                         "best-first and keeps each only if the soup's probe score does not drop. "
+                                         "Saves <job>_soup.safetensors and soup/soup.json. Uses this page's model, "
+                                         "references and probe settings.")
 
                     # ---- Post-hoc EMA
                     with sections.section("Tools", "Post-hoc EMA",
@@ -14640,8 +15065,9 @@ def build_page(local: bool = True):
                              "before the run. This makes the same kind of average after the run from the step "
                              "checkpoints it kept, so you can try a few decays on finished files and keep the one you "
                              "like (musubi-tuner's post-hoc EMA). Checkpoints of one run, in any order: they are put "
-                             "in step order. Checkpoints to keep limits how far back it can reach. LoRA and LoKr "
-                             "files; not OFT or DoRA.")
+                             "in step order by the step in each file name. If a name has none, all are ordered by "
+                             "modification time and treated as evenly spaced. Checkpoints to keep limits how far "
+                             "back it can reach. LoRA and LoKr files; not OFT or DoRA.")
                         ema_files = ui.textarea("Checkpoints (one per line)").props("autogrow").classes("w-full")
                         with fields():
                             ema_mode = ui.select({"sigma_rel": "Power (EDM2)", "beta": "Decay per checkpoint"},
@@ -14786,12 +15212,16 @@ def build_page(local: bool = True):
                         queue_pause = ui.button("", on_click=lambda: (QUEUE.set_paused(
                             not QUEUE.snapshot()["paused"]), queue_draw(force=True)), color=None) \
                             .props("outline dense no-caps")
-                        ui.button("Clear queue", icon="clear_all", on_click=lambda: (QUEUE.clear(),
-                                                                                     queue_draw(force=True)),
+                        async def clear_queue_asked():
+                            if await confirm_clear_queue("The running one keeps going."):
+                                QUEUE.clear()
+                                queue_draw(force=True)
+
+                        ui.button("Clear queue", icon="clear_all", on_click=clear_queue_asked,
                                   color=None).props("flat dense no-caps") \
                             .tooltip("Remove every waiting run (the running one goes on)")
                     hint("Add runs with Add to queue (bottom bar, or the wizard's last page): each starts when the "
-                         "one before it is done, finished, stopped or failed. Kill pauses the queue. The queue lives "
+                         "one before it is done, finished, stopped or failed. Kill pauses the queue when runs are waiting. The queue lives "
                          "in output/_queue.json, but it is the WebUI that starts the next run, so keep the WebUI "
                          "running; a WebUI restarted with runs waiting and nothing running pauses the queue until you "
                          "Resume it.")
@@ -14836,8 +15266,7 @@ def build_page(local: bool = True):
                                 "since you switched it on.")
                 near_dup_label = ui.label("").classes("w-full text-sm text-orange-8")
                 near_dup_label.visible = False
-                with section("Configuration race", "Smoothed probe score per configuration; the lowest leaves after "
-                             "every round", "emoji_events") as race_exp:
+                with section("Configuration race", "Smoothed probe score per configuration", "emoji_events") as race_exp:
                     race_label = hint("")
                     race_table = ui.table(columns=[
                         {"name": "name", "label": "Configuration", "field": "name", "align": "left"},
@@ -15923,8 +16352,8 @@ The tabs follow the work, in three groups: **Wizard, Train, Dataset** set a run 
 Previous Runs** watch it and look back, and **Help** is this page. The **run strip** under the tabs is on every tab: what
 the trainer is doing, the job, the step, a progress bar, the time left and the number of queued runs. Click it for the
 Monitor. The browser tab's title carries the progress too, so a tab in the background still tells you how far the run
-is. The chip at the top right is the machine: the free space of the drive with your runs and models (amber under
-15 GB, red under 5 GB), and the instance number on a vast.ai rental.
+is. The chip at the top right shows free disk space (amber under 15 GB, red under 5 GB). On a vast.ai rental it also
+says vast.ai; hover over it for the instance number.
 
 The **Monitor** shows one view at a time: **Overview** (GPUs, disk and memory, the queue, the race, the likeness chart
 and the loss), **Images** (the probe images and your samples, a race's configurations side by side), **Details** (the
@@ -15996,7 +16425,7 @@ run whose probe images are not downloaded says so: use the cloud icon on its row
 
 The WebUI does the looking while it runs. Closed, run `python scripts/vast/rulz_fleet.py daemon` instead, or nothing
 moves the queue, downloads files or checks the watches. The same file is the command line for all of this
-(`rulz_fleet.py --help`). Nothing here rents, stops or destroys an instance.
+(`rulz_fleet.py --help`). Nothing here rents or destroys an instance; rebooting one can kill its run.
 
 **An instance's own controls**: **Open WebUI** on its card opens that instance's RulZ AI Trainer page in a new tab, signed
 in through vast.ai's Instance Portal (the same token as vast.ai's Open button). Its **⋮** menu has **Update
@@ -16005,32 +16434,31 @@ when they changed) and restarts its WebUI; it waits while a run is going. **Rebo
 and start its container: the disk is kept, a run going there is killed (the dialog says so first).
 
 ## Wizard
-New to LoRA training? The **Wizard** tab sets up a character / person LoRA in six short pages: who you are training
+New to LoRA training? The **Wizard** tab sets up a character / person LoRA in seven short pages: who you are training
 (job name, trigger word, how much of the person counts), the model, your photos, the training, samples and likeness
-checks, then the extras and the start. The basics are filled in for you (the identity recipe with LoRA rank 32,
+checks, then extras and review and start. The basics are filled in for you (the identity recipe with LoRA rank 32,
 adamw8bit at 1e-4, and recommendations from your GPUs and photos). **Advanced** at the top shows every setting on every
-page. The last page asks whether you want experimental settings; each one has a *What is this?* button saying what it
+page. The Extras page asks whether you want experimental settings; each one has a *What is this?* button saying what it
 does and what testing found so far. The wizard edits the same settings as the Train tab, so you can switch between the
 two at any time; styles and concepts are set up on the Train tab.
 
 ## Quick start
 1. **Datasets**: on the Dataset tab, *Create dataset*, open it and upload images with same-name `.txt` captions (or
-   copy a folder on the machine running RulZ AI Trainer); tick one or more for training. Optional trigger word is
-   prepended.
-2. **Model**: either a Hugging Face repo (Base / SFT, about 30 GB, stored under `models/`) or three single
-   ComfyUI-style files: diffusion model, Qwen3.5-9B text encoder and Flux2 VAE.
+   copy a folder on the machine running RulZ AI Trainer); tick one or more for training. The trigger word is added
+   according to the model family.
+2. **Model**: the form starts on MOSS-Image. Other families use their own diffusion model, text encoder and VAE files.
 3. Click **Start training** (the bar at the bottom of the Train and Monitor tabs). First run caches VAE latents and
    text embeddings; the text encoder is loaded once for caching and unloaded before the diffusion model is loaded.
    **Add to queue** instead starts the run after the current one (and any queued before it) is done; the Monitor's
-   *Queue* section reorders, removes, pauses and resumes the waiting runs. Kill pauses the queue, Stop goes on to the
-   next run. Keep the WebUI open: it is what starts the next run.
+   *Queue* section reorders, removes, pauses and resumes the waiting runs. Kill pauses the queue when runs are waiting.
+   Stop saves after the current step and goes on to the next run. Keep the WebUI open to start the next run.
 4. LoRAs are written to `output/<job>/<job>_<step>.safetensors` and `output/<job>/<job>.safetensors` (bf16 by default).
 
 ## Quantization
 *Diffusion model quant* and *Text encoder quant*: `auto` keeps whatever the file already is (bf16 stays bf16, a
 ComfyUI int8/nvfp4 file stays quantized), `none` dequantizes to bf16, and `int8`, `int8_convrot` or `nvfp4`
 quantize on load. Only the frozen base weights are quantized; the LoRA itself always trains in fp32.
-int8 roughly halves VRAM for the base model (about 5 GB for the DiT); nvfp4 quarters it.
+int8 roughly halves the base model weights; nvfp4 uses about a quarter of their bf16 size.
 
 *Blocks kept without recompute* (next to *Gradient checkpointing*): checkpointing runs each block's forward twice
 per step to save memory. Kept blocks store their activations and skip the second run, with identical results.
@@ -16088,12 +16516,12 @@ left the log says what to change. The failed try's logs are kept as train_oom1.l
 ## Unequal GPUs
 *Data parallel balance* (Model, next to the GPU settings): in data parallel every step waits for the slowest GPU.
 auto (default) times each GPU during the first steps and splits a step's images by speed when that is at least 5%
-faster per image, keeping the images per step the same (it needs several per step: gradient accumulation 3 or
-more). grow lets the faster GPU train more images in the slower one's time, so each step holds more images: lower
+faster per image, keeping the images per step the same. Splitting a step requires several batches per step.
+grow lets the faster GPU train more images in the slower one's time, so each step holds more images: lower
 the steps to match. The log says what was measured and chosen.
 
 ## Block swap
-*Block swap* (Train tab, memory section; single GPU) keeps the frozen weights of that many DiT blocks in system RAM and
+*Block swap* (Train tab, Model section, next to the GPU settings; single GPU only) keeps the frozen weights of that many DiT blocks in system RAM and
 streams each block's weights to the GPU just before it runs, the next one copied in while the current one computes.
 Measured on Krea 2 int8 with 14 of 28 blocks swapped: the training step's peak went from 10.8 to 7.7 GB at about the
 same step time. It needs gradient checkpointing and turns torch.compile off, unless *Compile with block swap*
@@ -16129,7 +16557,8 @@ An optional ComfyUI-format LoRA (for example an 8-step distill) applied only whi
 never during the training step. Set *Sample steps* to match it.
 
 ## Optimizers
-`adamw8bit` is the default (AdamW with 8-bit state); `adamw` keeps full-precision state and `adafactor` a smaller
+`adamw8bit` is the Train tab and Wizard starting choice (AdamW with 8-bit state); a config with no optimizer uses
+`adamw`, which keeps full-precision state, and `adafactor` uses a smaller
 one (the fine-tune choice). `automagic3` and `automagic4` tune the learning rate themselves from the weights' update
 directions (the rate you set is the start; schedule, warm-up, LoRA+ and the per-image rate do not apply; *Automagic
 lr groups* `by_type` gives the text-side, attention, feed-forward and other layers their own rate). Automagic 4 also
@@ -16235,7 +16664,7 @@ alignment train against that same ArcFace, so they can raise its score without t
 choice), that nothing trains on: it scores the
 same faces against the same references on its own scale, and (*Best checkpoint, early stop and race follow it*, on by
 default) its score replaces ArcFace's in the decisions. *auto* turns it on for those runs and for the probe noise
-check. The Monitor draws it as a dashed "face (AdaFace)" line; ArcFace pulling away from it is the warning sign, and the
+check. The Monitor draws it as a dashed "face (AdaFace)" or "face (FaceNet)" line; ArcFace pulling away from it is the warning sign, and the
 reward stage logs a warning when ArcFace runs more than 10 points further ahead than when the stage began.
 
 ## Probes on the second GPU
@@ -16259,7 +16688,7 @@ the log lists them. It only warns: to act on it, remove one photo of each pair a
 
 ## Copy check (SSCD)
 A LoRA trained on a few photos can learn to redraw one of them: same pose, same outfit, same background. *Copy check*
-(Likeness-filtered self-training section) compares pictures with your training photos using SSCD, a copy detector
+(Train tab, Likeness probes & controller, Advanced, Likeness-filtered self-training) compares pictures with your training photos using SSCD, a copy detector
 (a cosine of about 0 for an unrelated picture, above 0.9 for a flipped copy). Self-training leaves out a picture above
 *Copy limit* (0.5, raised to the photos' own typical match among themselves + 0.1 when they already look alike, as in
 one shoot in one room), shown as "copies a photo" in the round's log and in `selftrain.json`. Each probe logs its
@@ -16280,7 +16709,7 @@ one that leaves the prompt* (both experimental, unit-tested only). It sees frami
 clothing or setting.
 
 ## Training maps
-After Fizgig's training maps. With *Training maps* on (Likeness section), a few training pictures are checked before
+After Fizgig's training maps. With *Training maps* on (Train tab, Training maps section), a few training pictures are checked before
 training and about once an epoch at three fixed noise levels with fixed noise, so only the LoRA changes between
 captures. The **Training maps** tab draws them over each picture: *Learned since the start* (green better, magenta
 worse; read it first), *Not learned yet* (red misses most), *Where the LoRA acts* (should sit on the subject; on a
@@ -16305,7 +16734,7 @@ the combined score, with chips to show only some of the three. *Rename* gives a 
 its history file only (never the job folder). A run that is still training updates live.
 
 *Score sample folders* compares finished runs from any trainer (ai-toolkit, Fizgig, OneTrainer, this one) on the
-probe scores, in one spreadsheet. List each run as `name = folder` (its sample pictures, sub-folders included): a
+likeness scores of sample pictures, in one spreadsheet. List each run as `name = folder` (its sample pictures, sub-folders included): a
 file or folder name with "face" marks face pictures, "body" body pictures, and the step comes from the file name
 ("step000200", "200.png"). The baseline folder holds the base model's renders of the same prompts without a LoRA,
 the zero of the face score and of the anchored body score (4 to 8 body seeds). The spreadsheet (also saved in
@@ -16353,7 +16782,7 @@ itself summons the subject.
 **LoKr** (*Adapter* in the LoRA section): instead of a rank-r pair, each layer learns a Kronecker pair, a small w1
 (up to factor x factor) and w2 holding the rest, so the update tiles the weight with structure rather than a thin
 slice. Fizgig's measured default is factor 8 (its highest likeness and more natural skin on the same data; ~20%
-slower steps; about 400 MB on a 12B model). Rank, alpha, LoRA+ and dropout don't apply. The file is LyCORIS
+slower steps; about 400 MB on a 12B model). Rank, alpha and LoRA+ don't apply. The file is LyCORIS
 format: ComfyUI's LoRA loader takes it for MOSS-Image and Krea 2; diffusers cannot load LoKr. A race can pit LoRA
 against LoKr: `network_type=lokr, lokr_factor=8` in one row.
 
@@ -16582,17 +17011,18 @@ Hugging Face source (ideogram-ai/ideogram-4-fp8, gated, or its unsloth/ideogram-
 dequantized on load, then quantized for your GPU. Buckets are on the 16 px grid.
 
 **Captions**: Ideogram 4 was trained on structured JSON captions (Ideogram's prompting guide has the schema). A
-same-name `.json` caption is used as it is; a plain `.txt` caption is wrapped into the smallest valid JSON caption, and
-the trigger word goes into its subject (object) element. Set *Max caption tokens* to 2048 for long JSON captions.
+same-name `.json` caption is used as it is; a plain `.txt` caption is wrapped into the smallest valid JSON caption. The
+trigger word goes in front of the first object element's description, or into a new object element when there is none;
+a caption that already holds the trigger is left alone. Set *Max caption tokens* to 2048 for long JSON captions.
 Sample prompts can be plain sentences (wrapped the same way) or JSON captions. What trainers report (community
 reports, disputed, not tested in RulZ AI Trainer): for one character several got equal or better results with plain
 natural-language captions; JSON with correct boxes is what a multi-character LoRA needs, and a bad JSON caption hurts
-more than plain text. Boxes are `[y_min, x_min, y_max, x_max]` normalised 0-1000 whatever the training resolution, and
+more than plain text. Boxes are `[y_min, x_min, y_max, x_max]` integers 0-1000 whatever the training resolution, and
 vision captioners often swap x and y, so check them. Do not caption traits that should always appear (tattoos, a
-default outfit, hair or eye colour). In JSON, put the full caption and the trigger in `high_level_description` and only
-the trigger in the character element (a colour palette there shifts hair colour). Test the LoRA with prompts in the
-same style as the captions. A plain "woman" or "man" (or a real name) works better as the trigger than a made-up
-token, which got printed as text.
+default outfit, hair or eye colour). Some trainers put the full caption and the trigger in `high_level_description` and
+only the trigger in the character element (a colour palette there shifts hair colour); this trainer does not move the
+trigger there. Test the LoRA with prompts in the same style as the captions. A plain "woman" or "man" (or a real name)
+works better as the trigger than a made-up token, which got printed as text.
 
 **Setup the wizard picks for a character** (community reports, not run in RulZ AI Trainer): a LoKr at factor 4 (full
 rank in LyCORIS's sense, files of about 1 GB), Automagic 3 starting at 1e-5 (AdamW8bit at 5e-5 with isolation on, which
