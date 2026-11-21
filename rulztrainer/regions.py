@@ -185,8 +185,11 @@ def analyze_bodies(items, embed, cache_path: Path, progress=None, recache: bool 
         if progress:
             progress(i + 1, len(todo))
     if todo:
+        from .atomic import writing
+
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps(cache), encoding="utf-8")
+        with writing(cache_path) as tmp:  # as analyze_faces: a run killed while it writes must not leave a torn cache
+            tmp.write_text(json.dumps(cache), encoding="utf-8")
     return {k: cache[_file_key(p)].get("emb") for k, p in sources.items()}
 
 

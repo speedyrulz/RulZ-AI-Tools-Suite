@@ -16,6 +16,8 @@ from typing import Callable
 
 log = logging.getLogger("rulztrainer")
 ProgressFn = Callable[[str, "float | None"], None]
+READ_TIMEOUT = 60.0  # seconds a download waits for the next bytes
+BLOCK_SIZE = 8192  # as urlretrieve reads
 
 
 def _report(progress: ProgressFn | None, text: str, frac: float | None = None) -> None:
@@ -44,8 +46,29 @@ def download_url(url: str, dest: Path, label: str, progress: ProgressFn | None =
             _report(progress, f"Downloading {label}: {blocks * block_size / 1e6:.0f} MB", None)
 
     _report(progress, f"Downloading {label}...", 0.0)
-    urllib.request.urlretrieve(url, str(tmp), reporthook=hook)
-    tmp.replace(dest)
+    try:
+        # a read timeout (not for the whole file): a server that goes quiet must not hold the download for ever
+        with urllib.request.urlopen(url, timeout=READ_TIMEOUT) as response, open(tmp, "wb") as out:
+            try:
+                total = int(response.headers.get("Content-Length") or 0)
+            except ValueError:
+                total = 0
+            blocks = 0
+            received = 0
+            while True:
+                block = response.read(BLOCK_SIZE)
+                if not block:
+                    break
+                out.write(block)
+                received += len(block)
+                blocks += 1
+                hook(blocks, BLOCK_SIZE, total)
+        if total and received != total:  # a body that came short must not take a good earlier file's place
+            raise OSError(f"Download of {label} ended after {received} of {total} bytes")
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    tmp.replace(dest)  # (a whole download whose rename fails, a locked file on Windows, stays as .part)
     _report(progress, f"Downloaded {label}", 1.0)
     return dest
 

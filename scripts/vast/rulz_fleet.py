@@ -95,6 +95,7 @@ DISPATCH_STALE = 900.0  # a dispatch that has not reported for this long is take
 SERIES_KEPT = 400
 # a rebooting instance may be out of reach, or not "running" on vast.ai, this long before that counts as usual
 REBOOT_GRACE = 900.0
+POLL_DEADLINE = 300.0  # seconds one poll_all waits for its looks (a snapshot call times out at 120 s, twice with a retry)
 UPDATE_STALE = 3600.0  # an update this computer started and never heard back from is taken for over after this
 # an update cut off by a dropped connection that no look has seen begin (the instance writes its record after the
 # fetch, which may take up to 300 s) is taken for one that never began after this
@@ -687,9 +688,15 @@ class Fleet:
         threads = [threading.Thread(target=look, args=(i,), daemon=True) for i in instances]
         for t in threads:
             t.start()
+        # one deadline for the tick: an instance whose look hangs counts as out of reach and the rest go on (its
+        # thread is a daemon, so it cannot hold up the exit)
+        deadline = time.monotonic() + POLL_DEADLINE
         for t in threads:
-            t.join()
-        return snaps
+            t.join(max(0.0, deadline - time.monotonic()))
+        for inst in instances:
+            snaps.setdefault(str(inst["id"]), {"ok": False, "instance": int(inst["id"]), "polled": self.now(),
+                                               "error": f"no answer within {POLL_DEADLINE:g} s"})
+        return dict(snaps)
 
     def observe(self, st: dict, inst: dict, snap: dict) -> None:
         """Take one look into the record: the instance's reach, its runs' states (a run that ended is closed, its
@@ -1384,6 +1391,7 @@ class Fleet:
     def stop_run(self, name: str, kill: bool = False) -> dict:
         """The WebUI's Stop (or Kill) on the instance that runs this job; name may be an instance id instead."""
         st = self.read()
+        job = ""
         if name in st["instances"]:
             inst = st["instances"][name]
         else:
@@ -1391,7 +1399,11 @@ class Fleet:
             if rec is None:
                 raise Refused(f"No running job {name!r} in the fleet.")
             inst = self.instance(rec["instance"])
-        done = self.remote_for(inst).agent("stop", *(["--kill"] if kill else []))
+            job = rec["job"]  # the agent refuses when another job has taken over there
+        # no retry on a dropped connection: the Stop may have been delivered, and a second one would hit the next
+        # job of that queue (a Kill that worked would be refused as "no job running")
+        done = self.remote_for(inst).agent("stop", *(["--kill"] if kill else []), *(["--job", job] if job else []),
+                                           retry=False)
         if done.returncode != 0:
             raise Refused((done.stderr or b"").decode("utf-8", "replace").strip() or "stop failed")
         return dict(json.loads(done.stdout), instance=inst["id"])

@@ -518,7 +518,10 @@ def manifest_dir(tag: str, root: Path | None = None) -> Path:
 def save_manifest(manifest: dict, root: Path | None = None) -> Path:
     path = manifest_dir(manifest["tag"], root) / "manifest.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, indent=1, default=str), encoding="utf-8")
+    from .atomic import writing
+
+    with writing(path) as tmp:  # a kill mid-write must not leave a torn manifest
+        tmp.write_text(json.dumps(manifest, indent=1, default=str), encoding="utf-8")
     return path
 
 
