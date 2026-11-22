@@ -16,7 +16,8 @@ import type { RePracticeTask } from '@shared/types'
 import { batchAdapterLabel } from '../../lib/adapters'
 import { cn, formatCompact, formatDuration, formatTokens, relativeTime } from '../../lib/format'
 import { useApp } from '../../stores/app'
-import { solvedTasks, useBatch } from '../../stores/batch'
+import { useBatch } from '../../stores/batch'
+import { practiceRecords, solvedTasks, useReTraces } from '../../stores/reTraces'
 import { isChatBusy, useChat } from '../../stores/chat'
 import { availableTools, useMcp } from '../../stores/mcp'
 import { Badge, Button, IconButton, Input, NumberInput, ProgressBar, Switch, Tooltip } from '../ui'
@@ -59,7 +60,9 @@ export function BatchStart({ tasks, family, kitDir }: { tasks: RePracticeTask[];
   useEffect(() => void init(), [init])
 
   const options = useMemo(() => ({ ...opts, family }), [opts, family])
-  const planned = useMemo(() => planBatch(tasks, options, solvedTasks(summaries)), [tasks, options, summaries])
+  const traces = useReTraces((s) => s.traces)
+  useEffect(() => useReTraces.getState().init(), [])
+  const planned = useMemo(() => planBatch(tasks, options, solvedTasks(practiceRecords(summaries, traces))), [tasks, options, summaries, traces])
   const taskCount = options.attempts > 0 ? planned.length / options.attempts : 0
   const set = <K extends keyof BatchOptions>(key: K, value: BatchOptions[K]): void => setOpts((o) => ({ ...o, [key]: value }))
 

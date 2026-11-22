@@ -13,6 +13,7 @@ import { useApp } from './app'
 import { isChatBusy, isGrading, onTurnEnd, useChat } from './chat'
 import { WBENCH_BUSY, wbenchRunning } from '../lib/wbenchFlag'
 import { readyInstance, useModels } from './models'
+import { practiceRecords, solvedTasks, useReTraces } from './reTraces'
 
 interface BatchState {
   loaded: boolean
@@ -31,13 +32,6 @@ interface BatchState {
   stop: (mode: BatchStop) => void
   /** Removes a run from the list. Its chats and recorded data stay. */
   remove: (id: string) => Promise<void>
-}
-
-/** Tasks a session in the chat list has solved. */
-export function solvedTasks(summaries: { rePracticeTask?: string; reOutcome?: string }[]): Set<string> {
-  const out = new Set<string>()
-  for (const s of summaries) if (s.rePracticeTask && s.reOutcome === 'solved') out.add(s.rePracticeTask)
-  return out
 }
 
 export const useBatch = create<BatchState>((set, get) => {
@@ -138,7 +132,7 @@ export const useBatch = create<BatchState>((set, get) => {
       const settings = useApp.getState().settings
       if (!settings) return
       const opts = cleanBatchOptions(options)
-      const items = planBatch(tasks, opts, solvedTasks(useChat.getState().summaries))
+      const items = planBatch(tasks, opts, solvedTasks(practiceRecords(useChat.getState().summaries, useReTraces.getState().traces)))
       if (!items.length) return void toast('No practice tasks match this selection.')
       const models = useModels.getState()
       const wanted = settings.re.modelId
