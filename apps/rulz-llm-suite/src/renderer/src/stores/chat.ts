@@ -374,6 +374,7 @@ export const useChat = create<ChatState>((set, get) => {
       modelId: ho.modelId,
       systemPrompt: src.systemPrompt,
       sampling: src.sampling,
+      adapters: src.adapters ?? null,
       presetId: src.presetId,
       activeTools: src.activeTools,
       re: reCopy(src.re),
@@ -738,6 +739,7 @@ export const useChat = create<ChatState>((set, get) => {
         modelId,
         messages: toWire(history, conv.systemPrompt, inst.hasVision, undefined, !!conv.re),
         sampling: conv.sampling,
+        adapters: conv.adapters ?? null,
         overflow: settings?.contextOverflow ?? 'truncateMiddle',
         tools: toolRequestFor(conv.activeTools, toolOpts(conv)),
         record: conv.re?.collect ? { conversationId: conv.id } : undefined
@@ -898,6 +900,7 @@ export const useChat = create<ChatState>((set, get) => {
         modelId: useModels.getState().activeModelId,
         systemPrompt: s?.defaultSystemPrompt ?? '',
         sampling: s?.defaultSampling ?? DEFAULT_SAMPLING,
+        adapters: null,
         presetId: null,
         messages: []
       }
@@ -1194,6 +1197,7 @@ export const useChat = create<ChatState>((set, get) => {
           modelId,
           messages: [...toWire(conv.messages, conv.systemPrompt, inst.hasVision), { role: 'user', content: HANDOFF_PROMPT }],
           sampling: { ...conv.sampling, temperature: Math.min(conv.sampling.temperature, 0.5), maxTokens: null, jsonSchema: '' },
+          adapters: conv.adapters ?? null,
           // The chat is near the limit by definition, so always make room rather than refuse.
           overflow: 'truncateMiddle',
           // Little context is left at this point; spend it on the handoff, not on reasoning.
@@ -1243,6 +1247,7 @@ export const useChat = create<ChatState>((set, get) => {
         modelId,
         systemPrompt: opts.clone ? `${RE_SYSTEM_PROMPT}\n\n${clonePrompt(opts.clone)}` : RE_SYSTEM_PROMPT,
         sampling: reSampling(s?.defaultSampling ?? DEFAULT_SAMPLING),
+        adapters: null,
         presetId: null,
         activeTools: starter,
         re: { target: opts.target, goal: opts.goal, collect: opts.collect, outcome: 'unrated', practice: opts.practice, clone: opts.clone },

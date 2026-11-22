@@ -15,10 +15,12 @@ export interface ServerArgsInput {
   config: LoadConfig
   port: number
   alias: string
+  /** LoRA adapters to load, in llama-server id order. */
+  adapters?: { path: string }[]
 }
 
 /** Turns a LoadConfig into llama-server arguments. Unset values are left to llama.cpp (incl. --fit). */
-export function buildServerArgs({ model, config: c, port, alias }: ServerArgsInput): string[] {
+export function buildServerArgs({ model, config: c, port, alias, adapters = [] }: ServerArgsInput): string[] {
   const args = [
     '--model', model.path,
     '--host', '127.0.0.1',
@@ -72,6 +74,8 @@ export function buildServerArgs({ model, config: c, port, alias }: ServerArgsInp
     if (kv.draftK !== 'f16') args.push('--spec-draft-type-k', kv.draftK)
     if (kv.draftV !== 'f16') args.push('--spec-draft-type-v', kv.draftV)
   }
+  // Plain --lora (scale 1): --lora-scaled splits on ':' and breaks on Windows paths. Scales are set after loading.
+  for (const a of adapters) args.push('--lora', a.path)
   if (c.seed !== null) args.push('--seed', String(c.seed))
   if (c.chatTemplateFile.trim()) args.push('--chat-template-file', c.chatTemplateFile.trim())
   const s = c.sampling

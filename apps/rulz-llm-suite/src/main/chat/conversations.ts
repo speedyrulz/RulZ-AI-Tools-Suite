@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs'
 import { join } from 'node:path'
 import { shell } from 'electron'
 import type { Conversation, ConversationSummary } from '@shared/types'
-import { parseSampling } from '../settings/schema'
+import { parseChatAdapters, parseSampling } from '../settings/schema'
 import { readJson, writeJsonAtomic } from '../util/jsonFile'
 
 const ID_RE = /^[\w-]{1,64}$/
@@ -116,7 +116,8 @@ export class ConversationStore {
   async get(id: string): Promise<Conversation | null> {
     const c = await readJson<Conversation | null>(this.file(id), null)
     // Chats saved by older versions lack newer sampling fields.
-    return c ? { ...c, sampling: parseSampling(c.sampling) } : null
+    // An adapters value that isn't a list (damaged or from another version) becomes null: the model's defaults.
+    return c ? { ...c, sampling: parseSampling(c.sampling), ...(c.adapters === undefined ? {} : { adapters: parseChatAdapters(c.adapters) }) } : null
   }
 
   async save(c: Conversation): Promise<ConversationSummary> {

@@ -1,7 +1,9 @@
-import { Ellipsis, Eye, FolderOpen, FolderSearch, Play, RefreshCw, Search, Trash2 } from 'lucide-react'
+import { Ellipsis, Eye, FolderOpen, FolderSearch, Play, RefreshCw, Repeat, Search, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
-import type { LoadConfig, ModelEntry } from '@shared/types'
+import { adapterChoices } from '@shared/adapters'
+import type { AdapterEntry, LoadConfig, ModelEntry } from '@shared/types'
+import { AdapterConvertDialog } from '../components/models/AdapterConvertDialog'
 import { EstimateView, useEstimate } from '../components/models/EstimateView'
 import { LoadSettingsForm } from '../components/models/LoadSettingsForm'
 import { Badge, Button, Dialog, DropdownMenu, IconButton, Input } from '../components/ui'
@@ -16,6 +18,7 @@ export function ModelsPage() {
   const models = useModels((s) => s.models)
   const scanned = useModels((s) => s.scanned)
   const instances = useModels((s) => s.instances)
+  const adapters = useModels((s) => s.adapters)
   const rescan = useModels((s) => s.rescan)
   const settings = useApp((s) => s.settings)
   const updateSettings = useApp((s) => s.updateSettings)
@@ -25,6 +28,8 @@ export function ModelsPage() {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [scanning, setScanning] = useState(false)
   const [trashTarget, setTrashTarget] = useState<ModelEntry | null>(null)
+  const [adapterTrash, setAdapterTrash] = useState<AdapterEntry | null>(null)
+  const [convertOpen, setConvertOpen] = useState(false)
 
   const list = useMemo(() => {
     const q = query.trim().toLowerCase()
@@ -63,6 +68,9 @@ export function ModelsPage() {
             }}
           >
             <FolderSearch size={14} /> Change folder
+          </Button>
+          <Button size="sm" onClick={() => setConvertOpen(true)}>
+            <Repeat size={14} /> Convert PEFT adapter
           </Button>
           <Button size="sm" onClick={() => void doRescan()} disabled={scanning}>
             <RefreshCw size={14} className={scanning ? 'animate-spin' : undefined} /> Rescan
@@ -111,6 +119,7 @@ export function ModelsPage() {
               <tbody>
                 {list.map((m) => {
                   const inst = instances.find((i) => i.modelId === m.id)
+                  const fits = adapterChoices(m, adapters)
                   return (
                     <tr
                       key={m.id}
@@ -125,6 +134,11 @@ export function ModelsPage() {
                           {m.error && <Badge tone="danger">Unreadable</Badge>}
                         </div>
                         <div className="truncate text-[11px] text-faint">{m.folder || '/'}</div>
+                        {fits.length > 0 && (
+                          <div className="truncate text-[11px] text-faint" title={fits.map((a) => a.name).join(', ')}>
+                            Adapters: {fits.map((a) => a.name).join(', ')}
+                          </div>
+                        )}
                       </td>
                       <td className="truncate border-b border-border py-2 text-muted">{m.info?.architecture ?? '—'}</td>
                       <td className="border-b border-border py-2 text-muted">{m.info?.sizeLabel ?? '—'}</td>
@@ -158,6 +172,7 @@ export function ModelsPage() {
               </tbody>
             </table>
           )}
+          {scanned && adapters.length > 0 && <AdaptersSection adapters={adapters} models={models} onTrash={setAdapterTrash} />}
         </div>
       </div>
 
@@ -195,7 +210,96 @@ export function ModelsPage() {
       >
         {trashTarget && <div className="px-5 py-3 font-mono text-xs break-all text-muted">{trashTarget.files.join('\n')}</div>}
       </Dialog>
+
+      <Dialog
+        open={!!adapterTrash}
+        onOpenChange={(o) => !o && setAdapterTrash(null)}
+        title="Move adapter to the Recycle Bin?"
+        description={adapterTrash ? `${formatBytes(adapterTrash.sizeBytes)}. The file goes to the Recycle Bin, so you can restore it from there.` : undefined}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setAdapterTrash(null)}>
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              onClick={async () => {
+                const t = adapterTrash
+                setAdapterTrash(null)
+                if (!t) return
+                try {
+                  await invoke('adapters:trash', t.id)
+                  toast.success(`Moved ${t.name} to the Recycle Bin`)
+                } catch (e) {
+                  toast.error(errorMessage(e))
+                }
+              }}
+            >
+              Move to Recycle Bin
+            </Button>
+          </>
+        }
+      >
+        {adapterTrash && <div className="px-5 py-3 font-mono text-xs break-all text-muted">{adapterTrash.path}</div>}
+      </Dialog>
+
+      <AdapterConvertDialog open={convertOpen} onClose={() => setConvertOpen(false)} />
     </div>
+  )
+}
+
+/** Every LoRA adapter file in the models folder, with what it was trained on. */
+function AdaptersSection({ adapters, models, onTrash }: { adapters: AdapterEntry[]; models: ModelEntry[]; onTrash: (a: AdapterEntry) => void }) {
+  return (
+    <section className="mt-8" aria-labelledby="adapters-heading">
+      <h2 id="adapters-heading" className="mb-2 font-[family-name:var(--font-display)] text-[13px] font-semibold">
+        Adapters <span className="font-normal text-faint tabular-nums">· {adapters.length}</span>
+      </h2>
+      <table className="w-full table-fixed border-separate border-spacing-0 text-[13px]">
+        <thead className="text-left text-[11px] text-faint uppercase">
+          <tr>
+            <th className="border-b border-border py-2 pl-3 font-medium">Adapter</th>
+            <th className="w-28 border-b border-border py-2 font-medium">Architecture</th>
+            <th className="w-16 border-b border-border py-2 font-medium">Alpha</th>
+            <th className="w-48 border-b border-border py-2 font-medium">Base model</th>
+            <th className="w-20 border-b border-border py-2 text-right font-medium">Size</th>
+            <th className="w-12 border-b border-border py-2" />
+          </tr>
+        </thead>
+        <tbody>
+          {adapters.map((a) => {
+            const orphan = !models.some((m) => adapterChoices(m, [a]).length > 0)
+            return (
+              <tr key={a.id} className="hover:bg-hover/50">
+                <td className="border-b border-border py-2 pr-3 pl-3">
+                  <div className="truncate font-medium" title={a.id}>
+                    {a.name}
+                  </div>
+                  {a.error ? (
+                    <div className="truncate text-[11px] text-danger" title={a.error}>
+                      Unreadable: {a.error}
+                    </div>
+                  ) : (
+                    orphan && <div className="text-[11px] text-faint">No model with this architecture</div>
+                  )}
+                </td>
+                <td className="truncate border-b border-border py-2 text-muted">{a.architecture || '—'}</td>
+                <td className="border-b border-border py-2 text-muted tabular-nums">{a.info?.loraAlpha ?? '—'}</td>
+                <td className="truncate border-b border-border py-2 text-muted" title={a.info?.baseModelName}>
+                  {a.info?.baseModelName ?? '—'}
+                </td>
+                <td className="border-b border-border py-2 text-right text-muted tabular-nums">{formatBytes(a.sizeBytes)}</td>
+                <td className="border-b border-border py-2 pr-2 text-right">
+                  <IconButton size="sm" label="Move to Recycle Bin" onClick={() => onTrash(a)}>
+                    <Trash2 size={14} />
+                  </IconButton>
+                </td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </section>
   )
 }
 

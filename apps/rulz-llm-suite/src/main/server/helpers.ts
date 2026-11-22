@@ -3,8 +3,9 @@ import { createHash, timingSafeEqual } from 'node:crypto'
 import { sep } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { z } from 'zod'
+import { adapterBaseMatch, adapterChoices, clampScale } from '@shared/adapters'
 import { draftFiles, fileName } from '@shared/draft'
-import { KV_CACHE_TYPES, type DraftKind, type LoadConfig, type ModelEntry, type ModelSampling } from '@shared/types'
+import { KV_CACHE_TYPES, type AdapterEntry, type DraftKind, type LoadAdapter, type LoadConfig, type ModelEntry, type ModelSampling } from '@shared/types'
 
 /** The id a model is listed under in GET /v1/models: its name, or its path when names collide. */
 export function publicModelId(model: ModelEntry, all: ModelEntry[]): string {
@@ -264,6 +265,8 @@ const remoteLoadPatchSchema = z
     draftCacheTypeV: z.enum(KV_CACHE_TYPES as [string, ...string[]]),
     // null, 'builtin' or the id of one of draft_choices; checked against the library before it is used.
     draftFile: z.string().min(1).max(1024).nullable(),
+    // Ids from adapter_choices with a strength; [] removes them all. Ids are checked against the library by the server.
+    adapters: z.array(z.object({ id: z.string().min(1).max(1024), scale: z.number().finite() }).strict()).max(16),
     // Any subset of the model's sampling defaults; null clears one.
     sampling: z
       .object({
@@ -302,6 +305,7 @@ const REMOTE_LOAD_KEYS = [
   'draftCacheTypeK',
   'draftCacheTypeV',
   'draftFile',
+  'adapters',
   'sampling'
 ] as const satisfies readonly (keyof LoadConfig)[]
 
@@ -340,6 +344,43 @@ export function draftFileFromRemote(value: string | null, model: ModelEntry, mod
   const choice = draftChoices(model, models).find((c) => c.id === value)
   if (!choice) return undefined
   return choice.built_in ? 'builtin' : model.path.slice(0, model.path.length - model.id.length) + choice.id.split('/').join(sep)
+}
+
+export interface AdapterChoice {
+  id: string
+  name: string
+  size_bytes: number
+  base_model: string | null
+  alpha: number | null
+  base_match: 'match' | 'mismatch' | 'unknown'
+}
+
+/** The adapters a client may pick for `model`: same architecture, anywhere in the models folder. */
+export function adapterChoiceList(model: ModelEntry, adapters: AdapterEntry[]): AdapterChoice[] {
+  return adapterChoices(model, adapters).map((a) => ({
+    id: a.id,
+    name: a.name,
+    size_bytes: a.sizeBytes,
+    base_model: a.info?.baseModelName ?? null,
+    alpha: a.info?.loraAlpha ?? null,
+    base_match: adapterBaseMatch(a, model)
+  }))
+}
+
+/** A client's adapter list as saved: every id must be one of the model's choices, none twice; strengths clamped. */
+export function adaptersFromRemote(
+  value: LoadAdapter[],
+  model: ModelEntry,
+  adapters: AdapterEntry[]
+): { ok: true; adapters: LoadAdapter[] } | { ok: false; error: string } {
+  const allowed = new Set(adapterChoices(model, adapters).map((a) => a.id))
+  const seen = new Set<string>()
+  for (const a of value) {
+    if (!allowed.has(a.id)) return { ok: false, error: `Invalid load setting adapters: ${a.id} is not one of adapter_choices` }
+    if (seen.has(a.id)) return { ok: false, error: `Invalid load setting adapters: ${a.id} is listed twice` }
+    seen.add(a.id)
+  }
+  return { ok: true, adapters: value.map((a) => ({ id: a.id, scale: clampScale(a.scale) })) }
 }
 
 type RemoteLoadKey = (typeof REMOTE_LOAD_KEYS)[number]

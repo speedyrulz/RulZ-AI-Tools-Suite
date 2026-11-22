@@ -1,6 +1,6 @@
 import { promises as fs, watch, type FSWatcher } from 'node:fs'
 import { basename, dirname, join, relative, sep } from 'node:path'
-import type { GgufInfo, ModelEntry, SidecarFile } from '@shared/types'
+import type { AdapterEntry, GgufInfo, ModelEntry, SidecarFile } from '@shared/types'
 import { draftKind } from '@shared/draft'
 export { draftKind }
 import { readJson, writeJsonAtomic } from '../util/jsonFile'
@@ -136,6 +136,23 @@ export function groupModels(root: string, files: ScannedFile[]): ModelEntry[] {
   return models.sort((a, b) => a.id.localeCompare(b.id))
 }
 
+/** The LoRA adapter files among the scanned ones (never listed as models). Pure; unit-tested. */
+export function groupAdapters(root: string, files: ScannedFile[]): AdapterEntry[] {
+  return files
+    .filter((f) => classifyFile(basename(f.path), f.info) === 'adapter')
+    .map((f) => ({
+      id: toId(root, f.path),
+      name: displayName(basename(f.path)),
+      path: f.path,
+      sizeBytes: f.sizeBytes,
+      architecture: f.info?.architecture ?? 'unknown',
+      info: f.info,
+      error: f.error,
+      modifiedAt: f.mtimeMs
+    }))
+    .sort((a, b) => a.id.localeCompare(b.id))
+}
+
 async function walk(dir: string, depth: number, out: { path: string; size: number; mtimeMs: number }[]): Promise<void> {
   if (depth > 8) return
   let entries
@@ -164,7 +181,7 @@ async function walk(dir: string, depth: number, out: { path: string; size: numbe
 }
 
 /** Bump when GgufInfo gains fields or its derivation changes, so cached metadata is re-read. */
-const CACHE_VERSION = 4
+const CACHE_VERSION = 5
 
 interface CacheEntry {
   v?: number
@@ -226,6 +243,7 @@ const TEMP_FILE = /(\.(part|partial|tmp|temp|crdownload|download|incomplete|aria
 /** Scans the models folder, caches GGUF metadata, and watches for changes. */
 export class ModelLibrary {
   private models: ModelEntry[] = []
+  private adapters: AdapterEntry[] = []
   private cache: Record<string, CacheEntry> = {}
   private cacheLoaded = false
   private watcher: FSWatcher | null = null
@@ -236,7 +254,8 @@ export class ModelLibrary {
   constructor(
     private readonly cachePath: string,
     private readonly getRoot: () => string,
-    private readonly onChange: (models: ModelEntry[]) => void
+    private readonly onChange: (models: ModelEntry[]) => void,
+    private readonly onAdaptersChange: (adapters: AdapterEntry[]) => void = () => undefined
   ) {}
 
   list(): ModelEntry[] {
@@ -245,6 +264,14 @@ export class ModelLibrary {
 
   get(id: string): ModelEntry | undefined {
     return this.models.find((m) => m.id === id)
+  }
+
+  listAdapters(): AdapterEntry[] {
+    return this.adapters
+  }
+
+  getAdapter(id: string): AdapterEntry | undefined {
+    return this.adapters.find((a) => a.id === id)
   }
 
   scan(): Promise<ModelEntry[]> {
@@ -317,11 +344,14 @@ export class ModelLibrary {
     if (dirty) await writeJsonAtomic(this.cachePath, this.cache)
 
     const models = groupModels(root, files)
+    const adapters = groupAdapters(root, files)
     // The models folder changed while this scan ran; the scan of the new folder publishes instead.
     if (this.getRoot() !== root) return models
     this.models = models
+    this.adapters = adapters
     this.ensureWatcher(root)
     this.onChange(this.models)
+    this.onAdaptersChange(this.adapters)
     return this.models
   }
 

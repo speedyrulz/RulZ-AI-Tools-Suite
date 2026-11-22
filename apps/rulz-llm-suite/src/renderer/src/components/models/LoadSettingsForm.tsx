@@ -10,6 +10,7 @@ import { cn, formatBytes, formatTokens } from '../../lib/format'
 import { useApp } from '../../stores/app'
 import { useModels } from '../../stores/models'
 import { Field, IconButton, Input, NumberInput, Select, Slider, Switch, Textarea } from '../ui'
+import { AdapterPicker } from './AdapterPicker'
 
 const CTX_PRESETS = [4096, 8192, 16384, 32768, 65536, 131072, 262144]
 const DRAFT_LABELS: Record<DraftKind, string> = { mtp: 'MTP', eagle3: 'EAGLE-3', dflash: 'DFlash', dspark: 'DSpark' }
@@ -308,6 +309,8 @@ export function LoadSettingsForm({
           )}
         </div>
       )}
+
+      {model && <AdapterPicker model={model} adapters={config.adapters ?? []} onChange={(a) => set('adapters', a)} />}
 
       <Collapsible.Root open={samplingOpen} onOpenChange={setSamplingOpen}>
         <Collapsible.Trigger className="flex items-center gap-1 text-xs font-medium text-muted hover:text-text">

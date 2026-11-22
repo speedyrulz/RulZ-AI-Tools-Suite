@@ -59,6 +59,27 @@ export interface LoadConfig {
   extraArgs: string
   /** Sampling defaults for requests that reach this model through the API server. */
   sampling: ModelSampling
+  /**
+   * LoRA adapters loaded with the model (one --lora each), by AdapterEntry id, in this order. `scale` is
+   * the default strength: what API requests and chats without their own adapter settings get.
+   */
+  adapters: LoadAdapter[]
+}
+
+/** An adapter by AdapterEntry id with a strength; 0 = off, 1 = as trained. */
+export interface LoadAdapter {
+  id: string
+  scale: number
+}
+
+/** An adapter a running instance loaded. Its position in LoadedInstance.adapters is llama-server's adapter id. */
+export interface InstanceAdapter {
+  /** AdapterEntry id (path relative to the models folder). */
+  id: string
+  name: string
+  path: string
+  /** Default scale, set on the server after loading. */
+  scale: number
 }
 
 /**
@@ -468,6 +489,58 @@ export interface GgufInfo {
   hasChatTemplate: boolean
   /** Built-in multi-token-prediction layers (nextn), usable as a draft without a separate file. */
   mtpLayers?: number
+  /** Adapter files: adapter.type ("lora", "alora"). */
+  adapterType?: string
+  /** Adapter files: adapter.lora.alpha. */
+  loraAlpha?: number
+  /** Adapter files: the base model it was trained on (general.base_model.0.name, else general.basename). */
+  baseModelName?: string
+}
+
+/** A LoRA adapter GGUF (general.type = "adapter") found in the models folder. */
+export interface AdapterEntry {
+  /** Path relative to the models folder, with forward slashes. */
+  id: string
+  /** File name without .gguf. */
+  name: string
+  path: string
+  sizeBytes: number
+  /** general.architecture; adapters are offered to models with the same one. */
+  architecture: string
+  info: GgufInfo | null
+  error?: string
+  modifiedAt: number
+}
+
+/** Converting a Hugging Face PEFT LoRA folder to GGUF with llama.cpp's convert_lora_to_gguf.py. */
+export interface AdapterConvertRequest {
+  /** Folder with adapter_config.json and adapter_model.safetensors (or .bin). */
+  peftDir: string
+  /** Folder with the base model's config.json (weights not needed); empty = use baseModelId or the adapter config. */
+  baseDir: string
+  /** Hugging Face id of the base model, read from the Hub when baseDir is empty; empty = from adapter_config.json. */
+  baseModelId: string
+  outType: 'f32' | 'f16' | 'bf16' | 'q8_0' | 'auto'
+  /** File name for the result, written into the models folder (".gguf" added when missing). */
+  outName: string
+}
+
+export interface AdapterConvertResult {
+  ok: boolean
+  /** The written file, when ok. */
+  outPath?: string
+  error?: string
+  /** Last lines of the converter's output. */
+  logTail: string[]
+}
+
+export interface AdapterConverterStatus {
+  available: boolean
+  python: string | null
+  /** Path of convert_lora_to_gguf.py, found next to the llama.cpp build the engine uses. */
+  script: string | null
+  /** Why it isn't available. */
+  error?: string
 }
 
 /** Speculative-decoding head formats llama.cpp can load from a sidecar file. */
@@ -516,6 +589,8 @@ export interface MemoryEstimate {
   perGpu: GpuEstimate[]
   /** Expert weights the MoE offload setting keeps in system RAM (0 when off or unknown). */
   cpuExpertBytes: number
+  /** LoRA adapter weights included in the totals (0 when none). */
+  adapterBytes: number
 }
 
 export interface GpuEstimate {
@@ -564,6 +639,8 @@ export interface LoadedInstance {
   contextLength: number | null
   hasVision: boolean
   estimate: MemoryEstimate | null
+  /** Adapters this instance loaded, in llama-server id order (index = id). Empty when none. */
+  adapters: InstanceAdapter[]
 }
 
 export interface InstanceErrorEvent {
@@ -646,6 +723,11 @@ export interface Conversation {
   activeTools?: string[]
   /** Reverse-engineering session details; absent for ordinary chats. */
   re?: ReSession
+  /**
+   * This chat's adapter strengths, by AdapterEntry id. Absent or null = the loaded model's defaults. An
+   * adapter the model loaded but this list leaves out keeps its default; ids the model didn't load are ignored.
+   */
+  adapters?: LoadAdapter[] | null
 }
 
 export interface ConversationSummary {
@@ -702,6 +784,8 @@ export interface ChatRequest {
   tools?: ToolRequest
   /** Record the request and reply for this conversation's RE training data. */
   record?: { conversationId: string }
+  /** The conversation's adapter strengths (Conversation.adapters); sent to llama-server as `lora`. */
+  adapters?: LoadAdapter[] | null
 }
 
 export type StreamEvent =

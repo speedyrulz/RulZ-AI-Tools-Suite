@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto'
 import http, { type IncomingMessage, type ServerResponse } from 'node:http'
-import type { ApiReSession, ReOverview, ApiRequestLog, ApiServerSettings, ApiServerStatus, GpuStat, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@shared/types'
+import type { AdapterEntry, ApiReSession, ReOverview, ApiRequestLog, ApiServerSettings, ApiServerStatus, GpuStat, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@shared/types'
 import { fileName } from '@shared/draft'
 import { API_RE_ID, RE_OUTCOMES, RE_SESSION_HEADER } from '@shared/re'
 import type { RecordedRound } from '../chat/service'
 import type { InstanceManager } from '../engine/instances'
 import {
+  adapterChoiceList,
+  adaptersFromRemote,
   applyRemoteLoadPatch,
   authorized,
   draftChoices,
@@ -66,6 +68,8 @@ const PRACTICE_ID = /^[\w-]{1,80}$/
 export interface ApiServerDeps {
   instances: InstanceManager
   getModels: () => ModelEntry[]
+  /** LoRA adapter files in the models folder. */
+  getAdapters?: () => AdapterEntry[]
   getSettings: () => ApiServerSettings
   /** The model's saved load defaults (what a load without explicit settings uses). */
   getLoadDefaults: (modelId: string) => { config: LoadConfig; custom: boolean }
@@ -260,13 +264,20 @@ export class ApiServer {
         if (method === 'POST') {
           const json = await jsonBody()
           if (!json) return
-          const parsed = parseRemoteLoadPatch(json.config ?? {})
+          // `adapters` may sit beside `config` as well as in it.
+          const raw = json.adapters !== undefined ? { ...((json.config as object | undefined) ?? {}), adapters: json.adapters } : (json.config ?? {})
+          const parsed = parseRemoteLoadPatch(raw)
           if (!parsed.ok) return fail(400, `Invalid load setting ${parsed.error}`, 'invalid_request_error')
           const patch = { ...parsed.patch }
           if (patch.draftFile !== undefined) {
             const draftFile = draftFileFromRemote(patch.draftFile, model, this.deps.getModels())
             if (draftFile === undefined) return fail(400, 'Invalid load setting draftFile: not one of draft_choices', 'invalid_request_error')
             patch.draftFile = draftFile
+          }
+          if (patch.adapters !== undefined) {
+            const checked = adaptersFromRemote(patch.adapters, model, this.deps.getAdapters?.() ?? [])
+            if (!checked.ok) return fail(400, checked.error, 'invalid_request_error')
+            patch.adapters = checked.adapters
           }
           const merged = applyRemoteLoadPatch(this.deps.getLoadDefaults(model.id).config, patch)
           // dry_run only estimates memory for the changed settings, so a form can show it while editing.
@@ -644,6 +655,8 @@ export class ApiServer {
       // What "automatic" (draftFile null) uses, and what else can be picked.
       default_draft: m.draft?.kind ? { name: m.draft.builtIn ? 'Built-in MTP layers' : fileName(m.draft.path), kind: m.draft.kind, built_in: !!m.draft.builtIn } : null,
       draft_choices: draftChoices(m, this.deps.getModels()),
+      adapters: config.adapters ?? [],
+      adapter_choices: adapterChoiceList(m, this.deps.getAdapters?.() ?? []),
       gpus: this.deps.gpus().map(({ index, name, memUsedMiB, memTotalMiB }) => ({ index, name, memUsedMiB, memTotalMiB })),
       estimate: this.deps.estimate(m, config),
       max_context_length: m.info?.contextLength,

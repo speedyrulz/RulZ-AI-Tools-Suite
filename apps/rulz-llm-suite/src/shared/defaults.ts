@@ -43,7 +43,8 @@ export const DEFAULT_LOAD_CONFIG: LoadConfig = {
     repeatPenalty: null,
     presencePenalty: null,
     override: false
-  }
+  },
+  adapters: []
 }
 
 export const DEFAULT_SAMPLING: SamplingParams = {

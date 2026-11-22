@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { toast } from 'sonner'
-import type { HardwareSnapshot, LoadConfig, LoadedInstance, ModelEntry } from '@shared/types'
+import type { AdapterEntry, HardwareSnapshot, LoadConfig, LoadedInstance, ModelEntry } from '@shared/types'
 import { errorMessage, invoke, on } from '../lib/api'
 import { pickActive } from '../lib/activeModel'
 import { once } from '../lib/once'
@@ -8,6 +8,8 @@ import { once } from '../lib/once'
 interface ModelsState {
   models: ModelEntry[]
   scanned: boolean
+  /** LoRA adapter files in the models folder. */
+  adapters: AdapterEntry[]
   instances: LoadedInstance[]
   hardware: HardwareSnapshot | null
   /** Model that new chat messages go to. */
@@ -56,12 +58,14 @@ export const useModels = create<ModelsState>((set, get) => {
   return {
     models: [],
     scanned: false,
+    adapters: [],
     instances: [],
     hardware: null,
     activeModelId: null,
 
     init: once(async () => {
       on('models:changed', (models) => set({ models, scanned: true }))
+      on('adapters:changed', (adapters) => set({ adapters }))
       on('instances:changed', (instances) => set({ instances, activeModelId: pickActive(instances, get().activeModelId, loadingModelId) }))
       on('instances:error', (e) => {
         toast.error(`${e.modelName}: ${e.error}`, { description: e.logTail.slice(-4).join('\n'), duration: 15000 })
@@ -73,6 +77,11 @@ export const useModels = create<ModelsState>((set, get) => {
         invoke('hardware:snapshot')
       ])
       set((s) => ({ models: s.models.length ? s.models : models, scanned: s.scanned || models.length > 0, instances, hardware }))
+      // An adapters:changed event that arrived first is newer than this list.
+      void invoke('adapters:list').then(
+        (adapters) => set((s) => (s.adapters.length ? s : { adapters })),
+        () => undefined
+      )
       // An empty (or missing) folder scans so fast that its result can arrive before the listener
       // above, leaving "Scanning models…" up for good. Ask for the scan's result directly.
       if (!get().scanned) void get().rescan()
