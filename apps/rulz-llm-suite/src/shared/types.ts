@@ -173,6 +173,8 @@ export interface AppSettings {
   minimizeToTray: boolean
   /** The close button hides the window to the system tray; Quit from the tray menu exits. */
   closeToTray: boolean
+  /** Writing mode: folder holding the novel projects; '' = <Documents>\RulZ Novels. */
+  writingRoot: string
   /** Offer MCP tools to the model in chats. */
   toolsEnabled: boolean
   /** Ask before each tool call unless the tool is in allowedTools. */
@@ -812,6 +814,8 @@ export interface ChatRequest {
   record?: { conversationId: string }
   /** The conversation's adapter strengths (Conversation.adapters); sent to llama-server as `lora`. */
   adapters?: LoadAdapter[] | null
+  /** The caller already fitted the messages to the context (Writing mode): do not trim; fail if too large. */
+  prefitted?: boolean
 }
 
 export type StreamEvent =

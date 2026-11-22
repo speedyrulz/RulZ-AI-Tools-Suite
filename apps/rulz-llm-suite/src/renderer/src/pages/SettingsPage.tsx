@@ -120,6 +120,30 @@ export function SettingsPage() {
           </Field>
         </Card>
 
+        <Card title="Writing" description="Folder that holds your novel projects, one folder per project. They are plain Markdown files you can also edit in other apps.">
+          <Field label="Projects folder" hint="Default: Documents\RulZ Novels">
+            <div className="flex gap-2">
+              <PathInput value={settings.writingRoot} placeholder="Default: Documents\RulZ Novels" onCommit={(v) => void update({ writingRoot: v })} />
+              <Button
+                onClick={async () => {
+                  const dir = await invoke('dialog:pickFolder', { title: 'Choose the folder for your novel projects', defaultPath: settings.writingRoot || undefined })
+                  if (dir) await update({ writingRoot: dir })
+                }}
+              >
+                <FolderSearch size={14} /> Change…
+              </Button>
+              <Button
+                onClick={async () => {
+                  const root = await invoke('novel:root')
+                  await invoke('shell:openPath', root)
+                }}
+              >
+                <FolderOpen size={14} /> Open folder
+              </Button>
+            </div>
+          </Field>
+        </Card>
+
         <Card title="Default load settings" description="Used for models without their own saved settings.">
           {loadDefaults && <LoadSettingsForm model={null} config={loadDefaults} onChange={setLoadDefaults} />}
           <div className="flex justify-end">

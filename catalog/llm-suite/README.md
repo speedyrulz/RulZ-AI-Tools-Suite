@@ -95,6 +95,29 @@ Discover/downloads, RAG and a CLI are planned.
   ids in load order) to set adapter strengths for that request. `POST /v1/models/{id}/unload` unloads every running instance of a model (replying with how many it
   `unloaded`), so a client can free the memory when it is done with a model.
   Default port 1234 (pick another if LM Studio is running).
+- **Writing mode** (`Ctrl+7`) — write a novel with a local model. A project is a plain folder of Markdown files
+  (default `Documents\RulZ Novels`, set in **Settings → Writing**), so Obsidian, VS Code or a sync client can open it
+  too.
+  - **Outline**: chapters and scenes, each scene with beats, POV, characters present, a target word count, a status
+    and a summary. **Plan chapters** and **Plan scenes** ask the model for a plan; **Summarize** writes a scene or
+    chapter summary. Every proposal is a card you accept, edit or reject.
+  - **Story bible**: characters, places and other entries as Markdown files with front matter (aliases, keyword
+    triggers, priority, always-include). An entry goes into a request when its name, an alias or a trigger appears in
+    the beats or the text near the cursor, when it is the scene's POV or present, or when it was used earlier in the
+    scene. The **Context** tab shows each part's tokens against its cap, every included entry and why, and what was
+    cut to fit.
+  - **Editor**: CodeMirror with Markdown, search and soft wrap. **Continue**, **Draft scene**, **Rewrite** (tighter,
+    more vivid, another tone, show don't tell, or your own note), **Expand**, **Condense** and **Dialogue**, with up to
+    four alternatives. AI text is a pending change with **Accept** / **Reject** per change; nothing is written until
+    you accept it.
+  - **Requests** are assembled to fit the model's context: system and style, fixed bible entries, the story so far
+    (summaries), the scene, triggered entries, then the latest prose in steps, so llama-server can reuse its prompt
+    cache between requests. Each project has its own model, sampling (including DRY, XTC and avoid words) and adapters.
+  - **Your text is kept safe**: atomic saves; an unsaved-text journal every few hundred milliseconds that is offered
+    back after a crash; a conflict banner when another program changed the file; snapshots in **History**; deleted
+    scenes, chapters and entries in **Trash**; a project whose `project.json` or `outline.json` can't be read is
+    opened read-only instead of being reset. Closing the window first saves or journals open text.
+  - Not yet tried with a real model.
 - **Reverse Engineering mode** (`Ctrl+6`) — runs a local model as a reverse engineer with the REA MCP tools, and
   collects fine-tuning data while it works. Tuned first for Ornith 1.5 35B-A3B (Heretic MTP APEX I-Mini).
   - **Sessions**: pick a program, library, package or folder and a goal (overview, license check, network, config,

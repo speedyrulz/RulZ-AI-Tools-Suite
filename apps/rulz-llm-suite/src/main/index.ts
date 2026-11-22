@@ -26,6 +26,8 @@ import { gradePractice, listPractice, preparePractice } from './re/practice'
 import { buildOverview, MAX_OVERVIEW_SESSIONS } from './re/overview'
 import { findPython, type PythonCommand } from './re/python'
 import { exportDataset, TraceStore, type ExportSession } from './re/traces'
+import { registerNovelIpc } from './novel/ipc'
+import { NovelStore } from './novel/store'
 
 const MiB = 1024 * 1024
 const isDev = !app.isPackaged && !!process.env.ELECTRON_RENDERER_URL
@@ -393,6 +395,7 @@ async function main(): Promise<void> {
   handle('chat:abort', (id) => chat.abort(id))
   handle('chat:releaseTurn', (id) => chat.releaseTurn(id))
   handle('chat:countTokens', (modelId, messages, tools) => chat.countTokens(modelId, messages, tools))
+  handle('chat:countText', (modelId, text) => chat.countText(modelId, text))
 
   handle('conversations:list', () => conversations.list())
   handle('conversations:get', (id) => conversations.get(id))
@@ -483,6 +486,36 @@ async function main(): Promise<void> {
   handle('bench:stop', () => bench.stop())
   handle('bench:delete', (id) => benchStore.delete(id))
 
+  // ---- Writing mode ----
+  const novel = new NovelStore({
+    rootSetting: () => settings.get().writingRoot,
+    documents: () => app.getPath('documents'),
+    trashItem: (path) => shell.trashItem(path),
+    emit: (change) => broadcast('novel:changed', change)
+  })
+  // The close-time handshake (data safety rule 4): the renderer saves or journals its dirty buffers and answers.
+  let flushTimeoutMs = 3000
+  let flushing: Promise<void> | null = null
+  let flushDone: (() => void) | null = null
+  let novelFlushed = false
+  const flushNovel = (): Promise<void> => {
+    if (!novel.hasOpenProject()) return Promise.resolve()
+    flushing ??= new Promise<void>((resolve) => {
+      const finish = (): void => {
+        clearTimeout(timer)
+        flushDone = null
+        // A cancelled shutdown must not leave a settled promise that skips the next flush.
+        flushing = null
+        resolve()
+      }
+      const timer = setTimeout(finish, flushTimeoutMs)
+      flushDone = finish
+      broadcast('novel:flush', undefined)
+    })
+    return flushing
+  }
+  registerNovelIpc(novel, () => flushDone?.())
+
   handle('presets:list', () => settings.listPresets())
   handle('presets:save', (p) => settings.savePreset(p))
   handle('presets:delete', (id) => settings.deletePreset(id))
@@ -495,14 +528,28 @@ async function main(): Promise<void> {
     mainWindow?.hide()
   })
   mainWindow.on('close', (e) => {
-    if (quitting || !settings.get().closeToTray) return
+    if (!quitting && settings.get().closeToTray) {
+      e.preventDefault()
+      ensureTray()
+      mainWindow?.hide()
+      return
+    }
+    // Really closing: let the Writing page save or journal its open text first, then close for real.
+    if (novelFlushed || !novel.hasOpenProject()) return
     e.preventDefault()
-    ensureTray()
-    mainWindow?.hide()
+    void flushNovel().finally(() => {
+      novelFlushed = true
+      mainWindow?.close()
+    })
   })
-  // Windows logoff/shutdown must not be blocked by close-to-tray.
+  // Windows logoff/shutdown must not be blocked by close-to-tray. The system gives little time, so the
+  // Writing page is asked to flush at once and waits at most a second. The real backstop is the journal:
+  // the Writing page writes every dirty buffer through novel:journal about 300 ms after each edit, so at
+  // most that much typing can be missing after a forced shutdown, and it is offered back on the next open.
   mainWindow.on('session-end', () => {
     quitting = true
+    flushTimeoutMs = 1000
+    void flushNovel()
   })
   mainWindow.on('show', destroyTray)
   mainWindow.on('focus', () => hardware.poke())
@@ -513,9 +560,20 @@ async function main(): Promise<void> {
 
   app.on('second-instance', showMainWindow)
   app.on('window-all-closed', () => app.quit())
-  app.on('before-quit', () => {
+  app.on('before-quit', (e) => {
     quitting = true
+    // app.quit() fires this before the window's close event. Hold the quit until the Writing page has
+    // saved or journalled its text, then quit again; the second pass tears everything down.
+    if (!novelFlushed && novel.hasOpenProject()) {
+      e.preventDefault()
+      void flushNovel().finally(() => {
+        novelFlushed = true
+        app.quit()
+      })
+      return
+    }
     destroyTray()
+    novel.dispose()
     hardware.stop()
     library.dispose()
     // The benchmark first: it sets its stop flag and starts unloading before the servers are killed.

@@ -125,6 +125,7 @@ export const settingsSchema = z.object({
   rightPanelOpen: z.boolean().catch(D.rightPanelOpen),
   minimizeToTray: z.boolean().catch(D.minimizeToTray),
   closeToTray: z.boolean().catch(D.closeToTray),
+  writingRoot: z.string().catch(D.writingRoot),
   toolsEnabled: z.boolean().catch(D.toolsEnabled),
   confirmToolCalls: z.boolean().catch(D.confirmToolCalls),
   allowedTools: z.array(z.string()).catch(D.allowedTools),

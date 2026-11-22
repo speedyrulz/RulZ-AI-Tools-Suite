@@ -1,0 +1,356 @@
+// Writing mode: types shared by the main process (file store) and the renderer (Writing page).
+// Design and data-safety rules: docs/writing-mode-design.md. This file is the contract; change it
+// only together with both sides.
+import type { LoadAdapter, SamplingParams } from './types'
+
+export const NOVEL_FORMAT = 1
+
+// ---------------------------------------------------------------------------------------------
+// Project files
+// ---------------------------------------------------------------------------------------------
+
+export interface NovelBudget {
+  /** Sent as max_tokens and kept free in the context. */
+  replyTokens: number
+  /** Share of what is left after system/style/task/scene for the prose tail (0–1). */
+  proseShare: number
+  /** Share of the available context for bible entries, fixed + triggered (0–1). */
+  bibleShare: number
+}
+
+/** project.json. Unknown keys found on disk are kept by the store when it rewrites the file. */
+export interface NovelProject {
+  format: number
+  id: string
+  title: string
+  createdAt: string
+  updatedAt: string
+  /** null = the active chat model. */
+  modelId: string | null
+  sampling: SamplingParams
+  adapters: LoadAdapter[] | null
+  budget: NovelBudget
+  /** Free-form POV/tense line shown to the model next to style.md, e.g. "Close third, past tense". */
+  povTense: string
+}
+
+export type SceneStatus = 'idea' | 'beats' | 'draft' | 'revised'
+
+export interface NovelScene {
+  id: string
+  title: string
+  /** File name inside manuscript\, fixed at creation; never renamed on reorder. */
+  file: string
+  /** The plan for the scene. */
+  beats: string
+  /** Recap of what was written (accepted by the user). */
+  summary: string
+  /** Byte hash (see NovelTextFile.hash) of the scene file the summary was made from; '' = none. */
+  summaryOf: string
+  status: SceneStatus
+  /** Bible entry id or null. */
+  pov: string | null
+  /** Bible entry ids ticked as present. */
+  present: string[]
+  /** Triggered entries kept for this scene (sticky), entry ids. */
+  sticky: string[]
+  targetWords: number | null
+}
+
+export interface NovelChapter {
+  id: string
+  title: string
+  /** Optional grouping label such as "Act I". */
+  act: string
+  summary: string
+  /** Combined hash of the chapter's scene hashes the summary was made from; '' = none. */
+  summaryOf: string
+  /** At least one scene. */
+  scenes: NovelScene[]
+}
+
+/** outline.json */
+export interface NovelOutline {
+  format: number
+  chapters: NovelChapter[]
+}
+
+export type BibleKind = 'character' | 'place' | 'lore' | 'other'
+
+export interface BibleEntry {
+  /** File name without .md; also the id used in NovelScene.pov/present/sticky. */
+  id: string
+  name: string
+  kind: BibleKind
+  aliases: string[]
+  triggers: string[]
+  /** 0–100; higher stays when the budget is tight. */
+  priority: number
+  /** true = in every request. */
+  always: boolean
+  /** Markdown body after the front matter. */
+  body: string
+  /** Front-matter problems, shown on the entry; never thrown. */
+  problems: string[]
+}
+
+// ---------------------------------------------------------------------------------------------
+// Text files as the store hands them over (bytes ↔ text rules: design, data safety rule 2)
+// ---------------------------------------------------------------------------------------------
+
+export interface NovelFileMeta {
+  bom: boolean
+  eol: 'crlf' | 'lf'
+}
+
+/** A user-text file: scene, bible entry or style.md. `text` is LF-normalised, without BOM. */
+export interface NovelTextFile {
+  /** Path relative to the project folder with forward slashes, e.g. "manuscript/01-ferry-k3f9.md". */
+  path: string
+  text: string
+  /** sha256 hex of the raw bytes on disk ('' when the file does not exist). */
+  hash: string
+  meta: NovelFileMeta
+  /** Not valid UTF-8: shown read-only, never saved. */
+  readOnly: boolean
+  /** Unsaved-edit journal newer than the file, if any (data safety rule 4). */
+  journal: { text: string; baseHash: string; savedAt: string } | null
+}
+
+export interface NovelProjectSummary {
+  id: string
+  title: string
+  folder: string
+  updatedAt: string
+  words: number
+}
+
+/** Everything the Writing page needs to show a project (scene texts are loaded on demand). */
+export interface NovelProjectState {
+  folder: string
+  project: NovelProject
+  outline: NovelOutline
+  bible: BibleEntry[]
+  style: NovelTextFile
+  /** Words per scene file (relative path → count), for the outline tree. */
+  words: Record<string, number>
+  /** Scene files referenced by the outline but missing on disk. */
+  missing: string[]
+  /** .md files in manuscript\ not referenced by the outline. */
+  orphans: string[]
+  /** project.json or outline.json could not be parsed: the project is read-only (data safety rule 8). */
+  blocked: string | null
+}
+
+// ---------------------------------------------------------------------------------------------
+// Saving
+// ---------------------------------------------------------------------------------------------
+
+export interface NovelSaveRequest {
+  folder: string
+  path: string
+  text: string
+  /** Hash the editor's text was based on; '' for a new file. */
+  baseHash: string
+  /** "Keep mine" after a conflict: write even though the disk changed (the disk version is snapshotted first). */
+  force?: boolean
+  /** Take a history snapshot before writing (Accept, Restore, Keep mine). */
+  snapshot?: boolean
+}
+
+export type NovelSaveResult =
+  | { ok: true; hash: string }
+  | { ok: false; reason: 'conflict'; diskHash: string; diskText: string }
+  | { ok: false; reason: 'readOnly' | 'blocked' }
+  | { ok: false; reason: 'error'; error: string }
+
+export interface NovelHistoryItem {
+  /** Compact stamp as used in the file name, e.g. "20261122T101500". */
+  stamp: string
+  /** Relative path of the snapshot inside the project. */
+  snapshot: string
+  bytes: number
+}
+
+export interface NovelTrashItem {
+  id: string
+  deletedAt: string
+  /** What was deleted, e.g. 'Chapter "The ferry" (3 scenes)'. */
+  label: string
+  files: string[]
+}
+
+// ---------------------------------------------------------------------------------------------
+// Outline and project changes: applied in order by the main process (data safety rule 7)
+// ---------------------------------------------------------------------------------------------
+
+export type SceneField = 'title' | 'beats' | 'summary' | 'summaryOf' | 'status' | 'pov' | 'present' | 'sticky' | 'targetWords'
+export type ChapterField = 'title' | 'act' | 'summary' | 'summaryOf'
+
+export type OutlineOp =
+  | { op: 'setScene'; sceneId: string; field: SceneField; value: unknown }
+  | { op: 'setChapter'; chapterId: string; field: ChapterField; value: unknown }
+  /** Adds a chapter with one empty scene; `index` null = at the end. File names are made by main. */
+  | { op: 'addChapter'; chapterId: string; sceneId: string; title: string; index: number | null }
+  | { op: 'addScene'; chapterId: string; sceneId: string; title: string; index: number | null; beats?: string }
+  | { op: 'moveChapter'; chapterId: string; index: number }
+  | { op: 'moveScene'; sceneId: string; toChapterId: string; index: number }
+  /** Adds an orphan file from manuscript\ as a scene. */
+  | { op: 'adoptFile'; file: string; chapterId: string; sceneId: string; index: number | null }
+
+export type ProjectPatch = Partial<Pick<NovelProject, 'title' | 'modelId' | 'sampling' | 'adapters' | 'budget' | 'povTense'>>
+
+// ---------------------------------------------------------------------------------------------
+// Request assembly (pure: src/shared/novelAssembly.ts)
+// ---------------------------------------------------------------------------------------------
+
+export type NovelAction =
+  | 'continue'
+  | 'rewrite'
+  | 'expand'
+  | 'condense'
+  | 'dialogue'
+  | 'draftScene'
+  | 'summarizeScene'
+  | 'summarizeChapter'
+  | 'outlineChapters'
+  | 'outlineScenes'
+
+export type RewriteVariant = 'tighter' | 'vivid' | 'tone' | 'show' | 'custom'
+
+export type AssemblyPartKind = 'system' | 'task' | 'scene' | 'prose' | 'fixedEntries' | 'triggeredEntries' | 'storySoFar'
+
+/** A piece of text the assembler may include, with its real token count (counted by the renderer). */
+export interface Counted {
+  text: string
+  tokens: number
+}
+
+export interface AssemblyEntry extends Counted {
+  id: string
+  name: string
+  priority: number
+  /** Why it is a candidate: "always", "pov", "present", "sticky", "trigger: witch", "via: Mara Venn". */
+  reason: string
+  fixed: boolean
+  /** The entry cut to its first paragraph, used before dropping it. */
+  short: Counted
+}
+
+export interface AssemblySummary extends Counted {
+  /** "Chapter 2: The ferry" or "Scene: Night crossing". */
+  label: string
+  kind: 'chapter' | 'scene'
+  /** Missing or stale summary replaced by beats. */
+  fallback: 'none' | 'missing' | 'stale'
+}
+
+export interface AssemblyInput {
+  action: NovelAction
+  /** Model context length (per slot) and a measured template overhead in tokens. */
+  contextLength: number
+  templateOverhead: number
+  budget: NovelBudget
+  system: Counted
+  task: Counted
+  scene: Counted
+  /** Candidate entries, fixed ones included. */
+  entries: AssemblyEntry[]
+  /** Oldest first. */
+  summaries: AssemblySummary[]
+  /** Prose before the cursor split into paragraph blocks, oldest first, each counted. */
+  proseBlocks: Counted[]
+  /** Prose after the cursor (insertion mid-text), counted; may be empty. */
+  proseAfter: Counted
+  /** Anchor step in tokens (about a quarter of the tail budget) for a stable prose start. */
+  anchorStep: number
+}
+
+export interface AssemblyPart {
+  kind: AssemblyPartKind
+  tokens: number
+  cap: number | null
+}
+
+export interface AssemblyDropped {
+  kind: AssemblyPartKind
+  label: string
+  /** 'dropped' or 'cut' (entry shortened to its first paragraph). */
+  how: 'dropped' | 'cut'
+  reason: string
+}
+
+export interface AssemblyResult {
+  /** OpenAI-style messages ready for chat:start with prefitted: true. */
+  messages: { role: 'system' | 'user' | 'assistant'; content: string }[]
+  parts: AssemblyPart[]
+  dropped: AssemblyDropped[]
+  /** Included entry ids (for the sticky list and the Context panel). */
+  includedEntries: string[]
+  /** Index into proseBlocks of the first block included. */
+  proseStart: number
+  totalTokens: number
+  available: number
+  warnings: string[]
+}
+
+/** Structured reply schemas (JSON-schema output, validated with zod in novelPrompts.ts). */
+export interface OutlineChaptersReply {
+  chapters: { title: string; act: string; summary: string }[]
+}
+export interface OutlineScenesReply {
+  scenes: { title: string; beats: string; pov: string | null; present: string[] }[]
+}
+export interface SummaryReply {
+  summary: string
+}
+
+// ---------------------------------------------------------------------------------------------
+// IPC (merged into IpcInvoke / IpcEvents in ipc.ts). `folder` is the project's absolute folder.
+// ---------------------------------------------------------------------------------------------
+
+export interface NovelIpcInvoke {
+  /** Projects in the projects root (setting writingRoot; '' = <Documents>\RulZ Novels). */
+  'novel:listProjects': () => NovelProjectSummary[]
+  'novel:root': () => string
+  'novel:createProject': (title: string) => NovelProjectState
+  /** Opens (and starts watching) a project folder, inside the root or anywhere. */
+  'novel:openProject': (folder: string) => NovelProjectState
+  'novel:closeProject': (folder: string) => void
+  'novel:readFile': (folder: string, path: string) => NovelTextFile
+  'novel:saveFile': (req: NovelSaveRequest) => NovelSaveResult
+  /** Unsaved-edit journal (debounced by the renderer); a successful save removes it. */
+  'novel:journal': (folder: string, path: string, text: string, baseHash: string) => void
+  'novel:discardJournal': (folder: string, path: string) => void
+  /** Applies ops in order and writes outline.json; creates empty scene files for new scenes. */
+  'novel:outlinePatch': (folder: string, ops: OutlineOp[]) => NovelProjectState
+  'novel:projectPatch': (folder: string, patch: ProjectPatch) => NovelProject
+  /** Creates bible/<id>.md with front matter; returns the new entry. */
+  'novel:createEntry': (folder: string, name: string, kind: BibleKind) => BibleEntry
+  'novel:deleteScene': (folder: string, sceneId: string) => NovelProjectState
+  'novel:deleteChapter': (folder: string, chapterId: string) => NovelProjectState
+  'novel:deleteEntry': (folder: string, entryId: string) => NovelProjectState
+  'novel:history': (folder: string, path: string) => NovelHistoryItem[]
+  'novel:readSnapshot': (folder: string, snapshot: string) => string
+  'novel:trash': (folder: string) => NovelTrashItem[]
+  'novel:restoreTrash': (folder: string, id: string) => NovelProjectState
+  'novel:emptyTrash': (folder: string) => void
+  /** Moves the whole project folder to the Recycle Bin. */
+  'novel:deleteProject': (folder: string) => void
+  /** Renderer's answer to the 'novel:flush' event: every dirty buffer is saved or journalled. */
+  'novel:flushDone': () => void
+  /** Token count of a text on the loaded model (cached per instance); null if the model can't count. */
+  'chat:countText': (modelId: string, text: string) => number | null
+}
+
+export type NovelChange =
+  | { kind: 'text'; folder: string; path: string; hash: string }
+  | { kind: 'deleted'; folder: string; path: string }
+  | { kind: 'state'; folder: string; state: NovelProjectState }
+
+export interface NovelIpcEvents {
+  /** A file changed on disk outside the app, or the project state changed (outline/project/bible). */
+  'novel:changed': NovelChange
+  /** The window is closing: save or journal every dirty buffer, then invoke 'novel:flushDone'. */
+  'novel:flush': undefined
+}

@@ -96,6 +96,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   rightPanelOpen: true,
   minimizeToTray: false,
   closeToTray: false,
+  writingRoot: '',
   toolsEnabled: true,
   confirmToolCalls: true,
   allowedTools: [],
