@@ -68,9 +68,15 @@ function makeStore(disk: Record<string, string> = { 's1.md': 'The ferry crossed.
     checksProblem: null
   }
   const patches: StateOp[][] = []
+  const held: string[] = []
+  const released: string[] = []
+  const closed = { value: false }
   const store: WritingStore = {
+    hold: async (_f, owner) => void held.push(owner),
+    release: async (_f, owner) => void released.push(owner),
     projectState: async () => state,
     readFile: async (_f, rel) => {
+      if (closed.value) throw new Error('That project is not open.')
       const name = rel.replace('manuscript/', '')
       if (!(name in disk)) throw new Error('missing')
       return { path: rel, text: disk[name], hash: `hash:${disk[name]}`, meta: {} as NovelTextFile['meta'], readOnly: false, journal: null }
@@ -80,7 +86,7 @@ function makeStore(disk: Record<string, string> = { 's1.md': 'The ferry crossed.
       return { state, rejected: [] }
     }
   }
-  return { store, state, disk, patches }
+  return { store, state, disk, patches, held, released, closed }
 }
 
 /** A chat whose replies are scripted per request. `hold` keeps the stream open until released or aborted. */
@@ -437,6 +443,71 @@ describe('job ownership', () => {
     expect(runs.get(job.id, 'phone:a')?.id).toBe(job.id)
     runs.dismiss(job.id, 'phone:b')
     expect(runs.get(job.id, 'phone:a')).toBeNull()
+  })
+})
+
+describe('project hold, dismiss and request building', () => {
+  it('holds the project for the job and releases it at the end', async () => {
+    const t = setup()
+    const job = t.runs.run(request())
+    await finished(t.runs, job.id)
+    await waitFor(() => t.released.length === 1)
+    expect(t.held).toEqual([`job:${job.id}`])
+    expect(t.released).toEqual([`job:${job.id}`])
+  })
+
+  it('fails the job when the project is not open any more instead of going on with missing data', async () => {
+    const t = setup()
+    t.closed.value = true
+    const done = await finished(t.runs, t.runs.run(request()).id)
+    expect(done.status).toBe('error')
+    expect(done.error).toContain('not open')
+  })
+
+  it('fails the job when the project cannot be held, and releases nothing', async () => {
+    const t = setup()
+    t.store.hold = async () => {
+      throw new Error('That folder does not exist.')
+    }
+    const done = await finished(t.runs, t.runs.run(request()).id)
+    expect(done.error).toBe('The project could not be opened: That folder does not exist.')
+    expect(t.released).toEqual([])
+  })
+
+  it('still counts a dismissed running job as the running one', async () => {
+    let release: () => void = () => undefined
+    const hold = new Promise<void>((r) => (release = r))
+    const t = setup({ reply: () => ({ chunks: ['x'], hold }) })
+    const job = t.runs.run(request())
+    await waitFor(() => t.requests.length === 1)
+    t.runs.dismiss(job.id)
+    expect(t.runs.get(job.id)).toBeNull()
+    expect(() => t.runs.run(request())).toThrow('already working on another AI action')
+    await waitFor(() => t.released.length === 1)
+    expect(() => t.runs.run(request())).not.toThrow()
+    release()
+  })
+
+  it('builds chapter actions for the chapter even when the phone also sends a scene', async () => {
+    const t = setup({ reply: () => JSON.stringify({ scenes: [{ title: 'A', beats: 'b', pov: null, present: [] }] }) })
+    const done = await finished(t.runs, t.runs.run(request({ action: 'outlineScenes', sceneId: 's1', chapterId: 'c2', text: 'ignored', count: 1 })).id)
+    expect(done.status).toBe('done')
+    expect(String(t.requests[0].messages[1].content)).toContain('Chapter 2: Two')
+    const t2 = setup({ reply: () => '{"summary":"x"}' })
+    await finished(t2.runs, t2.runs.run(request({ action: 'summarizeChapter', sceneId: 's1', chapterId: 'c2', text: '' })).id)
+    expect(String(t2.requests[0].messages[1].content)).toContain('Chapter: Two')
+  })
+
+  it('sends the whole-scene actions without a note or selection, as the desktop does', async () => {
+    for (const action of ['summarizeScene', 'checkScene', 'updateState'] as const) {
+      const t = setup({ reply: () => '{"summary":"x","findings":[],"changes":[]}' })
+      await finished(t.runs, t.runs.run(request({ action, note: 'zzz-note', cursor: 0, selection: { from: 0, to: 5 } })).id)
+      expect(t.requests).toHaveLength(1)
+      expect(JSON.stringify(t.requests[0].messages)).not.toContain('zzz-note')
+    }
+    const t = setup()
+    await finished(t.runs, t.runs.run(request({ note: 'zzz-note' })).id)
+    expect(JSON.stringify(t.requests[0].messages)).toContain('zzz-note')
   })
 })
 

@@ -512,3 +512,59 @@ describe('phone settings and pairing', () => {
     expect(tailscaleAddresses({ utun3: [iface('100.70.0.1')], Ethernet: [iface('192.168.1.5')] })).toEqual(['100.70.0.1'])
   })
 })
+
+describe('server shutdown and pairing codes', () => {
+  it('closes even when a peer holds a plain HTTP connection open', async () => {
+    await start()
+    const net = await import('node:net')
+    const sock = net.connect(server!.port!, '127.0.0.1')
+    await new Promise((r) => sock.once('connect', r))
+    sock.write('GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n')
+    await new Promise((r) => sock.once('data', r))
+    const t0 = Date.now()
+    await server!.close()
+    server = null
+    expect(Date.now() - t0).toBeLessThan(2000)
+    sock.destroy()
+  })
+
+  function access(initial: Partial<AppSettings>) {
+    let settings: AppSettings = { ...DEFAULT_SETTINGS, phonePort: 0, ...initial }
+    const a = new PhoneAccess({
+      settings: { get: () => settings, update: async (patch) => (settings = parseSettings({ ...settings, ...patch })) },
+      host: fakeHost().host,
+      emit: () => undefined,
+      addresses: () => ['127.0.0.1'],
+      dnsName: async () => undefined
+    })
+    return { a, get: () => settings }
+  }
+
+  it('makes the first code when it starts enabled without one, and a phone can pair with it', async () => {
+    const t = access({ phoneEnabled: true, phoneToken: '' })
+    try {
+      await t.a.start()
+      expect(t.get().phoneToken).toMatch(/^[A-Za-z0-9_-]{43}$/)
+      expect(t.a.status().state).toBe('on')
+    } finally {
+      await t.a.dispose()
+    }
+  })
+
+  it('gives the server the code pairing() makes, and runs token changes one at a time', async () => {
+    const t = access({ phoneEnabled: false, phoneToken: '' })
+    try {
+      // Enabled with an empty code behind the app's back: pairing must still teach the server the new code.
+      await t.a.setEnabled(true)
+      const [p1, p2, fresh] = await Promise.all([t.a.pairing(), t.a.pairing(), t.a.newToken()])
+      expect(p1.token).toBeTruthy()
+      expect(p2.token).toBeTruthy()
+      // The last one wins, and settings agree with what the last call returned.
+      expect(t.get().phoneToken).toBe(fresh.token)
+      expect((await t.a.pairing()).token).toBe(fresh.token)
+    } finally {
+      await t.a.dispose()
+    }
+  })
+})
+

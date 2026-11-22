@@ -563,7 +563,7 @@ async function main(): Promise<void> {
     store: storeAdapter(novel),
     chat: chatAdapter(chat, chatTap),
     models: modelsAdapter(library, instances),
-    busyReason: chatBusyReason(chat),
+    busyReason: chatBusyReason(chat, () => bench.isRunning()),
     // A phone may use a project's jobs while it holds the project open (a reconnected phone has a new id).
     holds: (owner, folder) => novel.ownersOf(folder).includes(owner),
     emit: writingEvents.emit

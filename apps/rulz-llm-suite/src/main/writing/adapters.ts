@@ -41,13 +41,19 @@ export function chatAdapter(chat: ChatService, tap: ChatEventTap): WritingChat {
  * A sentence when the chat service has a request in flight (the desktop or the API is generating), else null.
  * WritingRuns asks only while no phone job runs, so a running request belongs to the desktop or the API.
  */
-export function chatBusyReason(chat: ChatService): () => string | null {
-  return () => (chat.busy ? 'LLM Suite is writing something else on the computer.' : null)
+export function chatBusyReason(chat: ChatService, benchRunning?: () => boolean): () => string | null {
+  return () => {
+    if (chat.busy) return 'LLM Suite is writing something else on the computer.'
+    if (benchRunning?.()) return 'LLM Suite is running a benchmark on the computer.'
+    return null
+  }
 }
 
 /** NovelStore as a run reads it. */
 export function storeAdapter(store: NovelStore): WritingStore {
   return {
+    hold: async (folder, owner) => void (await store.openProject(folder, owner)),
+    release: (folder, owner) => store.closeProject(folder, owner),
     projectState: (folder) => store.projectState(folder),
     readFile: (folder, rel) => store.readFile(folder, rel),
     statePatch: (folder, ops) => store.statePatch(folder, ops)

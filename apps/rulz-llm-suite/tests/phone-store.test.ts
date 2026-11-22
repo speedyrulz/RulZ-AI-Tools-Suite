@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -250,6 +250,52 @@ describe('a phone save and the desktop', () => {
     s.events.length = 0
     await runAs(WINDOW_OWNER, () => s.store.saveFile({ folder: st.folder, path: rel, text: g.text + 'more\n', baseHash: g.hash }))
     expect(s.kinds()).toEqual(['text'])
+  })
+})
+
+describe('an outside change found by a read, before the watcher reports it', () => {
+  it('announces it and snapshots before the next overwrite', async () => {
+    const s = setup()
+    const st = await s.store.createProject('Book')
+    const rel = sceneRel(st)
+    const first = await s.store.readFile(st.folder, rel)
+    // Take the baseline snapshot, as a first save would.
+    await s.store.saveFile({ folder: st.folder, path: rel, text: 'mine\n', baseHash: first.hash })
+    const mine = await s.store.readFile(st.folder, rel)
+    writeFileSync(join(st.folder, ...rel.split('/')), 'from another editor\n')
+    s.events.length = 0
+    // A phone reads inside the watcher's delay.
+    const seen = await runAs('phone:1', () => s.store.readFile(st.folder, rel))
+    expect(seen.text).toBe('from another editor\n')
+    // The state follows a moment later (it is built after the read returns).
+    for (let i = 0; i < 200 && s.events.length < 2; i++) await new Promise((r) => setTimeout(r, 25))
+    expect(s.kinds()).toEqual(['text', 'state'])
+    expect(s.events[0]).toEqual({ change: { kind: 'text', folder: st.folder, path: rel, hash: seen.hash }, origin: undefined })
+    expect(s.events[1].origin).toBeUndefined()
+    // The watcher's own event now finds nothing new.
+    s.events.length = 0
+    await s.store.onExternalChange(st.folder, rel)
+    expect(s.events).toEqual([])
+    // The next overwrite snapshots the outside version first.
+    const before = readdirSync(join(st.folder, '.rulz', 'history'), { recursive: true }).length
+    await s.store.saveFile({ folder: st.folder, path: rel, text: 'later\n', baseHash: seen.hash })
+    const after = readdirSync(join(st.folder, '.rulz', 'history'), { recursive: true }).length
+    expect(after).toBeGreaterThan(before)
+    expect(mine.hash).not.toBe(seen.hash)
+  })
+
+  it('announces a project file changed outside when a second owner opens the project', async () => {
+    const s = setup()
+    const st = await s.store.createProject('Book')
+    const file = join(st.folder, 'outline.json')
+    const outline = JSON.parse(readFileSync(file, 'utf8'))
+    outline.chapters[0].title = 'Edited elsewhere'
+    writeFileSync(file, JSON.stringify(outline))
+    s.events.length = 0
+    const opened = await s.store.openProject(st.folder, 'phone:2')
+    expect(opened.outline.chapters[0].title).toBe('Edited elsewhere')
+    expect(s.kinds()).toEqual(['state'])
+    expect(s.events[0].origin).toBeUndefined()
   })
 })
 

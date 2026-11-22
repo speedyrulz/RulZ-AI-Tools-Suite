@@ -24,6 +24,8 @@ export class PhoneAccess {
   private readonly dnsName: () => Promise<string | undefined>
   private listeningOn: string[] = []
   private listeningPort = 0
+  /** The pairing code the server holds. */
+  private serverToken = ''
   private watch: NodeJS.Timeout | null = null
   private state: PhoneStatus['state'] = 'off'
   private error: string | undefined
@@ -60,29 +62,22 @@ export class PhoneAccess {
   }
 
   async setEnabled(enabled: boolean): Promise<PhoneStatus> {
-    const patch: Partial<AppSettings> = { phoneEnabled: enabled }
-    if (enabled && !this.opts.settings.get().phoneToken) patch.phoneToken = newToken()
-    await this.opts.settings.update(patch)
-    await this.serial(() => this.apply())
+    await this.serial(async () => {
+      await this.opts.settings.update({ phoneEnabled: enabled })
+      await this.apply()
+    })
     return this.status()
   }
 
-  async pairing(): Promise<PhonePairing> {
-    const s = this.opts.settings.get()
-    if (!s.phoneToken) await this.opts.settings.update({ phoneToken: newToken() })
-    const token = this.opts.settings.get().phoneToken
-    const host = this.status().addresses[0] ?? ''
-    const params = new URLSearchParams({ host, port: String(s.phonePort), token, name: this.dns?.split('.')[0] || hostname() })
-    const url = `${PHONE_LINK_SCHEME}://pair?${params}`
-    const qrSvg = await QRCode.toString(url, { type: 'svg', margin: 1, errorCorrectionLevel: 'M' })
-    return { url, qrSvg, host, port: s.phonePort, token }
+  pairing(): Promise<PhonePairing> {
+    return this.serial(() => this.pairingNow())
   }
 
-  async newToken(): Promise<PhonePairing> {
-    const token = newToken()
-    await this.opts.settings.update({ phoneToken: token })
-    this.server.setToken(token)
-    return this.pairing()
+  newToken(): Promise<PhonePairing> {
+    return this.serial(async () => {
+      await this.opts.settings.update({ phoneToken: newToken() })
+      return this.pairingNow()
+    })
   }
 
   async dispose(): Promise<void> {
@@ -90,9 +85,35 @@ export class PhoneAccess {
     await this.server.close()
   }
 
-  private serial(fn: () => Promise<void>): Promise<void> {
-    this.busy = this.busy.then(fn, fn)
-    return this.busy
+  /** Runs one step at a time (settings changes, token changes and the listening state never interleave). */
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.busy.then(fn, fn)
+    this.busy = run.then(
+      () => undefined,
+      () => undefined
+    )
+    return run
+  }
+
+  /** The pairing code: made here if it is missing, and handed to the server whenever it differs from the one it holds. */
+  private async currentToken(): Promise<string> {
+    if (!this.opts.settings.get().phoneToken) await this.opts.settings.update({ phoneToken: newToken() })
+    const token = this.opts.settings.get().phoneToken
+    if (token !== this.serverToken) {
+      this.serverToken = token
+      this.server.setToken(token)
+    }
+    return token
+  }
+
+  private async pairingNow(): Promise<PhonePairing> {
+    const token = await this.currentToken()
+    const s = this.opts.settings.get()
+    const host = this.status().addresses[0] ?? ''
+    const params = new URLSearchParams({ host, port: String(s.phonePort), token, name: this.dns?.split('.')[0] || hostname() })
+    const url = `${PHONE_LINK_SCHEME}://pair?${params}`
+    const qrSvg = await QRCode.toString(url, { type: 'svg', margin: 1, errorCorrectionLevel: 'M' })
+    return { url, qrSvg, host, port: s.phonePort, token }
   }
 
   private changed(): void {
@@ -106,7 +127,7 @@ export class PhoneAccess {
 
   /** Brings the server in line with the settings and the current Tailscale addresses. */
   private async apply(): Promise<void> {
-    const s = this.opts.settings.get()
+    let s = this.opts.settings.get()
     if (!s.phoneEnabled) {
       this.stopWatch()
       await this.server.close()
@@ -116,6 +137,9 @@ export class PhoneAccess {
       this.changed()
       return
     }
+    // Turning on makes the first pairing code.
+    await this.currentToken()
+    s = this.opts.settings.get()
     this.watch ??= setInterval(() => void this.serial(() => this.apply()), WATCH_MS)
     const addresses = this.addresses()
     if (!addresses.length) {
@@ -132,6 +156,7 @@ export class PhoneAccess {
     this.changed()
     try {
       await this.server.listen(addresses, s.phonePort, s.phoneToken)
+      this.serverToken = s.phoneToken
       this.listeningOn = addresses
       this.listeningPort = s.phonePort
       this.state = 'on'

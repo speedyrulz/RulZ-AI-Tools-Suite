@@ -131,7 +131,16 @@ export class PhoneServer {
     this.pending.clear()
     const servers = this.servers
     this.servers = []
-    await Promise.all(servers.map((s) => new Promise<void>((r) => s.close(() => r()))))
+    await Promise.all(
+      servers.map(
+        (s) =>
+          new Promise<void>((r) => {
+            s.close(() => r())
+            // A peer that holds a plain HTTP connection open must not stall the close (and the queue behind it).
+            s.closeAllConnections?.()
+          })
+      )
+    )
   }
 
   private release(conn: Conn): void {
@@ -206,10 +215,15 @@ export class PhoneServer {
       ws.send(JSON.stringify({ t: 'denied', reason }))
       ws.close(4001, reason)
     }
+    // First: a socket that errors before anything else is set up must not crash or linger.
+    ws.on('error', () => ws.terminate())
     if (this.lockedOut(address)) return deny('locked')
     this.pending.set(ws, address)
-    ws.once('close', () => this.pending.delete(ws))
     const timer = setTimeout(() => deny('timeout'), HELLO_TIMEOUT_MS)
+    ws.once('close', () => {
+      clearTimeout(timer)
+      this.pending.delete(ws)
+    })
 
     ws.once('message', (data) => {
       clearTimeout(timer)
@@ -240,7 +254,6 @@ export class PhoneServer {
       ws.send(JSON.stringify({ t: 'welcome', protocol: PHONE_PROTOCOL, version: this.host.version, name: this.host.name }))
       this.onClientsChanged(this.clients())
     })
-    ws.on('error', () => ws.terminate())
   }
 
   private async request(conn: Conn, msg: Record<string, unknown> | null): Promise<void> {

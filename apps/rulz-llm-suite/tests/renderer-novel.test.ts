@@ -483,6 +483,32 @@ describe('novel store: data safety fixes', () => {
 
   const count = (channel: string): number => calls.filter((c) => c.channel === channel).length
 
+  it('a reload that finishes after the project was closed does not re-open it for the window', async () => {
+    const { useNovel } = await loadStore()
+    const win = (globalThis as unknown as { window: { rulz: { invoke: (c: string, ...a: unknown[]) => Promise<unknown> } } }).window
+    const inner = win.rulz.invoke
+    let release: () => void = () => undefined
+    const slow = new Promise<void>((r) => (release = r))
+    win.rulz.invoke = async (channel, ...args) => {
+      if (channel === 'novel:openProject') {
+        const state = await inner(channel, ...args)
+        await slow
+        return state
+      }
+      return inner(channel, ...args)
+    }
+    const reload = useNovel.getState().reloadState()
+    await vi.advanceTimersByTimeAsync(5)
+    expect(await useNovel.getState().closeProject()).toBe(true)
+    const closesBefore = count('novel:closeProject')
+    release()
+    await reload
+    expect(useNovel.getState().folder).toBeNull()
+    expect(useNovel.getState().state).toBeNull()
+    // The extra owner that the late open added is given back.
+    expect(count('novel:closeProject')).toBe(closesBefore + 1)
+  })
+
   it('opening the folder that is already open leaves buffers and timers alone (finding 1)', async () => {
     const { useNovel } = await loadStore()
     useNovel.getState().edit(PATH, 'A edited')

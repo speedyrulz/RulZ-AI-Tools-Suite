@@ -61,6 +61,9 @@ import type { WritingAlt, WritingJob, WritingJobStatus, WritingResult, WritingRu
 
 /** The slice of NovelStore a run uses. `projectState` is the store's state for an open project (see adapters.ts). */
 export interface WritingStore {
+  /** Keeps the project open for `owner` ('job:<id>') so it stays open while a job runs, even if the phone leaves. */
+  hold(folder: string, owner: string): Promise<void>
+  release(folder: string, owner: string): Promise<void>
   projectState(folder: string): Promise<NovelProjectState>
   readFile(folder: string, rel: string): Promise<NovelTextFile>
   statePatch(folder: string, ops: StateOp[]): Promise<NovelStatePatchResult>
@@ -127,6 +130,8 @@ interface JobRec {
   /** Update state: what the result's items would do, for applyState. */
   /** Who started it ('phone:<clientId>'); undefined for a call made inside main. */
   owner?: string
+  /** dismiss() forgot the job while it still ran: it keeps counting as the running job until execute ends. */
+  dismissed?: boolean
   /** applyState calls of this job run one after the other. */
   applyChain: Promise<unknown>
   state?: { sceneId: string; textHash: string; items: StateCardItem[]; applied: Set<string> }
@@ -143,6 +148,8 @@ class Stopped extends Error {}
 
 export class WritingRuns {
   private jobs = new Map<string, JobRec>()
+  /** The job that is running, kept until its execute ends even when dismissed. */
+  private current: JobRec | null = null
   private readonly now: () => number
   private readonly newId: () => string
   private readonly throttleMs: number
@@ -199,6 +206,7 @@ export class WritingRuns {
     }
     this.trim(req.folder)
     this.jobs.set(rec.job.id, rec)
+    this.current = rec
     this.send(rec)
     void this.execute(rec, req, of).catch((e) => this.fail(rec, errorMessage(e)))
     return this.snapshot(rec)
@@ -237,7 +245,10 @@ export class WritingRuns {
   dismiss(jobId: string, owner?: string): void {
     const rec = this.owned(jobId, owner)
     if (!rec) return
-    if (RUNNING.includes(rec.job.status)) this.abort(jobId)
+    if (RUNNING.includes(rec.job.status)) {
+      this.abort(jobId)
+      rec.dismissed = true
+    }
     if (rec.timer) clearTimeout(rec.timer)
     rec.timer = null
     this.jobs.delete(jobId)
@@ -291,8 +302,8 @@ export class WritingRuns {
   // -------------------------------------------------------------------------------------------
 
   private activeJob(): JobRec | undefined {
-    for (const r of this.jobs.values()) if (RUNNING.includes(r.job.status)) return r
-    return undefined
+    const c = this.current
+    return c && (RUNNING.includes(c.job.status) || c.dismissed) ? c : undefined
   }
 
   private snapshot(rec: JobRec): WritingJob {
@@ -338,6 +349,7 @@ export class WritingRuns {
 
   private finish(rec: JobRec, status: 'done' | 'stopped' | 'error', over: Partial<WritingJob>): void {
     rec.abort = null
+    if (this.current === rec && !rec.dismissed) this.current = null
     this.setStatus(rec, status, { progress: null, partial: '', endedAt: this.now(), ...over })
   }
 
@@ -362,7 +374,11 @@ export class WritingRuns {
     const files = new Map<string, NovelTextFile>()
     const hashes: Record<string, string> = {}
     for (let i = 0; i < paths.length; i += 8) {
-      const got = await Promise.all(paths.slice(i, i + 8).map((p) => this.deps.store.readFile(folder, p).then((f) => [p, f] as const, () => null)))
+      const got = await Promise.all(paths.slice(i, i + 8).map((p) => this.deps.store.readFile(folder, p).then((f) => [p, f] as const, (e) => {
+        // A file that is gone is left out; a project that is not open any more fails the job.
+        if (/not open/i.test(errorMessage(e))) throw e
+        return null
+      })))
       for (const g of got) {
         if (!g) continue
         files.set(g[0], g[1])
@@ -439,11 +455,23 @@ export class WritingRuns {
   // -------------------------------------------------------------------------------------------
 
   private async execute(rec: JobRec, req: WritingRunRequest, of: number): Promise<void> {
+    const holder = `job:${rec.job.id}`
+    let held = false
     try {
+      // The job holds its project open for its whole run, so a phone that leaves does not close it underneath.
+      try {
+        await this.deps.store.hold(req.folder, holder)
+        held = true
+      } catch (e) {
+        throw new Error(`The project could not be opened: ${errorMessage(e)}`)
+      }
       await this.executeInner(rec, req, of)
     } catch (e) {
-      if (e instanceof Stopped || rec.stopRequested) return this.finish(rec, 'stopped', {})
-      throw e
+      if (e instanceof Stopped || rec.stopRequested) this.finish(rec, 'stopped', {})
+      else this.fail(rec, errorMessage(e))
+    } finally {
+      if (held) await this.deps.store.release(req.folder, holder).catch(() => undefined)
+      if (this.current === rec) this.current = null
     }
   }
 
@@ -455,18 +483,22 @@ export class WritingRuns {
     if (st.blocked) throw new Error(`The project is read-only: ${st.blocked}`)
 
     // ---- what the action works on, as the desktop checks it before it sends anything
-    const scene = req.sceneId ? findScene(st.outline, req.sceneId) : null
-    if (req.sceneId && !scene) throw new Error('The scene is not in the outline any more.')
-    if (req.chapterId && !findChapter(st.outline, req.chapterId)) throw new Error('The chapter is not in the outline any more.')
     const needsScene = action !== 'outlineChapters' && action !== 'outlineScenes' && action !== 'summarizeChapter'
+    // Chapter and project actions work on no scene, whatever the phone sent.
+    const scene = needsScene && req.sceneId ? findScene(st.outline, req.sceneId) : null
+    if (needsScene && req.sceneId && !scene) throw new Error('The scene is not in the outline any more.')
+    if (req.chapterId && !findChapter(st.outline, req.chapterId)) throw new Error('The chapter is not in the outline any more.')
     if (needsScene && !scene) {
       throw new Error(action === 'checkScene' && req.chapterId ? 'Check one scene at a time: choose a scene.' : 'Choose a scene first.')
     }
     if ((action === 'outlineScenes' || action === 'summarizeChapter') && !req.chapterId) throw new Error('Choose a chapter first.')
     const text = req.text
-    const cursor = Math.max(0, Math.min(Math.round(req.cursor) || 0, text.length))
+    // Summarize scene, Check and Update state read the whole scene: the desktop sends them with the cursor at the end,
+    // no selection and no note.
+    const wholeScene = action === 'summarizeScene' || action === 'checkScene' || action === 'updateState'
+    const cursor = wholeScene ? text.length : Math.max(0, Math.min(Math.round(req.cursor) || 0, text.length))
     let selection: { from: number; to: number } | null = null
-    if (req.selection) {
+    if (req.selection && !wholeScene) {
       const from = Math.max(0, Math.min(req.selection.from, text.length))
       const to = Math.max(from, Math.min(req.selection.to, text.length))
       selection = from === to ? null : { from, to }
@@ -527,10 +559,11 @@ export class WritingRuns {
 
     // ---- the request, built and fitted exactly as the desktop does
     const over: Partial<RunContext> = { sceneId: scene?.scene.id ?? null }
-    if (req.chapterId) over.chapterId = req.chapterId
+    if (action === 'outlineScenes' || action === 'summarizeChapter') over.chapterId = req.chapterId
     if (action === 'outlineChapters') over.count = clampCount(req.count, 8)
     if (action === 'outlineScenes') over.count = clampCount(req.count, 5)
-    if (scene || action === 'outlineChapters' || action === 'outlineScenes') over.note = req.note ?? ''
+    // A note goes with the prose actions and the outline plans only (the desktop's summaries, check and state send none).
+    if ((isProseAction(action) && scene) || action === 'outlineChapters' || action === 'outlineScenes') over.note = req.note ?? ''
     const overhead = await templateOverheadWith(countTokens, model.instanceId, model.modelId, count)
     this.checkStop(rec)
     const ctx: RunContext = {

@@ -363,7 +363,9 @@ export class NovelStore {
     const open = this.projects.get(key)
     if (open) {
       open.owners.add(owner)
-      await this.exclusive(open, () => this.loadJson(open, false))
+      // A file that changed outside while the watcher's delay was still running is found here: announce it.
+      const changed = await this.exclusive(open, () => this.loadJson(open, false))
+      if (changed) await originStore.run(undefined, () => this.publish(open))
       return this.state(open)
     }
     const st = await fs.stat(folder).catch(() => null)
@@ -470,6 +472,8 @@ export class NovelStore {
       const known = p.hashes.get(f.rel)
       if (known !== undefined && known === hash) continue
       p.hashes.set(f.rel, hash)
+      // Changed outside since the app last saw it: the next write must snapshot this version first (rule 5).
+      if (known !== undefined) p.lastSnap.delete(f.rel)
       changed = true
       try {
         if (!bytes) throw new Error(`${f.what} is missing.`)
@@ -865,6 +869,20 @@ export class NovelStore {
     return clean
   }
 
+  /**
+   * A read found a file different from the hash the app knew: it changed outside, and the watcher's event (delayed)
+   * will find the hash already updated and say nothing. Do what the watcher would: snapshot before the next
+   * overwrite, and tell every listener (not as anybody's request).
+   */
+  private heardLate(p: OpenProject, key: string, rel: string, hash: string, known: string): void {
+    p.lastSnap.delete(key)
+    originStore.run(undefined, () => {
+      if (hash) this.announce({ kind: 'text', folder: p.folder, path: rel, hash })
+      else if (known) this.announce({ kind: 'deleted', folder: p.folder, path: rel })
+      void this.publish(p).catch(() => undefined)
+    })
+  }
+
   /** Reads a user-text file. `remember` false only records a baseline hash when there is none (state builds). */
   private async loadText(p: OpenProject, rel: string, remember: boolean): Promise<NovelTextFile> {
     const path = join(p.folder, ...rel.split('/'))
@@ -872,13 +890,17 @@ export class NovelStore {
     const bytes = await readBytes(p.folder, path)
     const key = lc(rel)
     if (!bytes) {
+      const known = p.hashes.get(key)
       if (remember) p.hashes.set(key, '')
       else if (!p.hashes.has(key)) p.hashes.set(key, '')
+      if (remember && known) this.heardLate(p, key, rel, '', known)
       return { path: rel, text: '', hash: '', meta: { ...NEW_FILE_META }, readOnly: false, journal: await this.journalFor(p, rel, '') }
     }
     const d = decodeBytes(bytes)
+    const known = p.hashes.get(key)
     if (remember) p.hashes.set(key, d.hash)
     else if (!p.hashes.has(key)) p.hashes.set(key, d.hash)
+    if (remember && known !== undefined && known !== d.hash) this.heardLate(p, key, rel, d.hash, known)
     // First look at a file in this session: keep what was there before anything can change it.
     if (remember && !p.sessionSnapped.has(key) && (await this.snapshot(p, rel, bytes))) p.sessionSnapped.add(key)
     return { path: rel, text: d.text, hash: d.hash, meta: d.meta, readOnly: d.readOnly, journal: await this.journalFor(p, rel, d.text) }

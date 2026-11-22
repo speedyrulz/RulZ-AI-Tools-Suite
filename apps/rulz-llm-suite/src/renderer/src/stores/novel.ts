@@ -1333,8 +1333,15 @@ export const useNovel = create<NovelState>((set, get) => {
     reloadState: async () => {
       const folder = get().folder
       if (!folder) return
+      const epoch0 = epoch
       try {
-        applyState(await invoke('novel:openProject', folder))
+        const st = await invoke('novel:openProject', folder)
+        // The project was closed or switched meanwhile: the open above added the window as an owner again.
+        if (epoch !== epoch0 || get().folder !== folder) {
+          if (get().folder !== folder) await invoke('novel:closeProject', folder).catch(() => undefined)
+          return
+        }
+        applyState(st)
       } catch {
         // Keep what is shown; the next change event retries.
       }
