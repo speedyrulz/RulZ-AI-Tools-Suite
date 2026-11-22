@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_SAMPLING } from '@shared/defaults'
+import { DEFAULT_LOAD_CONFIG, DEFAULT_SAMPLING } from '@shared/defaults'
 import { addPairs, BUILTIN_PROMPTS, cleanRun, newRun, nextOutput, nextPair, randomSeeds, scores } from '@shared/writingBench'
 
 function fixture() {
-  return newRun({ label: 'test', prompts: BUILTIN_PROMPTS.slice(0, 2), candidates: ['a', 'b'].map((id) => ({ id, label: id, modelId: id, modelName: id, adapters: [], sampling: DEFAULT_SAMPLING })), seeds: [1, 2], maxTokens: 600 }, '2026-01-01', 'run')
+  return newRun({ label: 'test', prompts: BUILTIN_PROMPTS.slice(0, 2), candidates: ['a', 'b'].map((id) => ({ id, label: id, modelId: id, modelName: id, adapters: [], sampling: DEFAULT_SAMPLING, load: null })), seeds: [1, 2], maxTokens: 600 }, '2026-01-01', 'run')
 }
 describe('writing benchmark', () => {
   it('orders outputs by candidate, prompt and seed and finds the first pending', () => {
@@ -37,5 +37,23 @@ describe('writing benchmark', () => {
     expect(cleanRun({ ...run, outputs: [] }).ok).toBe(false)
     expect(cleanRun({ ...run, id: '../bad' }).ok).toBe(false)
     expect(cleanRun({ ...run, candidates: [{ ...run.candidates[0], sampling: {} }] }).ok).toBe(false)
+  })
+  it('reads a candidate without load settings (an old run file) as the model saved settings', () => {
+    const run = fixture()
+    const old = { ...run, candidates: run.candidates.map(({ load: _load, ...rest }) => rest) }
+    const cleaned = cleanRun(old)
+    expect(cleaned.ok).toBe(true)
+    if (cleaned.ok) expect(cleaned.run.candidates.map((c) => c.load)).toEqual([null, null])
+  })
+  it('keeps a candidate load config and rejects a malformed one', () => {
+    const run = fixture()
+    const load = { ...DEFAULT_LOAD_CONFIG, contextLength: 4096, gpuLayers: 20 }
+    const withLoad = { ...run, candidates: [{ ...run.candidates[0], load }, run.candidates[1]] }
+    expect(cleanRun(withLoad)).toEqual({ ok: true, run: withLoad })
+    expect(cleanRun({ ...run, candidates: [{ ...run.candidates[0], load: { ...load, contextLength: 'big' } }, run.candidates[1]] }).ok).toBe(false)
+    expect(cleanRun({ ...run, candidates: [{ ...run.candidates[0], load: 'x' }, run.candidates[1]] }).ok).toBe(false)
+    // "Auto (fit)" context and empty draft tokens are stored as null and must still load next time.
+    const auto = { ...run, candidates: [{ ...run.candidates[0], load: { ...load, contextLength: null, draftTokens: null } }, run.candidates[1]] }
+    expect(cleanRun(auto).ok).toBe(true)
   })
 })

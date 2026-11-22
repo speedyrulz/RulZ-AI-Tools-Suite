@@ -12,7 +12,7 @@ async function setup() {
   return { dir, store: new WritingBenchStore(dir), root: join(dir, 'writing-bench') }
 }
 function run() {
-  return newRun({ label: 'test', prompts: BUILTIN_PROMPTS.slice(0, 1), candidates: [{ id: 'a', label: 'A', modelId: 'a', modelName: 'A', adapters: [], sampling: DEFAULT_SAMPLING }], seeds: [1], maxTokens: 600 }, 'now', 'run')
+  return newRun({ label: 'test', prompts: BUILTIN_PROMPTS.slice(0, 1), candidates: [{ id: 'a', label: 'A', modelId: 'a', modelName: 'A', adapters: [], sampling: DEFAULT_SAMPLING, load: null }], seeds: [1], maxTokens: 600 }, 'now', 'run')
 }
 afterEach(async () => { await Promise.all(dirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true }))) })
 describe('writing benchmark store', () => {
