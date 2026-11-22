@@ -2,6 +2,7 @@
 import type { BatchRun } from './batch'
 import type { BenchmarkRequest, BenchmarkRun } from './benchmark'
 import type { NovelIpcEvents, NovelIpcInvoke } from './novel'
+import type { WritingBenchIpcInvoke } from './writingBench'
 import type {
   AdapterConvertRequest,
   AdapterConvertResult,
@@ -47,7 +48,7 @@ export interface AppInfo {
 }
 
 /** Request/response channels (ipcRenderer.invoke ↔ ipcMain.handle). */
-export interface IpcInvoke extends NovelIpcInvoke {
+export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke {
   'app:info': () => AppInfo
   'settings:get': () => AppSettings
   'settings:update': (patch: Partial<AppSettings>) => AppSettings

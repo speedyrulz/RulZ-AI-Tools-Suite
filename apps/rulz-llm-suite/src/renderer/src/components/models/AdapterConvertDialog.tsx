@@ -1,11 +1,20 @@
 import { AlertTriangle, CheckCircle2, FolderSearch, Repeat } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
-import type { AdapterConverterStatus, AdapterConvertRequest, AdapterConvertResult } from '@shared/types'
+import type { AdapterConverterStatus, AdapterConvertRequest, AdapterConvertResult, AdapterEntry } from '@shared/types'
 import { defaultConvertName } from '../../lib/adapters'
 import { errorMessage, invoke, on } from '../../lib/api'
+import { useModels } from '../../stores/models'
 import { Button, Dialog, Field, IconButton, Input, Select } from '../ui'
 
 const OUT_TYPES: AdapterConvertRequest['outType'][] = ['f16', 'bf16', 'f32', 'q8_0', 'auto']
+
+/** The base model the converted adapter says it was trained on, from the adapter library; says so when unknown. */
+function convertedBase(library: AdapterEntry[], outPath: string | undefined, outName: string): string {
+  const norm = (p: string): string => p.replace(/\\/g, '/').toLowerCase()
+  const file = (outPath ?? outName).split(/[\\/]/).pop() ?? ''
+  const entry = library.find((a) => (outPath && norm(a.path) === norm(outPath)) || norm(a.path).endsWith('/' + norm(file)) || norm(a.name + '.gguf') === norm(file))
+  return entry?.info?.baseModelName?.trim() || 'an unknown base model'
+}
 
 /** Converts a Hugging Face PEFT LoRA folder to a GGUF adapter in the models folder. */
 export function AdapterConvertDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
@@ -21,6 +30,7 @@ export function AdapterConvertDialog({ open, onClose }: { open: boolean; onClose
   const [confirmClose, setConfirmClose] = useState(false)
   const [lines, setLines] = useState<string[]>([])
   const [result, setResult] = useState<AdapterConvertResult | null>(null)
+  const library = useModels((s) => s.adapters)
   const logRef = useRef<HTMLDivElement>(null)
   const stick = useRef(true)
 
@@ -184,7 +194,12 @@ export function AdapterConvertDialog({ open, onClose }: { open: boolean; onClose
             (result.ok ? (
               <div className="flex items-start gap-2 text-[13px] text-ok">
                 <CheckCircle2 size={16} className="mt-px shrink-0" />
-                <span className="break-all">Converted: {(result.outPath ?? outName).split(/[\\/]/).pop()}</span>
+                <div className="min-w-0 space-y-1">
+                  <div className="break-all">Converted: {(result.outPath ?? outName).split(/[\\/]/).pop()}</div>
+                  <div className="text-muted">
+                    Trained on {convertedBase(library, result.outPath, outName)}. Add it to a chat's adapters or a Writing project's <strong className="font-semibold text-body">Adapters</strong>.
+                  </div>
+                </div>
               </div>
             ) : (
               <div className="flex items-start gap-2 rounded-md border border-danger/40 bg-danger/10 p-2 text-xs text-danger">

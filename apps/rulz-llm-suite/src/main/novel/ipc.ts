@@ -27,5 +27,9 @@ export function registerNovelIpc(store: NovelStore, onFlushDone: () => void): vo
   handle('novel:deleteProject', (folder) => store.deleteProject(folder))
   handle('novel:statePatch', (folder, ops) => store.statePatch(folder, ops))
   handle('novel:dismissFinding', (folder, sceneId, key, dismissed) => store.dismissFinding(folder, sceneId, key, dismissed))
+  handle('novel:record', (folder, line) => store.record(folder, line))
+  handle('novel:recordsInfo', (folder) => store.recordsInfo(folder))
+  handle('novel:exportRecords', (folder, outDir, opts) => store.exportRecords(folder, outDir, opts))
+  handle('novel:deleteRecords', (folder) => store.deleteRecords(folder))
   handle('novel:flushDone', onFlushDone)
 }

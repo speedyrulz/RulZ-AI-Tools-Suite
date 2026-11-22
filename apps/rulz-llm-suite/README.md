@@ -131,6 +131,18 @@ Discover/downloads, RAG and a CLI are planned.
     (their entry, their state and summaries of the scenes they were in). **Add to voice notes** appends an answer to a
     `## Voice` section in the character's entry. For **Dialogue**, or a selection that names a character, that
     character's voice notes come first in the request.
+  - **Recording** (Project panel, on by default): every AI action is recorded with what you did with it (accepted,
+    mixed, rejected, edited) and, once you stop editing, the final text, in `.rulz\records\<day>.jsonl`. Nothing about
+    your writing waits for it. **Export training data…** writes `train.jsonl` (SFT), `pairs.jsonl` (DPO: the
+    alternative you accepted over the ones you looked at, and optionally your edits over the model's text) and a
+    manifest into a new folder outside the project. Cut-off, rejected and abandoned outputs are left out.
+    **Delete records…** moves them to the Recycle Bin.
+  - **Adapters**: the Project panel shows which base model an adapter was trained on and warns on a mismatch; the
+    PEFT converter says where to use a converted adapter.
+  - **Writing benchmark** (Benchmark on the Writing start page): 2 to 6 candidates (model, adapters, sampling) write
+    the same prompts with the same seeds; you vote blind on pairs (A / B / Tie / Skip, keys 1/2/3/S) and an Elo
+    scoreboard ranks them. Bundled prompts or your own; each run is one file you can resume. While a benchmark runs,
+    chat, batch runs, the hardware benchmark and model loading wait for it.
   - Not yet tried with a real model.
 - **Reverse Engineering mode** (`Ctrl+6`) — runs a local model as a reverse engineer with the REA MCP tools, and
   collects fine-tuning data while it works. Tuned first for Ornith 1.5 35B-A3B (Heretic MTP APEX I-Mini).

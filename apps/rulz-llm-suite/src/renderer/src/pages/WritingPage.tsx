@@ -1,5 +1,7 @@
-import { Feather } from 'lucide-react'
-import { useEffect } from 'react'
+import { Feather, Scale } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { WbenchView } from '../components/wbench/WbenchView'
+import { Button } from '../components/ui'
 import { BlockedBanner } from '../components/writing/Banners'
 import { EntryEditor } from '../components/writing/EntryEditor'
 import { LeftColumn, Welcome } from '../components/writing/LeftColumn'
@@ -9,12 +11,19 @@ import { StatusBar } from '../components/writing/StatusBar'
 import { lastProjectFolder, useNovel } from '../stores/novel'
 
 let triedReopen = false
+let benchWasOpen = false
 
 export function WritingPage() {
   const folder = useNovel((s) => s.folder)
   const target = useNovel((s) => s.target)
   const panelOpen = useNovel((s) => s.panelOpen)
   const opening = useNovel((s) => s.opening)
+  // The benchmark view stays up while you visit another page and come back.
+  const [benchOpen, setBenchOpenState] = useState(benchWasOpen)
+  const setBenchOpen = (v: boolean): void => {
+    benchWasOpen = v
+    setBenchOpenState(v)
+  }
 
   useEffect(() => {
     const s = useNovel.getState()
@@ -27,7 +36,18 @@ export function WritingPage() {
     }
   }, [])
 
-  if (!folder) return opening ? <div className="flex h-full items-center justify-center text-sm text-faint">Opening the project…</div> : <Welcome />
+  if (!folder) {
+    if (opening) return <div className="flex h-full items-center justify-center text-sm text-faint">Opening the project…</div>
+    if (benchOpen) return <WbenchView onBack={() => setBenchOpen(false)} />
+    return (
+      <div className="relative h-full">
+        <Welcome />
+        <Button size="sm" className="absolute top-4 right-6" onClick={() => setBenchOpen(true)}>
+          <Scale size={14} aria-hidden /> Benchmark
+        </Button>
+      </div>
+    )
+  }
 
   return (
     <div className="flex h-full flex-col">
