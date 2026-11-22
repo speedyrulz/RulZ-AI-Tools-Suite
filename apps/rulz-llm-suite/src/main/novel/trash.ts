@@ -22,8 +22,8 @@ export interface TrashManifest {
 
 export const trashRoot = (folder: string): string => join(folder, '.rulz', 'trash')
 
-async function exists(path: string): Promise<boolean> {
-  await assertAppPath(path)
+async function exists(folder: string, path: string): Promise<boolean> {
+  await assertAppPath(folder, path)
   return fs.access(path).then(
     () => true,
     () => false
@@ -31,9 +31,9 @@ async function exists(path: string): Promise<boolean> {
 }
 
 /** rename, or copy + delete across volumes (a project folder can be a junction onto another disk). */
-async function moveFile(from: string, to: string): Promise<void> {
-  await assertAppPath(from)
-  await assertAppPath(to)
+async function moveFile(folder: string, from: string, to: string): Promise<void> {
+  await assertAppPath(folder, from)
+  await assertAppPath(folder, to)
   await fs.mkdir(dirname(to), { recursive: true })
   try {
     await retryTransient(() => fs.rename(from, to))
@@ -45,11 +45,11 @@ async function moveFile(from: string, to: string): Promise<void> {
 }
 
 /** Moves pairs back in reverse order; returns what could not be moved so the caller can say so. */
-async function rollback(moved: { src: string; dst: string }[]): Promise<string[]> {
+async function rollback(folder: string, moved: { src: string; dst: string }[]): Promise<string[]> {
   const failed: string[] = []
   for (const m of [...moved].reverse()) {
     try {
-      await moveFile(m.dst, m.src)
+      await moveFile(folder, m.dst, m.src)
     } catch (err) {
       failed.push(`${m.dst} (${err instanceof Error ? err.message : String(err)})`)
     }
@@ -71,19 +71,19 @@ function withRollbackNote(err: unknown, failed: string[]): Error {
 export async function moveToTrash(folder: string, rels: string[], label: string, outline?: TrashOutline, now = new Date()): Promise<TrashManifest> {
   const base = stampOf(now)
   let id = base
-  for (let n = 2; await exists(join(trashRoot(folder), id)); n++) id = `${base}-${n}`
+  for (let n = 2; await exists(folder, join(trashRoot(folder), id)); n++) id = `${base}-${n}`
   const dir = join(trashRoot(folder), id)
-  await assertAppPath(dir)
+  await assertAppPath(folder, dir)
   const manifestPath = join(dir, 'manifest.json')
   const tmpDir = join(folder, '.rulz', 'tmp')
-  const writeManifest = (m: TrashManifest): Promise<boolean> => writeBytesAtomic(manifestPath, tmpDir, Buffer.from(JSON.stringify(m, null, 2), 'utf8'))
+  const writeManifest = (m: TrashManifest): Promise<boolean> => writeBytesAtomic(folder, manifestPath, tmpDir, Buffer.from(JSON.stringify(m, null, 2), 'utf8'))
   const files: { from: string; to: string }[] = []
   const moved: { src: string; dst: string }[] = []
   try {
     const plan: { rel: string; src: string; to: string; dst: string }[] = []
     for (const rel of rels) {
       const src = join(folder, ...rel.split('/'))
-      if (!(await exists(src))) continue
+      if (!(await exists(folder, src))) continue
       const to = `.rulz/trash/${id}/${rel}`
       plan.push({ rel, src, to, dst: join(folder, ...to.split('/')) })
     }
@@ -91,16 +91,16 @@ export async function moveToTrash(folder: string, rels: string[], label: string,
     // The manifest goes first, so a crash in the middle of the moves leaves an item that can be listed and restored.
     await writeManifest({ ...manifest, status: 'moving' })
     for (const x of plan) {
-      await moveFile(x.src, x.dst)
+      await moveFile(folder, x.src, x.dst)
       moved.push({ src: x.src, dst: x.dst })
       files.push({ from: x.rel, to: x.to })
     }
     await writeManifest(manifest)
     return manifest
   } catch (err) {
-    const failed = await rollback(moved)
+    const failed = await rollback(folder, moved)
     // Only a trash folder that holds no files any more loses its manifest.
-    if (!failed.length && (await assertAppPath(dir).then(() => true, () => false))) await fs.rm(join(dir, 'manifest.json'), { force: true }).catch(() => undefined)
+    if (!failed.length && (await assertAppPath(folder, dir).then(() => true, () => false))) await fs.rm(join(dir, 'manifest.json'), { force: true }).catch(() => undefined)
     throw withRollbackNote(err, failed)
   }
 }
@@ -110,7 +110,7 @@ export async function undoTrash(folder: string, manifest: TrashManifest): Promis
   const failed: string[] = []
   for (const f of manifest.files) {
     try {
-      await moveFile(join(folder, ...f.to.split('/')), join(folder, ...f.from.split('/')))
+      await moveFile(folder, join(folder, ...f.to.split('/')), join(folder, ...f.from.split('/')))
     } catch (err) {
       failed.push(`${f.from} (${err instanceof Error ? err.message : String(err)})`)
     }
@@ -122,13 +122,13 @@ export async function undoTrash(folder: string, manifest: TrashManifest): Promis
 /** After a restore whose outline write failed: moves the restored files back into their trash item. */
 export async function returnToTrash(folder: string, manifest: TrashManifest): Promise<void> {
   const moved = manifest.files.map((f) => ({ src: join(folder, ...f.to.split('/')), dst: join(folder, ...f.from.split('/')) }))
-  const failed = await rollback(moved)
+  const failed = await rollback(folder, moved)
   if (failed.length) throw new Error(`Some restored files could not be moved back into the trash: ${failed.join('; ')}`)
 }
 
 export async function readManifest(folder: string, id: string): Promise<TrashManifest> {
   if (!/^[\w-]+$/.test(id)) throw new Error('That trash item does not exist.')
-  await assertAppPath(join(trashRoot(folder), id))
+  await assertAppPath(folder, join(trashRoot(folder), id))
   try {
     const m = JSON.parse(await fs.readFile(join(trashRoot(folder), id, 'manifest.json'), 'utf8')) as TrashManifest
     if (!m || !Array.isArray(m.files)) throw new Error('bad manifest')
@@ -142,7 +142,7 @@ export async function readManifest(folder: string, id: string): Promise<TrashMan
 
 /** Trash items, newest first. A folder with an unreadable manifest is skipped (its files stay). */
 export async function listTrash(folder: string): Promise<NovelTrashItem[]> {
-  await assertAppPath(trashRoot(folder))
+  await assertAppPath(folder, trashRoot(folder))
   let dirs: string[]
   try {
     dirs = (await fs.readdir(trashRoot(folder), { withFileTypes: true })).filter((e) => e.isDirectory()).map((e) => e.name)
@@ -170,26 +170,31 @@ export async function restoreFiles(folder: string, manifest: TrashManifest): Pro
     const prefix = `.rulz/trash/${manifest.id}/`.toLowerCase()
     const to = cleanRelPath(folder, f.to, '.rulz/trash/')
     if (!to.toLowerCase().startsWith(prefix)) throw new Error('The trash item is damaged (a file points outside it).')
+    // Inside the item, a second .rulz part is only the exact journal layout .rulz/unsaved/<name>.json.
+    const inner = to.slice(prefix.length)
+    if (inner.split('/').some((seg) => seg.toLowerCase() === '.rulz') && !/^\.rulz\/unsaved\/[^/]+\.json$/i.test(inner)) {
+      throw new Error('The trash item is damaged (a file points into the app folder).')
+    }
     const from = cleanRelPath(folder, f.from, '.rulz/unsaved/')
     if (!USER_PATH.test(from) && !/^\.rulz\/unsaved\/[^/]+\.json$/i.test(from)) throw new Error(`The trash item is damaged ("${f.from}" is not a restorable file).`)
     return [{ from, to, src: join(folder, ...to.split('/')), dst: join(folder, ...from.split('/')) }]
   })
   // An item left by a crash during the moves lists every planned file; only those that arrived can come back.
   if (manifest.status === 'moving') {
-    for (let i = pairs.length - 1; i >= 0; i--) if (!(await exists(pairs[i].src))) pairs.splice(i, 1)
+    for (let i = pairs.length - 1; i >= 0; i--) if (!(await exists(folder, pairs[i].src))) pairs.splice(i, 1)
   }
   for (const p of pairs) {
-    if (await exists(p.dst)) throw new Error(`Cannot restore: "${p.from}" already exists. Rename or remove it first.`)
+    if (await exists(folder, p.dst)) throw new Error(`Cannot restore: "${p.from}" already exists. Rename or remove it first.`)
   }
   const moved: { src: string; dst: string }[] = []
   try {
     for (const p of pairs) {
-      await moveFile(p.src, p.dst)
+      await moveFile(folder, p.src, p.dst)
       moved.push({ src: p.src, dst: p.dst })
     }
   } catch (err) {
     // rollback moves dst back to src, so the pairs are swapped here.
-    const failed = await rollback(moved.map((m) => ({ src: m.dst, dst: m.src })))
+    const failed = await rollback(folder, moved.map((m) => ({ src: m.dst, dst: m.src })))
     throw withRollbackNote(err, failed)
   }
 }
@@ -213,7 +218,7 @@ async function holdsFiles(d: string): Promise<boolean> {
  */
 export async function removeTrashFolder(folder: string, id: string): Promise<void> {
   const dir = join(trashRoot(folder), id)
-  await assertAppPath(dir)
+  await assertAppPath(folder, dir)
   const manifest = join(dir, 'manifest.json')
   const rest = (await fs.readdir(dir, { withFileTypes: true }).catch(() => [])).filter((e) => !(e.isFile() && e.name === 'manifest.json'))
   for (const e of rest) {

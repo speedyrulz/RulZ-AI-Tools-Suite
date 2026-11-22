@@ -358,3 +358,69 @@ describe('links inside .rulz', () => {
     expect(readdirSync(outside)).toEqual([])
   })
 })
+
+describe('links in a trashed journal path', () => {
+  function junction(target: string, path: string): boolean {
+    try {
+      symlinkSync(target, path, 'junction')
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  async function discarded(s: Ctx, title: string) {
+    const st = await s.store.createProject(title)
+    const rel = sceneRel(st)
+    await s.store.journal(st.folder, rel, 'typed\n', '')
+    await s.store.discardJournal(st.folder, rel)
+    const [item] = await s.store.trash(st.folder)
+    const outside = join(s.base, 'outside')
+    mkdirSync(outside)
+    return { st, item, outside, trashDir: join(st.folder, '.rulz', 'trash') }
+  }
+
+  const listing = (dir: string): string[] => readdirSync(dir, { recursive: true }).map(String).sort()
+
+  it('a junction at .rulz/trash/<id>: restore, list and empty are refused, the outside dir is untouched', async () => {
+    const s = setup()
+    const t = await discarded(s, 'Item link')
+    const itemDir = join(t.trashDir, t.item.id)
+    const moved = join(t.outside, 'item')
+    renameSync(itemDir, moved)
+    if (!junction(moved, itemDir)) return
+    const before = listing(t.outside)
+    await expect(s.store.restoreTrash(t.st.folder, t.item.id)).rejects.toThrow(/link|outside|unreadable/)
+    expect(await s.store.trash(t.st.folder)).toEqual([])
+    await expect(s.store.emptyTrash(t.st.folder)).rejects.toThrow(/link/)
+    expect(listing(t.outside)).toEqual(before)
+    expect(existsSync(join(t.st.folder, '.rulz', 'unsaved', `${sceneRel(t.st).replace(/\//g, '__')}.json`))).toBe(false)
+  })
+
+  it('a junction at .rulz/trash: restore, list and empty are refused, the outside dir is untouched', async () => {
+    const s = setup()
+    const t = await discarded(s, 'Trash root link')
+    renameSync(t.trashDir, join(t.outside, 'trash'))
+    if (!junction(join(t.outside, 'trash'), t.trashDir)) return
+    const before = listing(t.outside)
+    await expect(s.store.restoreTrash(t.st.folder, t.item.id)).rejects.toThrow(/link|outside/)
+    await expect(s.store.trash(t.st.folder)).rejects.toThrow(/link|outside/)
+    await expect(s.store.emptyTrash(t.st.folder)).rejects.toThrow(/link|outside/)
+    expect(listing(t.outside)).toEqual(before)
+  })
+
+  it('refuses a manifest "to" that goes into .rulz/history inside the item, and any second .rulz part but the journal layout', async () => {
+    const s = setup()
+    const t = await discarded(s, 'Inner rulz')
+    const manifestPath = join(t.trashDir, t.item.id, 'manifest.json')
+    const m = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    const from = m.files[0].from
+    for (const to of [`.rulz/trash/${t.item.id}/.rulz/history/x`, `.rulz/trash/${t.item.id}/.rulz/unsaved/sub/x.json`, `.rulz/trash/${t.item.id}/a/.rulz/unsaved/x.json`]) {
+      writeFileSync(manifestPath, JSON.stringify({ ...m, files: [{ from, to }] }))
+      await expect(s.store.restoreTrash(t.st.folder, t.item.id)).rejects.toThrow(/damaged/)
+    }
+    writeFileSync(manifestPath, JSON.stringify(m))
+    await s.store.restoreTrash(t.st.folder, t.item.id)
+    expect(existsSync(join(t.st.folder, '.rulz', 'unsaved', `${sceneRel(t.st).replace(/\//g, '__')}.json`))).toBe(true)
+  })
+});

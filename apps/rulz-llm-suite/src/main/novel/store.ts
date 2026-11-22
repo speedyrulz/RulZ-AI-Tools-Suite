@@ -25,7 +25,7 @@ import {
 import { defaultProject } from '@shared/novelPrompts'
 import { applyOutlineOps, emptyOutline, validSceneFile, findChapter, findScene, newId, removeChapter, removeScene, reinsert, sceneFileName, slugify } from '@shared/novelOutline'
 import { wordCount } from '@shared/novelText'
-import { USER_PATH, assertAppPath, cleanRelPath, decodeBytes, encodeText, isInside, NEW_FILE_META, readBytes, realInside, serialized, sha256, writeBytesAtomic } from './files'
+import { USER_PATH, assertAppPath, assertNoLinks, cleanRelPath, decodeBytes, encodeText, isInside, NEW_FILE_META, readBytes, realInside, serialized, sha256, writeBytesAtomic } from './files'
 import { listHistory, takeSnapshot } from './history'
 import { deleteJournal, discardJournal, readJournal, writeJournal } from './journal'
 import { listTrash, moveToTrash, readManifest, removeTrashFolder, restoreFiles, returnToTrash, trashRoot, undoTrash, type TrashManifest, type TrashOutline } from './trash'
@@ -194,7 +194,7 @@ export class NovelStore {
     for (const e of await fs.readdir(root, { withFileTypes: true }).catch(() => [])) {
       if (!e.isDirectory() || e.name.startsWith('.')) continue
       const folder = join(root, e.name)
-      const pj = await readBytes(join(folder, 'project.json')).catch(() => null)
+      const pj = await readBytes(folder, join(folder, 'project.json')).catch(() => null)
       if (!pj) continue
       const mtime = (await fs.stat(join(folder, 'project.json')).catch(() => null))?.mtime.toISOString() ?? ''
       try {
@@ -211,13 +211,13 @@ export class NovelStore {
   /** Words in a closed project's scenes; 0 when the outline cannot be read. */
   private async countWords(folder: string): Promise<number> {
     try {
-      const bytes = await readBytes(join(folder, 'outline.json'))
+      const bytes = await readBytes(folder, join(folder, 'outline.json'))
       if (!bytes) return 0
       const outline = normalizeOutline(parseJsonBytes(bytes, 'outline.json'))
       let n = 0
       for (const c of outline.chapters) {
         for (const s of c.scenes) {
-          const b = await readBytes(join(folder, 'manuscript', s.file)).catch(() => null)
+          const b = await readBytes(folder, join(folder, 'manuscript', s.file)).catch(() => null)
           if (b) n += wordCount(decodeBytes(b).text)
         }
       }
@@ -266,10 +266,10 @@ export class NovelStore {
         }
       ]
     }
-    await writeBytesAtomic(join(folder, 'project.json'), tmp, json(project))
-    await writeBytesAtomic(join(folder, 'outline.json'), tmp, json(outline))
-    await writeBytesAtomic(join(folder, 'style.md'), tmp, Buffer.alloc(0))
-    await writeBytesAtomic(join(folder, 'manuscript', file), tmp, Buffer.alloc(0))
+    await writeBytesAtomic(folder, join(folder, 'project.json'), tmp, json(project))
+    await writeBytesAtomic(folder, join(folder, 'outline.json'), tmp, json(outline))
+    await writeBytesAtomic(folder, join(folder, 'style.md'), tmp, Buffer.alloc(0))
+    await writeBytesAtomic(folder, join(folder, 'manuscript', file), tmp, Buffer.alloc(0))
     return this.openProject(folder)
   }
 
@@ -297,7 +297,7 @@ export class NovelStore {
     }
     const st = await fs.stat(folder).catch(() => null)
     if (!st?.isDirectory()) throw new Error('That folder does not exist.')
-    if (!(await readBytes(join(folder, 'project.json')))) throw new Error('That folder is not a RulZ novel project (there is no project.json in it).')
+    if (!(await readBytes(folder, join(folder, 'project.json')))) throw new Error('That folder is not a RulZ novel project (there is no project.json in it).')
     const p: OpenProject = {
       folder: resolve(folder),
       project: defaultProject(basename(folder)),
@@ -356,7 +356,7 @@ export class NovelStore {
     ] as const
     let changed = false
     for (const f of files) {
-      const bytes = await readBytes(join(p.folder, f.rel))
+      const bytes = await readBytes(p.folder, join(p.folder, f.rel))
       const hash = bytes ? sha256(bytes) : ''
       const known = p.hashes.get(f.rel)
       if (known !== undefined && known === hash) continue
@@ -380,10 +380,10 @@ export class NovelStore {
   /** Writes a JSON file after snapshotting what is on disk. The caller holds the project's exclusive lock. */
   private async writeJson(p: OpenProject, rel: 'project.json' | 'outline.json', value: unknown): Promise<void> {
     const target = join(p.folder, rel)
-    const disk = await readBytes(target)
+    const disk = await readBytes(p.folder, target)
     if (disk) await this.snapshot(p, rel, disk, JSON_SNAPSHOT_GAP_MS)
     const bytes = json(value)
-    await serialized(target, () => writeBytesAtomic(target, join(p.folder, '.rulz', 'tmp'), bytes))
+    await serialized(target, () => writeBytesAtomic(p.folder, target, join(p.folder, '.rulz', 'tmp'), bytes))
     p.hashes.set(rel, sha256(bytes))
   }
 
@@ -398,7 +398,7 @@ export class NovelStore {
         if (p.blocked) throw new Error(`${p.blocked} The project is read-only until that file is fixed.`)
         const { result, project, outline } = await fn()
         const stale = async (rel: string): Promise<boolean> => {
-          const disk = await readBytes(join(p.folder, rel))
+          const disk = await readBytes(p.folder, join(p.folder, rel))
           return (disk ? sha256(disk) : '') !== p.hashes.get(rel)
         }
         if ((project && (await stale('project.json'))) || (outline && (await stale('outline.json')))) {
@@ -453,8 +453,8 @@ export class NovelStore {
       for (const file of createdFiles) {
         const rel = `manuscript/${file}`
         const target = join(p.folder, 'manuscript', file)
-        if (await readBytes(target)) continue
-        await writeBytesAtomic(target, tmp, Buffer.alloc(0))
+        if (await readBytes(p.folder, target)) continue
+        await writeBytesAtomic(p.folder, target, tmp, Buffer.alloc(0))
         p.hashes.set(lc(rel), sha256(Buffer.alloc(0)))
       }
       p.outline = outline
@@ -507,7 +507,7 @@ export class NovelStore {
     const key = `${st.mtimeMs}:${st.size}`
     const hit = p.wordCache.get(lc(rel))
     if (hit?.key === key) return hit.words
-    const bytes = await readBytes(path).catch(() => null)
+    const bytes = await readBytes(p.folder, path).catch(() => null)
     const words = bytes ? wordCount(decodeBytes(bytes).text) : 0
     p.wordCache.set(lc(rel), { key, words })
     return words
@@ -531,7 +531,7 @@ export class NovelStore {
         out.push(hit.entry)
         continue
       }
-      const bytes = await readBytes(path).catch(() => null)
+      const bytes = await readBytes(p.folder, path).catch(() => null)
       if (!bytes) continue
       const d = decodeBytes(bytes)
       const entry = parseEntry(e.name.replace(/\.md$/i, ''), d.text)
@@ -573,7 +573,7 @@ export class NovelStore {
   private async loadText(p: OpenProject, rel: string, remember: boolean): Promise<NovelTextFile> {
     const path = join(p.folder, ...rel.split('/'))
     await this.guard(p, path, join(p.folder, '.rulz'))
-    const bytes = await readBytes(path)
+    const bytes = await readBytes(p.folder, path)
     const key = lc(rel)
     if (!bytes) {
       if (remember) p.hashes.set(key, '')
@@ -638,7 +638,7 @@ export class NovelStore {
         // The project can have become blocked while this save waited in the queue.
         if (p.blocked) return { ok: false, reason: 'blocked' }
         await this.guard(p, target, join(p.folder, '.rulz'))
-        const disk = await readBytes(target)
+        const disk = await readBytes(p.folder, target)
         const d = disk ? decodeBytes(disk) : null
         if (d?.readOnly) return { ok: false, reason: 'readOnly' }
         const diskHash = d?.hash ?? ''
@@ -669,11 +669,11 @@ export class NovelStore {
         }
         if (p.blocked) return { ok: false, reason: 'blocked' }
         const unchanged = async (): Promise<boolean> => {
-          const now = await readBytes(target)
+          const now = await readBytes(p.folder, target)
           return (now ? sha256(now) : '') === diskHash
         }
-        if (!(await writeBytesAtomic(target, join(p.folder, '.rulz', 'tmp'), bytes, unchanged))) {
-          const now = await readBytes(target)
+        if (!(await writeBytesAtomic(p.folder, target, join(p.folder, '.rulz', 'tmp'), bytes, unchanged))) {
+          const now = await readBytes(p.folder, target)
           const nd = now ? decodeBytes(now) : null
           return { ok: false, reason: 'conflict', diskHash: nd?.hash ?? '', diskText: nd?.text ?? '' }
         }
@@ -726,7 +726,7 @@ export class NovelStore {
       for (let n = 2; taken.has(`${id}.md`); n++) id = `${base}-${n}`
       const text = formatEntry({ name: clean, kind: entryKind, aliases: [], triggers: [], priority: 50, always: false, body: '' })
       const bytes = Buffer.from(text, 'utf8')
-      await writeBytesAtomic(join(p.folder, 'bible', `${id}.md`), join(p.folder, '.rulz', 'tmp'), bytes)
+      await writeBytesAtomic(p.folder, join(p.folder, 'bible', `${id}.md`), join(p.folder, '.rulz', 'tmp'), bytes)
       p.hashes.set(lc(`bible/${id}.md`), sha256(bytes))
       return parseEntry(id, text)
     })
@@ -744,7 +744,7 @@ export class NovelStore {
     try {
       if (apply) {
         // The outline may have been edited outside while the files moved; if so, do not write over it.
-        const disk = await readBytes(join(p.folder, 'outline.json'))
+        const disk = await readBytes(p.folder, join(p.folder, 'outline.json'))
         if ((disk ? sha256(disk) : '') !== p.hashes.get('outline.json')) {
           throw new Error('outline.json changed on disk while deleting. Nothing was deleted; try again.')
         }
@@ -796,7 +796,7 @@ export class NovelStore {
     if (!USER_PATH.test(rel)) throw new Error('That entry does not exist.')
     await this.exclusive(p, async () => {
       if (p.blocked) throw new Error(p.blocked)
-      if (!(await readBytes(join(p.folder, ...rel.split('/'))))) throw new Error('That entry no longer exists.')
+      if (!(await readBytes(p.folder, join(p.folder, ...rel.split('/'))))) throw new Error('That entry no longer exists.')
       await this.withFileLocks(p, [rel], async () => {
         await this.guard(p, join(p.folder, ...rel.split('/')), join(p.folder, '.rulz'))
         await moveToTrash(p.folder, [rel], `Entry "${entryId}"`)
@@ -856,7 +856,8 @@ export class NovelStore {
     const p = this.get(folder)
     if (p.blocked) throw new Error(`${p.blocked} The project is read-only until that file is fixed.`)
     const dir = trashRoot(p.folder)
-    await assertAppPath(dir)
+    await assertAppPath(p.folder, dir)
+    await assertNoLinks(dir)
     if (!(await fs.stat(dir).catch(() => null))) return
     await this.opts.trashItem(dir)
   }
@@ -869,7 +870,7 @@ export class NovelStore {
     if (projectKey(dir) === projectKey(root) || (!isInside(root, dir) && !this.projects.has(projectKey(dir)))) {
       throw new Error('Only a project folder can be deleted here.')
     }
-    if (!(await readBytes(join(dir, 'project.json')).catch(() => null))) throw new Error('That folder is not a RulZ novel project.')
+    if (!(await readBytes(dir, join(dir, 'project.json')).catch(() => null))) throw new Error('That folder is not a RulZ novel project.')
     const open = this.projects.get(projectKey(dir))
     // The watcher holds the folder open; Windows can refuse to move a folder that is being watched.
     open?.watcher?.stop()
@@ -906,7 +907,7 @@ export class NovelStore {
     const clean = cleanRelPath(p.folder, snapshot, '.rulz/history/')
     if (!clean.toLowerCase().startsWith('.rulz/history/')) throw new Error('That is not a history snapshot.')
     await this.guard(p, join(p.folder, ...clean.split('/')))
-    const bytes = await readBytes(join(p.folder, ...clean.split('/')))
+    const bytes = await readBytes(p.folder, join(p.folder, ...clean.split('/')))
     if (!bytes) throw new Error('That snapshot no longer exists.')
     return decodeBytes(bytes).text
   }
@@ -935,7 +936,7 @@ export class NovelStore {
       // A read that fails (still locked after the retries) says nothing: only a missing file is "deleted".
       let bytes: Buffer | null
       try {
-        bytes = await readBytes(path)
+        bytes = await readBytes(p.folder, path)
       } catch {
         return
       }

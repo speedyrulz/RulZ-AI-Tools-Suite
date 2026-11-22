@@ -65,8 +65,8 @@ export function thinSnapshots(stamps: string[], now: Date): string[] {
 const historyDir = (folder: string, rel: string): string => join(folder, '.rulz', 'history', ...rel.split('/'))
 const relSnapshot = (rel: string, name: string): string => `.rulz/history/${rel}/${name}`
 
-async function names(dir: string): Promise<string[]> {
-  await assertAppPath(dir)
+async function names(folder: string, dir: string): Promise<string[]> {
+  await assertAppPath(folder, dir)
   try {
     return (await fs.readdir(dir, { withFileTypes: true })).filter((e) => e.isFile()).map((e) => e.name)
   } catch {
@@ -79,9 +79,9 @@ const stampOfName = (name: string): string => name.slice(0, name.length - extnam
 /** Snapshots of a file, newest first. */
 export async function listHistory(folder: string, rel: string): Promise<NovelHistoryItem[]> {
   const dir = historyDir(folder, rel)
-  await assertAppPath(dir)
+  await assertAppPath(folder, dir)
   const items: NovelHistoryItem[] = []
-  for (const name of await names(dir)) {
+  for (const name of await names(folder, dir)) {
     const stamp = stampOfName(name)
     if (stampTime(stamp) === null) continue
     const st = await fs.stat(join(dir, name)).catch(() => null)
@@ -96,19 +96,19 @@ export async function listHistory(folder: string, rel: string): Promise<NovelHis
  */
 export async function takeSnapshot(folder: string, rel: string, bytes: Uint8Array, now = new Date()): Promise<string | null> {
   const dir = historyDir(folder, rel)
-  await assertAppPath(dir)
+  await assertAppPath(folder, dir)
   const ext = extname(rel) || '.txt'
-  const existing = await names(dir)
+  const existing = await names(folder, dir)
   const newest = existing.filter((n) => stampTime(stampOfName(n)) !== null).sort((a, b) => compareStamps(stampOfName(a), stampOfName(b))).pop()
   if (newest) {
-    const prev = await readBytes(join(dir, newest)).catch(() => null)
+    const prev = await readBytes(folder, join(dir, newest)).catch(() => null)
     if (prev && Buffer.compare(prev, Buffer.from(bytes)) === 0) return null
   }
   const base = stampOf(now)
   let stamp = base
   const taken = new Set(existing.map((n) => n.toLowerCase()))
   for (let n = 2; taken.has(`${stamp}${ext}`.toLowerCase()); n++) stamp = `${base}-${n}`
-  await writeBytesAtomic(join(dir, `${stamp}${ext}`), join(folder, '.rulz', 'tmp'), bytes)
+  await writeBytesAtomic(folder, join(dir, `${stamp}${ext}`), join(folder, '.rulz', 'tmp'), bytes)
   const all = [...existing.map(stampOfName), stamp]
   const kept = new Set(thinSnapshots(all, now))
   for (const name of [...existing, `${stamp}${ext}`]) {

@@ -52,25 +52,22 @@ export function encodeText(text: string, meta: NovelFileMeta): Buffer {
 
 /**
  * Every path under a project's .rulz folder goes through this before it is read, written, moved or deleted.
- * The .rulz subfolders (history, unsaved, trash, tmp) are app-owned and never need to be links, so any link
- * from .rulz down to the path is refused (even one that points inside the project), and so is a path whose
- * real location is outside the project. Paths without a .rulz part are not checked here (the store guards
- * user files with realInside). Throws; nothing has been touched when it does.
+ * `folder` is the project folder (given by the caller, never guessed from the path). The .rulz subfolders
+ * (history, unsaved, trash, tmp) are app-owned and never need to be links, so every existing component from
+ * <folder>/.rulz down to the path is checked and any link is refused, even one that points inside the
+ * project; a path whose real location is outside the real project folder is refused too. A path outside the
+ * project is refused. A path in the project but not under .rulz is not checked here (the store guards user
+ * files with realInside). Throws; nothing has been touched when it does.
  */
-export async function assertAppPath(path: string): Promise<void> {
+export async function assertAppPath(folder: string, path: string): Promise<void> {
+  const root = resolve(folder)
   const full = resolve(path)
-  const parts = full.split(sep)
-  let idx = -1
-  for (let i = parts.length - 1; i >= 0; i--) {
-    if (parts[i].toLowerCase() === '.rulz') {
-      idx = i
-      break
-    }
-  }
-  if (idx < 0) return
-  const project = resolve(parts.slice(0, idx).join(sep) + sep)
-  let cur = project
-  for (const seg of parts.slice(idx)) {
+  if (!isInside(root, full)) throw new Error('That path is outside the project.')
+  const rulz = join(root, '.rulz')
+  if (!isInside(rulz, full)) return
+  const parts = full.slice(root.length).split(sep).filter(Boolean)
+  let cur = root
+  for (const seg of parts) {
     cur = join(cur, seg)
     let st
     try {
@@ -80,14 +77,28 @@ export async function assertAppPath(path: string): Promise<void> {
       if (code === 'ENOENT' || code === 'ENOTDIR') break
       throw err
     }
-    if (st.isSymbolicLink()) throw new Error('The project\'s .rulz folder contains a link, so nothing was written there.')
+    if (st.isSymbolicLink()) throw new Error("The project's .rulz folder contains a link, so nothing was written there.")
   }
-  if (!(await realInside(project, full))) throw new Error('The project\'s .rulz folder leads outside the project, so nothing was written there.')
+  if (!(await realInside(root, full))) throw new Error("The project's .rulz folder leads outside the project, so nothing was written there.")
+}
+
+/** Throws if a link (symlink or junction) is anywhere below `dir`; used before the whole trash folder is handed to the Recycle Bin. */
+export async function assertNoLinks(dir: string): Promise<void> {
+  let entries
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const e of entries) {
+    if (e.isSymbolicLink()) throw new Error("The project's .rulz folder contains a link, so nothing was moved.")
+    if (e.isDirectory()) await assertNoLinks(join(dir, e.name))
+  }
 }
 
 /** Reads a file's bytes; null when it does not exist. Retries transient Windows locks. */
-export async function readBytes(path: string): Promise<Buffer | null> {
-  await assertAppPath(path)
+export async function readBytes(folder: string, path: string): Promise<Buffer | null> {
+  await assertAppPath(folder, path)
   for (let attempt = 0; ; attempt++) {
     try {
       return await fs.readFile(path)
@@ -136,12 +147,12 @@ export function serialized<T>(path: string, fn: () => Promise<T>): Promise<T> {
  * Writes bytes via a temp file in `tmpDir` (inside the project's .rulz, never next to the user's files) and
  * a rename over `target`. Throws after about 750 ms of lock retries; the target is then unchanged.
  */
-export async function writeBytesAtomic(target: string, tmpDir: string, bytes: Uint8Array, stillValid?: () => Promise<boolean>): Promise<boolean> {
-  await assertAppPath(target)
-  await assertAppPath(tmpDir)
+export async function writeBytesAtomic(folder: string, target: string, tmpDir: string, bytes: Uint8Array, stillValid?: () => Promise<boolean>): Promise<boolean> {
+  await assertAppPath(folder, target)
+  await assertAppPath(folder, tmpDir)
   await fs.mkdir(dirname(target), { recursive: true })
   await fs.mkdir(tmpDir, { recursive: true })
-  await assertAppPath(tmpDir)
+  await assertAppPath(folder, tmpDir)
   const tmp = join(tmpDir, `${randomBytes(6).toString('hex')}.tmp`)
   const fh = await fs.open(tmp, 'w')
   try {
