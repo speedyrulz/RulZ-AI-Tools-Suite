@@ -88,7 +88,9 @@ export function buildServerArgs({ model, config: c, port, alias, adapters = [] }
   if (s.dryMultiplier !== null) args.push('--dry-multiplier', String(s.dryMultiplier))
   if (s.dryBase !== null) args.push('--dry-base', String(s.dryBase))
   if (s.dryAllowedLength !== null) args.push('--dry-allowed-length', String(s.dryAllowedLength))
-  if (s.dryPenaltyLastN !== null) args.push('--dry-penalty-last-n', String(s.dryPenaltyLastN))
+  // -1 (the whole context) is llama-server's own default, and some builds refuse it on the command line
+  // ("invalid dry-penalty-last-n = -1"), so it is left out; requests still send -1, which the server accepts.
+  if (s.dryPenaltyLastN !== null && s.dryPenaltyLastN >= 0) args.push('--dry-penalty-last-n', String(s.dryPenaltyLastN))
   // Breakers only matter while DRY is on, and a model with a multiplier of 0 or unset leaves them alone.
   if (s.drySequenceBreakers !== null && s.dryMultiplier !== null && s.dryMultiplier > 0) {
     for (const b of s.drySequenceBreakers) args.push('--dry-sequence-breaker', b)
