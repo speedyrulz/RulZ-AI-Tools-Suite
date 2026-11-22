@@ -2,19 +2,21 @@ import { useEffect } from 'react'
 import { useApp, type Page } from '../stores/app'
 import { useChat } from '../stores/chat'
 import { useModels } from '../stores/models'
+import { useNovel } from '../stores/novel'
 
 export const SHORTCUTS: [string, string][] = [
   ['Ctrl+L', 'Open the model picker'],
   ['Ctrl+N', 'New chat'],
-  ['Ctrl+1 … 6', 'Chat / My Models / MCP Tools / Developer / Settings / Reverse Engineering'],
+  ['Ctrl+1 … 7', 'Chat / My Models / MCP Tools / Developer / Settings / Reverse Engineering / Writing'],
   ['Ctrl+E', 'Eject all models'],
-  ['Ctrl+B', 'Toggle the chat settings panel'],
+  ['Ctrl+B', 'Toggle the chat settings panel, or the side panel on the Writing page'],
+  ['Ctrl+F', 'Search in the Writing editor'],
   ['Enter / Shift+Enter', 'Send / new line'],
   ['Esc', 'Stop generating'],
   ['F12', 'Developer tools']
 ]
 
-const PAGE_KEYS: Record<string, Page> = { '1': 'chat', '2': 'models', '3': 'mcp', '4': 'developer', '5': 'settings', '6': 're' }
+const PAGE_KEYS: Record<string, Page> = { '1': 'chat', '2': 'models', '3': 'mcp', '4': 'developer', '5': 'settings', '6': 're', '7': 'writing' }
 
 /**
  * Esc stops the reply only when nothing else used the key: closing a dialog or menu, or
@@ -57,6 +59,10 @@ export function useShortcuts(): void {
         void useModels.getState().unloadAll()
       } else if (key === 'b') {
         e.preventDefault()
+        if (app.page === 'writing') {
+          useNovel.getState().togglePanel()
+          return
+        }
         const open = app.settings?.rightPanelOpen ?? true
         void app.updateSettings({ rightPanelOpen: !open })
       } else if (key in PAGE_KEYS) {

@@ -347,6 +347,13 @@ export class ChatService {
     return this.contextApi(inst, set.defs).countConversation(withSystemNote(messages, set.note))
   }
 
+  /** Token count of plain text on the loaded model (cached per instance); null if it can't count. */
+  async countText(modelId: string, text: string): Promise<number | null> {
+    const inst = this.instances.readyFor(modelId)
+    if (!inst) return null
+    return this.contextApi(inst, []).countText(text)
+  }
+
   async start(req: ChatRequest): Promise<void> {
     const { requestId } = req
     const ctrl = new AbortController()
@@ -394,9 +401,19 @@ export class ChatService {
           req.sampling.maxTokens ?? Math.min(2048, Math.floor(inst.contextLength / 4)),
           Math.floor(inst.contextLength / 3)
         )
-        const fitted = await fitToContext(messages, inst.contextLength, reserve, req.overflow, api)
-        trimmed = fitted !== messages
-        messages = fitted
+        if (req.prefitted) {
+          // The caller assembled the request to fit (Writing mode): never trim it, fail clearly instead.
+          const max = req.sampling.maxTokens ?? reserve
+          const used = await api.countConversation(messages)
+          if (used === null) throw new Error("Could not count the request's tokens, so it was not sent.")
+          if (used + max > inst.contextLength) {
+            throw new Error(`The request is larger than the model's context (${(used + max).toLocaleString()} of ${inst.contextLength.toLocaleString()} tokens).`)
+          }
+        } else {
+          const fitted = await fitToContext(messages, inst.contextLength, reserve, req.overflow, api)
+          trimmed = fitted !== messages
+          messages = fitted
+        }
       }
 
       // Some templates print earlier tool arguments as Python lists; send them as JSON text instead

@@ -1,6 +1,7 @@
 // Single source of truth for IPC channels between the renderer and the main process.
 import type { BatchRun } from './batch'
 import type { BenchmarkRequest, BenchmarkRun } from './benchmark'
+import type { NovelIpcEvents, NovelIpcInvoke } from './novel'
 import type {
   AdapterConvertRequest,
   AdapterConvertResult,
@@ -46,7 +47,7 @@ export interface AppInfo {
 }
 
 /** Request/response channels (ipcRenderer.invoke ↔ ipcMain.handle). */
-export interface IpcInvoke {
+export interface IpcInvoke extends NovelIpcInvoke {
   'app:info': () => AppInfo
   'settings:get': () => AppSettings
   'settings:update': (patch: Partial<AppSettings>) => AppSettings
@@ -154,7 +155,7 @@ export interface IpcInvoke {
 }
 
 /** Push channels (webContents.send → ipcRenderer.on). */
-export interface IpcEvents {
+export interface IpcEvents extends NovelIpcEvents {
   'models:changed': ModelEntry[]
   'adapters:changed': AdapterEntry[]
   /** One output line of the running adapter conversion. */
