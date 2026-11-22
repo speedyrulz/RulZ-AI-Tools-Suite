@@ -323,7 +323,8 @@ def test_starts_own_servers_reuses_restarts_and_stops_them(fake):
     m.stop()
     assert not m.running()
     assert all(p.poll() is not None for p in fake.launched)
-    assert not server.port_in_use(first) and not server.port_in_use(first + 1)
+    # A process that just ended can hold its port a moment longer on Windows; the app allows the same settle.
+    assert not server.port_in_use(first, settle=5.0) and not server.port_in_use(first + 1, settle=5.0)
 
 
 def test_a_server_that_died_is_started_again(fake):

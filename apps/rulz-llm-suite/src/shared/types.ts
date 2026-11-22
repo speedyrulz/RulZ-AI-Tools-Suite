@@ -175,6 +175,12 @@ export interface AppSettings {
   closeToTray: boolean
   /** Writing mode: folder holding the novel projects; '' = <Documents>\RulZ Novels. */
   writingRoot: string
+  /** Phone access (RulZ Writer for Android): listen on the Tailscale address so the phone can connect. */
+  phoneEnabled: boolean
+  /** Port the phone connects to. */
+  phonePort: number
+  /** Pairing code: '' until phone access is first turned on. Never sent to the renderer except by phone:pairing. */
+  phoneToken: string
   /** Offer MCP tools to the model in chats. */
   toolsEnabled: boolean
   /** Ask before each tool call unless the tool is in allowedTools. */

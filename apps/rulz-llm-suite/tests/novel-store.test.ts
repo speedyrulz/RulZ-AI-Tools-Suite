@@ -570,8 +570,12 @@ describe('changes made outside the app', () => {
     const f = await s.store.readFile(st.folder, rel)
     s.events.length = 0
     await s.store.saveFile({ folder: st.folder, path: rel, text: 'v2\n', baseHash: f.hash })
+    // The save itself is announced once (so phones hear of it); the watcher's echo of it adds nothing.
+    const own = [{ kind: 'text', folder: st.folder, path: rel, hash: decodeBytes(readFileSync(abs(st, rel))).hash }]
+    expect(s.events).toEqual(own)
     await s.store.onExternalChange(st.folder, rel)
-    expect(s.events).toEqual([])
+    expect(s.events).toEqual(own)
+    s.events.length = 0
     writeFileSync(abs(st, rel), 'v3 from Obsidian\n')
     await s.store.onExternalChange(st.folder, rel)
     await s.store.onExternalChange(st.folder, rel)

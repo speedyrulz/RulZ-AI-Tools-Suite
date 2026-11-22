@@ -1,7 +1,7 @@
 {
   "name": "rulz-llm-suite",
   "productName": "RulZ LLM Suite",
-  "version": "0.25.1",
+  "version": "0.26.0",
   "description": "Run local LLMs with llama.cpp: model library, model loading and chat.",
   "main": "./out/main/index.js",
   "author": "RulZ",
@@ -19,6 +19,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.1",
+    "qrcode": "1.5.4",
+    "ws": "8.22.0",
     "zod": "4.1.12"
   },
   "devDependencies": {
@@ -38,8 +40,10 @@
     "@radix-ui/react-tooltip": "1.4.1",
     "@tailwindcss/vite": "4.1.14",
     "@types/node": "24.7.2",
+    "@types/qrcode": "1.5.6",
     "@types/react": "19.2.2",
     "@types/react-dom": "19.2.1",
+    "@types/ws": "8.18.2",
     "@vitejs/plugin-react": "5.0.4",
     "clsx": "2.1.1",
     "electron": "44.9.3",

@@ -95,6 +95,10 @@ APPS = {
         rect(5, 2, 14, 20, 2, W),
         # a small code-xml centred in the phone, drawn at 0.5 scale around (12, 12)
         p("m15 14 2-2-2-2", W), p("m9 10-2 2 2 2", W), p("m13.25 8-2.5 8", R)], (0, 0)),
+    "writer-android": ("RulZ Writer for Android", "smartphone", [
+        rect(5, 2, 14, 20, 2, W),
+        # a small pen-line centred in the phone: red pen body, white writing line
+        p("M13.5 7.5a1.5 1.5 0 0 1 2.12 2.12L10.5 14.75l-2.5.5.5-2.5Z", R), p("M12 16.5h3.5", W)], (0, 0)),
     "training-captioner": ("Rulz Training Captioner", "captions", [
         rect(3, 5, 18, 14, 2, W),
         p("M7 15h4", R), p("M15 15h2", R), p("M7 11h2", R), p("M13 11h4", R)], (0, 0)),
@@ -231,6 +235,7 @@ def render_foreground(r, app_id, size, mark, badge=True):
 APPS_DIR = ROOT / "apps"
 ICO9 = [16, 20, 24, 32, 40, 48, 64, 128, 256]
 RES = "rulz-coding-agent-android/android/app/src/main/res"
+WRITER_RES = "rulz-writer-android/android/app/src/main/res"
 DENSITY = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}   # launcher px; foreground = x 2.25
 
 # (app id, path under apps/, kind, size or frame list); kind: png | ico | favicon (no badge) | round | fg
@@ -264,6 +269,10 @@ INSTALL = [
 ] + [("coding-agent-android", f"{RES}/mipmap-{d}/ic_launcher.png", "png", px) for d, px in DENSITY.items()] \
   + [("coding-agent-android", f"{RES}/mipmap-{d}/ic_launcher_round.png", "round", px) for d, px in DENSITY.items()] \
   + [("coding-agent-android", f"{RES}/mipmap-{d}/ic_launcher_foreground.png", "fg", round(px * 2.25))
+     for d, px in DENSITY.items()] \
+  + [("writer-android", f"{WRITER_RES}/mipmap-{d}/ic_launcher.png", "png", px) for d, px in DENSITY.items()] \
+  + [("writer-android", f"{WRITER_RES}/mipmap-{d}/ic_launcher_round.png", "round", px) for d, px in DENSITY.items()] \
+  + [("writer-android", f"{WRITER_RES}/mipmap-{d}/ic_launcher_foreground.png", "fg", round(px * 2.25))
      for d, px in DENSITY.items()]
 
 

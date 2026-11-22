@@ -3,6 +3,7 @@ import { useEffect, useState, type ReactNode } from 'react'
 import type { LoadConfig, SamplingParams } from '@shared/types'
 import { ThinkingFields, VarietyFields } from '../components/chat/InferencePanel'
 import { LoadSettingsForm } from '../components/models/LoadSettingsForm'
+import { PhoneAccessSection } from '../components/settings/PhoneAccessSection'
 import { Button, Field, Input, Kbd, Select, Switch, Textarea } from '../components/ui'
 import { SHORTCUTS } from '../hooks/useShortcuts'
 import { invoke } from '../lib/api'
@@ -142,6 +143,10 @@ export function SettingsPage() {
               </Button>
             </div>
           </Field>
+        </Card>
+
+        <Card title="Phone access" description="Write in the Writing mode from the RulZ Writer app on your Android phone. The computer does the work; the phone is the screen.">
+          <PhoneAccessSection />
         </Card>
 
         <Card title="Default load settings" description="Used for models without their own saved settings.">

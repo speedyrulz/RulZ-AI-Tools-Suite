@@ -71,7 +71,10 @@ export function HomePage({
               </p>
             </div>
           </div>
-          <PhoneAppButton />
+          <div className="flex shrink-0 flex-wrap items-center gap-2.5">
+            <PhoneAppButton appId="coding-agent-android" />
+            <PhoneAppButton appId="writer-android" />
+          </div>
         </div>
       </section>
 

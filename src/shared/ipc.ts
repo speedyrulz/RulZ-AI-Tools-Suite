@@ -4,6 +4,7 @@ import type {
   InstallOptions,
   JobState,
   PhoneApp,
+  PhoneAppId,
   ReadmeDoc,
   SelfUpdate,
   RequirementId,
@@ -54,7 +55,7 @@ export interface IpcInvoke {
   'apps:log': (appId: string) => string[]
 
   /** The newest Android app release with an APK (null when there is none or GitHub was never reached). */
-  'phone:latest': () => PhoneApp | null
+  'phone:latest': (id: PhoneAppId) => PhoneApp | null
 
   /** `reloadPath` re-reads PATH first, to find programs installed since the launcher started. */
   /** `force` skips the 30-minute cache. */
