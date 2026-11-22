@@ -1,9 +1,10 @@
-import { Ellipsis, Eye, FolderOpen, FolderSearch, Play, RefreshCw, Repeat, Search, Trash2 } from 'lucide-react'
+import { Ellipsis, Eye, FolderOpen, FolderSearch, Gauge, Play, RefreshCw, Repeat, Search, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { adapterChoices } from '@shared/adapters'
 import type { AdapterEntry, LoadConfig, ModelEntry } from '@shared/types'
 import { AdapterConvertDialog } from '../components/models/AdapterConvertDialog'
+import { BenchmarkView } from '../components/models/BenchmarkView'
 import { EstimateView, useEstimate } from '../components/models/EstimateView'
 import { LoadSettingsForm } from '../components/models/LoadSettingsForm'
 import { Badge, Button, Dialog, DropdownMenu, IconButton, Input } from '../components/ui'
@@ -30,6 +31,7 @@ export function ModelsPage() {
   const [trashTarget, setTrashTarget] = useState<ModelEntry | null>(null)
   const [adapterTrash, setAdapterTrash] = useState<AdapterEntry | null>(null)
   const [convertOpen, setConvertOpen] = useState(false)
+  const [benchId, setBenchId] = useState<string | null>(null)
 
   const list = useMemo(() => {
     const q = query.trim().toLowerCase()
@@ -46,6 +48,9 @@ export function ModelsPage() {
     await rescan()
     setScanning(false)
   }
+
+  const benchModel = benchId ? models.find((m) => m.id === benchId) : undefined
+  if (benchModel) return <BenchmarkView key={benchModel.id} model={benchModel} onBack={() => setBenchId(null)} />
 
   return (
     <div className="flex h-full">
@@ -159,6 +164,7 @@ export function ModelsPage() {
                               </button>
                             }
                             items={[
+                              { label: 'Benchmark load settings…', icon: <Gauge size={13} />, onSelect: () => setBenchId(m.id), disabled: !!m.error },
                               { label: 'Show in Explorer', icon: <FolderOpen size={13} />, onSelect: () => void invoke('shell:showItem', m.path) },
                               'sep',
                               { label: 'Move to Recycle Bin…', icon: <Trash2 size={13} />, onSelect: () => setTrashTarget(m), danger: true }
@@ -176,7 +182,7 @@ export function ModelsPage() {
         </div>
       </div>
 
-      {selected && <ModelDetails key={selected.id} model={selected} onClose={() => setSelectedId(null)} />}
+      {selected && <ModelDetails key={selected.id} model={selected} onClose={() => setSelectedId(null)} onBenchmark={() => setBenchId(selected.id)} />}
 
       <Dialog
         open={!!trashTarget}
@@ -303,7 +309,7 @@ function AdaptersSection({ adapters, models, onTrash }: { adapters: AdapterEntry
   )
 }
 
-function ModelDetails({ model, onClose }: { model: ModelEntry; onClose: () => void }) {
+function ModelDetails({ model, onClose, onBenchmark }: { model: ModelEntry; onClose: () => void; onBenchmark: () => void }) {
   const settings = useApp((s) => s.settings)
   const [config, setConfig] = useState<LoadConfig | null>(null)
   const [custom, setCustom] = useState(false)
@@ -370,6 +376,9 @@ function ModelDetails({ model, onClose }: { model: ModelEntry; onClose: () => vo
         <EstimateView estimate={estimate} />
       </div>
       <div className="flex justify-end gap-2 border-t border-border px-5 py-3">
+        <Button variant="ghost" disabled={!!model.error} onClick={onBenchmark}>
+          <Gauge size={14} /> Benchmark
+        </Button>
         {custom && (
           <Button
             variant="ghost"

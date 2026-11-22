@@ -42,6 +42,15 @@ Discover/downloads, RAG and a CLI are planned.
   the llama.cpp build the app uses. Python with `torch`, `safetensors` and `transformers` is needed. Give a base model
   folder (only its `config.json` is read) or a Hugging Face model id; with neither, the converter reads the base named in
   `adapter_config.json` from the Hub.
+- **Load-settings benchmark** — **Benchmark** on My Models runs one fixed prompt over every combination of the settings
+  you pick (GPU layers, MoE offload, KV cache type, draft tokens, context length, batch and micro-batch sizes; at most
+  48 combinations), starting from the model's saved settings. For each it loads the model, sends an untimed warm-up and
+  then a few timed requests (prompt of 512, 2048 or 8192 tokens cut with the model's own tokenizer, end-of-text
+  ignored), and tables load time, time to first token, prompt and generation tok/s, draft acceptance and peak VRAM
+  (nvidia-smi sampled every ~0.5 s, minus what was in use before the load) next to the memory estimate. Combinations the
+  estimate calls likely out of memory can be skipped. The fastest row is marked, and **Save as defaults** stores a
+  row's settings as the model's defaults. A run unloads every loaded model first and leaves nothing loaded; runs are
+  kept in `%APPDATA%\RulZ LLM Suite\benchmarks.json` (newest 100).
 - **Chat** — streaming replies, collapsible reasoning ("thinking") blocks, Markdown with tables, LaTeX and
   highlighted code, image and text-file attachments (drag-drop / paste), copy, edit, regenerate, continue, branch,
   delete (with undo); per-chat adapter strengths (on/off and 0–2 in the side panel, applied per request without
