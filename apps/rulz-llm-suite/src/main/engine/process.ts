@@ -47,6 +47,21 @@ export function describeExitCode(code: number | null): string | undefined {
   }
 }
 
+/** Explains load failures that llama-server's log names plainly but buries among follow-on errors. */
+export function describeLoadLog(log: readonly string[]): string | undefined {
+  for (const line of log) {
+    const arch = line.match(/unknown model architecture:\s*'([^']*)'/i)?.[1]
+    if (arch !== undefined) {
+      return (
+        `This llama.cpp build does not support the model type '${arch}'. ` +
+        'Update llama.cpp and rebuild llama-server to get newer model types. ' +
+        'If the newest llama.cpp does not list this type either, the model needs a llama.cpp fork or a later llama.cpp release.'
+      )
+    }
+  }
+  return undefined
+}
+
 export interface CaptureResult {
   code: number | null
   output: string
