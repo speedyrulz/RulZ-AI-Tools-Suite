@@ -131,7 +131,9 @@ export function buildRequestBody(
     body.dry_multiplier = s.dryMultiplier
     body.dry_base = s.dryBase
     body.dry_allowed_length = s.dryAllowedLength
-    body.dry_penalty_last_n = s.dryPenaltyLastN
+    // -1 (the whole context) is llama-server's default, and some builds refuse it ("must be between 0 <= value"),
+    // which failed every request with DRY on: leave it out then.
+    if (s.dryPenaltyLastN >= 0) body.dry_penalty_last_n = s.dryPenaltyLastN
     if (s.drySequenceBreakers.length) body.dry_sequence_breakers = s.drySequenceBreakers
   }
   if (s.xtcProbability > 0) {

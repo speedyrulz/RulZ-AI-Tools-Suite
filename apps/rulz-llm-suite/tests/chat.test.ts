@@ -100,11 +100,14 @@ describe('buildRequestBody', () => {
       dry_multiplier: 0.8,
       dry_base: 1.75,
       dry_allowed_length: 3,
-      dry_penalty_last_n: -1,
       dry_sequence_breakers: ['\n', 'Aria'],
       xtc_probability: 0.5,
       xtc_threshold: 0.15
     })
+    // -1 (whole context) is the server default and some builds reject it in a request: left out; 0 and up are sent.
+    expect(body).not.toHaveProperty('dry_penalty_last_n')
+    const look = buildRequestBody('m', [], { ...DEFAULT_SAMPLING, dryMultiplier: 0.8, dryPenaltyLastN: 512 })
+    expect(look.dry_penalty_last_n).toBe(512)
     expect(body.logit_bias).toEqual([
       ['tapestry', -7],
       [' tapestry', -7],
