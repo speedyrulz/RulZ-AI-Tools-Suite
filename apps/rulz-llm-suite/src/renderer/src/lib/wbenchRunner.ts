@@ -2,7 +2,7 @@
 // it is finished. Everything it touches comes in through `WbenchDeps`, so it runs in tests without the
 // app. Also the small pure helpers the store and the views share (adapters for a request, what a vote
 // panel shows, progress).
-import type { InstanceAdapter, LoadAdapter, SamplingParams } from '@shared/types'
+import type { InstanceAdapter, LoadAdapter, LoadConfig, SamplingParams } from '@shared/types'
 import {
   addPairs,
   benchMessages,
@@ -213,6 +213,28 @@ export function requestAdapters(loaded: InstanceAdapter[], wanted: LoadAdapter[]
 /** Whether a loaded instance already has every adapter the candidate wants (so it need not be loaded again). */
 export function adaptersLoaded(loaded: InstanceAdapter[], wanted: LoadAdapter[]): boolean {
   return wanted.every((w) => loaded.some((a) => a.id === w.id))
+}
+
+/** A value with object keys in sorted order, so two configs compare by content, not by key order. */
+function sortedJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(sortedJson).join(',')}]`
+  if (v && typeof v === 'object') {
+    const o = v as Record<string, unknown>
+    return `{${Object.keys(o).sort().filter((k) => o[k] !== undefined).map((k) => `${JSON.stringify(k)}:${sortedJson(o[k])}`).join(',')}}`
+  }
+  return JSON.stringify(v) ?? 'null'
+}
+
+/** Whether two load configs are the same apart from their adapters (which a benchmark candidate sets on its own). */
+export function sameLoadConfig(a: LoadConfig, b: LoadConfig): boolean {
+  const { adapters: _a, ...x } = a
+  const { adapters: _b, ...y } = b
+  return sortedJson(x) === sortedJson(y)
+}
+
+/** The sampling and load settings a candidate is saved with: the edited values, else the select's choice and the model's saved load settings. */
+export function candidateSettings(edited: { sampling: SamplingParams | null; load: LoadConfig | null }, chosenSampling: SamplingParams): { sampling: SamplingParams; load: LoadConfig | null } {
+  return { sampling: edited.sampling ?? chosenSampling, load: edited.load ? { ...edited.load, adapters: [] } : null }
 }
 
 export interface RunProgress {

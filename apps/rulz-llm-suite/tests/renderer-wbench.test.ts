@@ -2,17 +2,19 @@
 // Writing benchmark, renderer side: the shared busy check, the run loop with fake deps, the vote and
 // what the vote panel may show. No component is rendered.
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { DEFAULT_SAMPLING } from '../src/shared/defaults'
+import { DEFAULT_LOAD_CONFIG, DEFAULT_SAMPLING } from '../src/shared/defaults'
 import type { InstanceAdapter } from '../src/shared/types'
 import { BUILTIN_PROMPTS, newRun, type BenchCandidate, type WritingBenchRun } from '../src/shared/writingBench'
 import {
   adaptersLoaded,
   applyVote,
+  candidateSettings,
   pairToShow,
   pairView,
   requestAdapters,
   runProgress,
   runWbenchLoop,
+  sameLoadConfig,
   type BenchReply,
   type BenchReplyInput,
   type BenchReplyResult,
@@ -28,7 +30,7 @@ vi.mock('../src/renderer/src/lib/api', () => ({
   errorMessage: (e: unknown) => (e instanceof Error ? e.message : String(e))
 }))
 
-const cand = (id: string): BenchCandidate => ({ id, label: `Label ${id}`, modelId: `${id}.gguf`, modelName: id, adapters: [], sampling: DEFAULT_SAMPLING })
+const cand = (id: string): BenchCandidate => ({ id, label: `Label ${id}`, modelId: `${id}.gguf`, modelName: id, adapters: [], sampling: DEFAULT_SAMPLING, load: null })
 
 function makeRun(): WritingBenchRun {
   // 2 prompts x 2 candidates x 2 seeds = 8 outputs, grouped by candidate.
@@ -231,6 +233,29 @@ describe('adapters for a request', () => {
     expect(adaptersLoaded(loaded, [{ id: 'a.gguf', scale: 1 }])).toBe(true)
     expect(adaptersLoaded(loaded, [{ id: 'c.gguf', scale: 1 }])).toBe(false)
     expect(adaptersLoaded([], [{ id: 'a.gguf', scale: 1 }])).toBe(false)
+  })
+})
+
+describe('load settings of a candidate', () => {
+  it('compares load configs apart from their adapters', () => {
+    const a = { ...DEFAULT_LOAD_CONFIG, adapters: [{ id: 'a.gguf', scale: 1 }] }
+    expect(sameLoadConfig(a, { ...DEFAULT_LOAD_CONFIG, adapters: [] })).toBe(true)
+    expect(sameLoadConfig(a, { ...DEFAULT_LOAD_CONFIG, adapters: [{ id: 'b.gguf', scale: 0.5 }] })).toBe(true)
+    expect(sameLoadConfig(a, { ...a, contextLength: 4096 })).toBe(false)
+    expect(sameLoadConfig(a, { ...a, gpuLayers: 12 })).toBe(false)
+    // Key order does not matter; a changed nested value does.
+    const shuffled = Object.fromEntries(Object.entries(DEFAULT_LOAD_CONFIG).reverse()) as typeof DEFAULT_LOAD_CONFIG
+    expect(sameLoadConfig(DEFAULT_LOAD_CONFIG, shuffled)).toBe(true)
+    expect(sameLoadConfig(DEFAULT_LOAD_CONFIG, { ...DEFAULT_LOAD_CONFIG, sampling: { ...DEFAULT_LOAD_CONFIG.sampling, temperature: 0.5 } })).toBe(false)
+  })
+  it('saves the edited values, else the chosen sampling, and clears adapters from the load config', () => {
+    const chosen = { ...DEFAULT_SAMPLING, temperature: 0.9 }
+    expect(candidateSettings({ sampling: null, load: null }, chosen)).toEqual({ sampling: chosen, load: null })
+    const edited = { ...DEFAULT_SAMPLING, temperature: 1.4 }
+    const load = { ...DEFAULT_LOAD_CONFIG, contextLength: 4096, adapters: [{ id: 'a.gguf', scale: 1 }] }
+    const out = candidateSettings({ sampling: edited, load }, chosen)
+    expect(out.sampling).toBe(edited)
+    expect(out.load).toEqual({ ...load, adapters: [] })
   })
 })
 

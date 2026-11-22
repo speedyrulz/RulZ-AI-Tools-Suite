@@ -1,7 +1,7 @@
 // Writing benchmark: types shared by the main-process store and the renderer.
 // Design: docs/writing-mode-design.md, "Stage 4 design" (Writing benchmark). Contract: change only with both sides.
-import type { LoadAdapter, SamplingParams } from './types'
-import { DEFAULT_SAMPLING } from './defaults'
+import type { LoadAdapter, LoadConfig, SamplingParams } from './types'
+import { DEFAULT_LOAD_CONFIG, DEFAULT_SAMPLING } from './defaults'
 
 export const WBENCH_FORMAT = 1
 
@@ -20,6 +20,8 @@ export interface BenchCandidate {
   modelName: string
   adapters: LoadAdapter[]
   sampling: SamplingParams
+  /** Load settings for this candidate in this run only; null = the model's saved load settings. Adapters come from `adapters`. */
+  load: LoadConfig | null
 }
 
 export type BenchFinish = 'stop' | 'length' | 'stopped' | 'error'
@@ -168,6 +170,23 @@ const promptOk = (v: unknown): v is BenchPrompt => obj(v) && str(v.id) && !!v.id
 export function cleanPrompts(raw: unknown): BenchPrompt[] {
   return Array.isArray(raw) ? raw.filter(promptOk).filter((p) => !p.builtin).map((p) => ({ ...p, builtin: false })) : []
 }
+const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v)
+/** A load config as a run file stores it: every key present must have the type of its default; a missing key is filled from the defaults. */
+function loadOk(v: unknown): boolean {
+  if (!obj(v)) return false
+  if (v.adapters !== undefined && !(Array.isArray(v.adapters) && v.adapters.every((a: unknown) => obj(a) && str(a.id) && finite(a.scale)))) return false
+  return Object.entries(DEFAULT_LOAD_CONFIG).every(([key, sample]) => {
+    const value = v[key]
+    if (value === undefined || key === 'adapters') return true
+    if (key === 'gpuLayers' || key === 'cpuMoe') return str(value) || finite(value)
+    if (sample === null) return value === null || finite(value) || str(value)
+    if (Array.isArray(sample)) return Array.isArray(value)
+    if (obj(sample)) return obj(value)
+    // Numeric settings may be null ("Auto (fit)" context, empty draft tokens): the main process checks them again on load.
+    if (typeof sample === 'number') return value === null || finite(value)
+    return typeof value === typeof sample
+  })
+}
 export function cleanRun(raw: unknown): { ok: true; run: WritingBenchRun } | { ok: false; problem: string } {
   const bad = (): { ok: false; problem: string } => ({ ok: false, problem: 'Invalid writing benchmark run.' })
   if (!obj(raw) || raw.format !== 1 || !str(raw.id) || !/^[A-Za-z0-9_-]{1,64}$/.test(raw.id) || !str(raw.label) || !str(raw.createdAt) || !str(raw.updatedAt) || !str(raw.status) || !['pending', 'running', 'stopped', 'done'].includes(raw.status)) return bad()
@@ -178,7 +197,7 @@ export function cleanRun(raw: unknown): { ok: true; run: WritingBenchRun } | { o
     if (Array.isArray(sample)) return Array.isArray(value) && value.every(str)
     if (typeof sample === 'number') return typeof value === 'number' && Number.isFinite(value)
     return typeof value === typeof sample
-  }) && ['auto', 'on', 'off'].includes(c.sampling.thinking as string) && ['default', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(c.sampling.reasoningEffort as string))) return bad()
+  }) && ['auto', 'on', 'off'].includes(c.sampling.thinking as string) && ['default', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(c.sampling.reasoningEffort as string) && (c.load === undefined || c.load === null || loadOk(c.load)))) return bad()
   const unique = (items: string[]): boolean => new Set(items).size === items.length
   const prompts = raw.prompts as BenchPrompt[], candidates = raw.candidates as BenchCandidate[], seeds = raw.seeds as number[]
   if (!unique(prompts.map((p) => p.id)) || !unique(candidates.map((c) => c.id)) || new Set(seeds).size !== seeds.length) return bad()
@@ -195,5 +214,7 @@ export function cleanRun(raw: unknown): { ok: true; run: WritingBenchRun } | { o
     if (!a || !b || a.candidateId === b.candidateId || a.promptId !== p.promptId || b.promptId !== p.promptId || a.seed !== p.seed || b.seed !== p.seed || pairKeys.has(key)) return bad()
     ids.add(p.id); pairKeys.add(key)
   }
-  return { ok: true, run: raw as unknown as WritingBenchRun }
+  // Run files from before per-candidate load settings have no `load`: that means the model's saved settings.
+  const cleaned = candidates.map((c) => ({ ...c, load: c.load ? ({ ...DEFAULT_LOAD_CONFIG, ...c.load } as LoadConfig) : null }))
+  return { ok: true, run: { ...(raw as unknown as WritingBenchRun), candidates: cleaned } }
 }

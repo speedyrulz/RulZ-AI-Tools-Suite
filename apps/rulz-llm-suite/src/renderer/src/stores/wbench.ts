@@ -4,7 +4,7 @@
 import { create } from 'zustand'
 import { toast } from 'sonner'
 import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
-import type { StreamEvent } from '@shared/types'
+import type { LoadConfig, StreamEvent } from '@shared/types'
 import {
   newRun,
   nextOutput,
@@ -25,6 +25,7 @@ import {
   requestAdapters,
   runProgress,
   runWbenchLoop,
+  sameLoadConfig,
   type BenchReply,
   type BenchReplyInput,
   type BenchReplyResult,
@@ -207,7 +208,17 @@ export const useWbench = create<WbenchState>((set, get) => {
     return next
   }
 
-  /** Loads the candidate's model with its adapters if needed; null (after a toast) if it cannot be used. */
+  /** The model's own saved load settings, else the app default, else the built-in default. */
+  const savedLoadConfig = async (modelId: string): Promise<LoadConfig> => {
+    const fallback = useApp.getState().settings?.defaultLoadConfig ?? DEFAULT_LOAD_CONFIG
+    try {
+      return (await invoke('models:getDefaults', modelId))?.config ?? fallback
+    } catch {
+      return fallback
+    }
+  }
+
+  /** Loads the candidate's model with its adapters and load settings if needed; null (after a toast) if it cannot be used. */
   const prepare = async (c: BenchCandidate): Promise<{ adapters: ReturnType<typeof requestAdapters> } | null> => {
     const models = useModels.getState()
     let inst = readyInstance(c.modelId)
@@ -215,12 +226,12 @@ export const useWbench = create<WbenchState>((set, get) => {
       toast.error(`${c.modelName} is no longer in your models folder.`)
       return null
     }
-    if (!inst || !adaptersLoaded(inst.adapters, c.adapters)) {
-      if (!inst && c.adapters.length === 0) inst = (await models.ensure(c.modelId)) ?? undefined
-      else {
-        const base = inst?.config ?? useApp.getState().settings?.defaultLoadConfig ?? DEFAULT_LOAD_CONFIG
-        inst = (await models.load(c.modelId, { ...base, adapters: c.adapters })) ?? undefined
-      }
+    // Every candidate runs on exactly its load settings (adapters aside): its own, else the model's saved ones,
+    // so a candidate never inherits an instance an earlier candidate loaded with custom settings.
+    const wanted = c.load ?? (await savedLoadConfig(c.modelId))
+    const wrongLoad = !!inst && !sameLoadConfig(inst.config, wanted)
+    if (!inst || wrongLoad || !adaptersLoaded(inst.adapters, c.adapters)) {
+      inst = (await models.load(c.modelId, { ...wanted, adapters: c.adapters })) ?? undefined
     }
     if (!inst) return null
     if (!adaptersLoaded(inst.adapters, c.adapters)) {
