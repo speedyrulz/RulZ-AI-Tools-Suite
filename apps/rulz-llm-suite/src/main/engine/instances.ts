@@ -1,7 +1,8 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { dirname } from 'node:path'
-import type { InstanceErrorEvent, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry, SidecarFile } from '@shared/types'
+import { adapterPathUsable } from '@shared/adapters'
+import type { AdapterEntry, InstanceAdapter, InstanceErrorEvent, LoadAdapter, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry, SidecarFile } from '@shared/types'
 import { readJson, writeJsonAtomic } from '../util/jsonFile'
 import { buildServerArgs } from './args'
 import type { EngineService } from './engine'
@@ -35,6 +36,8 @@ export interface InstanceManagerDeps {
   getDefaults: (id: string) => LoadConfig
   unloadPreviousOnLoad: () => boolean
   estimate: (model: ModelEntry, config: LoadConfig) => MemoryEstimate | null
+  /** An adapter file by id, for the adapters a load config names. */
+  getAdapter?: (id: string) => AdapterEntry | undefined
   pidFile: string
   onChange: (instances: LoadedInstance[]) => void
   onError: (event: InstanceErrorEvent) => void
@@ -49,7 +52,27 @@ export interface InstanceManagerDeps {
 }
 
 function sameConfig(a: LoadConfig, b: LoadConfig): boolean {
+  // The adapter list is part of the config, so the same model with other adapters or strengths is a new load.
   return JSON.stringify(a) === JSON.stringify(b)
+}
+
+/**
+ * The adapters a load passes to llama-server, in order, plus a log line for each one left out (not in
+ * the library any more, or a path llama.cpp can't take). Their position is llama-server's adapter id.
+ */
+export function resolveAdapters(
+  wanted: LoadAdapter[],
+  getAdapter: (id: string) => AdapterEntry | undefined
+): { loaded: InstanceAdapter[]; notes: string[] } {
+  const loaded: InstanceAdapter[] = []
+  const notes: string[] = []
+  for (const w of wanted) {
+    const a = getAdapter(w.id)
+    if (!a) notes.push(`[adapter skipped] ${w.id}: not found in the models folder`)
+    else if (!adapterPathUsable(a.path)) notes.push(`[adapter skipped] ${w.id}: llama.cpp can't load a path containing a comma; rename the file`)
+    else loaded.push({ id: a.id, name: a.name, path: a.path, scale: w.scale })
+  }
+  return { loaded, notes }
 }
 
 /** Runs one llama-server process per loaded model, each on its own localhost port. */
@@ -165,7 +188,8 @@ export class InstanceManager {
     const port = await freePort()
     this.checkDisposed()
     const instanceId = randomUUID()
-    const args = buildServerArgs({ model, config: cfg, port, alias: model.name })
+    const { loaded: adapters, notes: adapterNotes } = resolveAdapters(cfg.adapters ?? [], this.deps.getAdapter ?? (() => undefined))
+    const args = buildServerArgs({ model, config: cfg, port, alias: model.name, adapters })
     const proc = this.deps.spawnServer
       ? this.deps.spawnServer(exe, args)
       : spawn(exe, args, {
@@ -188,12 +212,13 @@ export class InstanceManager {
       startedAt: Date.now(),
       contextLength: null,
       hasVision: false,
+      adapters,
       estimate: this.deps.estimate(model, cfg)
     }
     const run: Running = {
       info,
       proc,
-      log: [`$ llama-server ${args.join(' ')}`],
+      log: [`$ llama-server ${args.join(' ')}`, ...adapterNotes],
       ready: null!,
       exited: false,
       exitCode: null,
@@ -300,6 +325,7 @@ export class InstanceManager {
     } catch {
       // props are informational only
     }
+    await this.applyAdapterScales(run, base)
     // An unload (or a crash) while /props was being read: report that, not a ready model, or the
     // exit that follows would look like an unexpected stop.
     this.checkStillLoading(run)
@@ -309,6 +335,23 @@ export class InstanceManager {
     run.lastUsedAt = Date.now()
     this.emit()
     return { ...run.info }
+  }
+
+  /** Sets the adapters' default strengths (they load at 1); a failure is logged and the load goes on. */
+  private async applyAdapterScales(run: Running, base: string): Promise<void> {
+    const adapters = run.info.adapters
+    if (!adapters.some((a) => a.scale !== 1)) return
+    try {
+      const res = await fetch(`${base}/lora-adapters`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(adapters.map((a, id) => ({ id, scale: a.scale }))),
+        signal: AbortSignal.timeout(10000)
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    } catch (err) {
+      run.log.push(`[adapter scales not set] ${(err as Error).message}; the adapters run at strength 1`)
+    }
   }
 
   private checkStillLoading(run: Running): void {

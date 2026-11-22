@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { requestLora } from '@shared/adapters'
 import type {
   ChatRequest,
   GenerationStats,
@@ -10,6 +11,7 @@ import type {
   WireToolCall
 } from '@shared/types'
 import type { InstanceManager } from '../engine/instances'
+import { parseChatAdapters } from '../settings/schema'
 import { fitToContext, IMAGE_TOKENS, imageCount, textOf, type ContextApi } from './context'
 import { errorFromBody, interpretChunk, SseParser, statsFromTimings, ToolCallAccumulator } from './sse'
 import { jsonifyToolCallArgs, templateStringifiesArgs } from './toolArgs'
@@ -83,7 +85,8 @@ export function buildRequestBody(
   alias: string,
   messages: WireMessage[],
   s: SamplingParams,
-  disableThinking = false
+  disableThinking = false,
+  lora: { id: number; scale: number }[] | null = null
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
     model: alias,
@@ -98,6 +101,8 @@ export function buildRequestBody(
     presence_penalty: s.presencePenalty,
     frequency_penalty: s.frequencyPenalty
   }
+  // Adapter strengths for this request only; llama-server runs the adapters it leaves out at 0.
+  if (lora) body.lora = lora
   if (s.maxTokens !== null) body.max_tokens = s.maxTokens
   if (s.stop.length) body.stop = s.stop
   if (s.seed !== null) body.seed = s.seed
@@ -366,7 +371,7 @@ export class ChatService {
         messages = jsonifyToolCallArgs(messages)
       }
 
-      const body = buildRequestBody(inst.modelName, messages, req.sampling, req.disableThinking)
+      const body = buildRequestBody(inst.modelName, messages, req.sampling, req.disableThinking, requestLora(inst.adapters ?? [], parseChatAdapters(req.adapters)))
       if (tools.length) body.tools = tools
       const res = await fetch(`${this.instances.baseUrl(inst)}/v1/chat/completions`, {
         method: 'POST',

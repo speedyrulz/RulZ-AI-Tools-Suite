@@ -1,6 +1,27 @@
 // Saved practice batch runs (the scoreboard), one JSON file in the app's data folder.
+import { clampScale } from '@shared/adapters'
 import { cleanBatchRun, settleRun, type BatchRun } from '@shared/batch'
 import { readJson, writeJsonAtomic } from '../util/jsonFile'
+
+/**
+ * cleanBatchRun (shared) doesn't keep the adapters a run recorded; they are cleaned and put back
+ * here: at most 16 {name, scale} entries, anything else dropped.
+ */
+export function cleanRun(raw: unknown): BatchRun | null {
+  const run = cleanBatchRun(raw)
+  if (!run) return null
+  const list = (raw as { adapters?: unknown }).adapters
+  const adapters = Array.isArray(list)
+    ? list
+        .flatMap((a: { name?: unknown; scale?: unknown } | null) =>
+          typeof a?.name === 'string' && a.name && typeof a.scale === 'number' && Number.isFinite(a.scale)
+            ? [{ name: a.name.slice(0, 200), scale: clampScale(a.scale) }]
+            : []
+        )
+        .slice(0, 16)
+    : []
+  return adapters.length ? { ...run, adapters } : run
+}
 
 /** Older runs beyond this are dropped when a new one is saved. */
 export const MAX_BATCH_RUNS = 200
@@ -27,7 +48,7 @@ export class BatchStore {
       const list = Array.isArray(raw) ? raw : []
       // Nothing is running when the file is first read: a run still marked so was cut off.
       this.runs = list.flatMap((r) => {
-        const run = cleanBatchRun(r)
+        const run = cleanRun(r)
         return run ? [settleRun(run)] : []
       })
     }
@@ -47,7 +68,7 @@ export class BatchStore {
 
   save(raw: unknown): Promise<void> {
     return this.enqueue(async () => {
-      const run = cleanBatchRun(raw)
+      const run = cleanRun(raw)
       if (!run) throw new Error('Not a batch run.')
       const runs = (await this.load()).filter((r) => r.id !== run.id)
       runs.push(run)

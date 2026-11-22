@@ -9,9 +9,10 @@ import { ConversationStore } from './chat/conversations'
 import { EngineService } from './engine/engine'
 import { HardwareMonitor } from './engine/hardware'
 import { McpManager } from './mcp/manager'
-import { InstanceManager } from './engine/instances'
+import { InstanceManager, resolveAdapters } from './engine/instances'
 import { broadcast, handle } from './ipc'
 import { estimateMemory, type FreeMemory } from './models/estimate'
+import { AdapterConverter } from './models/convert'
 import { ModelLibrary } from './models/library'
 import { ApiServer } from './server/apiServer'
 import { parseLoadConfig } from './settings/schema'
@@ -137,7 +138,8 @@ async function main(): Promise<void> {
   const library = new ModelLibrary(
     join(userData, 'gguf-cache.json'),
     () => settings.get().modelsDir,
-    (models) => broadcast('models:changed', models)
+    (models) => broadcast('models:changed', models),
+    (adapters) => broadcast('adapters:changed', adapters)
   )
 
   const freeMemory = (cfg: LoadConfig): FreeMemory => {
@@ -161,7 +163,11 @@ async function main(): Promise<void> {
     return { vramBytes: vram, ramBytes: snap.ramTotalBytes - snap.ramUsedBytes, gpus: all }
   }
   const draftFor = (model: ModelEntry, cfg: LoadConfig) => resolveDraft(model, cfg, library.list())
-  const estimate = (model: ModelEntry, cfg: LoadConfig) => estimateMemory({ ...model, draft: draftFor(model, cfg) }, cfg, freeMemory(cfg))
+  // Adapter files the load would pass to llama-server (same filter as the load itself), for the estimate.
+  const adapterBytes = (cfg: LoadConfig): number =>
+    resolveAdapters(cfg.adapters ?? [], (id) => library.getAdapter(id)).loaded.reduce((sum, a) => sum + (library.getAdapter(a.id)?.sizeBytes ?? 0), 0)
+  const estimate = (model: ModelEntry, cfg: LoadConfig) =>
+    estimateMemory({ ...model, draft: draftFor(model, cfg) }, cfg, freeMemory(cfg), adapterBytes(cfg))
 
   const instances = new InstanceManager({
     engine,
@@ -170,12 +176,21 @@ async function main(): Promise<void> {
     getDefaults: (id) => settings.getModelDefaults(id).config,
     unloadPreviousOnLoad: () => settings.get().unloadPreviousOnLoad,
     estimate,
+    getAdapter: (id) => library.getAdapter(id),
     pidFile: join(userData, 'running-pids.json'),
     onChange: (list) => broadcast('instances:changed', list),
     onError: (e) => broadcast('instances:error', e),
     onGone: (id) => chat.forget(id)
   })
   await instances.cleanupOrphans()
+
+  const converter = new AdapterConverter({
+    resolveExe: () => engine.resolveExe(),
+    getModelsDir: () => settings.get().modelsDir,
+    findPython,
+    onLog: (line) => broadcast('adapters:convertLog', line),
+    onConverted: () => void library.scan()
+  })
 
   const mcpConfigPath = join(userData, 'mcp.json')
   // The RE calculator (a sandboxed Python MCP server from the RE training kit) runs when Python 3 is installed.
@@ -201,6 +216,7 @@ async function main(): Promise<void> {
   const apiServer = new ApiServer({
     instances,
     getModels: () => library.list(),
+    getAdapters: () => library.listAdapters(),
     getSettings: () => settings.get().apiServer,
     getLoadDefaults: (id) => settings.getModelDefaults(id),
     setLoadDefaults: (id, config) => settings.setModelDefaults(id, config),
@@ -311,6 +327,18 @@ async function main(): Promise<void> {
     await settings.setModelDefaults(modelId, null)
     await library.scan()
   })
+  handle('adapters:list', () => library.listAdapters())
+  handle('adapters:trash', async (adapterId) => {
+    const adapter = library.getAdapter(adapterId)
+    if (!adapter) throw new Error('Adapter not found')
+    // A loaded adapter is held open by llama-server; its model has to be ejected first.
+    if (instances.list().some((i) => i.adapters.some((a) => a.id === adapterId))) throw new Error('Eject the model using this adapter before deleting it.')
+    await shell.trashItem(adapter.path)
+    await library.scan()
+  })
+  handle('adapters:converterStatus', () => converter.status())
+  handle('adapters:convert', (req) => converter.convert(req))
+  handle('adapters:cancelConvert', () => converter.cancel())
   handle('models:getDefaults', (modelId) => settings.getModelDefaults(modelId))
   handle('models:setDefaults', (modelId, config) => settings.setModelDefaults(modelId, config))
   handle('models:estimate', (modelId, config) => {

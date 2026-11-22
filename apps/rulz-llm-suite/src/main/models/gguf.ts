@@ -311,6 +311,9 @@ export function toGgufInfo(kv: Record<string, unknown>, fileName: string, hasNex
     slidingWindow: swaWindow(arch, num(a('attention.sliding_window')), blockCount),
     slidingWindowFraction,
     hasChatTemplate: typeof kv['tokenizer.chat_template'] === 'string',
-    mtpLayers: hasNextn ? num(a('nextn_predict_layers')) || undefined : undefined
+    mtpLayers: hasNextn ? num(a('nextn_predict_layers')) || undefined : undefined,
+    adapterType: str('adapter.type'),
+    loraAlpha: typeof kv['adapter.lora.alpha'] === 'number' ? (kv['adapter.lora.alpha'] as number) : undefined,
+    baseModelName: str('general.base_model.0.name') ?? str('general.basename')
   }
 }

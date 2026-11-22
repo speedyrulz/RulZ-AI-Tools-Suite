@@ -7,6 +7,7 @@ import { useChat } from '../../stores/chat'
 import { effectiveToolMode, findTool, tokensOf, useMcp } from '../../stores/mcp'
 import { formatCompact } from '../../lib/format'
 import { Button, Dialog, Field, IconButton, Input, NumberInput, Select, Slider, Switch, Textarea } from '../ui'
+import { AdapterPanel } from './AdapterPanel'
 
 function SliderRow({
   label,
@@ -276,6 +277,10 @@ export function InferencePanel() {
 
       <Section title="Thinking">
         <ThinkingFields sampling={s} onChange={setS} />
+      </Section>
+
+      <Section title="Adapters">
+        <AdapterPanel />
       </Section>
 
       <ToolsSection />

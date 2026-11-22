@@ -1,11 +1,33 @@
 import { z } from 'zod'
+import { clampScale } from '@shared/adapters'
 import { DEFAULT_LOAD_CONFIG, DEFAULT_SAMPLING, DEFAULT_SETTINGS } from '@shared/defaults'
-import { KV_CACHE_TYPES, REASONING_EFFORTS, type AppSettings, type LoadConfig, type Preset, type SamplingParams } from '@shared/types'
+import { KV_CACHE_TYPES, REASONING_EFFORTS, type AppSettings, type LoadAdapter, type LoadConfig, type Preset, type SamplingParams } from '@shared/types'
 
 // Every field falls back to its default on its own, so one bad value never resets the rest.
 const L = DEFAULT_LOAD_CONFIG
 const kvType = z.enum(KV_CACHE_TYPES as [string, ...string[]])
 const posIntOrNull = z.number().int().positive().nullable()
+
+/** Most adapters one model can load. */
+export const MAX_ADAPTERS = 16
+
+/** One adapter entry: bad entries are dropped, the strength is clamped, later duplicates of an id are dropped. */
+function cleanAdapters(raw: unknown): LoadAdapter[] {
+  if (!Array.isArray(raw)) return []
+  const out: LoadAdapter[] = []
+  for (const e of raw) {
+    const id = (e as { id?: unknown } | null)?.id
+    if (typeof id !== 'string' || !id || out.some((o) => o.id === id)) continue
+    out.push({ id, scale: clampScale((e as { scale?: unknown }).scale) })
+    if (out.length >= MAX_ADAPTERS) break
+  }
+  return out
+}
+
+/** A chat's adapter strengths: null (use the model's defaults) or a cleaned list. Never throws. */
+export function parseChatAdapters(raw: unknown): LoadAdapter[] | null {
+  return Array.isArray(raw) ? cleanAdapters(raw) : null
+}
 
 export const loadConfigSchema = z.object({
   contextLength: posIntOrNull.catch(L.contextLength),
@@ -38,6 +60,7 @@ export const loadConfigSchema = z.object({
   chatTemplateFile: z.string().catch(L.chatTemplateFile),
   parallel: z.number().int().min(1).max(64).catch(L.parallel),
   extraArgs: z.string().catch(L.extraArgs),
+  adapters: z.unknown().transform(cleanAdapters).catch([]),
   sampling: z
     .object({
       temperature: z.number().min(0).max(5).nullable().catch(null),

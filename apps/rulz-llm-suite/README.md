@@ -32,9 +32,20 @@ Discover/downloads, RAG and a CLI are planned.
     detected and used automatically (`--spec-type draft-<kind>`), with a per-model switch and draft length.
     MTP layers built into the model file (Qwen3.5+ "MTP" GGUFs) are detected too and preferred. A **Draft model**
     picker can choose built-in layers or any draft file in the models folder instead.
+  - **LoRA adapters**: adapter GGUFs anywhere in the models folder are offered for every model with the same
+    architecture, with a warning when an adapter names a different base model. Tick one or more in the load form, each
+    with a default strength (`--lora`; the strengths are set right after loading). Their size counts toward the memory
+    estimate. A path containing a comma can't be passed to llama.cpp; rename it.
+- **My Models ▸ Adapters** — lists the adapter files with architecture, size, LoRA alpha and base model, and which
+  models they go with. **Convert PEFT adapter** turns a Hugging Face PEFT folder (`adapter_config.json` +
+  `adapter_model.safetensors`) into a GGUF in the models folder with llama.cpp's `convert_lora_to_gguf.py`, found next to
+  the llama.cpp build the app uses. Python with `torch`, `safetensors` and `transformers` is needed. Give a base model
+  folder (only its `config.json` is read) or a Hugging Face model id; with neither, the converter reads the base named in
+  `adapter_config.json` from the Hub.
 - **Chat** — streaming replies, collapsible reasoning ("thinking") blocks, Markdown with tables, LaTeX and
   highlighted code, image and text-file attachments (drag-drop / paste), copy, edit, regenerate, continue, branch,
-  delete (with undo); a note typed while the model replies is sent now (stopping the reply, keeping its thinking) or
+  delete (with undo); per-chat adapter strengths (on/off and 0–2 in the side panel, applied per request without
+  reloading; a change makes the model process the chat again from the start); a note typed while the model replies is sent now (stopping the reply, keeping its thinking) or
   after it; tok/s, time-to-first-token and token stats; context usage meter with "truncate middle" or "stop" overflow
   policy; folders, pinning, search; per-chat system prompt, sampling and thinking settings (on/off, reasoning effort,
   thinking budget); presets; JSON-schema structured output. A message sent while its model is still loading waits for
@@ -62,12 +73,15 @@ Discover/downloads, RAG and a CLI are planned.
   context length, GPU layers, MoE expert offload (`cpuMoe`: `"off"`, `"all"` or a layer count), flash attention,
   KV cache types, parallel slots, the GPU split (mode, main GPU,
   per-GPU proportions), whether the vision projector runs on the CPU (`mmprojOnCpu`), the model's sampling
-  defaults (`sampling`: any subset, merged value by value; `null` clears one) and the draft (MTP) settings, including which draft (`draftFile`: `null` for automatic,
+  defaults (`sampling`: any subset, merged value by value; `null` clears one), LoRA adapters (`adapters`: a list of
+  `{ "id", "scale" }` with ids from `adapter_choices`; `[]` removes them) and the draft (MTP) settings, including which draft (`draftFile`: `null` for automatic,
   `"builtin"`, or the id of one of `draft_choices`). File paths and extra arguments stay app-only. A loaded model
   restarts with the new settings unless `"reload": false`; `"dry_run": true` only returns the memory estimate for the
   changed settings. Replies include the GPUs, `moe_layers` (layers with experts; `null` for dense models), whether the model has a draft head, what automatic uses
-  (`default_draft`), the drafts that can be picked (`draft_choices`, by path relative to the models folder), and the
-  memory estimate. `POST /v1/models/{id}/unload` unloads every running instance of a model (replying with how many it
+  (`default_draft`), the drafts that can be picked (`draft_choices`, by path relative to the models folder), the
+  adapters that can be picked (`adapter_choices`: id, name, size, base model, alpha and whether the base matches), and
+  the memory estimate. A chat-completions request may also carry llama.cpp's own `lora` field (`[{ "id", "scale" }]`,
+  ids in load order) to set adapter strengths for that request. `POST /v1/models/{id}/unload` unloads every running instance of a model (replying with how many it
   `unloaded`), so a client can free the memory when it is done with a model.
   Default port 1234 (pick another if LM Studio is running).
 - **Reverse Engineering mode** (`Ctrl+6`) — runs a local model as a reverse engineer with the REA MCP tools, and
@@ -91,7 +105,8 @@ Discover/downloads, RAG and a CLI are planned.
     score, so two models (or one model before and after fine-tuning) can be compared on the same tasks. Options: at
     most N tasks (taken family by family in turn, so a short run still covers every family), tries per task, a time
     limit per task (counted from the task's first reply, so loading the model is not counted), only tasks no earlier
-    session solved, and a label. Each task is a normal recorded practice session in its own chat. A tool call that
+    session solved, and a label. A run records the adapters the model had loaded and their strengths, shown next to
+    the model name, so a base model and its fine-tune can be told apart. Each task is a normal recorded practice session in its own chat. A tool call that
     would ask for approval is refused instead of waiting (the model is told why and carries on); the form warns when a
     tool every session starts with, such as `rea__open_binary`, still asks, with an **Always allow** button. A task
     still calling tools at the round limit or the time limit is graded as failed. **Stop after this task** and

@@ -13,6 +13,7 @@ import {
 } from '@shared/batch'
 import { starterToolsThatAsk } from '@shared/re'
 import type { RePracticeTask } from '@shared/types'
+import { batchAdapterLabel } from '../../lib/adapters'
 import { cn, formatCompact, formatDuration, formatTokens, relativeTime } from '../../lib/format'
 import { useApp } from '../../stores/app'
 import { solvedTasks, useBatch } from '../../stores/batch'
@@ -253,6 +254,7 @@ function RunRow({ run }: { run: BatchRun }) {
               </span>
               <span className="block truncate text-[10.5px] text-faint" title={run.modelId ?? ''}>
                 {run.label ? `${baseName(run.modelName || run.modelId || '')} · ` : ''}
+                {run.adapters?.length ? `${batchAdapterLabel(run.adapters)} · ` : ''}
                 {run.contextLength ? `${formatTokens(run.contextLength)} context · ` : ''}
                 {relativeTime(run.createdAt)}
               </span>
