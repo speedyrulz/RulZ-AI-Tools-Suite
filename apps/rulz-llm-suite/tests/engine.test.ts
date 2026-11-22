@@ -173,6 +173,12 @@ describe('sampling default arguments', () => {
     expect(args.slice(at, at + 4)).toEqual(['--dry-sequence-breaker', '\n', '--dry-sequence-breaker', 'Aria'])
     const off = buildServerArgs({ model, config: { ...DEFAULT_LOAD_CONFIG, sampling: { ...sampling, dryMultiplier: 0 } }, port: 1, alias: 'q' })
     expect(off).not.toContain('--dry-sequence-breaker')
+    // -1 (whole context) is the server's default and some builds refuse it as an argument: left out.
+    const whole = buildServerArgs({ model, config: { ...DEFAULT_LOAD_CONFIG, sampling: { ...sampling, dryPenaltyLastN: -1 } }, port: 1, alias: 'q' })
+    expect(whole).not.toContain('--dry-penalty-last-n')
+    expect(whole.join(' ')).toContain('--dry-multiplier 0.8')
+    const zero = buildServerArgs({ model, config: { ...DEFAULT_LOAD_CONFIG, sampling: { ...sampling, dryPenaltyLastN: 0 } }, port: 1, alias: 'q' })
+    expect(zero.join(' ')).toContain('--dry-penalty-last-n 0')
   })
 })
 
