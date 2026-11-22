@@ -20,6 +20,8 @@ import { SettingsStore } from './settings/store'
 import { FILE_TOOLS_SERVER } from './files/fileTools'
 import { API_RE_PREFIX, CLONE_FILE_TOOLS, extractAnswer } from '@shared/re'
 import { BatchStore } from './re/batches'
+import { BenchmarkRunner } from './bench/runner'
+import { BenchStore } from './bench/store'
 import { gradePractice, listPractice, preparePractice } from './re/practice'
 import { buildOverview, MAX_OVERVIEW_SESSIONS } from './re/overview'
 import { findPython, type PythonCommand } from './re/python'
@@ -212,6 +214,17 @@ async function main(): Promise<void> {
   const practiceRoot = join(userData, 're-practice')
   const batches = new BatchStore(join(userData, 're-batches.json'))
   const apiRe = (id: string): string => API_RE_PREFIX + id
+  const benchStore = new BenchStore(join(userData, 'benchmarks.json'))
+  const bench = new BenchmarkRunner({
+    instances,
+    getModel: (id) => library.get(id),
+    estimate,
+    draftFor,
+    sampleGpus: async () => (await hardware.refresh()).gpus,
+    engineVersion: async () => (await engine.getInfo()).version,
+    onChange: (run) => broadcast('bench:changed', run),
+    store: benchStore
+  })
 
   const apiServer = new ApiServer({
     instances,
@@ -465,6 +478,11 @@ async function main(): Promise<void> {
   handle('re:saveBatch', (run) => batches.save(run))
   handle('re:deleteBatch', (id) => batches.delete(id))
 
+  handle('bench:list', () => benchStore.list())
+  handle('bench:start', (req) => bench.start(req))
+  handle('bench:stop', () => bench.stop())
+  handle('bench:delete', (id) => benchStore.delete(id))
+
   handle('presets:list', () => settings.listPresets())
   handle('presets:save', (p) => settings.savePreset(p))
   handle('presets:delete', (id) => settings.deletePreset(id))
@@ -500,6 +518,8 @@ async function main(): Promise<void> {
     destroyTray()
     hardware.stop()
     library.dispose()
+    // The benchmark first: it sets its stop flag and starts unloading before the servers are killed.
+    void bench.stop()
     instances.killAllSync()
     void mcp.dispose()
     void apiServer.stop()
