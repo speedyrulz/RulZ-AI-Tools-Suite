@@ -26,3 +26,9 @@ def _own_vram_record(tmp_path, monkeypatch):
     from rulztrainer import measured
 
     monkeypatch.setattr(measured, "RECORD_FILE", tmp_path / "_vram_measured.json")
+
+
+@pytest.fixture(autouse=True)
+def _own_trainer_home(tmp_path_factory, monkeypatch):
+    """No test reads or writes the real user's storage.json (the chosen save folders, rulztrainer/storage.py)."""
+    monkeypatch.setenv("RULZ_TRAINER_HOME", str(tmp_path_factory.mktemp("rulz_trainer_home")))

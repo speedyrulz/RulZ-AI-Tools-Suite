@@ -414,6 +414,9 @@ and write the same files in `~/.rulz_vast/fleet`. The tab is not shown when the 
   LoRA and every LoRA / checkpoint each have a rule: *never*, *when the run ends* or *while it runs* (every 300 s by
   default). A single run can have its own rules. Files land in `~/.rulz_vast/runs/<instance>/<job>`, each fetched once
   at its size. The defaults: logs and probes while it runs; samples, maps and the best LoRA at the end; every LoRA never.
+  **Change save folder** on the Fleet tab puts downloads somewhere else (another drive, say). It offers to move what is
+  already downloaded there or to start fresh; a move copies, checks every file, switches, and only then deletes the old
+  copy, and one that stops half way can be resumed or cancelled. Downloads are paused while a move runs.
 - **Watches.** A watch raises an event when a number goes above or below a value: a run's (`step`, `progress`, `loss`,
   `avg_loss`, `lr`, `grad_norm`, `eta`, `elapsed`, `step_time`, `cost`), its last probe's (`face`, `body`, `combined`
   and their `_ema`, `best`, `since_improve`, `copy`, ...) or the machine's (`disk_free_gb`, `gpu_temp`, `gpu_util`,
@@ -2859,7 +2862,8 @@ most like the person. Each reward step:
 ## Previous runs (run history)
 
 The **Previous Runs** tab keeps the likeness history of every run, like TensorBoard, so runs can be compared after the
-job folder has been reused. A run with likeness scores writes one small file in `output/_history/` while it trains (a
+job folder has been reused (**Change save folder** above the table keeps this history in another folder, and offers to
+move what is saved now). A run with likeness scores writes one small file in `output/_history/` while it trains (a
 crash keeps what was saved) and again when it ends. It keeps what the Monitor's two likeness charts plot, on the run's
 normalized scale: the **mean face and mean body** score of the sample images at each sampling step (Identity
 similarity), and the smoothed **face, body and combined** score at each probe (Likeness probes & controller). Runs

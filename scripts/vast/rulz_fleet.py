@@ -53,6 +53,7 @@ for _path in (str(HERE), str(HERE.parents[1])):
 
 import rulz_remote as remote  # noqa: E402
 
+from rulztrainer import storage  # noqa: E402  (standard library only)
 from rulztrainer.train_queue import QueueLock  # noqa: E402  (standard library only)
 
 
@@ -335,7 +336,9 @@ class Fleet:
                  folder: str = remote.REMOTE_DIR, connect=None, list_instances=None, fetch=None, send=None,
                  vast=None, now=time.time):
         self.home = Path(home) if home else remote.STATE / "fleet"
-        self.pulls = Path(pulls) if pulls else (remote.PULLS if home is None else self.home / "files")
+        self._pulls_arg = Path(pulls) if pulls else None
+        self._home_given = home is not None
+        self._pull_cache: tuple | None = None
         self.key, self.folder, self.now = key, folder, now
         self.connect = connect or self._connect
         self.list_instances = list_instances or remote.list_instances
@@ -354,6 +357,99 @@ class Fleet:
         self.lanes: dict[tuple[str, str], Lane] = {}
         self.busy: set[tuple] = set()  # jobs handed to a lane and not done yet
         self.guard = threading.Lock()
+
+    # ---------------------------------------------------------------- where downloads go
+
+    def _pull_settings(self) -> dict:
+        """settings.pulls_dir / pulls_roots / move from the state file, read without the lock and kept while the file
+        is unchanged (and not just written: a coarse clock could hide a second write)."""
+        try:
+            st = self.state_file.stat()
+        except OSError:
+            return {}
+        key = (st.st_mtime_ns, st.st_size)
+        if self._pull_cache and self._pull_cache[0] == key:
+            return self._pull_cache[1]
+        data = self._read_json(self.state_file, {})
+        settings = data.get("settings") if isinstance(data, dict) else None
+        found = {k: settings.get(k) for k in ("pulls_dir", "pulls_roots", "move")} if isinstance(settings, dict) else {}
+        if time.time() - st.st_mtime > 2:
+            self._pull_cache = (key, found)
+        return found
+
+    @property
+    def pulls(self) -> Path:
+        """The folder new downloads go to: the constructor's `pulls`, else the folder chosen on the Fleet page
+        (settings.pulls_dir), else the built-in one (home/files for a Fleet with its own home, else remote.PULLS).
+        Looked up at each use, so a daemon follows a change without a restart."""
+        if self._pulls_arg is not None:
+            return self._pulls_arg
+        chosen = self._pull_settings().get("pulls_dir")
+        if isinstance(chosen, str) and chosen:
+            return Path(chosen)
+        return self.default_pulls()
+
+    def default_pulls(self) -> Path:
+        """The built-in downloads folder (what "Reset to default" goes back to)."""
+        return self.home / "files" if self._home_given else remote.PULLS
+
+    def pull_roots(self) -> list[Path]:
+        """Every folder this fleet's runs can be in: the current one, remote.PULLS (a process of an older version
+        keeps writing there) and the marked folders a "start fresh" left behind. Not a folder moved away from."""
+        roots = [self.pulls, self.default_pulls(), remote.PULLS]
+        roots += [Path(p) for p in self._pull_settings().get("pulls_roots") or []
+                  if isinstance(p, str) and storage.has_marker(p, "downloads")]
+        out: list[Path] = []
+        for root in roots:
+            if not any(storage.same_path(root, r) for r in out):
+                out.append(root)
+        return out
+
+    def root_of(self, path) -> Path | None:
+        """The root a path lies strictly inside (a folder of a run), else None."""
+        try:
+            target = Path(path).resolve()
+        except (OSError, ValueError):
+            return None
+        for root in self.pull_roots():
+            try:  # one root that cannot be resolved (an offline share) does not hide the others
+                base = root.resolve()
+                if target != base and target.is_relative_to(base):
+                    return root
+            except (OSError, ValueError):
+                continue
+        return None
+
+    def pull_folder(self, rec: dict) -> Path:
+        """Where a download of this run goes: the run's own folder when it exists inside a trusted root (current,
+        default, remote.PULLS or a marked past root), else <current root>/<instance>/<job> (a new run)."""
+        folder = rec.get("folder")
+        if folder and Path(folder).name == str(rec.get("job")) and self.root_of(folder) is not None \
+                and Path(folder).is_dir():
+            return Path(folder)
+        return self.pulls / str(rec["instance"]) / str(rec["job"])
+
+    def pulls_missing(self) -> Path | None:
+        """The chosen downloads folder when it is not there (an unplugged drive); None otherwise or when none chosen."""
+        chosen = self._pull_settings().get("pulls_dir") if self._pulls_arg is None else None
+        return Path(chosen) if isinstance(chosen, str) and chosen and not Path(chosen).is_dir() else None
+
+    def move_state(self) -> dict | None:
+        """The journal of a move of the downloads folder, with "active" (its process lives), or None."""
+        move = self.read()["settings"].get("move")
+        if not isinstance(move, dict) or not move.get("from") or not move.get("to"):
+            return None
+        return {**move, "active": storage.journal_live(move, "downloads")}
+
+    def _moving(self, fresh: bool = False) -> bool:
+        """A live process owns a move journal. fresh: read the state file now (not the cached copy)."""
+        if fresh:
+            data = self._read_json(self.state_file, {})
+            settings = data.get("settings") if isinstance(data, dict) else None
+            move = settings.get("move") if isinstance(settings, dict) else None
+        else:
+            move = self._pull_settings().get("move")
+        return storage.journal_live(move, "downloads")
 
     # ---------------------------------------------------------------- storage
 
@@ -505,14 +601,14 @@ class Fleet:
         self.run_path(rec["key"]).unlink(missing_ok=True)
 
     def run_folder(self, rec: dict) -> Path | None:
-        """The run's downloaded folder when it lies strictly inside the downloads root, else None (a record can
-        only point at files this fleet downloaded)."""
+        """The run's downloaded folder when it lies strictly inside one of the downloads roots (the current one,
+        remote.PULLS, a marked folder left behind by a "start fresh"), else None (a record can only point at files
+        this fleet downloaded)."""
         folder = rec.get("folder")
         if not folder:
             return None
         try:
-            path, base = Path(folder).resolve(), self.pulls.resolve()
-            return path if path != base and path.is_relative_to(base) else None
+            return Path(folder).resolve() if self.root_of(folder) is not None else None
         except (OSError, ValueError):
             return None
 
@@ -545,9 +641,9 @@ class Fleet:
                 result["binned"] = bool(move_to_recycle_bin(folder))
             except OSError as e:
                 raise Refused(f"{rec.get('job')}: its files could not be removed ({e}). The run stays listed.") from e
-            parent = folder.parent
+            parent, root = folder.parent, self.root_of(folder)
             try:
-                if parent != self.pulls.resolve() and parent.is_relative_to(self.pulls.resolve()) \
+                if root is not None and parent != root.resolve() and parent.is_relative_to(root.resolve()) \
                         and not any(parent.iterdir()):
                     parent.rmdir()
             except OSError:
@@ -1007,6 +1103,7 @@ class Fleet:
                             lambda inst=dict(inst), entry=copy.deepcopy(entry), snap=snaps[iid]:
                             self.dispatch(inst, entry, snap))
         settings = st["settings"]
+        moving = storage.journal_live(settings.get("move"), "downloads")
         for iid, snap in snaps.items():
             inst = st["instances"].get(iid) or {}
             if not snap.get("ok"):
@@ -1024,9 +1121,12 @@ class Fleet:
                     if not kinds or rec.get("pull_fails", 0) >= PULL_RETRIES:
                         self.update_run(key, lambda r: r.update(final_pull=False))
                         continue
+                    if moving:  # the downloads folder is being moved: new downloads wait
+                        continue
                     self.submit(iid, "io", ("pull", key),
                                 lambda inst=dict(inst), key=key, kinds=kinds: self.pull(inst, key, kinds, final=True))
-                elif rec.get("state") == "running" and now - rec.get("pulled_at", 0) >= settings["download_every"]:
+                elif rec.get("state") == "running" and not moving \
+                        and now - rec.get("pulled_at", 0) >= settings["download_every"]:
                     kinds = [k for k in DOWNLOAD_KINDS if modes.get(k) == "during"]
                     if kinds:
                         self.submit(iid, "io", ("pull", key),
@@ -1280,25 +1380,43 @@ class Fleet:
             found.append(entry)
         return sorted(found, key=lambda entry: entry["updated"], reverse=True)
 
+    def _download_store(self, entry: dict) -> None:
+        """Write an entry into downloads.json (the downloads lock is held)."""
+        entries = {item["run"]: item for item in self._downloads(15.0, raw=True) if item.get("run")}
+        entries[entry["run"]] = dict(entry)
+        self._write_json(self.downloads_file, entries)
+
     def _download_write(self, entry: dict) -> None:
         with self.downloads_lock:
-            entries = {item["run"]: item for item in self._downloads(15.0, raw=True) if item.get("run")}
-            entries[entry["run"]] = dict(entry)
-            self._write_json(self.downloads_file, entries)
+            self._download_store(entry)
+
+    def _download_begin(self, entry: dict) -> bool:
+        """Publish a download's first "going" entry unless a live process is moving the downloads folder; the check
+        and the write are one step under the downloads lock."""
+        with self.downloads_lock:
+            if self._moving(fresh=True):
+                return False
+            self._download_store(entry)
+        return True
 
     def pull(self, inst: dict, key: str, kinds: list[str], final: bool = False, *, manual: bool = False) -> dict:
         """Copy a run's files of these kinds here (the ones not here yet at their size)."""
         rec = self.load_run(key)
         if rec is None:
             return {}
-        dest = self.pulls / str(rec["instance"])
-        result: dict = {"folder": str(dest / rec["job"]), "fetched": 0, "mb": 0.0}
         started = self.now()
         entry = {"run": key, "job": str(rec["job"]), "instance": int(rec["instance"]), "kinds": list(kinds),
                  "manual": manual, "state": "going", "files_done": 0, "files_total": 0, "bytes_done": 0,
                  "bytes_total": 0, "started": started, "updated": started, "speed": 0.0,
                  "fetched": 0, "mb": 0.0, "pid": os.getpid()}
-        self._download_write(entry)
+        # "no move journal" and "the going entry is published" are one step under the downloads lock: a mover that
+        # writes its journal and then looks for downloads (under the same lock) sees this entry, or this sees its journal
+        if not self._download_begin(entry):
+            return {"error": "The downloads folder is being moved; downloads wait until that is done."}
+        root = self.pulls  # chosen once; the record gets the folder the files really went to (result["folder"])
+        folder = self.pull_folder(rec)  # a run keeps downloading into its own folder, wherever that root is
+        dest = folder.parent
+        result: dict = {"folder": str(folder), "fetched": 0, "mb": 0.0}
 
         def progress(byte_count, file_count):
             entry["bytes_done"] = min(entry["bytes_total"], entry["bytes_done"] + byte_count)
@@ -1310,6 +1428,8 @@ class Fleet:
                 self._download_write(entry)
 
         try:
+            if folder.parent == root / str(rec["instance"]) and self.pulls_missing() is not None:  # an unplugged drive or an offline share: never made up again
+                raise OSError(f"the downloads folder {root} was not found (is the drive connected?)")
             target = self.remote_for(inst)
             listing = target.agent_json("files", rec["job"], *[a for kind in kinds for a in ("--what", kind)])
             todo = remote.pull_plan(listing["files"], dest)
@@ -1375,6 +1495,8 @@ class Fleet:
         inst = self.read()["instances"].get(iid)
         if inst is None or inst.get("gone"):
             raise Refused(f"Instance {iid} is gone: its files can no longer be downloaded.")
+        if self._moving():
+            raise Refused("The downloads folder is being moved; try again when that is done.")
         mark = ("pull", key)
         elsewhere = any(e.get("run") == key and e.get("state") == "going" and e.get("pid") not in (None, os.getpid())
                         for e in self.downloads())  # another program (a daemon) is pulling it
@@ -1387,6 +1509,142 @@ class Fleet:
         finally:
             with self.guard:
                 self.busy.discard(mark)
+
+    # ---------------------------------------------------------------- changing the downloads folder
+
+    def move_blockers(self, held: bool = False) -> str:
+        """Why the downloads folder cannot be changed or moved now ("" when it can): a download is going. held: the
+        downloads lock is already held by the caller."""
+        if any(e.get("state") == "going" for e in (self._downloads(15.0) if held else self.downloads())):
+            return "A download is going. Change the folder when it has finished."
+        with self.guard:
+            if any(m and m[0] == "pull" for m in self.busy):
+                return "A download is going. Change the folder when it has finished."
+        return ""
+
+    def plan_pulls_folder(self, text) -> dict:
+        """Check a new downloads folder. {"path", "old", "warnings", "files", "bytes", "has_old"}; raises
+        storage.StorageError. Nothing is created or changed."""
+        old = self.pulls
+        new, warnings = storage.validate_root(text, kind="downloads", old=old, default=self.default_pulls(),
+                                              trusted=[remote.PULLS])
+        files, size = storage.tree_stats(old) if old.is_dir() else (0, 0)
+        return {"path": new, "old": old, "warnings": warnings, "files": files, "bytes": size,
+                "has_old": storage.has_data(old)}
+
+    @staticmethod
+    def _rebase(folder, old, new) -> str | None:
+        """folder with the old root's prefix replaced by the new one, None when it is not inside old."""
+        try:
+            rel = Path(os.path.abspath(str(folder))).relative_to(os.path.abspath(str(old)))
+        except ValueError:
+            try:
+                rel = Path(folder).resolve().relative_to(Path(old).resolve())
+            except (ValueError, OSError):
+                return None
+        return str(Path(new) / rel)
+
+    def _switch_pulls(self, old: Path, new: Path, keep_old: bool, rebase: bool):
+        """The function a move calls when the data is safely in `new`: the setting, the roots left behind and (after
+        a move) the run records' folders, all under the state lock."""
+        def switch():
+            with self.edit() as st:
+                s = st["settings"]
+                if storage.same_path(new, self.default_pulls()):
+                    s.pop("pulls_dir", None)
+                else:
+                    s["pulls_dir"] = str(new)
+                roots = [r for r in s.get("pulls_roots") or [] if not storage.same_path(r, new)]
+                if keep_old and not storage.same_path(old, self.default_pulls()) \
+                        and not storage.same_path(old, remote.PULLS) \
+                        and not any(storage.same_path(old, r) for r in roots):
+                    roots.append(str(old))
+                if roots:
+                    s["pulls_roots"] = roots
+                else:
+                    s.pop("pulls_roots", None)
+                if rebase:
+                    for path in sorted(self.runs_dir.glob("*.json")) if self.runs_dir.is_dir() else []:
+                        rec = self._read_json(path)
+                        if isinstance(rec, dict) and rec.get("folder"):
+                            moved = self._rebase(rec["folder"], old, new)
+                            if moved and moved != rec["folder"]:
+                                rec["folder"] = moved
+                                self.save_run(rec)
+            self._pull_cache = None
+        return switch
+
+    def _journal_callbacks(self):
+        checked = [False]
+
+        def set_move(journal):
+            with self.edit() as st:
+                st["settings"]["move"] = journal
+            self._pull_cache = None
+            if checked[0] or journal.get("phase") != "copying" or journal.get("failed"):
+                return
+            checked[0] = True
+            with self.downloads_lock:  # the journal is in place; a pull publishing its entry now sees it
+                blocked = self.move_blockers(held=True)
+            if blocked:
+                clear_move()
+                raise storage.StorageError(blocked)
+
+        def clear_move():
+            with self.edit() as st:
+                st["settings"].pop("move", None)
+            self._pull_cache = None
+        return set_move, clear_move
+
+    def apply_pulls_folder(self, text, mode: str = "fresh", progress=None) -> dict:
+        """Switch the downloads to the folder `text`. mode "move": the old folder's data goes there; "fresh": the old
+        data stays where it is (its runs stay listed and can be opened and removed) and the new folder starts empty.
+        Raises storage.StorageError, the setting unchanged, when refused or when a move fails before the switch."""
+        with storage.move_guard("downloads"):
+            blocked = self.move_blockers()
+            if blocked:
+                raise storage.StorageError(blocked)
+            if self.move_state():
+                raise storage.StorageError("An earlier move of the downloads was not finished: resume or cancel it "
+                                           "first.")
+            plan = self.plan_pulls_folder(text)
+            old, new = plan["old"], plan["path"]
+            if mode == "move" and plan["has_old"]:
+                set_move, clear_move = self._journal_callbacks()
+                result = storage.move_folder(old, new, kind="downloads",
+                                             switch=self._switch_pulls(old, new, False, True),
+                                             set_move=set_move, clear_move=clear_move, progress=progress)
+                return {**result, "path": new}
+            if plan["has_old"]:
+                storage.write_marker(old, "downloads")  # kept as a root the page still reads
+            new.mkdir(parents=True, exist_ok=True)
+            storage.write_marker(new, "downloads")
+            with self.downloads_lock:  # no download can begin between the check and the switch
+                blocked = self.move_blockers(held=True)
+                if blocked:
+                    raise storage.StorageError(blocked)
+                self._switch_pulls(old, new, plan["has_old"], False)()
+            return {"path": new, "method": "fresh" if plan["has_old"] else "nothing", "files": 0, "bytes": 0,
+                    "leftovers": []}
+
+    def resume_pulls_move(self, progress=None) -> dict:
+        with storage.move_guard("downloads"):
+            journal = self.move_state()
+            if not journal:
+                raise storage.StorageError("No move to resume.")
+            if storage.pid_alive(journal.get("pid")) and int(journal.get("pid") or 0) != os.getpid():
+                raise storage.StorageError("That move is still going in another program.")
+            old, new = Path(journal["from"]), Path(journal["to"])
+            set_move, clear_move = self._journal_callbacks()
+            return storage.move_folder(old, new, kind="downloads", switch=self._switch_pulls(old, new, False, True),
+                                       set_move=set_move, clear_move=clear_move, journal=journal, progress=progress)
+
+    def cancel_pulls_move(self) -> dict:
+        with storage.move_guard("downloads"):
+            journal = self.move_state()
+            if not journal:
+                raise storage.StorageError("No move to cancel.")
+            return storage.cancel_move(journal, self._journal_callbacks()[1])
 
     def stop_run(self, name: str, kill: bool = False) -> dict:
         """The WebUI's Stop (or Kill) on the instance that runs this job; name may be an instance id instead."""

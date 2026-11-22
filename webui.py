@@ -35,7 +35,7 @@ from rulztrainer.config import (AUTOMAGIC, KEEL, alpha_differs, alpha_lr_note, a
                                 ARCH_FULL_SAMPLE, ARCH_TURBO_DEFAULT_OFF, STILL_FFN_TARGETS, detect_video_data_preset, video_data_preset,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
 from rulztrainer import (__version__, blockaudit, bodysim, capabilities, facesim, history, lookfilter, machine, oom_recovery,
-                         promptcheck)
+                         promptcheck, storage)
 from rulztrainer.train_queue import TrainQueue
 from rulztrainer import renderhelper_ctl as rulz_renderctl
 from rulztrainer.dataset import skipped as dataset_skipped
@@ -9339,7 +9339,7 @@ def history_maps_dir(rec: dict, runs: list[dict]) -> Path | None:
     else the job folder's own training_maps/ while that folder still holds this run, else None."""
     from rulztrainer import trainmaps as TM
 
-    kept = history.HISTORY_DIR / rec["id"] / history.MAPS_SUBDIR
+    kept = history.history_dir() / rec["id"] / history.MAPS_SUBDIR
     if (kept / "maps.jsonl").is_file():
         return kept
     job_dir = history_job_dir(rec, runs)
@@ -9428,6 +9428,199 @@ def maps_compare(entries: list[tuple[str, dict]], picture: int, kind: str, level
                       "a": series[i] if i < len(series) else None,
                       "note": "" if at == step else f"its {'first' if at > step else 'latest'}: step {at:,}"})
     return items, (max(tops) if tops else 1.0)
+
+
+_SAVE_DIALOGS: set[str] = set()  # the save folders whose Change dialog was submitted and is not finished yet
+
+
+def save_folder_summary(result: dict, old) -> tuple[str, bool]:
+    """The notice after a change of save folder: (text, whether something needs the user's eye)."""
+    where, method = result["path"], result.get("method")
+    n, size = result.get("files", 0), storage.human_size(result.get("bytes", 0))
+    if method == "rename":
+        text = f"Moved {n} file(s), {size}, to {where} in one step."
+    elif method == "copy":
+        text = f"Copied {n} file(s), {size}, to {where}, checked every file, and removed the old copy."
+    elif method == "fresh":
+        text = f"New files are saved in {where} from now on. What was kept before stays in {old}."
+    else:
+        text = f"New files are saved in {where} from now on."
+    left = result.get("leftovers") or []
+    if left:
+        text += (f" {len(left)} item(s) in {old} could not be deleted and were left there (first: {left[0]}). "
+                 "Delete them yourself when nothing uses them.")
+    return text, bool(left)
+
+
+async def change_save_folder(*, kind: str, **kw) -> None:
+    """The Change save folder dialog for `kind` ("history" or "downloads"): one at a time. Once Save is pressed the
+    kind stays claimed (a second dialog is refused) until the folder is changed or the user cancels."""
+    if kind in _SAVE_DIALOGS or storage.moving_here(kind):
+        ui.notify("A change of this save folder is already going.", type="warning")
+        return
+    held: list = []
+    try:
+        await _save_folder_flow(kind, held, **kw)
+    finally:
+        if held:
+            _SAVE_DIALOGS.discard(kind)
+
+
+async def _save_folder_flow(kind: str, held: list, *, noun: str, current, default, plan, apply, blocked, after,
+                            fresh_note: str) -> None:
+    """The dialog's steps. `plan(text)` checks the folder
+    and returns {"path", "files", "bytes", "has_old", "warnings"} or raises storage.StorageError; `apply(text, mode)`
+    ("move" or "fresh") does it; `blocked()` says why now is not the time ("" when it is); `after()` redraws the
+    page. When the folder in use holds data, a second step asks: move it there, or start fresh there."""
+    why = blocked()
+    if why:
+        ui.notify(why, type="warning", multi_line=True)
+        return
+    old = Path(current())
+    with ui.dialog().props("persistent") as dlg, ui.card().classes("w-[38rem] max-w-full"):
+        ui.label(f"Change the save folder for {noun}").classes("text-base font-medium")
+        hint(f"In use now: {old}")
+        hint("Type the full path of a folder on the computer that runs this WebUI, not on the one this browser is on. "
+             "An empty or new folder works; so does one this app made for this earlier. Nothing in a folder is "
+             "deleted or overwritten by choosing it.")
+        path = ui.input("New folder", value=str(old)).classes("w-full")
+        err = ui.label("").classes("rz-banner error")
+        err.visible = False
+
+        async def save():
+            if kind in _SAVE_DIALOGS:  # a second press while the first is planning
+                return
+            err.visible = False
+            why_now = blocked()
+            if why_now:
+                err.text, err.visible = why_now, True
+                return
+            _SAVE_DIALOGS.add(kind)  # claimed before planning; released when the whole change is over
+            held.append(kind)
+            save_btn.set_enabled(False)
+            try:
+                found = await run.io_bound(plan, path.value)
+            except storage.StorageError as e:
+                err.text, err.visible = str(e), True
+                _SAVE_DIALOGS.discard(kind)
+                held.clear()
+                save_btn.set_enabled(True)
+                return
+            dlg.submit(found)
+
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.button("Reset to default", on_click=lambda: path.set_value(str(default))) \
+                .props("outline dense no-caps").tooltip(f"Puts {default} in the box; Save then switches to it")
+            ui.space()
+            ui.button("Cancel", on_click=lambda: dlg.submit(None)).props("flat")
+            save_btn = ui.button("Save", on_click=save).props("unelevated no-caps")
+    found = await dlg
+    dlg.delete()
+    if not found:
+        return
+    mode = "fresh"
+    if found["has_old"]:
+        with ui.dialog().props("persistent") as dlg2, ui.card().classes("w-[38rem] max-w-full"):
+            ui.label("What about what is in the old folder?").classes("text-base font-medium")
+            hint(f"{old} holds {found['files']} file(s), {storage.human_size(found['bytes'])}.")
+            for line in found["warnings"]:
+                hint(line, warn=True)
+            hint("Move it there: copies everything to the new folder, checks every file, switches, and only then "
+                 "deletes the old copy. A big folder takes a while: keep this WebUI running until it is done. If it "
+                 "stops half way, nothing is lost and you can resume or cancel the move.")
+            hint(f"Start fresh there: the new folder starts empty and the old files stay in {old}. {fresh_note}")
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("Cancel", on_click=lambda: dlg2.submit(None)).props("flat")
+                ui.button("Start fresh there", on_click=lambda: dlg2.submit("fresh")).props("outline no-caps")
+                ui.button("Move it there", icon="drive_file_move", on_click=lambda: dlg2.submit("move")) \
+                    .props("unelevated no-caps")
+        mode = await dlg2
+        dlg2.delete()
+        if not mode:
+            return
+    else:
+        for line in found["warnings"]:
+            ui.notify(line, type="warning", multi_line=True)
+    if mode == "move":
+        ui.notify(f"Moving to {found['path']}. Keep this WebUI running until it says it is done.", type="info",
+                  multi_line=True)
+    try:
+        result = await run.io_bound(apply, str(found["path"]), mode)
+    except storage.StorageError as e:
+        ui.notify(str(e), type="warning", multi_line=True)
+        after()
+        return
+    except OSError as e:
+        ui.notify(f"Could not change the save folder: {e}", type="warning", multi_line=True)
+        after()
+        return
+    text, warn = save_folder_summary(result, old)
+    ui.notify(text, type="warning" if warn else "positive", multi_line=True)
+    after()
+
+
+def save_move_banner(kind: str, noun: str, journal, resume, cancel, after):
+    """A banner with Resume / Cancel for a move that was cut off. Returns update(): shows it while the journal says
+    so. journal() -> the leftover journal dict or None; resume() / cancel() run off the page's thread."""
+    with ui.row().classes("rz-banner warning w-full items-center gap-3") as box:
+        text = ui.label("").classes("flex-1")
+        resume_btn = ui.button("Resume move", icon="play_arrow").props("unelevated dense no-caps")
+        cancel_btn = ui.button("Cancel move", icon="close").props("outline dense no-caps")
+    box.visible = False
+    flight = {"on": False}
+
+    async def run_it(func, what: str):
+        if flight["on"]:  # Resume and Cancel (or a double click) never run at once
+            return
+        flight["on"] = True
+        resume_btn.set_enabled(False)
+        cancel_btn.set_enabled(False)
+        try:
+            result = await run.io_bound(func)
+        except storage.StorageError as e:
+            ui.notify(str(e), type="warning", multi_line=True)
+        except OSError as e:
+            ui.notify(f"{what} failed: {e}", type="warning", multi_line=True)
+        else:
+            if "path" in result or "method" in result:
+                note, warn = save_folder_summary({"path": result.get("path", ""), **result}, "the old folder")
+                ui.notify(f"Move finished. {note}" if result.get("method") != "nothing" else "Move finished.",
+                          type="warning" if warn else "positive", multi_line=True)
+            else:
+                kept = result.get("kept") or []
+                ui.notify("Move cancelled; the old folder is still in use."
+                          + (f" Left in the new folder: {', '.join(kept[:3])}" if kept else ""),
+                          type="warning" if kept else "positive", multi_line=True)
+        finally:
+            flight["on"] = False
+            resume_btn.set_enabled(True)
+            cancel_btn.set_enabled(True)
+        after()
+
+    resume_btn.on_click(lambda: run_it(resume, "Resuming the move"))
+    cancel_btn.on_click(lambda: run_it(cancel, "Cancelling the move"))
+
+    def update() -> None:
+        j = journal()
+        mine = storage.moving_here(kind) or flight["on"]
+        other = bool(j) and storage.pid_alive(j.get("pid")) and int(j.get("pid") or 0) != os.getpid()
+        box.visible = bool(j) and not mine
+        if not box.visible:
+            return
+        past_switch = j.get("phase") in storage.PHASES_NO_CANCEL
+        resume_btn.visible = not other
+        cancel_btn.visible = not other and not past_switch
+        why = f" It stopped because: {j['failed']}" if j.get("failed") else ""
+        if other:
+            text.text = f"The {noun} folder is being moved by another program ({j['from']} to {j['to']})."
+        elif past_switch:
+            text.text = (f"A move of the {noun} folder to {j['to']} did not finish.{why} The files are in the new "
+                         f"folder; Resume finishes the switch and clears out {j['from']}.")
+        else:
+            text.text = (f"An earlier move of the {noun} folder from {j['from']} to {j['to']} did not finish.{why} "
+                         "Nothing was lost: the old folder is still in use until the move is finished. Resume it or "
+                         "cancel it.")
+    return update
 
 
 _history_import_started = False
@@ -9619,12 +9812,13 @@ def build_history_tab(charts: list, f: Form | None = None):
                 hint(f"No {kind} probe by step {step:,}: {', '.join(missing)}")
             captions = {id(e): " · ".join(x for x in (heading, label, f"Step {e['step']:,}", probe_caption(e)) if x)
                         for heading, e, label, _ in items}
-            view = [(history.HISTORY_DIR / e["file"], captions[id(e)]) for _, e, _, _ in items]
+            hroot = history.history_dir()
+            view = [(hroot / e["file"], captions[id(e)]) for _, e, _, _ in items]
             for heading in dict.fromkeys(h for h, _, _, _ in items):
                 ui.label(heading).classes("rz-subhead w-full")
                 with ui.element("div").classes("rz-gallery"):
                     for _, e, label, note in (it for it in items if it[0] == heading):
-                        path = history.HISTORY_DIR / e["file"]
+                        path = hroot / e["file"]
                         picked_now = str(path) in state["picks"]
                         with ui.column().classes("rz-shot gap-0" + (" rz-picked" if picked_now else "")):
                             ui.image(image_url(path)).props("ratio=1 fit=contain") \
@@ -9680,10 +9874,14 @@ def build_history_tab(charts: list, f: Form | None = None):
             return 0
 
     def reload(force: bool = False):
+        update_banners()
         sync_fleet()
-        sig = history.signature()
+        sig = (str(history.history_dir()), history.signature())  # another folder: everything is read again
         if sig == state["sig"] and not force:
             return
+        if state.get("dir") != sig[0]:
+            state["dir"] = sig[0]
+            reset_views()
         state["sig"] = sig
         state["runs"] = history.list_runs()
         n_vast = sum(1 for r in state["runs"] if (r.get("source") or {}).get("kind") == "vast")
@@ -9769,9 +9967,69 @@ def build_history_tab(charts: list, f: Form | None = None):
                      "and maps once you download their files.")
             ui.button("Import old runs", icon="move_to_inbox", on_click=import_old).props("outline") \
                 .tooltip("Add the runs whose job folders are in the output folder but not in this list yet")
+    def history_blocked() -> str:
+        if _running():
+            return "A training run is going in this WebUI. Change the history folder when it has finished."
+        return ""
+
+    async def check_disk() -> None:
+        """Whether the chosen folder is there, asked off the page's thread (an offline share can take a long while to
+        answer); update_banners shows the last answer."""
+        state["disk_busy"] = True
+        try:
+            state["missing_root"] = await run.io_bound(history.missing_root)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            state["disk_busy"] = False
+
+    def reset_views() -> None:
+        """The probe grid, the picks and the maps remember files of the folder they were drawn from."""
+        state["picks"].clear()
+        state["captions"].clear()
+        state["shown"] = None
+        state["maps_cache"].clear()
+        state["maps_pics"].clear()
+        state["maps_shown"] = None
+
+    def update_banners() -> None:
+        if not state.get("disk_busy"):
+            background_tasks.create(check_disk())
+        missing = state.get("missing_root")
+        history_missing.text = (f"Save folder not found: {missing}. Is the drive connected or the share online? "
+                                "Nothing is saved to the history until it is back; change the folder to use another "
+                                "one." if missing else "")
+        history_missing.visible = missing is not None
+        save_tip.text = f"Kept in {history.history_dir()}"
+        move_banner()
+
+    def after_folder_change() -> None:
+        state["sig"] = None
+        state["fleet_sig"] = None
+        reset_views()
+        reload(True)
+
+    async def change_folder():
+        await change_save_folder(
+            kind="history", noun="Previous Runs", current=history.history_dir, default=history.HISTORY_DIR,
+            plan=history.plan_save_folder, blocked=history_blocked, after=after_folder_change,
+            apply=lambda text, mode: history.apply_save_folder(text, mode, blocked=history_blocked),
+            fresh_note="Runs saved there stop being listed. Runs from vast.ai come back from the Fleet's records.")
+
     with card():
-        count = hint("")
-        count.tooltip(f"Kept in {history.HISTORY_DIR}")
+        with ui.row().classes("w-full items-center gap-2"):
+            count = hint("")
+            with count:
+                save_tip = ui.tooltip(f"Kept in {history.history_dir()}")
+            ui.space()
+            ui.button("Change save folder", icon="drive_file_move", on_click=change_folder, color=None) \
+                .props("outline dense no-caps") \
+                .tooltip("Choose where the saved runs, their probe images and training maps are kept, on the "
+                         "computer that runs this WebUI. Offers to move what is saved now.")
+        history_missing = ui.label("").classes("rz-banner error")
+        history_missing.visible = False
+        move_banner = save_move_banner("history", "history", storage.history_move, history.resume_save_move,
+                                       history.cancel_save_move, after_folder_change)
         table = ui.table(columns=HISTORY_COLUMNS, rows=[], row_key="id", selection="multiple",
                          pagination={"rowsPerPage": 10, "sortBy": "started", "descending": True},
                          on_select=lambda _: apply_scale()).props("flat dense").classes("w-full")
@@ -10565,17 +10823,30 @@ class RegionBlock:
 _FLEET_PROBE_IMAGE = re.compile(r"^(?:(?P<racer>.+?)_)?step(?P<step>\d{6})_(?P<kind>face|body)_(?P<seed>\d+)\.png$")
 
 
+def fleet_roots(root) -> list[Path]:
+    """`root` as a list of downloads folders: one folder, or several (Fleet.pull_roots())."""
+    return [Path(root)] if isinstance(root, (str, os.PathLike)) else [Path(r) for r in root]
+
+
 def fleet_folder(rec: dict | None, root) -> Path | None:
-    """A run's downloaded folder when it lies inside `root` (the fleet's downloads folder), else None: a record
-    can only send the page to files it downloaded."""
+    """A run's downloaded folder when it lies inside `root` (the fleet's downloads folder, or a list of them: the
+    current one, the default and those left behind by a "start fresh"), else None: a record can only send the page
+    to files it downloaded."""
     folder = (rec or {}).get("folder")
     if not folder:
         return None
     try:
-        path, base = Path(folder).resolve(), Path(root).resolve()
-        return path if path != base and path.is_relative_to(base) else None
+        path = Path(folder).resolve()
     except (OSError, ValueError):
         return None
+    for one in fleet_roots(root):
+        try:  # a root that cannot be resolved (an offline share) does not hide the others
+            base = one.resolve()
+            if path != base and path.is_relative_to(base):
+                return path
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def fleet_remove_plan(recs: list[dict], root, downloading=lambda key: False) -> list[dict]:
@@ -10672,8 +10943,17 @@ async def fleet_make_report(rec: dict, root, pull, make, notify, send, reload=No
     name = f"{rec.get('job')} (instance {rec.get('instance')})"
 
     def folder_of(r):
-        default = Path(root) / str(r.get("instance")) / str(r.get("job"))
-        return fleet_folder(r, root) or (fleet_folder({"folder": str(default)}, root) if default.is_dir() else None)
+        found = fleet_folder(r, root)
+        if found is not None:
+            return found
+        for one in fleet_roots(root):  # the usual place under each root, the current one first
+            default = one / str(r.get("instance")) / str(r.get("job"))
+            try:
+                if default.is_dir():
+                    return fleet_folder({"folder": str(default)}, root)
+            except OSError:
+                continue
+        return None
 
     async def pulled(kinds) -> str:
         """Pull the kinds; the reason it failed ("" when it did). Whatever goes wrong here must not stop the report."""
@@ -10839,7 +11119,22 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
     import rulz_fleet
 
     charts = charts if charts is not None else ChartList({})  # the page's charts: fitted to the window and recoloured
-    state: dict = {"shape": None, "cards": {}, "seen": {}, "dl": {}, "accept": {}, "render_wait": set()}
+    state: dict = {"shape": None, "cards": {}, "seen": {}, "dl": {}, "accept": {}, "render_wait": set(),
+                   "roots": None, "missing": None, "disk_busy": False}
+
+    def cached_roots() -> list:
+        """The downloads roots as the last background look found them (marker files are read off the page's thread,
+        which an offline share could stall); the current folder until the first look is back."""
+        return state.get("roots") or [fl.pulls]
+
+    async def check_disk() -> None:
+        state["disk_busy"] = True
+        try:
+            state["roots"], state["missing"] = await run.io_bound(lambda: (fl.pull_roots(), fl.pulls_missing()))
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            state["disk_busy"] = False
 
     def pull_entries() -> list[dict]:
         """The downloads going or just finished (newest first); none while the fleet module has no such list."""
@@ -10850,13 +11145,22 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
             return []
 
     def open_here(path) -> None:
-        base = Path(fl.pulls).resolve()
+        roots = cached_roots()
+        inside = False
         try:
-            inside = Path(path).resolve() == base or Path(path).resolve().is_relative_to(base)
+            target = Path(path).resolve()
         except (OSError, ValueError):
-            inside = False
+            target = None
+        for r in roots if target is not None else []:
+            try:  # one root that cannot be resolved does not reject the others
+                if target == r.resolve() or target.is_relative_to(r.resolve()):
+                    inside = True
+                    break
+            except (OSError, ValueError):
+                continue
         if not inside:
-            ui.notify(f"Only folders inside {base} can be opened from here.", type="warning", multi_line=True)
+            ui.notify("Only folders inside " + (" or ".join(str(r) for r in roots) or str(fl.pulls))
+                      + " can be opened from here.", type="warning", multi_line=True)
             return
         try:
             shown = open_folder(path)
@@ -10904,12 +11208,21 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
             ui.button("Find instances", icon="travel_explore", on_click=find, color=None) \
                 .props("outline dense no-caps").tooltip("Ask vast.ai which instances are running: new RulZ AI Trainer "
                                                         "instances join, stopped and destroyed ones are marked")
-            ui.button("Open downloads folder", icon="folder_open", on_click=lambda: open_here(fl.pulls),
-                      color=None).props("outline dense no-caps")                 .tooltip(f"Opens {fl.pulls}, where this page puts the files it downloads, on the computer that runs "
-                         "this WebUI")
+            open_btn = ui.button("Open downloads folder", icon="folder_open", on_click=lambda: open_here(fl.pulls),
+                                 color=None).props("outline dense no-caps")
+            with open_btn:
+                open_tip = ui.tooltip("")
+            ui.button("Change save folder", icon="drive_file_move", on_click=lambda: change_pulls_folder(),
+                      color=None).props("outline dense no-caps") \
+                .tooltip("Choose where this page puts the files it downloads, on the computer that runs this WebUI. "
+                         "Offers to move what is downloaded now.")
             ui.button("Look now", icon="refresh", on_click=look_now, color=None).props("flat dense no-caps")
         vast_note = ui.label("").classes("rz-banner warning")
         vast_note.visible = False
+        pulls_missing_note = ui.label("").classes("rz-banner error")
+        pulls_missing_note.visible = False
+        pulls_move_banner = save_move_banner("downloads", "downloads", fl.move_state, fl.resume_pulls_move,
+                                             fl.cancel_pulls_move, lambda: refresh(force=True))
         hint("Your vast.ai instances from this computer, over ssh (the vastai CLI with your API key, and your ssh "
              "key on your vast.ai account). This WebUI looks at them every few seconds while it runs; closed, "
              "nothing moves the queue, downloads files or checks the watches unless "
@@ -10968,7 +11281,7 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
         try:
             first = fleet_download_defaults(rulz_fleet.DOWNLOAD_KINDS, fl.read()["settings"]["download"],
                                             rec.get("download"))
-            folder = rec.get("folder") or str(fl.pulls / str(rec.get("instance")) / str(rec.get("job")))
+            folder = await run.io_bound(fl.pull_folder, rec)  # the run's own folder when it has one, else a new one
             with ui.dialog().props("persistent") as dlg, ui.card().classes("w-[34rem] max-w-full"):
                 ui.label(f"Download files of {rec.get('job')}").classes("text-base font-medium")
                 hint(f"Instance {rec.get('instance')} · {rec.get('state')}")
@@ -11349,7 +11662,7 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
         runs = current_runs()
         for iid, w in state["cards"].items():
             mine = fleet_card_run(runs, iid)
-            folder = fleet_folder(mine, fl.pulls) if mine and mine.get("state") == "running" else None
+            folder = fleet_folder(mine, cached_roots()) if mine and mine.get("state") == "running" else None
             w["region_exp"].visible = w["region"].fill(folder) if folder else False
 
     def paint_run_pull() -> None:
@@ -11528,8 +11841,9 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
     # ------------------------------------------------------------ downloads
     with section("Automatic downloads", "What comes down from the instances, each kind by its own rule",
                  "cloud_download", open_=False):
-        hint(f"Files land in {fl.pulls} (one folder per instance and job) and are fetched only once at their "
-             "size. An instance's disk goes with the instance: what is not downloaded when it is destroyed is gone.")
+        pulls_hint = hint("")
+        pulls_hint.text = f"Files land in {fl.pulls} (one folder per instance and job) and are fetched only once at their " \
+                          "size. An instance's disk goes with the instance: what is not downloaded when it is destroyed is gone."
         dl_selects: dict = {}
         with fields():
             for kind, label in rulz_fleet.DOWNLOAD_KINDS.items():
@@ -11778,7 +12092,7 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
                     cmp_caps.append(ui.label("").classes("text-xs text-white text-center"))
     show_full = image_viewer()
     cmp_btn.on_click(lambda: open_compare())
-    run_open.on_click(lambda: open_here(fleet_folder(picked_run(), fl.pulls) or fl.pulls))
+    run_open.on_click(lambda: open_here(fleet_folder(picked_run(), cached_roots()) or fl.pulls))
 
     def picked_keys() -> list[str]:
         return [row["key"] for row in run_table.selected]
@@ -11853,7 +12167,7 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
                 and not k.startswith("probe_") and k != "job_name"][:18]
         run_settings.text = ("Settings: " + ", ".join(f"{k} {cfg[k]}" for k in keys)) if keys else \
             "Its settings are not on record yet."
-        folder = fleet_folder(rec, fl.pulls)
+        folder = fleet_folder(rec, cached_roots())
         run_folder.text = (f"Files: {folder} ({rec.get('downloaded_mb', 0)} MB: "
                            f"{', '.join(rec.get('downloaded') or [])})" if folder else "No files downloaded.") + \
             (f" · last download failed: {rec['pull_error']}" if rec.get("pull_error") else "")
@@ -11905,7 +12219,7 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
         if not cmp_box.visible:
             cmp["shown"] = None
             return
-        runs, own = rescaled_runs(fleet_compare_runs(recs, fl.pulls), cmp_scale())
+        runs, own = rescaled_runs(fleet_compare_runs(recs, cached_roots()), cmp_scale())
         groups = probe_image_groups(runs)
         kind = cmp_kind.value
         steps = probe_image_steps(groups, kind)
@@ -11927,6 +12241,7 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
                tuple((len(r["loss"]), last(r["loss"]), len(r["probes"].get("combined") or []),
                       last(r["probes"].get("combined") or []), last(r["probes"].get("face") or []),
                       last(r["probes"].get("body") or []), len(r["probe_images"])) for r in runs),
+               tuple(e["path"] for r in runs for e in r["probe_images"]),  # a moved folder: the same pictures elsewhere
                json.dumps(cmp_scale(), sort_keys=True), kind, step, tuple(cmp["picks"]))
         if sig == cmp["shown"]:
             return
@@ -12049,7 +12364,7 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
         if not recs:
             ui.notify("Tick a run first.", type="warning")
             return
-        plan = await run.io_bound(fleet_remove_plan, recs, fl.pulls, fl.downloading)
+        plan = await run.io_bound(lambda: fleet_remove_plan(recs, fl.pull_roots(), fl.downloading))
         todo = [p for p in plan if not p["skip"]]
         total = sum(p["mb"] for p in todo)
         with ui.dialog() as dlg, ui.card().classes("w-[36rem] max-w-full"):
@@ -12117,7 +12432,7 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
                 continue
             busy.add(key)
             try:
-                await fleet_make_report(rec, fl.pulls, report_pull, report_make,
+                await fleet_make_report(rec, await run.io_bound(fl.pull_roots), report_pull, report_make,
                                         lambda text, kind: ui.notify(text, type=kind, multi_line=True),
                                         ui.download, fl.load_run)
             finally:
@@ -12156,10 +12471,38 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
         state["seen"][name] = sig
         return True
 
+    def paint_pulls_folder() -> None:
+        """Everything on the page that names the downloads folder, and the banners about it."""
+        here = fl.pulls
+        open_tip.text = f"Opens {here}, where this page puts the files it downloads, on the computer that runs this WebUI"
+        pulls_hint.text = (f"Files land in {here} (one folder per instance and job) and are fetched only once at "
+                           "their size. An instance's disk goes with the instance: what is not downloaded when it is "
+                           "destroyed is gone.")
+        if not state["disk_busy"]:
+            background_tasks.create(check_disk())
+        missing = state["missing"]
+        pulls_missing_note.text = (f"Save folder not found: {missing}. Is the drive connected or the share online? "
+                                   "Downloads fail until it is back; change the folder to use another one."
+                                   if missing else "")
+        pulls_missing_note.visible = missing is not None
+        pulls_move_banner()
+
+    def pulls_blocked() -> str:
+        return fl.move_blockers()
+
+    async def change_pulls_folder():
+        await change_save_folder(
+            kind="downloads", noun="downloads", current=lambda: fl.pulls, default=fl.default_pulls(),
+            plan=fl.plan_pulls_folder,
+            blocked=pulls_blocked, after=lambda: refresh(force=True),
+            apply=lambda text, mode: fl.apply_pulls_folder(text, mode),
+            fresh_note="The runs downloaded there stay listed on this page and can still be opened and removed.")
+
     def refresh(force: bool = False) -> None:
         """Redraw the parts that changed since the last look at the fleet's files (every 3 s, and after an action)."""
         if force:
             state["seen"] = {}
+        paint_pulls_folder()
         view = fl.overview()
         looked = view.get("looked")
         look_line.text = ("Nothing in the fleet to look at." if not view["instances"] and not view["queue"]["waiting"]
