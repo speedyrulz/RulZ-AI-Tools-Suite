@@ -1,5 +1,6 @@
 // Single source of truth for IPC channels between the renderer and the main process.
 import type { BatchRun } from './batch'
+import type { BenchmarkRequest, BenchmarkRun } from './benchmark'
 import type {
   AdapterConvertRequest,
   AdapterConvertResult,
@@ -71,6 +72,17 @@ export interface IpcInvoke {
   /** Runs one conversion (one at a time); output lines arrive as adapters:convertLog events. */
   'adapters:convert': (req: AdapterConvertRequest) => AdapterConvertResult
   'adapters:cancelConvert': () => void
+
+  /** Saved benchmark runs, newest first (a running one included). */
+  'bench:list': () => BenchmarkRun[]
+  /**
+   * Starts a load-settings benchmark (one at a time; refused while one runs). It unloads every loaded
+   * model first. Returns the new run; progress arrives as bench:changed events.
+   */
+  'bench:start': (req: BenchmarkRequest) => BenchmarkRun
+  /** Stops the running benchmark: the current combination is ended and its model unloaded. */
+  'bench:stop': () => void
+  'bench:delete': (runId: string) => void
 
   'instances:list': () => LoadedInstance[]
   'instances:load': (modelId: string, config: LoadConfig | null) => LoadedInstance
@@ -147,6 +159,8 @@ export interface IpcEvents {
   'adapters:changed': AdapterEntry[]
   /** One output line of the running adapter conversion. */
   'adapters:convertLog': string
+  /** A benchmark run changed (started, a combination finished or started, stopped, done). */
+  'bench:changed': BenchmarkRun
   'instances:changed': LoadedInstance[]
   'instances:error': InstanceErrorEvent
   'hardware:update': HardwareSnapshot
