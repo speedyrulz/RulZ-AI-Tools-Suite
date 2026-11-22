@@ -280,3 +280,81 @@ describe('trash items left by a crash', () => {
 })
 
 void (null as unknown as Ctx)
+
+describe('links inside .rulz', () => {
+  function junction(target: string, path: string): boolean {
+    try {
+      symlinkSync(target, path, 'junction')
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  async function project(s: Ctx, title: string) {
+    const st = await s.store.createProject(title)
+    const outside = join(s.base, 'outside')
+    mkdirSync(outside)
+    return { st, outside }
+  }
+
+  it('a junction at .rulz/history out of the project: save with snapshot is refused, nothing lands outside', async () => {
+    const s = setup()
+    const { st, outside } = await project(s, 'History link')
+    const rel = sceneRel(st)
+    writeFileSync(abs(st, rel), 'v1\n')
+    if (!junction(outside, join(st.folder, '.rulz', 'history'))) return
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const f = await s.store.readFile(st.folder, rel)
+    const r = await s.store.saveFile({ folder: st.folder, path: rel, text: 'v2\n', baseHash: f.hash, snapshot: true })
+    expect(r).toMatchObject({ ok: false, reason: 'error', error: expect.stringMatching(/link|outside/) })
+    expect(readFileSync(abs(st, rel), 'utf8')).toBe('v1\n')
+    expect(readdirSync(outside)).toEqual([])
+    await expect(s.store.history(st.folder, rel)).rejects.toThrow()
+  })
+
+  it('a junction at .rulz/unsaved: the journal is refused, nothing lands outside', async () => {
+    const s = setup()
+    const { st, outside } = await project(s, 'Unsaved link')
+    if (!junction(outside, join(st.folder, '.rulz', 'unsaved'))) return
+    await expect(s.store.journal(st.folder, sceneRel(st), 'typed\n', '')).rejects.toThrow(/link|outside/)
+    expect(readdirSync(outside)).toEqual([])
+  })
+
+  it('a junction at .rulz/trash: deleting a scene is refused, the file stays, nothing lands outside', async () => {
+    const s = setup()
+    const { st, outside } = await project(s, 'Trash link')
+    const cur = await s.store.outlinePatch(st.folder, [{ op: 'addScene', chapterId: st.outline.chapters[0].id, sceneId: 's-two2222', title: 'Two', index: null }])
+    const two = cur.outline.chapters[0].scenes[1]
+    writeFileSync(abs(cur, `manuscript/${two.file}`), 'two\n')
+    if (!junction(outside, join(st.folder, '.rulz', 'trash'))) return
+    await expect(s.store.deleteScene(st.folder, two.id)).rejects.toThrow(/link|outside/)
+    expect(readFileSync(abs(cur, `manuscript/${two.file}`), 'utf8')).toBe('two\n')
+    expect(readdirSync(outside)).toEqual([])
+    expect((await s.store.openProject(st.folder)).outline.chapters[0].scenes).toHaveLength(2)
+    await expect(s.store.emptyTrash(st.folder)).rejects.toThrow(/link|outside/)
+  })
+
+  it('refuses a .rulz subfolder that is a link even when it points inside the project', async () => {
+    const s = setup()
+    const { st } = await project(s, 'Inner link')
+    mkdirSync(join(st.folder, 'elsewhere'))
+    if (!junction(join(st.folder, 'elsewhere'), join(st.folder, '.rulz', 'unsaved'))) return
+    await expect(s.store.journal(st.folder, sceneRel(st), 'typed\n', '')).rejects.toThrow(/link/)
+    expect(readdirSync(join(st.folder, 'elsewhere'))).toEqual([])
+  })
+
+  it('a junction at .rulz/tmp stops every write', async () => {
+    const s = setup()
+    const { st, outside } = await project(s, 'Tmp link')
+    const rel = sceneRel(st)
+    writeFileSync(abs(st, rel), 'v1\n')
+    const f = await s.store.readFile(st.folder, rel)
+    rmSync(join(st.folder, '.rulz', 'tmp'), { recursive: true, force: true })
+    if (!junction(outside, join(st.folder, '.rulz', 'tmp'))) return
+    const r = await s.store.saveFile({ folder: st.folder, path: rel, text: 'v2\n', baseHash: f.hash })
+    expect(r).toMatchObject({ ok: false, reason: 'error' })
+    expect(readFileSync(abs(st, rel), 'utf8')).toBe('v1\n')
+    expect(readdirSync(outside)).toEqual([])
+  })
+})

@@ -2,7 +2,7 @@
 import { promises as fs } from 'node:fs'
 import { extname, join } from 'node:path'
 import type { NovelHistoryItem } from '@shared/novel'
-import { readBytes, writeBytesAtomic } from './files'
+import { assertAppPath, readBytes, writeBytesAtomic } from './files'
 
 const MAX_SNAPSHOTS = 200
 const MIN = 60_000
@@ -66,6 +66,7 @@ const historyDir = (folder: string, rel: string): string => join(folder, '.rulz'
 const relSnapshot = (rel: string, name: string): string => `.rulz/history/${rel}/${name}`
 
 async function names(dir: string): Promise<string[]> {
+  await assertAppPath(dir)
   try {
     return (await fs.readdir(dir, { withFileTypes: true })).filter((e) => e.isFile()).map((e) => e.name)
   } catch {
@@ -78,6 +79,7 @@ const stampOfName = (name: string): string => name.slice(0, name.length - extnam
 /** Snapshots of a file, newest first. */
 export async function listHistory(folder: string, rel: string): Promise<NovelHistoryItem[]> {
   const dir = historyDir(folder, rel)
+  await assertAppPath(dir)
   const items: NovelHistoryItem[] = []
   for (const name of await names(dir)) {
     const stamp = stampOfName(name)
@@ -94,6 +96,7 @@ export async function listHistory(folder: string, rel: string): Promise<NovelHis
  */
 export async function takeSnapshot(folder: string, rel: string, bytes: Uint8Array, now = new Date()): Promise<string | null> {
   const dir = historyDir(folder, rel)
+  await assertAppPath(dir)
   const ext = extname(rel) || '.txt'
   const existing = await names(dir)
   const newest = existing.filter((n) => stampTime(stampOfName(n)) !== null).sort((a, b) => compareStamps(stampOfName(a), stampOfName(b))).pop()

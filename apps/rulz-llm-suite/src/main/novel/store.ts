@@ -25,7 +25,7 @@ import {
 import { defaultProject } from '@shared/novelPrompts'
 import { applyOutlineOps, emptyOutline, validSceneFile, findChapter, findScene, newId, removeChapter, removeScene, reinsert, sceneFileName, slugify } from '@shared/novelOutline'
 import { wordCount } from '@shared/novelText'
-import { USER_PATH, cleanRelPath, decodeBytes, encodeText, isInside, NEW_FILE_META, readBytes, realInside, serialized, sha256, writeBytesAtomic } from './files'
+import { USER_PATH, assertAppPath, cleanRelPath, decodeBytes, encodeText, isInside, NEW_FILE_META, readBytes, realInside, serialized, sha256, writeBytesAtomic } from './files'
 import { listHistory, takeSnapshot } from './history'
 import { deleteJournal, discardJournal, readJournal, writeJournal } from './journal'
 import { listTrash, moveToTrash, readManifest, removeTrashFolder, restoreFiles, returnToTrash, trashRoot, undoTrash, type TrashManifest, type TrashOutline } from './trash'
@@ -856,6 +856,7 @@ export class NovelStore {
     const p = this.get(folder)
     if (p.blocked) throw new Error(`${p.blocked} The project is read-only until that file is fixed.`)
     const dir = trashRoot(p.folder)
+    await assertAppPath(dir)
     if (!(await fs.stat(dir).catch(() => null))) return
     await this.opts.trashItem(dir)
   }

@@ -3,7 +3,7 @@
 import { promises as fs } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { NovelChapter, NovelScene, NovelTrashItem } from '@shared/novel'
-import { cleanRelPath, retryTransient, USER_PATH, writeBytesAtomic } from './files'
+import { assertAppPath, cleanRelPath, retryTransient, USER_PATH, writeBytesAtomic } from './files'
 import { stampOf } from './history'
 
 export type TrashOutline =
@@ -23,6 +23,7 @@ export interface TrashManifest {
 export const trashRoot = (folder: string): string => join(folder, '.rulz', 'trash')
 
 async function exists(path: string): Promise<boolean> {
+  await assertAppPath(path)
   return fs.access(path).then(
     () => true,
     () => false
@@ -31,6 +32,8 @@ async function exists(path: string): Promise<boolean> {
 
 /** rename, or copy + delete across volumes (a project folder can be a junction onto another disk). */
 async function moveFile(from: string, to: string): Promise<void> {
+  await assertAppPath(from)
+  await assertAppPath(to)
   await fs.mkdir(dirname(to), { recursive: true })
   try {
     await retryTransient(() => fs.rename(from, to))
@@ -70,6 +73,7 @@ export async function moveToTrash(folder: string, rels: string[], label: string,
   let id = base
   for (let n = 2; await exists(join(trashRoot(folder), id)); n++) id = `${base}-${n}`
   const dir = join(trashRoot(folder), id)
+  await assertAppPath(dir)
   const manifestPath = join(dir, 'manifest.json')
   const tmpDir = join(folder, '.rulz', 'tmp')
   const writeManifest = (m: TrashManifest): Promise<boolean> => writeBytesAtomic(manifestPath, tmpDir, Buffer.from(JSON.stringify(m, null, 2), 'utf8'))
@@ -96,7 +100,7 @@ export async function moveToTrash(folder: string, rels: string[], label: string,
   } catch (err) {
     const failed = await rollback(moved)
     // Only a trash folder that holds no files any more loses its manifest.
-    if (!failed.length) await fs.rm(join(dir, 'manifest.json'), { force: true }).catch(() => undefined)
+    if (!failed.length && (await assertAppPath(dir).then(() => true, () => false))) await fs.rm(join(dir, 'manifest.json'), { force: true }).catch(() => undefined)
     throw withRollbackNote(err, failed)
   }
 }
@@ -124,6 +128,7 @@ export async function returnToTrash(folder: string, manifest: TrashManifest): Pr
 
 export async function readManifest(folder: string, id: string): Promise<TrashManifest> {
   if (!/^[\w-]+$/.test(id)) throw new Error('That trash item does not exist.')
+  await assertAppPath(join(trashRoot(folder), id))
   try {
     const m = JSON.parse(await fs.readFile(join(trashRoot(folder), id, 'manifest.json'), 'utf8')) as TrashManifest
     if (!m || !Array.isArray(m.files)) throw new Error('bad manifest')
@@ -137,6 +142,7 @@ export async function readManifest(folder: string, id: string): Promise<TrashMan
 
 /** Trash items, newest first. A folder with an unreadable manifest is skipped (its files stay). */
 export async function listTrash(folder: string): Promise<NovelTrashItem[]> {
+  await assertAppPath(trashRoot(folder))
   let dirs: string[]
   try {
     dirs = (await fs.readdir(trashRoot(folder), { withFileTypes: true })).filter((e) => e.isDirectory()).map((e) => e.name)
@@ -207,6 +213,7 @@ async function holdsFiles(d: string): Promise<boolean> {
  */
 export async function removeTrashFolder(folder: string, id: string): Promise<void> {
   const dir = join(trashRoot(folder), id)
+  await assertAppPath(dir)
   const manifest = join(dir, 'manifest.json')
   const rest = (await fs.readdir(dir, { withFileTypes: true }).catch(() => [])).filter((e) => !(e.isFile() && e.name === 'manifest.json'))
   for (const e of rest) {
