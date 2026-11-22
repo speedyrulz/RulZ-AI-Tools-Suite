@@ -32,13 +32,35 @@ Discover/downloads, RAG and a CLI are planned.
     detected and used automatically (`--spec-type draft-<kind>`), with a per-model switch and draft length.
     MTP layers built into the model file (Qwen3.5+ "MTP" GGUFs) are detected too and preferred. A **Draft model**
     picker can choose built-in layers or any draft file in the models folder instead.
+  - **LoRA adapters**: adapter GGUFs anywhere in the models folder are offered for every model with the same
+    architecture, with a warning when an adapter names a different base model. Tick one or more in the load form, each
+    with a default strength (`--lora`; the strengths are set right after loading). Their size counts toward the memory
+    estimate. A path containing a comma can't be passed to llama.cpp; rename it.
+- **My Models ▸ Adapters** — lists the adapter files with architecture, size, LoRA alpha and base model, and which
+  models they go with. **Convert PEFT adapter** turns a Hugging Face PEFT folder (`adapter_config.json` +
+  `adapter_model.safetensors`) into a GGUF in the models folder with llama.cpp's `convert_lora_to_gguf.py`, found next to
+  the llama.cpp build the app uses. Python with `torch`, `safetensors` and `transformers` is needed. Give a base model
+  folder (only its `config.json` is read) or a Hugging Face model id; with neither, the converter reads the base named in
+  `adapter_config.json` from the Hub.
+- **Load-settings benchmark** — **Benchmark** on My Models runs one fixed prompt over every combination of the settings
+  you pick (GPU layers, MoE offload, KV cache type, draft tokens, context length, batch and micro-batch sizes; at most
+  48 combinations), starting from the model's saved settings. For each it loads the model, sends an untimed warm-up and
+  then a few timed requests (prompt of 512, 2048 or 8192 tokens cut with the model's own tokenizer, end-of-text
+  ignored), and tables load time, time to first token, prompt and generation tok/s, draft acceptance and peak VRAM
+  (nvidia-smi sampled every ~0.5 s, minus what was in use before the load) next to the memory estimate. Combinations the
+  estimate calls likely out of memory can be skipped. The fastest row is marked, and **Save as defaults** stores a
+  row's settings as the model's defaults. A run unloads every loaded model first and leaves nothing loaded; runs are
+  kept in `%APPDATA%\RulZ LLM Suite\benchmarks.json` (newest 100).
 - **Chat** — streaming replies, collapsible reasoning ("thinking") blocks, Markdown with tables, LaTeX and
   highlighted code, image and text-file attachments (drag-drop / paste), copy, edit, regenerate, continue, branch,
-  delete (with undo); a note typed while the model replies is sent now (stopping the reply, keeping its thinking) or
+  delete (with undo); per-chat adapter strengths (on/off and 0–2 in the side panel, applied per request without
+  reloading; a change makes the model process the chat again from the start); a note typed while the model replies is sent now (stopping the reply, keeping its thinking) or
   after it; tok/s, time-to-first-token and token stats; context usage meter with "truncate middle" or "stop" overflow
   policy; folders, pinning, search; per-chat system prompt, sampling and thinking settings (on/off, reasoning effort,
   thinking budget); presets; JSON-schema structured output. A message sent while its model is still loading waits for
-  that load.
+  that load. Samplers for fiction: DRY (stops the model repeating earlier passages, with sequence breakers such as
+  character names), XTC (now and then skips the likeliest tokens for fresher wording) and an avoid-words list (sent as
+  logit bias, so use distinctive words); DRY and XTC can also be set as a model's API defaults.
 - **Chat handoff** — at 85% context (or any time via the header button) the model writes a handoff summary and
   a new chat with the same settings continues from it.
 - **MCP tools** — configure servers in `mcp.json` (same format as LM Studio / Cursor; stdio `command` or remote
@@ -62,14 +84,70 @@ Discover/downloads, RAG and a CLI are planned.
   context length, GPU layers, MoE expert offload (`cpuMoe`: `"off"`, `"all"` or a layer count), flash attention,
   KV cache types, parallel slots, the GPU split (mode, main GPU,
   per-GPU proportions), whether the vision projector runs on the CPU (`mmprojOnCpu`), the model's sampling
-  defaults (`sampling`: any subset, merged value by value; `null` clears one) and the draft (MTP) settings, including which draft (`draftFile`: `null` for automatic,
+  defaults (`sampling`: any subset, merged value by value; `null` clears one), LoRA adapters (`adapters`: a list of
+  `{ "id", "scale" }` with ids from `adapter_choices`; `[]` removes them) and the draft (MTP) settings, including which draft (`draftFile`: `null` for automatic,
   `"builtin"`, or the id of one of `draft_choices`). File paths and extra arguments stay app-only. A loaded model
   restarts with the new settings unless `"reload": false`; `"dry_run": true` only returns the memory estimate for the
   changed settings. Replies include the GPUs, `moe_layers` (layers with experts; `null` for dense models), whether the model has a draft head, what automatic uses
-  (`default_draft`), the drafts that can be picked (`draft_choices`, by path relative to the models folder), and the
-  memory estimate. `POST /v1/models/{id}/unload` unloads every running instance of a model (replying with how many it
+  (`default_draft`), the drafts that can be picked (`draft_choices`, by path relative to the models folder), the
+  adapters that can be picked (`adapter_choices`: id, name, size, base model, alpha and whether the base matches), and
+  the memory estimate. A chat-completions request may also carry llama.cpp's own `lora` field (`[{ "id", "scale" }]`,
+  ids in load order) to set adapter strengths for that request. `POST /v1/models/{id}/unload` unloads every running instance of a model (replying with how many it
   `unloaded`), so a client can free the memory when it is done with a model.
   Default port 1234 (pick another if LM Studio is running).
+- **Writing mode** (`Ctrl+7`) — write a novel with a local model. A project is a plain folder of Markdown files
+  (default `Documents\RulZ Novels`, set in **Settings → Writing**), so Obsidian, VS Code or a sync client can open it
+  too.
+  - **Outline**: chapters and scenes, each scene with beats, POV, characters present, a target word count, a status
+    and a summary. **Plan chapters** and **Plan scenes** ask the model for a plan; **Summarize** writes a scene or
+    chapter summary. Every proposal is a card you accept, edit or reject.
+  - **Story bible**: characters, places and other entries as Markdown files with front matter (aliases, keyword
+    triggers, priority, always-include). An entry goes into a request when its name, an alias or a trigger appears in
+    the beats or the text near the cursor, when it is the scene's POV or present, or when it was used earlier in the
+    scene. The **Context** tab shows each part's tokens against its cap, every included entry and why, and what was
+    cut to fit.
+  - **Editor**: CodeMirror with Markdown, search and soft wrap. **Continue**, **Draft scene**, **Rewrite** (tighter,
+    more vivid, another tone, show don't tell, or your own note), **Expand**, **Condense** and **Dialogue**, with up to
+    four alternatives. AI text is a pending change with **Accept** / **Reject** per change; nothing is written until
+    you accept it.
+  - **Requests** are assembled to fit the model's context: system and style, fixed bible entries, the story so far
+    (summaries), the scene, triggered entries, then the latest prose in steps, so llama-server can reuse its prompt
+    cache between requests. Each project has its own model, sampling (including DRY, XTC and avoid words) and adapters.
+  - **Your text is kept safe**: atomic saves; an unsaved-text journal every few hundred milliseconds that is offered
+    back after a crash; a conflict banner when another program changed the file; snapshots in **History**; deleted
+    scenes, chapters and entries in **Trash**; a project whose `project.json` or `outline.json` can't be read is
+    opened read-only instead of being reset. Closing the window first saves or journals open text.
+  - **Check** (scene toolbar) and **Check chapter** (chapter menu) ask the model to read a scene against the bible,
+    the story so far and the tracked state, and list problems: continuity, character, timeline, POV, tense. Each
+    problem quotes the scene and is marked in the margin; **Jump**, **Fix** (a Rewrite you accept or reject) or
+    **Dismiss** (remembered per scene in `.rulz\checks.json`) in the **Checks** tab.
+  - **Tracked state** (`state.json`): facts per character or thing (location, what they know or carry, condition,
+    relationships), each true from one scene until another in reading order. **Update state** asks the model what
+    changed in a scene; you accept or reject each change before anything is written. The **State** tab shows the state
+    before or after the current scene and lets you add, edit, end or remove facts; facts whose scene or entry was
+    deleted, or that end before they start after a scene move, are listed for repair. The state before the scene goes
+    into every request.
+  - **Interview** tab: chat with a character, in their voice, who knows only what they know by the current scene
+    (their entry, their state and summaries of the scenes they were in). **Add to voice notes** appends an answer to a
+    `## Voice` section in the character's entry. For **Dialogue**, or a selection that names a character, that
+    character's voice notes come first in the request.
+  - **Recording** (Project panel, on by default): every AI action is recorded with what you did with it (accepted,
+    mixed, rejected, edited) and, once you stop editing, the final text, in `.rulz\records\<day>.jsonl`. Nothing about
+    your writing waits for it. **Export training data…** writes `train.jsonl` (SFT), `pairs.jsonl` (DPO: the
+    alternative you accepted over the ones you looked at, and optionally your edits over the model's text) and a
+    manifest into a new folder outside the project. Cut-off, rejected and abandoned outputs are left out.
+    **Delete records…** moves them to the Recycle Bin.
+  - **Adapters**: the Project panel shows which base model an adapter was trained on and warns on a mismatch; the
+    PEFT converter says where to use a converted adapter.
+  - **Writing benchmark** (Benchmark on the Writing start page): 2 to 6 candidates (model, adapters, sampling) write
+    the same prompts with the same seeds; you vote blind on pairs (A / B / Tie / Skip, keys 1/2/3/S) and an Elo
+    scoreboard ranks them. **Adjust settings** on a candidate changes its sampling and its load settings (context,
+    GPU layers, KV cache…) for that run only; presets and the model's saved settings are not touched. **Settings for
+    all candidates** sets the same values for every candidate; a setting a candidate changed itself wins for that
+    candidate. Every output's generation and prompt speed is saved, and the scoreboard shows each candidate's average
+    tokens/s (weighted by tokens). Bundled prompts or your own; each run is one file you can resume. While a benchmark runs,
+    chat, batch runs, the hardware benchmark and model loading wait for it.
+  - Not yet tried with a real model.
 - **Reverse Engineering mode** (`Ctrl+6`) — runs a local model as a reverse engineer with the REA MCP tools, and
   collects fine-tuning data while it works. Tuned first for Ornith 1.5 35B-A3B (Heretic MTP APEX I-Mini).
   - **Sessions**: pick a program, library, package or folder and a goal (overview, license check, network, config,
@@ -91,7 +169,8 @@ Discover/downloads, RAG and a CLI are planned.
     score, so two models (or one model before and after fine-tuning) can be compared on the same tasks. Options: at
     most N tasks (taken family by family in turn, so a short run still covers every family), tries per task, a time
     limit per task (counted from the task's first reply, so loading the model is not counted), only tasks no earlier
-    session solved, and a label. Each task is a normal recorded practice session in its own chat. A tool call that
+    session solved, and a label. A run records the adapters the model had loaded and their strengths, shown next to
+    the model name, so a base model and its fine-tune can be told apart. Each task is a normal recorded practice session in its own chat. A tool call that
     would ask for approval is refused instead of waiting (the model is told why and carries on); the form warns when a
     tool every session starts with, such as `rea__open_binary`, still asks, with an **Always allow** button. A task
     still calling tools at the round limit or the time limit is graded as failed. **Stop after this task** and

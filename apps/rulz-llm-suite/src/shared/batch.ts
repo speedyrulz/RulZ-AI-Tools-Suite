@@ -85,6 +85,8 @@ export interface BatchRun {
   kitDir: string
   options: BatchOptions
   items: BatchItem[]
+  /** Adapters the model had loaded when the run started, with the strengths its sessions used. Absent = none or an older run. */
+  adapters?: { name: string; scale: number }[]
 }
 
 /** How a turn in the chat ended (see onTurnEnd in the chat store). */

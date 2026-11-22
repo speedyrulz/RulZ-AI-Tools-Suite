@@ -26,7 +26,7 @@ describe('DeltaBatcher', () => {
   })
 })
 import { errorFromBody, interpretChunk, SseParser, statsFromTimings } from '../src/main/chat/sse'
-import { parseSettings } from '../src/main/settings/schema'
+import { parseSampling, parseSettings } from '../src/main/settings/schema'
 import { openAfterThinking } from '../src/renderer/src/lib/thinking'
 
 describe('SseParser', () => {
@@ -48,6 +48,14 @@ describe('interpretChunk', () => {
     expect(interpretChunk({ choices: [], prompt_progress: { total: 110, cache: 10, processed: 60 } }).progress).toEqual({ processed: 50, total: 100 })
     const stats = statsFromTimings({ predicted_per_second: 42, predicted_n: 10, prompt_n: 5, cache_n: 3 }, {})
     expect(stats).toEqual({ tokensPerSecond: 42, predictedTokens: 10, promptTokens: 8, cachedTokens: 3 })
+  })
+  it('fills the prompt speed from prompt_n / prompt_ms, cached tokens excluded', () => {
+    const stats = statsFromTimings({ prompt_n: 200, prompt_ms: 400, predicted_per_second: 30, predicted_n: 60, cache_n: 50 }, {})
+    expect(stats.promptTokensPerSecond).toBeCloseTo(500, 6)
+    expect(stats.promptTokens).toBe(250)
+    expect(statsFromTimings({ prompt_n: 0, prompt_ms: 5 }, {}).promptTokensPerSecond).toBeUndefined()
+    expect(statsFromTimings({ prompt_n: 5, prompt_ms: 0 }, {}).promptTokensPerSecond).toBeUndefined()
+    expect(statsFromTimings(undefined, {}).promptTokensPerSecond).toBeUndefined()
   })
   it('reads error bodies', () => {
     expect(errorFromBody(400, '{"error":{"message":"context exceeded"}}')).toBe('context exceeded')
@@ -80,6 +88,53 @@ describe('buildRequestBody', () => {
       thinking_budget_tokens: 1024,
       reasoning_budget_message: 'Time to answer.'
     })
+  })
+  it('sends nothing for DRY, XTC or avoided words with the default settings', () => {
+    const plain = buildRequestBody('m', [], DEFAULT_SAMPLING)
+    for (const key of Object.keys(plain)) expect(key).not.toMatch(/^dry_|^xtc_|^logit_bias$/)
+  })
+  it('sends DRY, XTC and the avoid list when they are on', () => {
+    const body = buildRequestBody('m', [], {
+      ...DEFAULT_SAMPLING,
+      dryMultiplier: 0.8,
+      dryAllowedLength: 3,
+      drySequenceBreakers: ['\n', 'Aria'],
+      xtcProbability: 0.5,
+      xtcThreshold: 0.15,
+      avoidWords: ['tapestry', ' ', 'tapestry', 'testament'],
+      avoidStrength: 7
+    })
+    expect(body).toMatchObject({
+      dry_multiplier: 0.8,
+      dry_base: 1.75,
+      dry_allowed_length: 3,
+      dry_sequence_breakers: ['\n', 'Aria'],
+      xtc_probability: 0.5,
+      xtc_threshold: 0.15
+    })
+    // -1 (whole context) is the server default and some builds reject it in a request: left out; 0 and up are sent.
+    expect(body).not.toHaveProperty('dry_penalty_last_n')
+    const look = buildRequestBody('m', [], { ...DEFAULT_SAMPLING, dryMultiplier: 0.8, dryPenaltyLastN: 512 })
+    expect(look.dry_penalty_last_n).toBe(512)
+    expect(body.logit_bias).toEqual([
+      ['tapestry', -7],
+      [' tapestry', -7],
+      ['testament', -7],
+      [' testament', -7]
+    ])
+  })
+  it('leaves DRY settings out while DRY is off, and XTC settings while XTC is off', () => {
+    const body = buildRequestBody('m', [], { ...DEFAULT_SAMPLING, dryMultiplier: 0, dryBase: 3, xtcProbability: 0, xtcThreshold: 0.3 })
+    expect(body).not.toHaveProperty('dry_base')
+    expect(body).not.toHaveProperty('dry_sequence_breakers')
+    expect(body).not.toHaveProperty('xtc_threshold')
+  })
+  it('loads sampling saved before DRY, XTC and avoid words existed', () => {
+    const { dryMultiplier: _a, xtcProbability: _b, avoidWords: _c, ...old } = DEFAULT_SAMPLING
+    expect(parseSampling(old)).toEqual(DEFAULT_SAMPLING)
+    expect(parseSampling({ ...old, dryMultiplier: 'x', avoidWords: [1], xtcProbability: 7, drySequenceBreakers: 'no' })).toEqual(DEFAULT_SAMPLING)
+    expect(parseSampling({ ...old, dryMultiplier: 0.8, avoidWords: ['tapestry'] })).toMatchObject({ dryMultiplier: 0.8, avoidWords: ['tapestry'] })
+    expect(parseSettings({}).defaultSampling).toMatchObject({ dryMultiplier: 0, xtcProbability: 0, avoidWords: [], avoidStrength: 5 })
   })
   it('turns thinking off, including when a handoff asks for it', () => {
     const off = buildRequestBody('m', [], { ...DEFAULT_SAMPLING, thinking: 'off', reasoningEffort: 'high', thinkingBudget: 10 })

@@ -44,6 +44,9 @@ export function reSampling(base: SamplingParams): SamplingParams {
     repeatPenalty: 1,
     presencePenalty: 0,
     frequencyPenalty: 0,
+    dryMultiplier: 0,
+    xtcProbability: 0,
+    avoidWords: [],
     maxTokens: null,
     jsonSchema: '',
     thinking: 'on'

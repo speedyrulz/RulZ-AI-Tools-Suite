@@ -5,7 +5,7 @@ import { buildServerArgs } from '../src/main/engine/args'
 import { parseLoadConfig } from '../src/main/settings/schema'
 import { parseDevices, parseVersion } from '../src/main/engine/engine'
 import { parseNvidiaSmi } from '../src/main/engine/hardware'
-import { describeExitCode, splitArgs } from '../src/main/engine/process'
+import { describeExitCode, describeLoadLog, splitArgs } from '../src/main/engine/process'
 import { LogLineSplitter, nextProgress, progressFromDots } from '../src/main/engine/progress'
 import { estimateMemory, gpuShares, kvCacheBytes } from '../src/main/models/estimate'
 import { parseTensorSplit, rebalanceSplit } from '../src/shared/split'
@@ -153,6 +153,33 @@ describe('sampling default arguments', () => {
     expect(args).toContain('--temp 0.6 --top-k 20 --min-p 0')
     expect(args).not.toContain('--top-p')
   })
+  it('passes DRY and XTC defaults only when set', () => {
+    const none = buildServerArgs({ model, config: DEFAULT_LOAD_CONFIG, port: 1, alias: 'q' }).join(' ')
+    expect(none).not.toMatch(/--dry-|--xtc-/)
+    const sampling = {
+      ...DEFAULT_LOAD_CONFIG.sampling,
+      dryMultiplier: 0.8,
+      dryBase: 1.5,
+      dryAllowedLength: 3,
+      dryPenaltyLastN: 2048,
+      drySequenceBreakers: ['\n', 'Aria'],
+      xtcProbability: 0.5,
+      xtcThreshold: 0.1
+    }
+    const args = buildServerArgs({ model, config: { ...DEFAULT_LOAD_CONFIG, sampling }, port: 1, alias: 'q' })
+    expect(args.join(' ')).toContain('--dry-multiplier 0.8 --dry-base 1.5 --dry-allowed-length 3 --dry-penalty-last-n 2048')
+    expect(args.join(' ')).toContain('--xtc-probability 0.5 --xtc-threshold 0.1')
+    const at = args.indexOf('--dry-sequence-breaker')
+    expect(args.slice(at, at + 4)).toEqual(['--dry-sequence-breaker', '\n', '--dry-sequence-breaker', 'Aria'])
+    const off = buildServerArgs({ model, config: { ...DEFAULT_LOAD_CONFIG, sampling: { ...sampling, dryMultiplier: 0 } }, port: 1, alias: 'q' })
+    expect(off).not.toContain('--dry-sequence-breaker')
+    // -1 (whole context) is the server's default and some builds refuse it as an argument: left out.
+    const whole = buildServerArgs({ model, config: { ...DEFAULT_LOAD_CONFIG, sampling: { ...sampling, dryPenaltyLastN: -1 } }, port: 1, alias: 'q' })
+    expect(whole).not.toContain('--dry-penalty-last-n')
+    expect(whole.join(' ')).toContain('--dry-multiplier 0.8')
+    const zero = buildServerArgs({ model, config: { ...DEFAULT_LOAD_CONFIG, sampling: { ...sampling, dryPenaltyLastN: 0 } }, port: 1, alias: 'q' })
+    expect(zero.join(' ')).toContain('--dry-penalty-last-n 0')
+  })
 })
 
 describe('describeExitCode', () => {
@@ -160,6 +187,24 @@ describe('describeExitCode', () => {
     expect(describeExitCode(3221225781)).toMatch(/DLL .* could not be found/)
     expect(describeExitCode(-1073741515)).toMatch(/0xC0000135/)
     expect(describeExitCode(1)).toBeUndefined()
+  })
+})
+
+describe('describeLoadLog', () => {
+  it('names an architecture the llama.cpp build does not know', () => {
+    const log = [
+      '0.00.225.842 E common_fit_params: encountered an error while trying to fit params to free device memory: failed to load model',
+      "0.00.392.753 E llama_model_load: error loading model: unknown model architecture: 'lfm3'",
+      '0.00.394.010 E srv  llama_server: exiting due to model loading error'
+    ]
+    const msg = describeLoadLog(log)
+    expect(msg).toContain("model type 'lfm3'")
+    expect(msg).toMatch(/Update llama\.cpp and rebuild/)
+  })
+
+  it('leaves other failures to the raw log', () => {
+    expect(describeLoadLog(['E llama_model_load: error loading model: out of memory'])).toBeUndefined()
+    expect(describeLoadLog([])).toBeUndefined()
   })
 })
 

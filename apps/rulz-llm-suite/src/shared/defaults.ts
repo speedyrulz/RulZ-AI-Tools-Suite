@@ -42,8 +42,16 @@ export const DEFAULT_LOAD_CONFIG: LoadConfig = {
     minP: null,
     repeatPenalty: null,
     presencePenalty: null,
+    dryMultiplier: null,
+    dryBase: null,
+    dryAllowedLength: null,
+    dryPenaltyLastN: null,
+    drySequenceBreakers: null,
+    xtcProbability: null,
+    xtcThreshold: null,
     override: false
-  }
+  },
+  adapters: []
 }
 
 export const DEFAULT_SAMPLING: SamplingParams = {
@@ -54,6 +62,15 @@ export const DEFAULT_SAMPLING: SamplingParams = {
   repeatPenalty: 1.1,
   presencePenalty: 0,
   frequencyPenalty: 0,
+  dryMultiplier: 0,
+  dryBase: 1.75,
+  dryAllowedLength: 2,
+  dryPenaltyLastN: -1,
+  drySequenceBreakers: ['\n', ':', '"', '*'],
+  xtcProbability: 0,
+  xtcThreshold: 0.1,
+  avoidWords: [],
+  avoidStrength: 5,
   maxTokens: null,
   stop: [],
   seed: null,
@@ -79,6 +96,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   rightPanelOpen: true,
   minimizeToTray: false,
   closeToTray: false,
+  writingRoot: '',
+  phoneEnabled: false,
+  phonePort: 7421,
+  phoneToken: '',
   toolsEnabled: true,
   confirmToolCalls: true,
   allowedTools: [],

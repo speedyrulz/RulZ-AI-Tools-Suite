@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { requestLora } from '@shared/adapters'
 import type {
   ChatRequest,
   GenerationStats,
@@ -10,6 +11,7 @@ import type {
   WireToolCall
 } from '@shared/types'
 import type { InstanceManager } from '../engine/instances'
+import { parseChatAdapters } from '../settings/schema'
 import { fitToContext, IMAGE_TOKENS, imageCount, textOf, type ContextApi } from './context'
 import { errorFromBody, interpretChunk, SseParser, statsFromTimings, ToolCallAccumulator } from './sse'
 import { jsonifyToolCallArgs, templateStringifiesArgs } from './toolArgs'
@@ -79,11 +81,32 @@ export function limiter(n: number): Limiter {
   }
 }
 
+/**
+ * logit_bias entries that discourage each word, with and without a leading space (llama-server biases
+ * every token of a string key). Empty and duplicate entries are skipped; strength 0 sends nothing.
+ */
+export function avoidWordsBias(words: string[], strength: number): [string, number][] {
+  if (!(strength > 0)) return []
+  const out: [string, number][] = []
+  const seen = new Set<string>()
+  for (const raw of words) {
+    const w = raw.trim()
+    if (!w) continue
+    for (const key of [w, ' ' + w]) {
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push([key, -strength])
+    }
+  }
+  return out
+}
+
 export function buildRequestBody(
   alias: string,
   messages: WireMessage[],
   s: SamplingParams,
-  disableThinking = false
+  disableThinking = false,
+  lora: { id: number; scale: number }[] | null = null
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
     model: alias,
@@ -98,9 +121,27 @@ export function buildRequestBody(
     presence_penalty: s.presencePenalty,
     frequency_penalty: s.frequencyPenalty
   }
+  // Adapter strengths for this request only; llama-server runs the adapters it leaves out at 0.
+  if (lora) body.lora = lora
   if (s.maxTokens !== null) body.max_tokens = s.maxTokens
   if (s.stop.length) body.stop = s.stop
   if (s.seed !== null) body.seed = s.seed
+  // Fiction samplers: only sent when on, so requests of people who never touch them stay as they were.
+  if (s.dryMultiplier > 0) {
+    body.dry_multiplier = s.dryMultiplier
+    body.dry_base = s.dryBase
+    body.dry_allowed_length = s.dryAllowedLength
+    // -1 (the whole context) is llama-server's default, and some builds refuse it ("must be between 0 <= value"),
+    // which failed every request with DRY on: leave it out then.
+    if (s.dryPenaltyLastN >= 0) body.dry_penalty_last_n = s.dryPenaltyLastN
+    if (s.drySequenceBreakers.length) body.dry_sequence_breakers = s.drySequenceBreakers
+  }
+  if (s.xtcProbability > 0) {
+    body.xtc_probability = s.xtcProbability
+    body.xtc_threshold = s.xtcThreshold
+  }
+  const bias = avoidWordsBias(s.avoidWords, s.avoidStrength)
+  if (bias.length) body.logit_bias = bias
   const thinking = disableThinking ? 'off' : s.thinking
   if (thinking !== 'auto') body.chat_template_kwargs = { enable_thinking: thinking === 'on' }
   if (thinking !== 'off') {
@@ -153,6 +194,11 @@ export type RoundRecorder = (conversationId: string, round: RecordedRound) => vo
 /** Streams chat completions from a loaded instance and forwards them to the renderer. */
 export class ChatService {
   private active = new Map<string, AbortController>()
+
+  /** True while any chat request is running (the window's, the API's or a phone job's). */
+  get busy(): boolean {
+    return this.active.size > 0
+  }
   /** Releases for models kept in use between tool rounds, by the request that asked for the tools. */
   private turnHolds = new Map<string, () => void>()
 
@@ -308,6 +354,13 @@ export class ChatService {
     return this.contextApi(inst, set.defs).countConversation(withSystemNote(messages, set.note))
   }
 
+  /** Token count of plain text on the loaded model (cached per instance); null if it can't count. */
+  async countText(modelId: string, text: string): Promise<number | null> {
+    const inst = this.instances.readyFor(modelId)
+    if (!inst) return null
+    return this.contextApi(inst, []).countText(text)
+  }
+
   async start(req: ChatRequest): Promise<void> {
     const { requestId } = req
     const ctrl = new AbortController()
@@ -355,9 +408,19 @@ export class ChatService {
           req.sampling.maxTokens ?? Math.min(2048, Math.floor(inst.contextLength / 4)),
           Math.floor(inst.contextLength / 3)
         )
-        const fitted = await fitToContext(messages, inst.contextLength, reserve, req.overflow, api)
-        trimmed = fitted !== messages
-        messages = fitted
+        if (req.prefitted) {
+          // The caller assembled the request to fit (Writing mode): never trim it, fail clearly instead.
+          const max = req.sampling.maxTokens ?? reserve
+          const used = await api.countConversation(messages)
+          if (used === null) throw new Error("Could not count the request's tokens, so it was not sent.")
+          if (used + max > inst.contextLength) {
+            throw new Error(`The request is larger than the model's context (${(used + max).toLocaleString()} of ${inst.contextLength.toLocaleString()} tokens).`)
+          }
+        } else {
+          const fitted = await fitToContext(messages, inst.contextLength, reserve, req.overflow, api)
+          trimmed = fitted !== messages
+          messages = fitted
+        }
       }
 
       // Some templates print earlier tool arguments as Python lists; send them as JSON text instead
@@ -366,7 +429,7 @@ export class ChatService {
         messages = jsonifyToolCallArgs(messages)
       }
 
-      const body = buildRequestBody(inst.modelName, messages, req.sampling, req.disableThinking)
+      const body = buildRequestBody(inst.modelName, messages, req.sampling, req.disableThinking, requestLora(inst.adapters ?? [], parseChatAdapters(req.adapters)))
       if (tools.length) body.tools = tools
       const res = await fetch(`${this.instances.baseUrl(inst)}/v1/chat/completions`, {
         method: 'POST',

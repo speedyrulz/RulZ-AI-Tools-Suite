@@ -24,8 +24,9 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
   bf16, with the Qwen3-4B text encoder; its own model entry ([details](#flux2-klein-4b)).
 - **Z-Image** (6.15B, Tongyi-MAI, Apache 2.0, not gated): LoRAs and full fine-tunes for Base and the 8-step Turbo, with
   a training adapter for Turbo; 12 GB cards with block swap ([details](#z-image)).
-- **Ideogram 4** (9.3B): LoRAs on one 16 GB card from the fp8 release, structured JSON captions or wrapped plain
-  ones; non-commercial license ([details](#ideogram-4)).
+- **Ideogram 4** (9.3B): LoRAs on one 16 GB card from the fp8 release, plain captions (wrapped into JSON) or
+  structured JSON ones, with a character setup taken from community reports; non-commercial license
+  ([details](#ideogram-4)).
 - **MiniMax H3** (33B video + audio): experimental LoRAs for H3 video generation from pictures (one-frame, as
   musubi-tuner trains them) and video clips, with clip samples and probes; two 16 GB cards or one with block swap
   ([details](#minimax-h3), [video clips](#video-clip-training-pan-2-minimax-h3)).
@@ -103,7 +104,7 @@ python webui.py --port 7870
 
 Open http://127.0.0.1:7870.
 
-New to LoRA training? Start on the **Wizard** tab. It sets up a character / person LoRA in six short pages:
+New to LoRA training? Start on the **Wizard** tab. It sets up a character / person LoRA in seven short pages:
 
 1. **Start:** the job name, the trigger word, and what the likeness should cover (face focus, the recommended one;
    face and body; face only; *Advanced* adds body focus and body only).
@@ -113,16 +114,27 @@ New to LoRA training? Start on the **Wizard** tab. It sets up a character / pers
    references.
 4. **Training:** steps, learning rate and LoRA rank.
 5. **Samples & probes:** sample prompts, how often to draw previews, save a checkpoint and run a likeness check.
-6. **Extras & start:** *Do you want to use any experimental settings?* No (recommended) keeps the setup as it is and
+6. **Extras:** *Do you want to use any experimental settings?* No (recommended) keeps the setup as it is and
    switches every extra off; Yes lists them by group (adapter and optimizer, likeness boosters, noise levels, the
    configuration race). Each shows how well tested it is (*Tested by others*, *Small or mixed result*, *Only speed
    tested*, *Not tested yet*) and has a *What is this?* button: what it does, what testing found so far with the
-   numbers, and its cost and limits. A review with any problems found, *Save config*, *Add to queue* and *Start
-   training* follow.
+   numbers, and its cost and limits.
+7. **Review & start:** review any problems found, save the config, add it to the queue, or start training.
 
 The basics are filled in for you: the identity recipe (see [Identity training](#identity-training-what-each-step-teaches-character-loras))
 with LoRA rank 32 / alpha 32, adamw8bit at 1e-4, and recommendations worked out from your GPUs (memory) and your
-photos (count and size) for the hardware, resolution, steps and samples. *Reset* puts that setup back. **Advanced**, at
+photos (count and size) for the hardware, resolution, steps and samples. *Reset* puts that setup back.
+
+**MOSS-Image defaults (since 3.54.0, from MOSS users' posts in the community Discord logs; not compared against the
+old values in RulZ AI Trainer).** For a character on MOSS-Image the wizard also sets: `timestep_sampling: reference`
+(MOSS's own high-noise curve, median sigma about 0.75; `timestep_shift` 1, resolution shift off), `weight_decay` 1e-4
+(the trainer's default is 0.01; MOSS users ran 5e-5 to 2e-4), training sizes 0.25 + 0.5 + 1.0 MP (512, 768 and 1024 px
+buckets, on a card with 12 GB or more; sizes above your photos' are left out), and `sample_skip_layer` -1 (off: the
+trainer trains block 22, and skipping it while sampling strips that likeness). Previews without the turbo LoRA use 25
+steps at CFG 3.5. Rank 32, adamw8bit and 1e-4 are unchanged. These land when the wizard sets up, and again if you pick
+MOSS-Image on the Model page afterwards (the identity preset applies only once, when switched on, so it does not
+overwrite them); switching to another model takes them back. The Train tab's *Weight decay* and *Skip layer* fields show
+them. Switching the identity preset on from the Train tab still sets `logit_normal`. **Advanced**, at
 the top of the wizard, shows every setting on every page, each with its recommendation (*Use* takes one, *Apply
 recommended* every one on the page), and the same switch on the **Train** tab shows that tab's *Advanced options*
 panels, experimental settings and tool sections (LoRA Isolation, Configuration race, Seed soup, Post-hoc EMA, Probe
@@ -398,12 +410,15 @@ and write the same files in `~/.rulz_vast/fleet`. The tab is not shown when the 
   A relay (`race_follow`) cannot be split: every configuration continues from each round's winner.
 - **Every run on record.** Each run seen on any instance is kept with its settings, numbers, probe scores, thinned
   loss, time and cost, also after the instance is destroyed. Runs already on an instance when it joins are listed too.
-  Tick two or more and *Compare* charts them together: face, body, combined and loss, then (since 3.53.0) their region
+  Tick two or more and *Compare* charts them together: face, body, combined and loss, then (since 4.3.0) their region
   sweeps by region, training pictures solid and held-out dashed, from each run's downloaded logs, then the probe images.
 - **Downloads, each kind by its own rule.** Logs and settings, probe images, sample images, training maps, the best
   LoRA and every LoRA / checkpoint each have a rule: *never*, *when the run ends* or *while it runs* (every 300 s by
   default). A single run can have its own rules. Files land in `~/.rulz_vast/runs/<instance>/<job>`, each fetched once
   at its size. The defaults: logs and probes while it runs; samples, maps and the best LoRA at the end; every LoRA never.
+  **Change save folder** on the Fleet tab puts downloads somewhere else (another drive, say). It offers to move what is
+  already downloaded there or to start fresh; a move copies, checks every file, switches, and only then deletes the old
+  copy, and one that stops half way can be resumed or cancelled. Downloads are paused while a move runs.
 - **Watches.** A watch raises an event when a number goes above or below a value: a run's (`step`, `progress`, `loss`,
   `avg_loss`, `lr`, `grad_norm`, `eta`, `elapsed`, `step_time`, `cost`), its last probe's (`face`, `body`, `combined`
   and their `_ema`, `best`, `since_improve`, `copy`, ...) or the machine's (`disk_free_gb`, `gpu_temp`, `gpu_util`,
@@ -603,8 +618,9 @@ section) and samples with its own turbo LoRA by default where it has one ([Turbo
   Optionally also the two text-projection blocks inside the DiT. The Qwen text encoder stays frozen, as the
   authors recommend.
 - **Samples** use MOSS-Image's turbo LoRA by default (12 steps, CFG 1, shift 5; on Base also Kijai's SFT sampling
-  LoRA). With *Turbo LoRA* set to none they use the reference Euler schedule (shift 5, CFG 3, negative-branch
-  layer-22 skip).
+  LoRA). With *Turbo LoRA* set to none they use the Euler schedule at shift 5 with 25 steps and CFG 3.5 (community
+  values for Base; 20 steps and CFG 3 before 3.54.0) and the negative-branch layer-22 skip (`sample_skip_layer`, 22;
+  the wizard sets it to -1, see below).
 
 ## Using two GPUs
 
@@ -1072,6 +1088,40 @@ with the swing between epochs down from 3.9 to 1.6 points; 0.99 smoothed without
 so many steps that it lagged the run and finished below no average. Fizgig uses 0.98 for Krea 2 and MOSS-Image too;
 it has not been measured on the models here.
 
+## Weight noise (`weight_noise`, since 3.55.0, off by default)
+
+After every optimizer step, small Gaussian noise is added to the LoRA's own weights. The noise goes on the weights,
+not on the gradients, and leaves the optimizer's state alone. This is ported from the
+[ai-toolkit-perceptual](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual) fork of ai-toolkit
+(MIT). Its authors report that it pushes training toward flatter minima, spreads learning over more of the LoRA's
+rank (+20% stable rank on one Flux 2 Klein 9B LoKr run) and resists overcooking on small datasets. **None of that has
+been measured in RulZ AI Trainer yet**: race it against off before relying on it.
+
+```yaml
+weight_noise: 0.0125            # sigma; 0 = off (0 to 0.1). The port's pick; 0.01 to 0.017 was its useful range
+weight_noise_mode: relative     # relative: sigma x each tensor's own RMS | absolute: sigma as it is
+weight_noise_bound_norm: false  # scale each tensor back to its pre-noise norm after the noise
+```
+
+- **Relative** (the default) scales the noise to each tensor's size. A LoRA-up tensor starts at zero, so it gets no
+  noise until it has learned something.
+- **Relative noise can let the weight norm creep up over a long run**, because a tensor that grows a little draws a
+  little more noise. `weight_noise_bound_norm` stops that. The train log shows `weight norm` and `noise norm` every
+  few steps: a weight norm still climbing after the loss has settled is the sign to turn it on.
+- **Order and randomness.** The noise is applied after the step and the weight average (`lora_ema`) update, so the
+  average smooths it out, and on the primary GPU before the other GPUs copy the LoRA. Steps skipped for non-finite
+  gradients get none. It has its own random generator, seeded from the run's seed and the step, so turning it on
+  changes no other random draw (data order, timesteps, dropout), and a resumed run draws the same noise as an
+  uninterrupted one.
+- **Where it applies.** LoRA and LoKr tensors only. DoRA's magnitude vector is left alone. It does nothing on OFT
+  (rotation generators, not plain weights) or on a full fine-tune, and the WebUI greys the controls there with the
+  reason.
+- **Racing.** `weight_noise`, `weight_noise_mode` and `weight_noise_bound_norm` can vary per configuration in a race,
+  for example `weight_noise=0` against `weight_noise=0.0125`.
+- **Mid-run checkpoints.** The fork's authors note that samples can look worse mid-run with noise on (extra limbs,
+  body horror) before the run settles, and that the best checkpoint often sits in a narrow window. Keep the held-out
+  best marker or frequent saves on.
+
 ## Samples and monitoring
 
 `sample_seed` is the seed of the first prompt; with `sample_walk_seed` each further prompt uses seed + 1.
@@ -1418,9 +1468,11 @@ between two sweeps only the weights change and a picture's learned share is meas
 | `region_steer_holdout` | 0 (off) | With region steering and held-out photos: a region learned this much further on the training pictures than on the held-out ones, and no better on those for two sweeps, is turned down in every picture. It may turn the face, hair or skin down. |
 | `region_steer_subject_ahead` | 0 (off) | With region steering and sweeps of the training pictures: a picture's face, hair or skin with less than this x the median picture's error left is turned down in that picture alone. The training steps have no clean reading of one picture's subject; the sweeps do. Needs at least 4 swept pictures with that region. |
 
-**Cost.** 3 forward passes per picture per sweep. Sweeping every training picture every epoch about doubles the
-training time (an epoch trains each picture once, at about 3 forward passes' worth of time); every 4th epoch adds about
-a quarter; 8 pictures in turn of a set of 62 about an eighth; the held-out photos alone next to nothing.
+**Cost.** The three noise levels of a picture are batched, as are pictures of the same size and text length. The
+time saved depends on the model: most when a batch-1 forward is held up by the CPU or block swap, least when the GPU
+is already busy at batch 1. Pictures and their fixed noise are kept in memory between sweeps, up to 4 GiB. Readings at
+another batch size can differ very slightly with bf16 kernels; a batch size reduced after a GPU memory error stays
+reduced for the rest of the run.
 
 **Held-out photos** are picked by file name, evenly through the set, so the same set always holds out the same ones
 and a resumed run keeps them. A set needs at least 10 photos and at most a fifth may be held out. What the model
@@ -1430,11 +1482,27 @@ limits: with two or three held-out photos the score rests on very few pictures, 
 matches a training photo (the near-duplicate check names such pairs before training) is not unseen.
 
 Like the training maps, a sweep changes nothing about training (no gradients, eval mode and back, the RNG restored, the
-weight average used), a failed sweep turns the sweeps off for the rest of the run, and a race has none. They are
-measured against a first sweep at one resolution, so not with `resolution_step_up`. A resumed run reads
+weight average used), and a failed sweep turns the sweeps off for the rest of the run (in a race: of that configuration).
+They are measured against a first sweep at one resolution, so not with `resolution_step_up`. A resumed run reads
 `region_sweep.json` back; without one its first sweep is of the already trained model and the log says so. Output:
 `region_sweep.jsonl` (one line per sweep), the Monitor's Region watch section (a sweep line, and the sweeps' contrast
 beside the training steps' in the table).
+
+**In a configuration race** (see [Configuration race](#configuration-race-race)) the same settings work, in both race
+modes (the configurations in turn, and `race_parallel`), as a report only. The same photos are held out of every
+configuration. Each configuration has its own sweep: a first sweep of that configuration before it trains (at its own
+step 0), then every `region_sweep_every` of its own epochs on its own step count, and one at its last step, each
+measured against its own first sweep. In turns, a sweep runs while its configuration is swapped in; with `race_parallel`
+the configuration's weight average is loaded into the first GPU's model copy, as for its probe, and swept there while
+the other lanes wait. The log gives the cost at the start (configurations x pictures). Nothing the sweeps read stops or
+steers anything: `holdout_patience` and `holdout_track_best` are off in a race (one log line says so when they are set)
+and stay off for the winner that trains on alone, whose sweeps go on in its own files, and region watch and region
+steering stay off in a race. `sweep_async` and `sweep_split` do not apply: race sweeps run on the training GPU (one log
+line). A race cannot resume, so every configuration's sweeps start fresh. Output per configuration `i` (its position in
+`race_configs`, from 0): `region_sweep.race<i>.json` and `region_sweep.race<i>.jsonl`, with the sweep's usual rows plus
+`config` (its name) and `index`; the plain `region_sweep.*` files are not written. `status.json` has
+`region_sweep_race.configs`, one entry per configuration that has swept: the latest row, its `line` and `history`, and
+`dropped` or `finished` once it has left. A configuration that is dropped keeps its files and its entry.
 
 **The sweep charts** (Monitor, Details view, Region watch section; one chart in 3.6.0, split up in 3.6.1) draw every
 sweep of the run against the step. On top is **the gap chart**: per region, how many points further it has been
@@ -2796,7 +2864,8 @@ most like the person. Each reward step:
 ## Previous runs (run history)
 
 The **Previous Runs** tab keeps the likeness history of every run, like TensorBoard, so runs can be compared after the
-job folder has been reused. A run with likeness scores writes one small file in `output/_history/` while it trains (a
+job folder has been reused (**Change save folder** above the table keeps this history in another folder, and offers to
+move what is saved now). A run with likeness scores writes one small file in `output/_history/` while it trains (a
 crash keeps what was saved) and again when it ends. It keeps what the Monitor's two likeness charts plot, on the run's
 normalized scale: the **mean face and mean body** score of the sample images at each sampling step (Identity
 similarity), and the smoothed **face, body and combined** score at each probe (Likeness probes & controller). Runs
@@ -2950,6 +3019,11 @@ average, parked on the CPU while it waits; the model copies carry the weights of
 identity loss or self-training; `torch.compile` is off; no training states. Manual drops, the gallery and the race table work as before
 (the table marks every configuration that is training). A three-configuration test on an RTX 5060 Ti and an RTX 4060
 Ti ran two at once at about 6.6 s per step each, against about 13 s one after the other.
+
+**Region sweeps and held-out photos in a race.** They work in both race modes as a report: every configuration is
+swept on its own steps against its own first sweep, the same photos are held out of all of them, and nothing is stopped
+or saved from them; region watch and region steering stay off in a race. The details are under
+[Region sweeps and held-out photos](#region-sweeps-and-held-out-photos-experimental).
 
 **On the Monitor.** The *Likeness probes* chart draws every configuration's smoothed face, body and combined scores
 as its own lines, named after it (`lora16 face`, `lokr8 combined`): one colour per configuration, the combined score
@@ -3235,7 +3309,7 @@ probe images, never during training steps.
 | Krea 2 | `krea2_turbo_lora_rank_64_bf16` ([Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2)) | 8 | 1 | from the image size |
 | FIBO 2.0 | `fibo_2.0_turbo_lora_avg_rank_270_bf16` ([Comfy-Org/Fibo-2.0](https://huggingface.co/Comfy-Org/Fibo-2.0)): Edit Turbo as a LoRA on dev | 4 | 1 | from the image size |
 | Qwen-Image 2.1 | `qwen_image_2.1_turbo_lora_avg_rank_178_bf16` ([Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1)), extracted from Qwen-Image-2.1-Turbo | 8 | 1 | the Turbo checkpoint's own sigmas |
-| Ideogram 4 | `ideogram_4_turbotime_v1` ([ostris/ideogram_4_turbotime_lora](https://huggingface.co/ostris/ideogram_4_turbotime_lora), community, rank 128, 847 MB): few steps, no CFG and no unconditional model | 8 | 1 | logit-normal, mu 0, std 1.75 (ai-toolkit's sampler, its samples') |
+| Ideogram 4 | `ideogram_4_turbotime_v1` ([ostris/ideogram_4_turbotime_lora](https://huggingface.co/ostris/ideogram_4_turbotime_lora), community, rank 128, 847 MB): few steps, no CFG and no unconditional model. A new setup starts without it (community reports: it wrecks character LoRAs); *Turbo LoRA: the model's own* turns it on | 8 | 1 | logit-normal, mu 0, std 1.75 (ai-toolkit's sampler, its samples') |
 | MiniMax H3 | lightx2v's `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16` ([Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3)), the FL2VA Turbo 8-step LoRA | 8 | 1 | 12 |
 | FLUX.2 Klein 9B | vafipas663's `flux-2-klein-9b_extracted_lora_rank_256-bf16` ([vafipas663/flux2-klein-base-9b-distill-lora](https://huggingface.co/vafipas663/flux2-klein-base-9b-distill-lora)), the distilled Klein extracted against Base | 4 | 1 | 2.02 |
 
@@ -3249,8 +3323,8 @@ on top of a Turbo model would distil it twice, so samples and probes would not s
 LoRA set by hand on a Turbo model logs a warning.
 
 MOSS-Image renders 12 steps rather than the card's 8 because Fizgig found 12 much better; Fizgig also found that
-its turbo LoRA can understate likeness, so judge a run's likeness on full-quality samples (`turbo_lora: ""`, 20 steps,
-CFG 3). The WebUI's *Turbo LoRA* choice (the model's own, none, or a file) moves the steps and CFG between the turbo
+its turbo LoRA can understate likeness, so judge a run's likeness on full-quality samples (`turbo_lora: ""`, 25 steps,
+CFG 3.5 since 3.54.0; CFG 2.5 makes good MOSS LoRAs look broken). The WebUI's *Turbo LoRA* choice (the model's own, none, or a file) moves the steps and CFG between the turbo
 and the full-quality defaults while they are still at a default. `turbo_lora` can also be a path to any
 ComfyUI-format LoRA with `turbo_lora_strength`. `sample_lora` + `sample_lora_strength` stack a second sampling-only
 LoRA (for example a style LoRA) alongside the turbo one.
@@ -3814,7 +3888,7 @@ AdaLN, q/k RMSNorm, 3-axis interleaved MRoPE), conditioned on 13 layers of Qwen3
   same architecture and size (9.29 GB), its own weights (they differ from the conditional model's by about 0.1-8%
   per tensor, a separately trained model, not a copy), run on the image tokens alone with no text. LoRAs train on the
   conditional model only; the unconditional one is not downloaded.
-- **Captions.** Ideogram 4 was trained on structured JSON captions only (the schema is in Ideogram's
+- **Captions.** Ideogram 4 was trained on structured JSON captions (the schema is in Ideogram's
   [prompting guide](https://github.com/ideogram-oss/ideogram4/blob/main/docs/prompting.md); plain prompts "will not
   work" there and are rewritten by an LLM first). A same-name `.json` caption is used as it is (compacted, key order
   kept), and what Ideogram's caption verifier would flag is logged; a plain `.txt` caption is wrapped into the smallest
@@ -3830,6 +3904,38 @@ AdaLN, q/k RMSNorm, 3-axis interleaved MRoPE), conditioned on 13 layers of Qwen3
   learns. When most of a run's pictures have a plain `.txt` caption with a median under 20 words, the log warns once
   at the start. A structured `.json` caption or a richer description lowers it. The wrapper above is still a short
   caption, and whether it avoids the effect is untested here.
+  What trainers report about which style to use is disputed (community reports, none of it tested in RulZ AI Trainer):
+  for one character several got equal or better results with plain natural-language captions, while JSON with correct
+  boxes is what a multi-character LoRA needs, and a bad JSON caption hurts more than plain text. Boxes are
+  `[y_min, x_min, y_max, x_max]` normalised 0-1000 whatever the training resolution (they do not change with it), and
+  vision captioners often swap x and y, so check them. Do not caption traits that should always appear (tattoos, a
+  default outfit, hair or eye colour). In a JSON caption, put the full caption and the trigger in
+  `high_level_description` and only the trigger in the character element: a colour palette there shifts hair colour.
+  Test the LoRA with prompts in the same style as the captions. A plain "woman" or "man" (or a real name) works better
+  as the trigger word than a made-up token, which got printed as text in the picture.
+- **Character setup (community reports).** The wizard's character defaults for Ideogram 4 follow what several trainers
+  reported on Ideogram 4 character LoRAs. None of these settings has been run in RulZ AI Trainer yet, so treat them as
+  a starting point to race against your own:
+  - *Adapter*: a LoKr at factor 4. It beat a rank-64 LoRA and factor 8 on moles and tattoos, and its file is about
+    1 GB; factor 8 or a rank 32-64 LoRA was fine for simple subjects. This trainer's LoKr is full rank in LyCORIS's
+    sense (`w1` a small matrix of the factor's size, `w2` the whole rest, no low-rank split), which is what "full
+    rank" meant in the reports.
+  - *Optimizer*: Automagic 3 starting at 1e-5 (it raises the rate itself; higher starts baked in artifacts, and it is
+    for small sets: on hundreds of images it climbed far too high). `automagic_min_lr` stays at 2e-5, which is not
+    below the start rate, so the trainer lowers the floor to a fifth of the start, 2e-6. With isolation on, the
+    trainer trains an Automagic pick as AdamW (DOP's pull-back drives Automagic's rate to its floor), so the wizard
+    then picks AdamW8bit at 5e-5, the
+    reported range being 5e-5 to 8e-5 (1e-4 borderline, 2e-4 destroyed a model by step 1500). For a style, AdamW8bit at
+    8e-5 learned one where Automagic 3 did not (one report).
+  - *Timesteps*: logit-normal, the nearest here to AI Toolkit's "weighted" timesteps that most of them used. Linear and
+    sigmoid were reported too, and which is better is disputed. Resolution shift stays on.
+  - *Resolution*: 512 + 768 + 1024 px buckets (0.25, 0.5, 1 MP; 0.5 MP stands in for 768 px). Training at 256 alone, or
+    at 512 alone with a quantized model, did not learn.
+  - *Batch size* 1: larger batches spiked memory and trained oddly.
+  - *Steps*: about 200 per picture (images x repeats), 3000 to 8000 in all. A first likeness showed at 1500-3000;
+    tattoos and fine marks needed 5500-7000. Save a checkpoint every 250 steps and compare several: some middle
+    checkpoints failed while their neighbours were fine, and overtraining showed as artifacts and baked colour, not
+    as a collapse.
 - **Text features** follow `Ideogram4Pipeline.encode_prompt`: the caption in Qwen3-VL's user turn, the outputs of
   decoder layers 0, 3, ..., 33 and 35 stacked per token with the layer index fastest. The empty prompt has no tokens
   at all: the pipeline's image-only unconditional branch.
@@ -3837,22 +3943,27 @@ AdaLN, q/k RMSNorm, 3-axis interleaved MRoPE), conditioned on 13 layers of Qwen3
   normalized with Ideogram's own per-channel shift and scale (its `latent_norm.py`, what its pipeline and ai-toolkit
   use), not the VAE's batch-norm statistics of MOSS-Image and FIBO 2.0 (up to 0.4 apart in shift): they are cached
   under their own names (`_ideo4`). diffusers' pipeline and ComfyUI decode with the bn statistics instead.
-- **Samples** render with ostris' community TurboTime LoRA (8 steps, CFG 1, no guidance pass). Without it, Ideogram's
-  presets: V4_DEFAULT_20 (20 steps at guidance 7, the last 2 at 3; mu 0, std 1.75), V4_QUALITY_48 (48, the last 3 at
-  3; std 1.5) and V4_TURBO_12 (12, the last at 3; mu 0.5): the logit-normal schedule with the resolution-aware mean,
-  checked against diffusers' and Ideogram's own. Ideogram's guidance g * cond + (1 - g) * uncond is this trainer's CFG
-  g. The trainer has no unconditional model: the guidance pass runs the image alone (the empty negative) on the model
-  you train, as ai-toolkit does, so full samples are close to, not the same as, the official pipeline's.
+- **Samples** start as Ideogram's full presets, without a turbo LoRA: V4_DEFAULT_20 (20 steps at guidance 7, the last 2
+  at 3; mu 0, std 1.75), V4_QUALITY_48 (48, the last 3 at 3; std 1.5) and V4_TURBO_12 (12, the last at 3; mu 0.5): the
+  logit-normal schedule with the resolution-aware mean, checked against diffusers' and Ideogram's own. Community
+  reports say ostris' TurboTime LoRA (8 steps, CFG 1, no guidance pass) at CFG 1 wrecks character LoRAs, so a new setup
+  (the Train tab after picking Ideogram 4, and the wizard) has *Turbo LoRA* on none; pick the model's own to use it. A
+  config saved earlier keeps its own Turbo LoRA setting. Ideogram's guidance g * cond + (1 - g) * uncond is this
+  trainer's CFG g. The trainer has no unconditional model: the guidance pass runs the image alone (the empty negative)
+  on the model you train, as ai-toolkit does, so samples are close to, not the same as, the official pipeline's, and
+  community reports say they can look distorted while the LoRA is fine. Judge final checkpoints in ComfyUI with the
+  LoRA on both the conditional and the unconditional model (main 1.0, unconditional about 0.2-0.5).
 - **Timesteps** (`timestep_sampling: reference`): Ideogram has not published its training distribution; the reference
   recipe is its documented logit-normal with the resolution-aware mean at the reference pipeline's defaults (mu 0.5,
-  std 1).
+  std 1). The wizard's character setup uses `logit_normal` instead (see Character setup above).
 - **LoRA targets**: q, k and v are one fused layer (`attention.qkv`, as in the checkpoint, ComfyUI and ai-toolkit), so
   any of the three trains it; `o`, `ffn_up_gate` (`feed_forward.w1` / `w3`) and `ffn_down` (`w2`) as usual. `adaln`
   adds the per-block modulation (ai-toolkit's Ideogram LoRAs train it), `text_in` the text projection
   (`llm_cond_proj`) and `embed` the image / timestep projections and the final layer.
 - **Export** keeps the checkpoint's module names, `diffusion_model.layers.<n>.attention.qkv.lora_down.weight` (and
   `lora_up`, `alpha`), the layout ai-toolkit saves. ComfyUI has no Ideogram 4 key mapping, so this is the layout it
-  loads: a *LoraLoaderModelOnly* on the conditional model (`ideogram4_*`, not `ideogram4_unconditional_*`). diffusers'
+  loads: a *LoraLoaderModelOnly* on the conditional model (`ideogram4_*`); community reports apply the same file to
+  the unconditional model (`ideogram4_unconditional_*`) too, at about 0.2-0.5 against 1.0 on the conditional one. diffusers'
   Ideogram 4 loader converts it (q / k / v split, alpha folded) when the LoRA holds only block layers (the default
   targets and `adaln`). Sampling-only LoRAs may also be in diffusers' layout (`attention.to_q/to_k/to_v/to_out.0`).
 - **Licence**: the Ideogram Non-Commercial Model Agreement. Non-commercial use only; a LoRA trained on Ideogram 4 is a
@@ -4732,6 +4843,11 @@ stay on the GPU.
   (it planned for the frozen model alone, and a LoKr run on a 16 GB card went past its memory). **These are counts
   of tensors, not measurements:** activations and DoRA's working memory are not in them, and no run here has
   compared the plan with a card's real peak. Out-of-memory recovery's own steps are unchanged.
+- **The estimate counts the 2 blocks in flight (4.1.1).** Block swap streams the block that runs and the next one
+  into the GPU, so swapping N blocks frees N - 2 blocks' weights at a step's peak, not N. The estimate (and MiniMax
+  H3's own count) gave every swapped block's weights back, so a card a little short got 1-2 swapped blocks that freed
+  nothing. It now plans 2 more than before; the plan from your own runs already counted them. After Fizgig found its
+  own planner making the same mistake. A count, not a measurement.
 - **The wizard plans from your own runs where it can (3.22.0).** Every finished run now leaves a row in a small
   local record (`output/_vram_measured.json`): the settings that decide memory and what the run measured. When the
   form's settings match a finished run of yours, the wizard picks the block swap count from that run instead of

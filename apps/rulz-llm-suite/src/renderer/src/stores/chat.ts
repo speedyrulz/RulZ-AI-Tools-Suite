@@ -21,6 +21,7 @@ import { uid } from '../lib/format'
 import { type QueuedNote, takeQueued } from '../lib/interject'
 import { editMessages, idsToDelete, removeMessages, restoreMessages } from '../lib/messages'
 import { once } from '../lib/once'
+import { WBENCH_BUSY, wbenchRunning } from '../lib/wbenchFlag'
 import { buildWire } from '../lib/wire'
 import { useApp } from './app'
 import { availableTools, effectiveToolMode, tokensOf, toolBudget, toolRequestFor } from './mcp'
@@ -374,6 +375,7 @@ export const useChat = create<ChatState>((set, get) => {
       modelId: ho.modelId,
       systemPrompt: src.systemPrompt,
       sampling: src.sampling,
+      adapters: src.adapters ?? null,
       presetId: src.presetId,
       activeTools: src.activeTools,
       re: reCopy(src.re),
@@ -738,6 +740,7 @@ export const useChat = create<ChatState>((set, get) => {
         modelId,
         messages: toWire(history, conv.systemPrompt, inst.hasVision, undefined, !!conv.re),
         sampling: conv.sampling,
+        adapters: conv.adapters ?? null,
         overflow: settings?.contextOverflow ?? 'truncateMiddle',
         tools: toolRequestFor(conv.activeTools, toolOpts(conv)),
         record: conv.re?.collect ? { conversationId: conv.id } : undefined
@@ -898,6 +901,7 @@ export const useChat = create<ChatState>((set, get) => {
         modelId: useModels.getState().activeModelId,
         systemPrompt: s?.defaultSystemPrompt ?? '',
         sampling: s?.defaultSampling ?? DEFAULT_SAMPLING,
+        adapters: null,
         presetId: null,
         messages: []
       }
@@ -930,6 +934,7 @@ export const useChat = create<ChatState>((set, get) => {
 
     send: async (text, attachments) => {
       if (isChatBusy(get())) return
+      if (wbenchRunning()) return void toast(WBENCH_BUSY)
       const cur = get().current ?? (await get().newChat())
       await appendAndGenerate(cur, text, attachments)
     },
@@ -971,6 +976,7 @@ export const useChat = create<ChatState>((set, get) => {
     regenerate: async (messageId) => {
       const cur = get().current
       if (!cur || isChatBusy(get())) return
+      if (wbenchRunning()) return void toast(WBENCH_BUSY)
       const idx = cur.messages.findIndex((m) => m.id === messageId)
       if (idx < 0) return
       const keep = cur.messages[idx].role === 'assistant' ? idx : idx + 1
@@ -980,6 +986,7 @@ export const useChat = create<ChatState>((set, get) => {
     continueMessage: async (messageId) => {
       const cur = get().current
       if (!cur || isChatBusy(get())) return
+      if (wbenchRunning()) return void toast(WBENCH_BUSY)
       const last = cur.messages.at(-1)
       if (last?.id !== messageId || last.role !== 'assistant') return
       // A turn that called tools is complete; writing more into it would mix new calls with the
@@ -993,6 +1000,7 @@ export const useChat = create<ChatState>((set, get) => {
       const target = cur.messages.find((m) => m.id === messageId)
       if (!target) return
       if (resend && target.role === 'user' && !isChatBusy(get())) {
+        if (wbenchRunning()) return void toast(WBENCH_BUSY)
         await startGeneration({ ...cur, messages: editMessages(cur.messages, messageId, content, true) }, 'new')
       } else {
         get().mutateCurrent((c) => ({ ...c, messages: editMessages(c.messages, messageId, content, false) }))
@@ -1169,6 +1177,7 @@ export const useChat = create<ChatState>((set, get) => {
       const conv = get().current
       set({ handoffConfirm: null })
       if (!conv || get().generation || get().handoff || get().autoLoadingModelId) return
+      if (wbenchRunning()) return void toast(WBENCH_BUSY)
       if (!conv.messages.length) {
         toast('There is nothing to hand off yet.')
         return
@@ -1194,6 +1203,7 @@ export const useChat = create<ChatState>((set, get) => {
           modelId,
           messages: [...toWire(conv.messages, conv.systemPrompt, inst.hasVision), { role: 'user', content: HANDOFF_PROMPT }],
           sampling: { ...conv.sampling, temperature: Math.min(conv.sampling.temperature, 0.5), maxTokens: null, jsonSchema: '' },
+          adapters: conv.adapters ?? null,
           // The chat is near the limit by definition, so always make room rather than refuse.
           overflow: 'truncateMiddle',
           // Little context is left at this point; spend it on the handoff, not on reasoning.
@@ -1212,6 +1222,10 @@ export const useChat = create<ChatState>((set, get) => {
     },
 
     startRe: async (input) => {
+      if (wbenchRunning()) {
+        if (!input.background) toast(WBENCH_BUSY)
+        return null
+      }
       if (isChatBusy(get()) || get().handoff) {
         if (!input.background) toast('Wait for the current reply to finish first.')
         return null
@@ -1243,6 +1257,7 @@ export const useChat = create<ChatState>((set, get) => {
         modelId,
         systemPrompt: opts.clone ? `${RE_SYSTEM_PROMPT}\n\n${clonePrompt(opts.clone)}` : RE_SYSTEM_PROMPT,
         sampling: reSampling(s?.defaultSampling ?? DEFAULT_SAMPLING),
+        adapters: null,
         presetId: null,
         activeTools: starter,
         re: { target: opts.target, goal: opts.goal, collect: opts.collect, outcome: 'unrated', practice: opts.practice, clone: opts.clone },

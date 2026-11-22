@@ -4,12 +4,14 @@ import { create } from 'zustand'
 import { toast } from 'sonner'
 import { cleanBatchOptions, planBatch, summarize, type BatchOptions, type BatchRun } from '@shared/batch'
 import type { RePracticeTask } from '@shared/types'
+import { batchAdapterLabel, batchAdapters, sameBatchAdapters } from '../lib/adapters'
 import { errorMessage, invoke } from '../lib/api'
 import { runBatchLoop, type BatchStop } from '../lib/batchRunner'
 import { uid } from '../lib/format'
 import { once } from '../lib/once'
 import { useApp } from './app'
 import { isChatBusy, isGrading, onTurnEnd, useChat } from './chat'
+import { WBENCH_BUSY, wbenchRunning } from '../lib/wbenchFlag'
 import { readyInstance, useModels } from './models'
 
 interface BatchState {
@@ -65,7 +67,7 @@ export const useBatch = create<BatchState>((set, get) => {
   }
 
   /** Loads the run's model if needed; null (after a toast) if it cannot be used. */
-  const readyModel = async (modelId: string | null): Promise<{ modelName: string; contextLength: number | null } | null> => {
+  const readyModel = async (modelId: string | null): Promise<{ modelName: string; contextLength: number | null; adapters: BatchRun['adapters'] } | null> => {
     if (!modelId) {
       toast.error('Load a model first, or choose one under New session.')
       return null
@@ -77,7 +79,8 @@ export const useBatch = create<BatchState>((set, get) => {
     // Messages go to the active model, so the run's model becomes it.
     useModels.getState().setActive(modelId)
     const inst = readyInstance(modelId) ?? (await useModels.getState().ensure(modelId))
-    return inst ? { modelName: inst.modelName, contextLength: inst.contextLength } : null
+    // The model is ready here, so its adapters are known; sessions use their default strengths.
+    return inst ? { modelName: inst.modelName, contextLength: inst.contextLength, adapters: batchAdapters(inst.adapters) } : null
   }
 
   const runBatch = async (runId: string): Promise<void> => {
@@ -131,6 +134,7 @@ export const useBatch = create<BatchState>((set, get) => {
 
     start: async (tasks, options, label, kitDir) => {
       if (get().activeId || get().starting) return
+      if (wbenchRunning()) return void toast(WBENCH_BUSY)
       const settings = useApp.getState().settings
       if (!settings) return
       const opts = cleanBatchOptions(options)
@@ -158,7 +162,8 @@ export const useBatch = create<BatchState>((set, get) => {
         maxToolRounds: settings.re.maxToolRounds,
         kitDir,
         options: opts,
-        items
+        items,
+        ...(model.adapters ? { adapters: model.adapters } : {})
       }
       set((s) => ({ runs: [run, ...s.runs], activeId: run.id }))
       save(run)
@@ -167,6 +172,7 @@ export const useBatch = create<BatchState>((set, get) => {
 
     resume: async (id) => {
       if (get().activeId || get().starting) return
+      if (wbenchRunning()) return void toast(WBENCH_BUSY)
       const run = get().runs.find((r) => r.id === id)
       if (!run || !run.items.some((i) => i.status === 'pending')) return
       set({ starting: true, stopping: null })
@@ -177,6 +183,12 @@ export const useBatch = create<BatchState>((set, get) => {
         set({ starting: false })
       }
       if (!model || get().activeId) return
+      // Results already recorded were made with the run's adapters; resuming with others would mix them.
+      if (!sameBatchAdapters(run.adapters, model.adapters)) {
+        const used = batchAdapterLabel(run.adapters) || 'no adapters'
+        toast.error(`This run used other adapters (${used}). Load the model with the same adapters, or start a new run.`)
+        return
+      }
       if (!patchRun(id, (r) => ({ ...r, status: 'running', finishedAt: undefined }))) return
       set({ activeId: id })
       void runBatch(id)

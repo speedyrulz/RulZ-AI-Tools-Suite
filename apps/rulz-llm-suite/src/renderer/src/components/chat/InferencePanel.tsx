@@ -1,12 +1,15 @@
-import { RotateCcw, Save, Trash2 } from 'lucide-react'
+import * as Collapsible from '@radix-ui/react-collapsible'
+import { ChevronRight, RotateCcw, Save, Trash2 } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
 import { useShallow } from 'zustand/react/shallow'
+import { breakersToText, textToBreakers, textToWords } from '@shared/variety'
 import { REASONING_EFFORTS, type ReasoningEffort, type SamplingParams } from '@shared/types'
 import { useApp } from '../../stores/app'
 import { useChat } from '../../stores/chat'
 import { effectiveToolMode, findTool, tokensOf, useMcp } from '../../stores/mcp'
 import { formatCompact } from '../../lib/format'
 import { Button, Dialog, Field, IconButton, Input, NumberInput, Select, Slider, Switch, Textarea } from '../ui'
+import { AdapterPanel } from './AdapterPanel'
 
 function SliderRow({
   label,
@@ -110,6 +113,115 @@ export function ThinkingFields({
   )
 }
 
+/** A one-per-line list. Keeps its own text while typing, so a new empty line stays until it is filled. */
+function ListArea({
+  value,
+  parse,
+  format,
+  placeholder,
+  onChange
+}: {
+  value: string[]
+  parse: (text: string) => string[]
+  format: (list: string[]) => string
+  placeholder?: string
+  onChange: (list: string[]) => void
+}) {
+  const [draft, setDraft] = useState(() => format(value))
+  const [seen, setSeen] = useState(value)
+  // Another source changed the list (a preset, a reset): show it.
+  if (seen !== value) {
+    setSeen(value)
+    if (JSON.stringify(parse(draft)) !== JSON.stringify(value)) setDraft(format(value))
+  }
+  return (
+    <Textarea
+      rows={3}
+      className="font-mono text-xs"
+      placeholder={placeholder}
+      value={draft}
+      onChange={(e) => {
+        setDraft(e.target.value)
+        onChange(parse(e.target.value))
+      }}
+    />
+  )
+}
+
+/** Repetition and variety controls (DRY, XTC, avoid words); also used for the new-chat defaults on the Settings page. */
+export function VarietyFields({
+  sampling: s,
+  onChange
+}: {
+  sampling: SamplingParams
+  onChange: <K extends keyof SamplingParams>(key: K, value: SamplingParams[K]) => void
+}) {
+  return (
+    <>
+      <SliderRow
+        label="DRY multiplier"
+        hint="0 = off. Penalises text that would repeat an earlier passage; around 0.8 is typical"
+        value={s.dryMultiplier}
+        min={0}
+        max={3}
+        step={0.05}
+        onChange={(v) => onChange('dryMultiplier', v)}
+      />
+      {s.dryMultiplier > 0 && (
+        <>
+          <SliderRow label="DRY base" hint="How fast the penalty grows with the length of the repeat" value={s.dryBase} min={1} max={4} step={0.05} onChange={(v) => onChange('dryBase', v)} />
+          <Field inline label="DRY allowed length" hint="Repeats up to this many tokens are not penalised">
+            <NumberInput value={s.dryAllowedLength} min={1} max={100} step={1} onChange={(v) => onChange('dryAllowedLength', Math.max(1, Math.round(v ?? 2)))} />
+          </Field>
+          <Field inline label="DRY look-back" hint="Tokens to look back over; -1 = the whole context, 0 = off">
+            <NumberInput value={s.dryPenaltyLastN} min={-1} step={64} onChange={(v) => onChange('dryPenaltyLastN', Math.max(-1, Math.round(v ?? -1)))} />
+          </Field>
+          <Field label="DRY sequence breakers" hint="One per line. A breaker ends a repeat, so DRY does not penalise what follows it. Add character names here to stop DRY from avoiding them. Write a newline as \n">
+            <ListArea value={s.drySequenceBreakers} parse={textToBreakers} format={breakersToText} onChange={(l) => onChange('drySequenceBreakers', l)} />
+          </Field>
+        </>
+      )}
+      <SliderRow
+        label="XTC probability"
+        hint="0 = off. How often the likeliest tokens are skipped for fresher wording; around 0.5 is typical"
+        value={s.xtcProbability}
+        min={0}
+        max={1}
+        step={0.05}
+        onChange={(v) => onChange('xtcProbability', v)}
+      />
+      {s.xtcProbability > 0 && (
+        <SliderRow
+          label="XTC threshold"
+          hint="Only tokens more likely than this can be skipped; above 0.5 turns XTC off"
+          value={s.xtcThreshold}
+          min={0}
+          max={0.6}
+          step={0.01}
+          onChange={(v) => onChange('xtcThreshold', v)}
+        />
+      )}
+      <Field
+        label="Avoid words"
+        hint="One per line. Works on tokens, so use distinctive words such as tapestry or testament. A phrase made of common words would penalise every word in it"
+      >
+        <ListArea value={s.avoidWords} parse={textToWords} format={(l) => l.join('\n')} onChange={(l) => onChange('avoidWords', l)} />
+      </Field>
+      {s.avoidWords.length > 0 && (
+        <SliderRow
+          label="Avoid strength"
+          hint="How hard to push these words down; 100 = effectively banned"
+          value={s.avoidStrength}
+          min={1}
+          max={100}
+          step={1}
+          onChange={(v) => onChange('avoidStrength', Math.round(v))}
+        />
+      )}
+    </>
+  )
+}
+
 const NO_TOOLS: string[] = []
 
 function ToolsSection() {
@@ -189,6 +301,7 @@ export function InferencePanel() {
   const updateSettings = useApp((s) => s.updateSettings)
   const [saveOpen, setSaveOpen] = useState(false)
   const [presetName, setPresetName] = useState('')
+  const [varietyOpen, setVarietyOpen] = useState(false)
 
   if (!current || !settings) {
     return <aside className="w-80 shrink-0 border-l border-border bg-panel p-4 text-xs text-faint">Open a chat to edit its settings.</aside>
@@ -198,6 +311,7 @@ export function InferencePanel() {
   const setS = <K extends keyof SamplingParams>(key: K, value: SamplingParams[K]): void =>
     mutate((c) => ({ ...c, sampling: { ...c.sampling, [key]: value } }))
   const activePreset = presets.find((p) => p.id === current.presetId)
+  const varietyOn = (s.dryMultiplier > 0 ? 1 : 0) + (s.xtcProbability > 0 ? 1 : 0) + (s.avoidWords.length > 0 ? 1 : 0)
 
   return (
     <aside className="flex w-80 shrink-0 flex-col overflow-y-auto border-l border-border bg-panel">
@@ -274,8 +388,25 @@ export function InferencePanel() {
         </Field>
       </Section>
 
+      <section className="border-b border-border px-4 py-4">
+        <Collapsible.Root open={varietyOpen} onOpenChange={setVarietyOpen}>
+          <Collapsible.Trigger className="flex w-full items-center gap-1 text-[11px] font-semibold tracking-wide text-faint uppercase hover:text-text">
+            <ChevronRight size={14} className={varietyOpen ? 'rotate-90 transition-transform' : 'transition-transform'} />
+            Repetition and variety
+            {varietyOn > 0 && <span className="font-normal normal-case"> · {varietyOn} on</span>}
+          </Collapsible.Trigger>
+          <Collapsible.Content className="mt-3 space-y-3">
+            <VarietyFields sampling={s} onChange={setS} />
+          </Collapsible.Content>
+        </Collapsible.Root>
+      </section>
+
       <Section title="Thinking">
         <ThinkingFields sampling={s} onChange={setS} />
+      </Section>
+
+      <Section title="Adapters">
+        <AdapterPanel />
       </Section>
 
       <ToolsSection />

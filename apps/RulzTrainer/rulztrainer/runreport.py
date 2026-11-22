@@ -55,6 +55,7 @@ SWITCHES = (  # settings worth naming on the summary when they are on
     ("region_weights", "region-weighted loss"), ("loss_watch", "loss watch"), ("per_image_lr", "per-image lr"),
     ("isolation", "LoRA Isolation"), ("finetune", "full fine-tune"), ("dora", "DoRA"),
     ("block_audit_every", "block audit"), ("resolution_shift", "resolution shift"),
+    ("weight_noise", "weight noise"),
 )
 
 
@@ -71,6 +72,7 @@ class Run:
     probes: list = field(default_factory=list)  # likeness.jsonl's records, oldest first
     images: dict = field(default_factory=dict)  # (racer, step, kind) -> {seed: Path}
     sweeps: list = field(default_factory=list)
+    race_sweeps: list = field(default_factory=list)
     watch: dict = field(default_factory=dict)
     audits: list = field(default_factory=list)  # block_audit.jsonl's rows, oldest first (blockaudit.py)
     maps: dict = field(default_factory=dict)  # {"pictures": [...], "rows": [...], "dir": Path}
@@ -156,6 +158,23 @@ def load(job_dir, root=None) -> Run:
     run.probes = _jsonl(job_dir / "likeness.jsonl") or list(run.status.get("probes") or [])
     run.images = probe_images(job_dir / "probes")
     run.sweeps = [r for r in _jsonl(job_dir / "region_sweep.jsonl") if isinstance(r, dict) and not r.get("first")]
+    configs = (run.status.get("region_sweep_race") or {}).get("configs") or []
+    races = []
+    for path in job_dir.glob("region_sweep.race*.jsonl"):
+        match = re.fullmatch(r"region_sweep\.race(\d+)\.jsonl", path.name)
+        if match:
+            races.append((int(match.group(1)), path))
+    for index, path in sorted(races):  # by the integer index: race10 after race2
+        info = next((c for c in configs if c.get("index") == index), {})
+        rows = [r for r in _jsonl(path) if isinstance(r, dict) and not r.get("first")]
+        if rows:
+            run.race_sweeps.append({"index": index, "config": info.get("config") or rows[-1].get("config") or
+                                    f"Configuration {index}", "dropped": info.get("dropped", False),
+                                    "failed": info.get("failed", False),
+                                    "finished": info.get("finished", False), "rows": rows})
+    if run.race_sweeps:
+        eligible = [c for c in run.race_sweeps if not c["dropped"] and not c["failed"]] or run.race_sweeps
+        run.sweeps = max(eligible, key=lambda c: max((r.get("step", 0) for r in c["rows"]), default=0))["rows"]
     run.watch = watch_data(job_dir)
     run.audits = [r for r in _jsonl(job_dir / "block_audit.jsonl") if isinstance(r, dict) and r.get("groups")]
     maps_dir = job_dir / "training_maps"
@@ -696,6 +715,9 @@ def loss_chart(ax, run: Run):
 
 
 def sweep_chart(ax, run: Run):
+    if run.race_sweeps:
+        race_sweep_chart(ax, run, "gap")
+        return
     gaps = sweep_gaps(run.sweeps)
     for region, color in SWEEP_COLORS.items():
         pts = gaps.get(region) or ([] if gaps else sweep_series(run.sweeps, region, "train"))
@@ -705,6 +727,22 @@ def sweep_chart(ax, run: Run):
         ax.axhline(0, color=FAINT, lw=0.7)
     ax.set_xlabel("training step", fontsize=7.5)
     ax.set_ylabel("train - held (points)" if gaps else "training error removed (%)", fontsize=7.5)
+    if ax.lines:
+        ax.legend(frameon=False, fontsize=7, loc="best", ncol=3)
+
+
+def race_sweep_chart(ax, run: Run, metric: str):
+    colors = list(SWEEP_COLORS.values())
+    for i, config in enumerate(run.race_sweeps):
+        points = (sweep_gaps(config["rows"]).get("subject", []) if metric == "gap" else
+                  sweep_series(config["rows"], "subject", "held"))
+        if points:
+            flags = [w for w in ("dropped", "finished", "failed") if config.get(w)]
+            label = str(config["config"]) + (f" ({', '.join(flags)})" if flags else "")
+            ax.plot(*zip(*points), color=FAINT if config["dropped"] else colors[i % len(colors)],
+                    marker="o", ms=3, lw=1.5, label=label)
+    ax.set_xlabel("configuration step", fontsize=7.5)
+    ax.set_ylabel("train - held (points)" if metric == "gap" else "held-out error removed (%)", fontsize=7.5)
     if ax.lines:
         ax.legend(frameon=False, fontsize=7, loc="best", ncol=3)
 
@@ -950,7 +988,7 @@ def summary(run: Run, path: Path, dpi: int = 150) -> Path:
                     page.text(sx + (j + 1) * (cw + 0.06) + cw / 2, drawn[1] + drawn[3] + 0.06, label, size=6.8,
                               color=MUTED, ha="center")
     elif run.sweeps:
-        x, y, w, h = page.card(8.1, y0, 7.3, 3.5, "What was learned: training minus held-out, per region (points)" if sweep_gaps(run.sweeps) else "What was learned: training photos, per region")
+        x, y, w, h = page.card(8.1, y0, 7.3, 3.5, "Race: subject gap by configuration (points)" if run.race_sweeps else ("What was learned: training minus held-out, per region (points)" if sweep_gaps(run.sweeps) else "What was learned: training photos, per region"))
         sweep_chart(page.axes(x + 0.45, y, w - 0.5, h - 0.4), run)
     else:
         x, y, w, h = page.card(8.1, y0, 7.3, 3.5, "Loss")
@@ -958,7 +996,7 @@ def summary(run: Run, path: Path, dpi: int = 150) -> Path:
     # loss (or sweeps) | result
     y1 = y0 + 3.8
     if run.maps and run.sweeps:
-        x, y, w, h = page.card(0.6, y1, 7.3, 2.6, "What was learned: training minus held-out, per region (points)" if sweep_gaps(run.sweeps) else "What was learned: training photos, per region")
+        x, y, w, h = page.card(0.6, y1, 7.3, 2.6, "Race: subject gap by configuration (points)" if run.race_sweeps else ("What was learned: training minus held-out, per region (points)" if sweep_gaps(run.sweeps) else "What was learned: training photos, per region"))
         sweep_chart(page.axes(x + 0.45, y, w - 0.5, h - 0.38), run)
     else:
         x, y, w, h = page.card(0.6, y1, 7.3, 2.6, "Loss")
@@ -1104,9 +1142,19 @@ def pdf(run: Run, path: Path) -> Path:
 
         # 4: sweeps
         if run.sweeps:
-            page = new("Region sweeps")
+            if run.race_sweeps:
+                page = new("Race region sweeps")
+                page.text(0.55, 0.85, "Subject = face, hair and skin. Each configuration uses its own steps.",
+                          size=8, color=MUTED)
+                for y0, metric, title in ((1.2, "gap", "Subject: training minus held-out (points)"),
+                                          (5.5, "held", "Subject: held-out error removed (%)")):
+                    x, y, w, h = page.card(0.5, y0, W - 1.0, 3.6, title)
+                    race_sweep_chart(page.axes(x + 0.55, y + 0.05, w - 0.7, h - 0.48), run, metric)
+                done(out, page)
+            selected = next((c for c in run.race_sweeps if c["rows"] is run.sweeps), None)
+            page = new("Region sweeps" + (f" - {selected['config']}" if selected else ""))
             page.text(0.55, 0.85, sweeps_text(run), size=7.5, color=MUTED)
-            x, y, w, h = page.card(0.5, 1.75, W - 1.0, 3.1, "Training minus held-out gap (points)" if sweep_gaps(run.sweeps) else "Training error removed (%)")
+            x, y, w, h = page.card(0.5, 1.75, W - 1.0, 3.1, "Subject gap by configuration (points)" if run.race_sweeps else ("Training minus held-out gap (points)" if sweep_gaps(run.sweeps) else "Training error removed (%)"))
             sweep_chart(page.axes(x + 0.55, y + 0.05, w - 0.7, h - 0.48), run)
             page.text(0.55, 5.05, "ERROR REMOVED (%): TRAINING SOLID, HELD-OUT DASHED", size=7.5, color=MUTED, weight="bold")
             for i, part in enumerate(SWEEP_COLORS):

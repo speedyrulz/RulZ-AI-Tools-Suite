@@ -62,8 +62,11 @@ export function cpuExpertBytes(model: ModelEntry, cfg: LoadConfig): number {
 /** Each GPU in use pays this much for its CUDA context and compute buffers. */
 const PER_GPU_BYTES = 600 * MiB
 
-/** Rough memory estimate for loading `model` with `cfg`. Errs on the high side. */
-export function estimateMemory(model: ModelEntry, cfg: LoadConfig, free: FreeMemory): MemoryEstimate {
+/**
+ * Rough memory estimate for loading `model` with `cfg`. Errs on the high side. `adapterBytes` is the
+ * size of the LoRA adapter files the load would add; they follow the model's weights onto the GPU.
+ */
+export function estimateMemory(model: ModelEntry, cfg: LoadConfig, free: FreeMemory, adapterBytes = 0): MemoryEstimate {
   const mmprojBytes = cfg.useMmproj && model.mmproj ? model.mmproj.sizeBytes : 0
   // A projector kept on the CPU (--no-mmproj-offload) costs RAM, not VRAM.
   const mmprojGpuBytes = cfg.mmprojOnCpu ? 0 : mmprojBytes
@@ -79,7 +82,7 @@ export function estimateMemory(model: ModelEntry, cfg: LoadConfig, free: FreeMem
     typeof cfg.gpuLayers === 'number' ? (layers ? Math.min(1, cfg.gpuLayers / (layers + 1)) : 1) : 1
   // The part that is divided between GPUs; the vision projector stays whole on the first one.
   // Experts kept on the CPU leave the GPU share; the rest of each layer still follows gpuLayers.
-  const splitBytes = (model.sizeBytes - expertCpuBytes + (kvBytes ?? 0)) * fraction + scaledOverhead + (cfg.draftGpu === 'cpu' ? 0 : draftBytes)
+  const splitBytes = (model.sizeBytes - expertCpuBytes + adapterBytes + (kvBytes ?? 0)) * fraction + scaledOverhead + (cfg.draftGpu === 'cpu' ? 0 : draftBytes)
 
   const gpus = free.gpus ?? []
   const shares = gpuShares(cfg, gpus)
@@ -95,7 +98,7 @@ export function estimateMemory(model: ModelEntry, cfg: LoadConfig, free: FreeMem
 
   const overheadBytes = PER_GPU_BYTES * Math.max(1, perGpu.length) + scaledOverhead
   const gpuBytes = perGpu.length ? perGpu.reduce((sum, g) => sum + g.bytes, 0) : splitBytes + PER_GPU_BYTES + mmprojGpuBytes
-  const totalBytes = weightsBytes + (kvBytes ?? 0) + overheadBytes
+  const totalBytes = weightsBytes + adapterBytes + (kvBytes ?? 0) + overheadBytes
   const freeVramBytes = perGpu.length ? perGpu.reduce((sum, g) => sum + g.freeBytes, 0) : free.vramBytes
 
   let verdict: MemoryEstimate['verdict'] = 'unknown'
@@ -120,6 +123,7 @@ export function estimateMemory(model: ModelEntry, cfg: LoadConfig, free: FreeMem
     freeRamBytes: free.ramBytes,
     verdict,
     perGpu,
-    cpuExpertBytes: expertCpuBytes
+    cpuExpertBytes: expertCpuBytes,
+    adapterBytes
   }
 }

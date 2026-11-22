@@ -6,6 +6,7 @@ import type { LoadConfig, ModelEntry } from '@shared/types'
 import { toast } from 'sonner'
 import { errorMessage, invoke } from '../../lib/api'
 import { cn, formatBytes } from '../../lib/format'
+import { WBENCH_BUSY, wbenchRunning } from '../../lib/wbenchFlag'
 import { useApp } from '../../stores/app'
 import { useModels } from '../../stores/models'
 import { Badge, Button, Switch, Tooltip } from '../ui'
@@ -180,6 +181,7 @@ function LoadPanel({ model, onDone }: { model: ModelEntry; onDone: () => void })
   if (!config) return <div className="flex-1" />
 
   const doLoad = async (): Promise<void> => {
+    if (wbenchRunning()) return void toast(WBENCH_BUSY)
     if (remember) {
       // Not remembering them is no reason not to load.
       await invoke('models:setDefaults', model.id, config).catch((e) => toast.error(`Could not save the settings: ${errorMessage(e)}`))

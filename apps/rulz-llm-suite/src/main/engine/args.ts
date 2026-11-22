@@ -15,10 +15,12 @@ export interface ServerArgsInput {
   config: LoadConfig
   port: number
   alias: string
+  /** LoRA adapters to load, in llama-server id order. */
+  adapters?: { path: string }[]
 }
 
 /** Turns a LoadConfig into llama-server arguments. Unset values are left to llama.cpp (incl. --fit). */
-export function buildServerArgs({ model, config: c, port, alias }: ServerArgsInput): string[] {
+export function buildServerArgs({ model, config: c, port, alias, adapters = [] }: ServerArgsInput): string[] {
   const args = [
     '--model', model.path,
     '--host', '127.0.0.1',
@@ -72,6 +74,8 @@ export function buildServerArgs({ model, config: c, port, alias }: ServerArgsInp
     if (kv.draftK !== 'f16') args.push('--spec-draft-type-k', kv.draftK)
     if (kv.draftV !== 'f16') args.push('--spec-draft-type-v', kv.draftV)
   }
+  // Plain --lora (scale 1): --lora-scaled splits on ':' and breaks on Windows paths. Scales are set after loading.
+  for (const a of adapters) args.push('--lora', a.path)
   if (c.seed !== null) args.push('--seed', String(c.seed))
   if (c.chatTemplateFile.trim()) args.push('--chat-template-file', c.chatTemplateFile.trim())
   const s = c.sampling
@@ -81,6 +85,18 @@ export function buildServerArgs({ model, config: c, port, alias }: ServerArgsInp
   if (s.minP !== null) args.push('--min-p', String(s.minP))
   if (s.repeatPenalty !== null) args.push('--repeat-penalty', String(s.repeatPenalty))
   if (s.presencePenalty !== null) args.push('--presence-penalty', String(s.presencePenalty))
+  if (s.dryMultiplier !== null) args.push('--dry-multiplier', String(s.dryMultiplier))
+  if (s.dryBase !== null) args.push('--dry-base', String(s.dryBase))
+  if (s.dryAllowedLength !== null) args.push('--dry-allowed-length', String(s.dryAllowedLength))
+  // -1 (the whole context) is llama-server's own default, and some builds refuse it on the command line
+  // ("invalid dry-penalty-last-n = -1"), so it is left out; requests still send -1, which the server accepts.
+  if (s.dryPenaltyLastN !== null && s.dryPenaltyLastN >= 0) args.push('--dry-penalty-last-n', String(s.dryPenaltyLastN))
+  // Breakers only matter while DRY is on, and a model with a multiplier of 0 or unset leaves them alone.
+  if (s.drySequenceBreakers !== null && s.dryMultiplier !== null && s.dryMultiplier > 0) {
+    for (const b of s.drySequenceBreakers) args.push('--dry-sequence-breaker', b)
+  }
+  if (s.xtcProbability !== null) args.push('--xtc-probability', String(s.xtcProbability))
+  if (s.xtcThreshold !== null) args.push('--xtc-threshold', String(s.xtcThreshold))
   if (c.extraArgs.trim()) args.push(...splitArgs(c.extraArgs))
   return args
 }

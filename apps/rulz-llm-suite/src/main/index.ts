@@ -9,9 +9,10 @@ import { ConversationStore } from './chat/conversations'
 import { EngineService } from './engine/engine'
 import { HardwareMonitor } from './engine/hardware'
 import { McpManager } from './mcp/manager'
-import { InstanceManager } from './engine/instances'
+import { InstanceManager, resolveAdapters } from './engine/instances'
 import { broadcast, handle } from './ipc'
 import { estimateMemory, type FreeMemory } from './models/estimate'
+import { AdapterConverter } from './models/convert'
 import { ModelLibrary } from './models/library'
 import { ApiServer } from './server/apiServer'
 import { parseLoadConfig } from './settings/schema'
@@ -19,10 +20,21 @@ import { SettingsStore } from './settings/store'
 import { FILE_TOOLS_SERVER } from './files/fileTools'
 import { API_RE_PREFIX, CLONE_FILE_TOOLS, extractAnswer } from '@shared/re'
 import { BatchStore } from './re/batches'
+import { BenchmarkRunner } from './bench/runner'
+import { BenchStore } from './bench/store'
+import { WritingBenchStore } from './wbench/store'
 import { gradePractice, listPractice, preparePractice } from './re/practice'
 import { buildOverview, MAX_OVERVIEW_SESSIONS } from './re/overview'
 import { findPython, type PythonCommand } from './re/python'
 import { exportDataset, TraceStore, type ExportSession } from './re/traces'
+import { registerNovelIpc } from './novel/ipc'
+import { NovelStore, runAs, WINDOW_OWNER } from './novel/store'
+import { createPhoneService, type PhoneService } from './phone/host'
+import { settingsForRenderer, settingsPatchFromRenderer } from './phone/settings'
+import { ChatEventTap, chatAdapter, chatBusyReason, modelsAdapter, storeAdapter } from './writing/adapters'
+import { WritingEvents, writingHandlers } from './writing/ipc'
+import { WritingRuns } from './writing/runs'
+import { PHONE_WRITING_CHANNELS } from '@shared/phone'
 
 const MiB = 1024 * 1024
 const isDev = !app.isPackaged && !!process.env.ELECTRON_RENDERER_URL
@@ -34,6 +46,7 @@ if (!isPrimaryInstance) app.quit()
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
+let phone!: PhoneService
 /** Set once the app is really exiting, so close-to-tray lets the window close. */
 let quitting = false
 
@@ -137,7 +150,8 @@ async function main(): Promise<void> {
   const library = new ModelLibrary(
     join(userData, 'gguf-cache.json'),
     () => settings.get().modelsDir,
-    (models) => broadcast('models:changed', models)
+    (models) => broadcast('models:changed', models),
+    (adapters) => broadcast('adapters:changed', adapters)
   )
 
   const freeMemory = (cfg: LoadConfig): FreeMemory => {
@@ -161,7 +175,11 @@ async function main(): Promise<void> {
     return { vramBytes: vram, ramBytes: snap.ramTotalBytes - snap.ramUsedBytes, gpus: all }
   }
   const draftFor = (model: ModelEntry, cfg: LoadConfig) => resolveDraft(model, cfg, library.list())
-  const estimate = (model: ModelEntry, cfg: LoadConfig) => estimateMemory({ ...model, draft: draftFor(model, cfg) }, cfg, freeMemory(cfg))
+  // Adapter files the load would pass to llama-server (same filter as the load itself), for the estimate.
+  const adapterBytes = (cfg: LoadConfig): number =>
+    resolveAdapters(cfg.adapters ?? [], (id) => library.getAdapter(id)).loaded.reduce((sum, a) => sum + (library.getAdapter(a.id)?.sizeBytes ?? 0), 0)
+  const estimate = (model: ModelEntry, cfg: LoadConfig) =>
+    estimateMemory({ ...model, draft: draftFor(model, cfg) }, cfg, freeMemory(cfg), adapterBytes(cfg))
 
   const instances = new InstanceManager({
     engine,
@@ -170,12 +188,21 @@ async function main(): Promise<void> {
     getDefaults: (id) => settings.getModelDefaults(id).config,
     unloadPreviousOnLoad: () => settings.get().unloadPreviousOnLoad,
     estimate,
+    getAdapter: (id) => library.getAdapter(id),
     pidFile: join(userData, 'running-pids.json'),
     onChange: (list) => broadcast('instances:changed', list),
     onError: (e) => broadcast('instances:error', e),
     onGone: (id) => chat.forget(id)
   })
   await instances.cleanupOrphans()
+
+  const converter = new AdapterConverter({
+    resolveExe: () => engine.resolveExe(),
+    getModelsDir: () => settings.get().modelsDir,
+    findPython,
+    onLog: (line) => broadcast('adapters:convertLog', line),
+    onConverted: () => void library.scan()
+  })
 
   const mcpConfigPath = join(userData, 'mcp.json')
   // The RE calculator (a sandboxed Python MCP server from the RE training kit) runs when Python 3 is installed.
@@ -197,10 +224,23 @@ async function main(): Promise<void> {
   const practiceRoot = join(userData, 're-practice')
   const batches = new BatchStore(join(userData, 're-batches.json'))
   const apiRe = (id: string): string => API_RE_PREFIX + id
+  const benchStore = new BenchStore(join(userData, 'benchmarks.json'))
+  const writingBenchStore = new WritingBenchStore(userData)
+  const bench = new BenchmarkRunner({
+    instances,
+    getModel: (id) => library.get(id),
+    estimate,
+    draftFor,
+    sampleGpus: async () => (await hardware.refresh()).gpus,
+    engineVersion: async () => (await engine.getInfo()).version,
+    onChange: (run) => broadcast('bench:changed', run),
+    store: benchStore
+  })
 
   const apiServer = new ApiServer({
     instances,
     getModels: () => library.list(),
+    getAdapters: () => library.listAdapters(),
     getSettings: () => settings.get().apiServer,
     getLoadDefaults: (id) => settings.getModelDefaults(id),
     setLoadDefaults: (id, config) => settings.setModelDefaults(id, config),
@@ -247,7 +287,12 @@ async function main(): Promise<void> {
     }
   })
 
-  const chat = new ChatService(instances, (e) => broadcast('chat:event', e), (req) => {
+  // Phone writing runs wait for their own requests' events through this tap.
+  const chatTap = new ChatEventTap()
+  const chat = new ChatService(instances, (e) => {
+    broadcast('chat:event', e)
+    chatTap.push(e)
+  }, (req) => {
     const disabled = new Set(settings.get().disabledTools)
     // The write/read file tools exist only in clone sessions.
     if (!req.files) for (const n of CLONE_FILE_TOOLS) disabled.add(n)
@@ -266,10 +311,13 @@ async function main(): Promise<void> {
 
   // ---- IPC ----
   handle('app:info', () => ({ version: app.getVersion(), userData, platform: process.platform }))
-  handle('settings:get', () => settings.get())
+  // The pairing code never goes to the window (only phone:pairing carries it); phone access is switched by phone:*.
+  handle('settings:get', () => settingsForRenderer(settings.get()))
   handle('settings:update', async (patch) => {
     const before = settings.get()
-    const next = await settings.update(patch)
+    const saved = await settings.update(settingsPatchFromRenderer(patch))
+    const next = settingsForRenderer(saved)
+    if (saved.phonePort !== before.phonePort) void phone.access.start()
     if (next.modelsDir !== before.modelsDir) void library.scan()
     if (next.enginePath !== before.enginePath) void engine.getInfo(true)
     if (next.theme !== before.theme) mainWindow?.setBackgroundColor(windowBackground(next.theme))
@@ -311,6 +359,18 @@ async function main(): Promise<void> {
     await settings.setModelDefaults(modelId, null)
     await library.scan()
   })
+  handle('adapters:list', () => library.listAdapters())
+  handle('adapters:trash', async (adapterId) => {
+    const adapter = library.getAdapter(adapterId)
+    if (!adapter) throw new Error('Adapter not found')
+    // A loaded adapter is held open by llama-server; its model has to be ejected first.
+    if (instances.list().some((i) => i.adapters.some((a) => a.id === adapterId))) throw new Error('Eject the model using this adapter before deleting it.')
+    await shell.trashItem(adapter.path)
+    await library.scan()
+  })
+  handle('adapters:converterStatus', () => converter.status())
+  handle('adapters:convert', (req) => converter.convert(req))
+  handle('adapters:cancelConvert', () => converter.cancel())
   handle('models:getDefaults', (modelId) => settings.getModelDefaults(modelId))
   handle('models:setDefaults', (modelId, config) => settings.setModelDefaults(modelId, config))
   handle('models:estimate', (modelId, config) => {
@@ -352,6 +412,7 @@ async function main(): Promise<void> {
   handle('chat:abort', (id) => chat.abort(id))
   handle('chat:releaseTurn', (id) => chat.releaseTurn(id))
   handle('chat:countTokens', (modelId, messages, tools) => chat.countTokens(modelId, messages, tools))
+  handle('chat:countText', (modelId, text) => chat.countText(modelId, text))
 
   handle('conversations:list', () => conversations.list())
   handle('conversations:get', (id) => conversations.get(id))
@@ -437,6 +498,84 @@ async function main(): Promise<void> {
   handle('re:saveBatch', (run) => batches.save(run))
   handle('re:deleteBatch', (id) => batches.delete(id))
 
+  handle('bench:list', () => benchStore.list())
+  handle('wbench:list', () => writingBenchStore.list())
+  handle('wbench:save', (run) => writingBenchStore.save(run))
+  handle('wbench:delete', (id) => writingBenchStore.delete(id))
+  handle('wbench:prompts', () => writingBenchStore.prompts())
+  handle('wbench:savePrompts', (prompts) => writingBenchStore.savePrompts(prompts))
+  handle('bench:start', (req) => bench.start(req))
+  handle('bench:stop', () => bench.stop())
+  handle('bench:delete', (id) => benchStore.delete(id))
+
+  // ---- Writing mode ----
+  const novel = new NovelStore({
+    rootSetting: () => settings.get().writingRoot,
+    documents: () => app.getPath('documents'),
+    trashItem: (path) => shell.trashItem(path),
+    // The window already has the result of its own requests; everything else (a phone's save, an outside edit)
+    // goes to the window and to the phones.
+    emit: (change, origin) => {
+      if (origin !== WINDOW_OWNER) broadcast('novel:changed', change)
+      phone.emit('novel:changed', change)
+    },
+    appVersion: () => app.getVersion()
+  })
+  // The close-time handshake (data safety rule 4): the renderer saves or journals its dirty buffers and answers.
+  let flushTimeoutMs = 3000
+  let flushing: Promise<void> | null = null
+  let flushDone: (() => void) | null = null
+  let novelFlushed = false
+  const flushNovel = (): Promise<void> => {
+    if (!novel.hasOpenProject()) return Promise.resolve()
+    flushing ??= new Promise<void>((resolve) => {
+      const finish = (): void => {
+        clearTimeout(timer)
+        flushDone = null
+        // A cancelled shutdown must not leave a settled promise that skips the next flush.
+        flushing = null
+        resolve()
+      }
+      const timer = setTimeout(finish, flushTimeoutMs)
+      flushDone = finish
+      broadcast('novel:flush', undefined)
+    })
+    return flushing
+  }
+  registerNovelIpc(novel, () => flushDone?.())
+
+  // ---- Phone access (RulZ Writer for Android) ----
+  // `phone` is read by the novel store's emit above, which only runs after startup.
+  phone = createPhoneService({
+    settings,
+    novel,
+    version: app.getVersion(),
+    emitStatus: (status) => broadcast('phone:changed', status)
+  })
+  handle('phone:status', () => phone.access.status())
+  handle('phone:setEnabled', (enabled) => phone.access.setEnabled(enabled === true))
+  handle('phone:pairing', () => phone.access.pairing())
+  handle('phone:newToken', () => phone.access.newToken())
+  handle('phone:disconnect', (clientId) => phone.access.disconnect(clientId))
+  // Writing runs: AI actions started from the phone, run here (docs/phone-access-design.md, "Writing runs").
+  const writingEvents = new WritingEvents()
+  const writingRuns = new WritingRuns({
+    store: storeAdapter(novel),
+    chat: chatAdapter(chat, chatTap),
+    models: modelsAdapter(library, instances),
+    busyReason: chatBusyReason(chat, () => bench.isRunning()),
+    // A phone may use a project's jobs while it holds the project open (a reconnected phone has a new id).
+    holds: (owner, folder) => novel.ownersOf(folder).includes(owner),
+    emit: writingEvents.emit
+  })
+  writingEvents.subscribe((job) => phone.emit('writing:job', job))
+  const writing = writingHandlers(writingRuns)
+  for (const channel of PHONE_WRITING_CHANNELS) {
+    // runAs: a state patch from Apply is announced as the phone's change, so the window hears about it.
+    phone.handlers.register(channel, ((owner: string, ...args: unknown[]) => runAs(owner, () => writing[channel](owner, ...args))) as never)
+  }
+  void phone.access.start()
+
   handle('presets:list', () => settings.listPresets())
   handle('presets:save', (p) => settings.savePreset(p))
   handle('presets:delete', (id) => settings.deletePreset(id))
@@ -449,14 +588,28 @@ async function main(): Promise<void> {
     mainWindow?.hide()
   })
   mainWindow.on('close', (e) => {
-    if (quitting || !settings.get().closeToTray) return
+    if (!quitting && settings.get().closeToTray) {
+      e.preventDefault()
+      ensureTray()
+      mainWindow?.hide()
+      return
+    }
+    // Really closing: let the Writing page save or journal its open text first, then close for real.
+    if (novelFlushed || !novel.hasOpenProject()) return
     e.preventDefault()
-    ensureTray()
-    mainWindow?.hide()
+    void flushNovel().finally(() => {
+      novelFlushed = true
+      mainWindow?.close()
+    })
   })
-  // Windows logoff/shutdown must not be blocked by close-to-tray.
+  // Windows logoff/shutdown must not be blocked by close-to-tray. The system gives little time, so the
+  // Writing page is asked to flush at once and waits at most a second. The real backstop is the journal:
+  // the Writing page writes every dirty buffer through novel:journal about 300 ms after each edit, so at
+  // most that much typing can be missing after a forced shutdown, and it is offered back on the next open.
   mainWindow.on('session-end', () => {
     quitting = true
+    flushTimeoutMs = 1000
+    void flushNovel()
   })
   mainWindow.on('show', destroyTray)
   mainWindow.on('focus', () => hardware.poke())
@@ -467,11 +620,25 @@ async function main(): Promise<void> {
 
   app.on('second-instance', showMainWindow)
   app.on('window-all-closed', () => app.quit())
-  app.on('before-quit', () => {
+  app.on('before-quit', (e) => {
     quitting = true
+    // app.quit() fires this before the window's close event. Hold the quit until the Writing page has
+    // saved or journalled its text, then quit again; the second pass tears everything down.
+    if (!novelFlushed && novel.hasOpenProject()) {
+      e.preventDefault()
+      void flushNovel().finally(() => {
+        novelFlushed = true
+        app.quit()
+      })
+      return
+    }
     destroyTray()
+    novel.dispose()
+    void phone.access.dispose()
     hardware.stop()
     library.dispose()
+    // The benchmark first: it sets its stop flag and starts unloading before the servers are killed.
+    void bench.stop()
     instances.killAllSync()
     void mcp.dispose()
     void apiServer.stop()

@@ -3,54 +3,88 @@ import QRCode from 'qrcode'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { create } from 'zustand'
-import type { PhoneApp } from '@shared/types'
+import type { PhoneApp, PhoneAppId } from '@shared/types'
 import { invoke } from '../lib/api'
 import { cn, formatBytes, formatDate } from '../lib/format'
 import { useApps } from '../stores/apps'
 import { Button, Dialog } from './ui'
 
-// A QR code with the direct download link of the newest RulZ Coding Agent for Android APK. The link comes from the
-// newest release on GitHub, so a new release changes the code: it is looked up when the launcher starts, every
-// 30 minutes, and whenever the app list is checked again (Check for updates).
+// QR codes with the direct download links of the newest RulZ Android companion APKs (RulZ Coding Agent for Android and
+// RulZ Writer for Android). Each link comes from the newest release on GitHub, so a new release changes the code: it is
+// looked up when the launcher starts, every 30 minutes, and whenever the app list is checked again (Check for updates).
 
 const RECHECK_MS = 30 * 60_000
 /** The main process keeps GitHub's answer for a minute, so asking again sooner changes nothing. */
 const MIN_GAP_MS = 60_000
 const SAVED = 'rulz.phoneApp'
 
-interface PhoneState {
+const PHONE_META: Record<PhoneAppId, { name: string; buttonLabel: string; description: string }> = {
+  'coding-agent-android': {
+    name: 'RulZ Coding Agent for Android',
+    buttonLabel: 'Coding Agent for Android',
+    description: 'Follow and steer RulZ Coding Agent from your phone.'
+  },
+  'writer-android': {
+    name: 'RulZ Writer for Android',
+    buttonLabel: 'Writer for Android',
+    description: "Write in RulZ LLM Suite's Writing mode from your phone."
+  }
+}
+
+const PHONE_IDS = Object.keys(PHONE_META) as PhoneAppId[]
+
+interface PhoneEntry {
   phone: PhoneApp | null
   /** Set when GitHub couldn't be asked and nothing is known yet. */
   error: string | null
+}
+
+interface PhoneStore {
+  byId: Record<PhoneAppId, PhoneEntry>
   check: () => Promise<void>
 }
 
-function saved(): PhoneApp | null {
+function savedKey(id: PhoneAppId): string {
+  return id === 'coding-agent-android' ? SAVED : `${SAVED}.${id}`
+}
+
+function saved(id: PhoneAppId): PhoneApp | null {
   try {
-    return JSON.parse(localStorage.getItem(SAVED) ?? 'null') as PhoneApp | null
+    return JSON.parse(localStorage.getItem(savedKey(id)) ?? 'null') as PhoneApp | null
   } catch {
     return null
   }
 }
 
-const usePhone = create<PhoneState>((set, get) => ({
+const usePhone = create<PhoneStore>((set, get) => ({
   // The last known release shows straight away, also when the launcher starts offline.
-  phone: saved(),
-  error: null,
+  byId: {
+    'coding-agent-android': { phone: saved('coding-agent-android'), error: null },
+    'writer-android': { phone: saved('writer-android'), error: null }
+  },
   check: async () => {
-    try {
-      const phone = await invoke('phone:latest')
-      if (phone) {
+    await Promise.all(
+      PHONE_IDS.map(async (id) => {
         try {
-          localStorage.setItem(SAVED, JSON.stringify(phone))
-        } catch {
-          // Only a convenience.
+          const phone = await invoke('phone:latest', id)
+          if (phone) {
+            try {
+              localStorage.setItem(savedKey(id), JSON.stringify(phone))
+            } catch {
+              // Only a convenience.
+            }
+            set((s) => ({ byId: { ...s.byId, [id]: { phone, error: null } } }))
+          } else if (!get().byId[id].phone) {
+            set((s) => ({ byId: { ...s.byId, [id]: { phone: null, error: 'No Android release found yet.' } } }))
+          }
+        } catch (e) {
+          if (!get().byId[id].phone) {
+            const msg = e instanceof Error ? e.message : String(e)
+            set((s) => ({ byId: { ...s.byId, [id]: { phone: null, error: msg } } }))
+          }
         }
-        set({ phone, error: null })
-      } else if (!get().phone) set({ error: 'No Android release found yet.' })
-    } catch (e) {
-      if (!get().phone) set({ error: e instanceof Error ? e.message : String(e) })
-    }
+      })
+    )
   }
 }))
 
@@ -81,10 +115,10 @@ function startChecks(): void {
   })
 }
 
-/** The newest Android release, as last looked up. */
-function usePhoneApp(): PhoneState {
+/** The newest Android release for `appId`, as last looked up. */
+function usePhoneApp(appId: PhoneAppId): PhoneEntry {
   useEffect(startChecks, [])
-  return usePhone()
+  return usePhone((s) => s.byId[appId])
 }
 
 function useQrSvg(text: string | undefined): string | null {
@@ -103,9 +137,16 @@ function useQrSvg(text: string | undefined): string | null {
 }
 
 /** The QR code with its explanation: `card` for the side panel of an app's page, `dialog` (larger) for the home page's dialog. */
-export function PhoneAppQr({ variant }: { variant: 'card' | 'dialog' }) {
-  const { phone, error } = usePhoneApp()
+export function PhoneAppQr({
+  appId = 'coding-agent-android',
+  variant
+}: {
+  appId?: PhoneAppId
+  variant: 'card' | 'dialog'
+}) {
+  const { phone, error } = usePhoneApp(appId)
   const svg = useQrSvg(phone?.url)
+  const meta = PHONE_META[appId]
 
   const copy = (): void => {
     if (!phone) return
@@ -135,7 +176,7 @@ export function PhoneAppQr({ variant }: { variant: 'card' | 'dialog' }) {
   const text = (
     <div className="min-w-0">
       <div className="flex items-center gap-1.5 text-[13px] font-semibold text-text">
-        <Smartphone className="size-3.5 text-accent-text" /> RulZ Coding Agent for Android
+        <Smartphone className="size-3.5 text-accent-text" /> {meta.name}
       </div>
       {phone ? (
         <>
@@ -181,23 +222,24 @@ export function PhoneAppQr({ variant }: { variant: 'card' | 'dialog' }) {
   )
 }
 
-/** The home page's button for the Android app: opens the QR code in a dialog, large enough to scan from a chair. */
-export function PhoneAppButton() {
-  const { phone } = usePhoneApp()
+/** The home page's button for an Android companion app: opens the QR code in a dialog, large enough to scan from a chair. */
+export function PhoneAppButton({ appId = 'coding-agent-android' }: { appId?: PhoneAppId }) {
+  const { phone } = usePhoneApp(appId)
   const [open, setOpen] = useState(false)
+  const meta = PHONE_META[appId]
   return (
     <>
       <button
         type="button"
         onClick={() => setOpen(true)}
-        title="Show the QR code that downloads RulZ Coding Agent for Android"
+        title={`Show the QR code that downloads ${meta.name}`}
         className="flex shrink-0 cursor-pointer items-center gap-3 rounded-xl border border-subtle-border bg-sunken py-2 pr-4 pl-2.5 text-left backdrop-blur transition-colors hover:border-accent/60"
       >
         <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-white text-black">
           <QrCode className="size-6" />
         </span>
         <span className="min-w-0">
-          <span className="block text-[13px] font-semibold text-text">Coding Agent for Android</span>
+          <span className="block text-[13px] font-semibold text-text">{meta.buttonLabel}</span>
           <span className="block text-xs text-faint">{phone ? `${phone.version} · Show QR code` : 'Show QR code'}</span>
         </span>
       </button>
@@ -206,11 +248,11 @@ export function PhoneAppButton() {
           open
           onOpenChange={(o) => !o && setOpen(false)}
           title="Get the Android app"
-          description="Follow and steer RulZ Coding Agent from your phone."
+          description={meta.description}
           className="w-[560px]"
           footer={<Button onClick={() => setOpen(false)}>Done</Button>}
         >
-          <PhoneAppQr variant="dialog" />
+          <PhoneAppQr appId={appId} variant="dialog" />
         </Dialog>
       )}
     </>

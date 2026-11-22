@@ -26,11 +26,12 @@ from . import history
 from . import lora as lora_mod
 from . import profiling
 from . import race as race_mod
+from . import weightnoise
 from .ema import LoraEMA
 from . import quant as Q
 from .config import AUTOMAGIC, KEEL, KEEL_FB, KEEL_ON_A3, MUON_EDGE_TARGETS, TrainConfig, alpha_lr_note, effective_optimizer, trained_optimizer, \
     alpha_lr_factor, _saved_alpha_cfg, \
-    keel_band_weights, keel_consensus_mode
+    keel_band_weights, keel_consensus_mode, weight_noise_reason
 from .config import side_to_mp
 from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, dropout_text_path,
                       ideogram4_caption_warning, items_for_side, load_batch,
@@ -768,7 +769,7 @@ class Trainer(RaceParallelMixin):
         cap_cpu_threads()
         cfg.save(self.job_dir / "config.yaml")
         self.status = Status(self.job_dir / "status.json")
-        self.run_id = history.new_run_id(cfg.job_name)  # this run's file in output/_history (Previous Runs tab)
+        self.run_id = history.new_run_id(cfg.job_name)  # this run's file in the history folder (Previous Runs tab)
         self.status.update(run_id=self.run_id)  # whose files the job folder holds (Previous Runs' downloads)
         self.run_started = time.time()
         self.stop_file = self.job_dir / "STOP"
@@ -788,8 +789,11 @@ class Trainer(RaceParallelMixin):
         self.kept: dict[int, list[int]] = {}  # id(model copy) -> blocks keeping their activations
         self.ema = None  # LoraEMA: the weight average saves, samples and probes use (lora_ema)
         self.resumed_ema = None  # its state from a resumed training state
+        self.resumed_alignment = None
+        self.resumed_id_loss = None
         self.resumed_controller = None  # the likeness controller's, from a resumed training state
         self.crash_save = None  # while training: saves the LoRA as it stands (run() calls it after an error)
+        self._wn_logged: set[int] = set()  # configurations weight_noise has said its piece about
         self.bad_steps = 0  # steps in a row left out for non-finite gradients (a parallel race: per configuration)
         self.skipped_steps = 0  # in the whole run
         self.vaes: dict[str, object] = {}  # VAE copies on the other GPUs (sampling / caching side jobs)
@@ -808,7 +812,7 @@ class Trainer(RaceParallelMixin):
         self.item_face_frac: dict[str, float] = {}
         self.loss_watch = None
         self.region_watch = None  # regionwatch.RegionWatch when region_watch is on
-        self.sweep = None  # regionsweep.RegionSweep when sweeps or held-out pictures are on
+        self.sweep = None  # regionsweep.RegionSweep when sweeps or held-out pictures are on (a race: the training one's)
         self.block_audit = None  # blockaudit.BlockAudit when block_audit_every is on
         self.holdout_items: list = []  # the photos kept out of training (holdout_images)
         self.holdout_stop = False  # the held-out subject score went holdout_patience sweeps without a new best
@@ -1599,6 +1603,9 @@ class Trainer(RaceParallelMixin):
             self.controller = self._make_controller(items)
             self._resume_body_strangers(step)
         self.id_loss = self._make_id_loss()
+        if self.id_loss is not None and self.resumed_id_loss is not None:
+            self.id_loss.rng.setstate(self.resumed_id_loss["rng"])
+            self.id_loss.n_eligible = self.resumed_id_loss["n_eligible"]
         if self.face_scorer is not None and self.face_detector is not None and self.face_detector is not self.face_scorer:
             # face_model antelopev2: buffalo_l's detector served the dataset analysis, the curriculum and the identity
             # loss's references. Not held for the whole run beside the R100 scorer (both on GPU 0 with face_provider
@@ -1916,11 +1923,33 @@ class Trainer(RaceParallelMixin):
             params, optimizer, scheduler = [], None, None
             params, optimizer, scheduler = self._finetune_rotate(cfg, at_step, carry)
 
+        phase = None
+        saved_lrs = None
+        scheduler_done = False
+
         def crash_save():
             """After an error: the LoRA as it stands, with a training state to go on from where the run can have one."""
             if compute_done > 0:
                 resumable = self.ft is None and self.race is None
-                self._emergency_save(injected, params, step, (optimizer, scheduler, gen, rng) if resumable else None)
+                # the step's commit window: inside optimizer.step() the weights and moments may be half-updated, so
+                # no state; once it returned, the step is finished here (lr restored, scheduler on) and saved as done
+                if phase == "in_step" and resumable:
+                    resumable = False
+                    states = sorted(p for p in self.job_dir.glob("state_*") if (p / "train_state.pt").is_file())
+                    log.warning("Optimizer step was interrupted; %s", f"resume from the last periodic state {states[-1]}"
+                                if states else "there is no periodic state to resume from")
+                if phase == "stepped" and resumable:
+                    if saved_lrs is not None:
+                        for g, lr0 in zip(optimizer.param_groups, saved_lrs):
+                            g["lr"] = lr0
+                    if not scheduler_done:
+                        try:
+                            scheduler.step()
+                        except Exception:  # noqa: BLE001
+                            log.exception("Could not advance the scheduler; no resumable crash state saved")
+                            resumable = False
+                self._emergency_save(injected, params, step, (optimizer, scheduler, gen, rng) if resumable else None,
+                                     state_step=step + 1 if phase == "stepped" else step)
 
         def probe_safely(job):
             return self._side_job(f"The probe at step {step}", job, False)
@@ -1945,6 +1974,7 @@ class Trainer(RaceParallelMixin):
             step_images = 0
             step_lr_mult = 1.0
             step_id: list[tuple] = []
+            id_loss_snapshot = (self.id_loss.rng.getstate(), self.id_loss.n_eligible) if self.id_loss else None
             if self.id_loss is not None:
                 self.id_ref = self.id_loss.pick_ref()  # one reference face per step
             retries0 = self._alloc_retries() if any(self.kept.values()) else None
@@ -2020,6 +2050,9 @@ class Trainer(RaceParallelMixin):
                 if not self._shrink_kept_blocks():
                     raise
                 retry_jobs = (per_rep, step_images)  # the same images, not the next ones from the iterator
+                if id_loss_snapshot is not None:
+                    self.id_loss.rng.setstate(id_loss_snapshot[0])
+                    self.id_loss.n_eligible = id_loss_snapshot[1]
                 free_cuda()
                 continue
             except RuntimeError as e:
@@ -2042,6 +2075,9 @@ class Trainer(RaceParallelMixin):
                     self.dp_quiet_steps = 0
                     self.sample_graphs = set()
                 retry_jobs = (per_rep, step_images)
+                if id_loss_snapshot is not None:
+                    self.id_loss.rng.setstate(id_loss_snapshot[0])
+                    self.id_loss.n_eligible = id_loss_snapshot[1]
                 free_cuda()
                 continue
             if self.dp is not None:  # (Keel scales each replica's sum by the step's band and counts its vote)
@@ -2051,6 +2087,9 @@ class Trainer(RaceParallelMixin):
             if getattr(optimizer, "gather", None) is not None:  # Keel: the micro-batch sums join the replicas' on
                 optimizer.gather()                              # p.grad for the clip
             grad_norm = step_grad_norm(params, cfg.clip_norm)
+            wn_stats = None  # weight_noise's norms, for the lines of this step that are logged
+            saved_lrs = None
+            scheduler_done = False
             if bad_gradients(params, grad_norm):  # the step counts, but nothing of it reaches the LoRA
                 if getattr(optimizer, "disarm", None) is not None:  # Keel: no step() to end its accumulation
                     optimizer.disarm()                              # (zero_grad arms it again)
@@ -2058,16 +2097,19 @@ class Trainer(RaceParallelMixin):
                 self._skip_bad_step(step + 1, self.bad_steps)
                 if not math.isfinite(accum_loss):  # (the chart and the running average stay readable)
                     accum_loss = losses[-1] if losses else 0.0
+                phase = "stepped"
             else:
                 self.bad_steps = 0
                 step_lr_mult *= self._clean_lr_scale(  # clean_share: half the lr on the lower-share epochs
                     cfg, step, self.batcher, cfg.batch_size * cfg.gradient_accumulation * n_dev)
                 step_lr_mult = limit_step_mult(cfg, step_lr_mult)
+                phase = "in_step"  # (from the lr scaling on: a state saved before the restore would keep the scaled lr)
                 if step_lr_mult != 1.0:  # true per-image lr: scale this step only (the scheduler restores it)
                     saved_lrs = [g["lr"] for g in optimizer.param_groups]
                     for g in optimizer.param_groups:
                         g["lr"] = g["lr"] * step_lr_mult
                 optimizer.step()
+                phase = "stepped"
                 if self.ft is not None and cfg.finetune_anchor > 0:  # bounded drift: toward the original weights
                     self.ft.pull_to_base(current_lr(optimizer, scheduler) * cfg.finetune_anchor)
                 if self.id_align_opt is not None and (cfg.id_align or cfg.body_align):
@@ -2075,14 +2117,19 @@ class Trainer(RaceParallelMixin):
                 if step_lr_mult != 1.0:
                     for g, lr0 in zip(optimizer.param_groups, saved_lrs):
                         g["lr"] = lr0
+                    saved_lrs = None
                 if self.ema is not None:
                     self.ema.update(step_images)
+                if cfg.weight_noise > 0:  # after the average, on the primary LoRA; sync_weights below copies it on
+                    wn_stats = self._apply_weight_noise(cfg, injected, step, (step + 1) % 5 == 0 or compute_done == 0)
             scheduler.step()
+            scheduler_done = True
             if retries0 is not None:
                 self._ease_memory_pressure(retries0)
             if self.dp is not None:
                 self.dp.sync_weights()
             step += 1
+            phase = None
             compute_done += 1
             if self.act_offload and compute_done in (1, 3):  # step 1 may include the checkpoint calibration
                 log.info("Activation offload: %.2f GB of block inputs sent to RAM in step %d",
@@ -2160,6 +2207,8 @@ class Trainer(RaceParallelMixin):
                     lr_s = f"{lr_now:.2e} (working {brake['lr_working']:.2e}, {100 * brake['braked_share']:.0f}% braked)"
                 else:
                     lr_s = f"{lr_now:.2e}"
+                if wn_stats is not None:
+                    id_s += (f" | weight norm {wn_stats['weight_norm']:.4g}, noise norm {wn_stats['noise_norm']:.3g}")
                 log.info("%sstep %d/%d loss %.4f avg %.4f lr %s grad %s %.1fs/it (last %d steps %.2fs each)%s", who,
                          step, cfg.steps, accum_loss, avg, lr_s, format_grad_norm(grad_norm, cfg.clip_norm),
                          elapsed / done_steps, len(last), sum(last) / len(last), id_s)
@@ -2167,6 +2216,8 @@ class Trainer(RaceParallelMixin):
                     if str(d).startswith("cuda")} if torch.cuda.is_available() else {}
             if self.race is not None:  # progress over every configuration's steps; the race table separately
                 id_extra = {**id_extra, "race": self._race_status(), "race_step": step}
+            if wn_stats is not None:  # (the last logged step's, kept on the status until the next one)
+                id_extra = {**id_extra, **wn_stats}
             if brake is not None:  # Automagic 4 / Keel: lr is the raw group rate, these are what the weights moved by
                 id_extra = {**id_extra, "lr_working": brake["lr_working"], "braked_share": brake["braked_share"],
                             "mean_brake": brake["mean_balance"], "brake_reference": brake["reference"]}
@@ -2244,6 +2295,7 @@ class Trainer(RaceParallelMixin):
                     stop = False
                     self.race.active.state.update(step=step, losses=losses, id_losses=id_losses)
                     bind(self._race_after_probe())
+                    self._race_first_sweep(model, injected, step)  # (a configuration's first turn: its step 0 sweep)
             if stop and not last:
                 log.info("Likeness controller: no improvement for %d probes%s, stopping at step %d",
                          cfg.step_up_stop_patience if cfg.resolution_step_up else cfg.likeness_patience,
@@ -2255,6 +2307,7 @@ class Trainer(RaceParallelMixin):
                 model.train()
             if self._race_running() and self._race_manual_drops(step, losses, id_losses):
                 bind(self.race.active)  # the configuration that trained was dropped: the next one takes over
+                self._race_first_sweep(model, injected, step)
                 model.train()
             state_every = cfg.save_state_every or cfg.save_every  # (after the probe: the state holds its result)
             if (cfg.save_state and state_every > 0 and step % state_every == 0 and step < cfg.steps
@@ -2552,6 +2605,20 @@ class Trainer(RaceParallelMixin):
         state_dir.mkdir(exist_ok=True)
         lora_mod.save_lora(injected, state_dir / "lora.safetensors", dtype=torch.float32, fmt=self.arch.lora_format)
         controller = getattr(self, "controller", None)
+        align_state = align_opt_state = align_layer = id_loss_state = None
+        try:
+            if getattr(self, "id_aligner", None) is not None:
+                align_state = self.id_aligner.state_dict()
+                align_opt_state = self.id_align_opt.state_dict() if self.id_align_opt is not None else None
+                align_layer = self.align_layer
+        except Exception:  # noqa: BLE001
+            log.exception("Could not save alignment state; it will start fresh on resume")
+            align_state = align_opt_state = align_layer = None
+        try:
+            if getattr(self, "id_loss", None) is not None:
+                id_loss_state = {"rng": self.id_loss.rng.getstate(), "n_eligible": self.id_loss.n_eligible}
+        except Exception:  # noqa: BLE001
+            log.exception("Could not save identity loss state; it will start fresh on resume")
         with atomic.writing(state_dir / "train_state.pt") as tmp:  # written last: a folder that has it is complete
             torch.save({
                 "step": step, "res_stage": self.res_stage, "optimizer": optimizer.state_dict(),
@@ -2563,6 +2630,8 @@ class Trainer(RaceParallelMixin):
                 "ema": self.ema.state_dict() if self.ema is not None else None,  # lora.safetensors: the raw weights
                 "dp_counts": self.balancer.counts if self.balancer is not None else None,
                 "controller": controller.resume_state() if controller is not None else None,
+                "id_aligner": align_state, "id_align_opt": align_opt_state, "align_layer": align_layer,
+                "id_loss": id_loss_state,
             }, tmp)
         log.info("Saved training state %s", state_dir)
         self.status.data["states"].append(str(state_dir))
@@ -2583,6 +2652,28 @@ class Trainer(RaceParallelMixin):
         self.status.write()
         return state_dir
 
+    def _apply_weight_noise(self, cfg, injected, step: int, want_stats: bool) -> dict | None:
+        """weight_noise after one optimizer step of the configuration `cfg` (never called for a skipped bad step):
+        noise on its LoRA / LoKr tensors, the norms when `want_stats`. The first call per configuration says in the
+        log whether the noise is on or why it is not (a fine-tune, OFT). Seeded from (the configuration's seed, step)
+        on a generator of its own, so no other random stream moves."""
+        first = id(cfg) not in self._wn_logged
+        self._wn_logged.add(id(cfg))
+        why = weight_noise_reason(cfg)
+        if first:
+            if why:
+                log.warning("weight_noise %g does nothing here: %s", cfg.weight_noise, why)
+            else:
+                log.info("Weight noise on: sigma %g (%s)%s, added to the adapter weights after every optimizer step. "
+                         "Ported from ai-toolkit-perceptual; not yet measured in RulZ AI Trainer",
+                         cfg.weight_noise, cfg.weight_noise_mode, ", norm bound to its pre-noise value"
+                         if cfg.weight_noise_bound_norm else "")
+        if why or self.ft is not None:
+            return None
+        return weightnoise.apply_weight_noise(
+            weightnoise.adapter_tensors(injected), cfg.weight_noise, cfg.weight_noise_mode,
+            cfg.weight_noise_bound_norm, cfg.seed, step, stats=want_stats)
+
     def _skip_bad_step(self, step: int, streak: int) -> None:
         """A step with non-finite gradients is left out (streak: how many in a row, this one included). Many in a row
         end the run (its LoRA still healthy, which run() saves), as they do a race's winner training on alone; while
@@ -2594,15 +2685,16 @@ class Trainer(RaceParallelMixin):
             raise RuntimeError(f"The gradients were not finite for {streak} steps in a row: the run is diverging. "
                                "Try a lower learning rate or another quantized backward")
 
-    def _emergency_save(self, injected, params, step: int, state: tuple | None = None) -> None:
+    def _emergency_save(self, injected, params, step: int, state: tuple | None = None,
+                        state_step: int | None = None) -> None:
         """The LoRA as it stands in a normal checkpoint file, and a training state to resume from when `state`
-        (optimizer, scheduler, generator, rng) is given."""
+        (optimizer, scheduler, generator, rng) is given, numbered state_step (default: step)."""
         if not all(bool(torch.isfinite(p).all()) for p in params):
             log.error("Nothing saved after the error: the LoRA holds non-finite weights at step %d", step)
             return
         log.info("Saved the LoRA of step %d after the error: %s", step, self.save(injected, step))
         if state is not None:
-            saved = self.save_state(step, injected, *state)
+            saved = self.save_state(step if state_step is None else state_step, injected, *state)
             if saved is not None:
                 log.info("To continue, resume from %s", saved)
 
@@ -2719,6 +2811,9 @@ class Trainer(RaceParallelMixin):
                 pass
         self.res_stage = int(st.get("res_stage", 0))
         self.resumed_ema = st.get("ema")  # None in states saved without an average (or by an older version)
+        self.resumed_alignment = (st.get("id_aligner"), st.get("id_align_opt"), st.get("align_layer"),
+                                  st.get("config") or {}) if st.get("id_aligner") is not None else None
+        self.resumed_id_loss = st.get("id_loss")
         self.resumed_dp_counts = st.get("dp_counts")
         self.resumed_controller = st.get("controller")
         return int(st["step"])
@@ -3024,6 +3119,7 @@ class Trainer(RaceParallelMixin):
                      "%.0f%%) for %d of its own probes in a row is dropped; the last one never is",
                      100 * sched.drift, sched.drift_probes)
         self.race = race_mod.RaceRun(variants, sched, wrappers, base, est)
+        self._race_sweep_plan(items)
         if self.race_parallel:  # every configuration trains on its own parameters (race_parallel.py)
             self.race.active = variants[0]
         else:
@@ -3049,6 +3145,7 @@ class Trainer(RaceParallelMixin):
         self.curriculum_w, self.ts_logit_shift = st["curriculum_w"], st["ts_logit_shift"]
         self.ts_strata = st["ts_strata"]
         self.all_items, self.injected = st["items"], st["injected"]
+        self.sweep = st.get("sweep")  # this configuration's own region sweep (None: off)
         self.id_aligner, self.id_align_opt = st.get("id_aligner"), st.get("id_align_opt")
         for vals in self.align_values.values():  # the log reports this configuration's values only
             vals.clear()
@@ -3090,6 +3187,7 @@ class Trainer(RaceParallelMixin):
         st["id_w"] = idloss_weight(cfg.id_loss_weight)
         st["id_aligner"], st["id_align_opt"] = self._make_id_aligner(cfg)
         self.id_aligner, self.id_align_opt = st["id_aligner"], st["id_align_opt"]
+        self._race_make_sweep(v)  # (its own region sweep, when they are on: measured from its own step 0)
         v.started = True
 
     def _race_park(self, v) -> None:
@@ -3292,7 +3390,8 @@ class Trainer(RaceParallelMixin):
         if str(path) not in self.status.data["saved"]:
             self.status.data["saved"].append(str(path))
         v.alive = False
-        keep = {k: v.state[k] for k in ("step", "controller") if k in v.state}
+        self._race_sweep_publish(v, **({"finished": True} if finished else {"dropped": True}))
+        keep = {k: v.state[k] for k in ("step", "controller", "sweep", "sweep_epoch") if k in v.state}
         v.state.clear()
         v.state.update(keep)
         v.down, v.up = {}, {}
@@ -3706,12 +3805,11 @@ class Trainer(RaceParallelMixin):
 
     def _split_holdout(self, cfg, items) -> list:
         """holdout_images: the photos kept out of training leave `items` (with everything made from them) and wait in
-        self.holdout_items for the sweeps. Raises ValueError when the set is too small for it."""
+        self.holdout_items for the sweeps. Raises ValueError when the set is too small for it. In a race this runs
+        once over the shared items, before each configuration's items are made from them: the same photos are held out
+        of every configuration."""
         self.holdout_items = []
         if cfg.holdout_images <= 0:
-            return items
-        if self.race_rows is not None:
-            log.info("Held-out pictures are off for a race (its configurations take turns on one model)")
             return items
         if self.region_watch_off:
             log.warning("Held-out pictures are off: no parts maps (%s); every photo trains", self.region_watch_off)
@@ -3727,19 +3825,47 @@ class Trainer(RaceParallelMixin):
 
     def _setup_sweep(self, cfg, step: int) -> None:
         """The region sweep over the training pictures and the held-out ones, or nothing when it is off or cannot
-        run."""
-        from safetensors.torch import load_file
-
-        from .regions import load_region_map
-
+        run. In a race every configuration owns one (_race_make_sweep, built when it starts); this takes the one of
+        the configuration that trains now."""
         self.sweep = None
         if not cfg.wants_region_sweep():
             return
         if self.race_rows is not None:
-            log.info("Region sweeps are off for a race (its configurations take turns on one model)")
+            active = getattr(getattr(self, "race", None), "active", None)
+            self.sweep = None if active is None else active.state.get("sweep")
             return
         if self.region_watch_off or self.batcher is None:
             return
+        resume = bool(cfg.resume_state) and step > 0
+        if not resume:  # (a plain run's sweep is fresh: no race configuration's files from an earlier run)
+            self._clear_sweep_files(plain=False)
+        self.sweep = self._make_sweep(cfg, resume=resume)
+
+    def _sweep_pictures(self, train_items, cfg) -> tuple[list, list]:
+        """(the training pictures, the held-out ones) a sweep reads: every photo once (not its crops or flips), the
+        held-out ones of the training pictures' resolution when there are some."""
+        def unique(pictures) -> list:
+            seen, out = set(), []
+            for it in pictures:
+                if regionsweep.whole_photo(it) and str(it.key) not in seen:
+                    seen.add(str(it.key))
+                    out.append(it)
+            return out
+
+        train = [] if cfg.region_sweep_pictures < 0 else unique(train_items)
+        side = train[0].side if train else (train_items[0].side if train_items else 0)
+        held = unique([it for it in self.holdout_items if it.side == side] or self.holdout_items)
+        return train, held
+
+    def _make_sweep(self, cfg, resume: bool = False, tag: str = "", extra: dict | None = None, label: str = "",
+                    copies: int | None = None):
+        """A RegionSweep over the batcher's training pictures and the held-out ones, or None when it cannot run
+        (logged). tag / extra / label: a race configuration's own sweep (its files, its row keys, its name in the log);
+        copies: see _maps_epoch_steps."""
+        from safetensors.torch import load_file
+
+        from .regions import load_region_map
+
         try:
             def probe(it, held: bool) -> dict:
                 rm = load_region_map(it.region_path) if it.region_path is not None else None
@@ -3753,35 +3879,25 @@ class Trainer(RaceParallelMixin):
                 return {"key": str(it.key), "held": held, "parts": None if rm is None else rm.parts, "load": load,
                         "latent_path": str(it.latent_path), "text_path": str(it.text_path)}
 
-            def unique(pictures) -> list:
-                seen, out = set(), []
-                for it in pictures:
-                    if regionsweep.whole_photo(it) and str(it.key) not in seen:
-                        seen.add(str(it.key))
-                        out.append(it)
-                return out
-
-            train = [] if cfg.region_sweep_pictures < 0 else unique(self.batcher.items)
-            side = train[0].side if train else (self.batcher.items[0].side if self.batcher.items else 0)
-            held = unique([it for it in self.holdout_items if it.side == side] or self.holdout_items)
+            train, held = self._sweep_pictures(self.batcher.items, cfg)
             probes = [probe(it, False) for it in train] + [probe(it, True) for it in held]
-            every = cfg.sweep_every_epochs() * self._maps_epoch_steps()[0]
-            self.sweep = regionsweep.RegionSweep(self.job_dir, probes, every, rotate=max(0, cfg.region_sweep_pictures),
-                                                 resume=bool(cfg.resume_state) and step > 0,
-                                                 patience=cfg.holdout_patience)
-            missing = len(probes) - len(self.sweep.probes)
-            log.info("Region sweep on: %d training pictures%s and %d held-out, every %d steps at %d fixed noise "
-                     "levels%s%s", len([p for p in self.sweep.probes if not p["held"]]),
+            every = cfg.sweep_every_epochs() * self._maps_epoch_steps(copies)[0]
+            # (a race's sweeps are report only: no patience, so none of them ever asks to stop)
+            sweep = regionsweep.RegionSweep(self.job_dir, probes, every, rotate=max(0, cfg.region_sweep_pictures),
+                                            resume=resume, patience=0 if tag else cfg.holdout_patience, tag=tag,
+                                            extra=extra)
+            missing = len(probes) - len(sweep.probes)
+            log.info("Region sweep on%s: %d training pictures%s and %d held-out, every %d steps%s at %d fixed noise "
+                     "levels%s%s", f" for {label}" if label else "", len([p for p in sweep.probes if not p["held"]]),
                      f" ({cfg.region_sweep_pictures} in turn per sweep)" if cfg.region_sweep_pictures > 0 else "",
-                     len([p for p in self.sweep.probes if p["held"]]), every, len(regionsweep.SIGMAS),
-                     f"; {missing} without a parts map left out" if missing else "",
-                     "; no saved state for this resume, so it counts from here" if self.sweep.late else "")
-            if not self.sweep.probes:
-                self.sweep = None
+                     len([p for p in sweep.probes if p["held"]]), every, " of its own" if label else "",
+                     len(regionsweep.SIGMAS), f"; {missing} without a parts map left out" if missing else "",
+                     "; no saved state for this resume, so it counts from here" if sweep.late else "")
+            return sweep if sweep.probes else None
         except Exception as e:  # noqa: BLE001
-            self.sweep = None
-            log.warning("Region sweeps could not start; training goes on without them (%s: %s)", type(e).__name__,
-                        str(e)[:200])
+            log.warning("Region sweeps%s could not start; training goes on without them (%s: %s)",
+                        f" of {label}" if label else "", type(e).__name__, str(e)[:200])
+            return None
 
     def _setup_block_audit(self, cfg, model, injected, step: int) -> None:
         """The block audit (blockaudit.py), or nothing when it is off or cannot run. Its groups are cut from the
@@ -3888,6 +4004,10 @@ class Trainer(RaceParallelMixin):
         sweep_async it is queued on the second GPU instead and followed when its readings are in."""
         if self.sweep is None:
             return
+        if self.sweep.tag and self.race is not None and self.race.active is not None:
+            # a race configuration's own sweep, read while it is swapped in: in-process, report only (see _race_sweep_run)
+            self._race_sweep_run(self.race.active, model, step, averaged=self._averaged)
+            return
         if self._analysis_start("sweep", step, injected, model=model):
             return
         self.status.update(stage=f"region sweep (step {step})")
@@ -3901,6 +4021,123 @@ class Trainer(RaceParallelMixin):
         if row is None:
             return
         self._sweep_after(row, injected, step)
+
+    # ------------------------------------------------------------ region sweeps in a race (report only)
+    def _race_sweep_plan(self, items) -> None:
+        """At the start of a race: what its region sweeps cost, and what stays off. Every configuration gets its own
+        sweep (_race_make_sweep) over the same pictures and the same held-out photos."""
+        cfg = self.race_base
+        if not cfg.wants_region_sweep():
+            return
+        self._clear_sweep_files(plain=True)  # (a race starts fresh: nothing of an earlier run in this folder)
+        if self.region_watch_off:
+            log.warning("Region sweeps are off: no parts maps (%s)", self.region_watch_off)
+            return
+        train, held = self._sweep_pictures(items, cfg)
+        n = len(self.race.variants)
+        every = cfg.sweep_every_epochs()
+        log.info("Region sweeps in the race: %d configurations, each with its own sweep of %d training pictures%s and "
+                 "%d held-out, every %d epoch%s of its own steps (%d forward passes per sweep of each), measured "
+                 "against its own first sweep. Report only: they never stop or steer the race, and the winner's "
+                 "goes on in its own region_sweep.race<i> files after the others leave", n, len(train),
+                 f" ({cfg.region_sweep_pictures} in turn per sweep)" if cfg.region_sweep_pictures > 0 else "",
+                 len(held), every, "" if every == 1 else "s",
+                 ((min(len(train), cfg.region_sweep_pictures) if cfg.region_sweep_pictures > 0 else len(train))
+                  + len(held)) * len(regionsweep.SIGMAS))
+        if cfg.holdout_patience > 0 or cfg.holdout_track_best:
+            log.info("In a race holdout_patience and holdout_track_best are off (the sweeps only report), and they "
+                     "stay off for the winner that trains on alone")
+        if cfg.sweep_async:
+            log.info("Race sweeps run on the training GPU (sweep_async is not used in a race)")
+
+    def _race_first_sweep(self, model, injected, step: int) -> None:
+        """A configuration that has just taken over (turn-taking race): its first sweep, at its own step 0, before it
+        trains. Later sweeps follow the main loop's schedule on its own step count."""
+        if self.sweep is not None and self.sweep.due(step):
+            self._side_job(f"Region sweep at step {step}", lambda: self._run_sweep(model, injected, step))
+            model.train()
+
+    def _race_make_sweep(self, v) -> None:
+        """A race configuration's own sweep, built when it starts (its image queue is there): its first sweep is at its
+        own step 0, then every sweep_every_epochs of its own epochs. Region watch and steering stay off in a race, so
+        nothing reads it but the Monitor and the report."""
+        cfg = v.cfg
+        if not cfg.wants_region_sweep() or self.region_watch_off or self.batcher is None:
+            return
+        copies = 1 if getattr(self, "race_parallel", False) else None
+        sweep = self._make_sweep(cfg, tag=f"race{v.idx}", extra={"config": v.name, "index": v.idx}, label=v.name,
+                                 copies=copies)
+        v.state["sweep"] = sweep
+        v.state["sweep_epoch"] = self._maps_epoch_steps(copies)[0]
+
+    def _race_sweep_run(self, v, model, step: int, averaged=None) -> None:
+        """One sweep of race configuration v, at its own step: the configuration's weights are in the model's wrappers
+        (swapped in, with `averaged` its weight average; or loaded by _rp_load_render). A failure turns off this
+        configuration's sweeps only."""
+        sweep = v.state.get("sweep")
+        if sweep is None:
+            return
+        try:
+            self.status.update(stage=f"region sweep of {v.name} (step {step})")
+            self._free_for_rendering()
+            try:
+                row = sweep.run(step, step / max(1, v.state.get("sweep_epoch", 1)), model,
+                                norm_device(self.replicas[0][2]), averaged=averaged)
+            finally:
+                free_cuda()
+                self.status.update(stage="training")
+            if row is None:
+                self._race_sweep_publish(v)  # (the entry says the sweeps are off now)
+                return
+            log.info("Region sweep [%s] at step %d: %s", v.name, step, regionsweep.describe(row))
+            self._race_sweep_publish(v, row)
+        except Exception as e:  # noqa: BLE001
+            self._race_sweep_failed(v, step, e)
+
+    def _race_sweep_failed(self, v, step: int, e) -> None:
+        """Anything going wrong around a race sweep (reading, loading weights, publishing): this configuration's
+        sweeps are off for the rest of the run, with the usual warning; training goes on."""
+        sweep = v.state.get("sweep")
+        if sweep is None:
+            return
+        if not sweep.failed:
+            sweep.fail(step, e)
+        with contextlib.suppress(Exception):
+            self._race_sweep_publish(v)
+
+    def _clear_sweep_files(self, plain: bool, race: bool = True) -> None:
+        """Delete old sweep files from the job folder (a reused folder must not show an earlier run's sweeps as this
+        run's): the race configurations' region_sweep.race*.json / .jsonl, and with plain the plain pair too. Only
+        this folder, never on a resume."""
+        names = []
+        if race:
+            names += [p.name for pat in ("region_sweep.race*.json", "region_sweep.race*.jsonl")
+                      for p in self.job_dir.glob(pat)]
+        if plain:
+            names += list(regionsweep.file_names())
+        for name in names:
+            with contextlib.suppress(OSError):
+                (self.job_dir / name).unlink()
+
+    def _race_sweep_publish(self, v, row: dict | None = None, **flags) -> None:
+        """status.json region_sweep_race: {"configs": [{"index", "config", the latest sweep's row, "line", "history"}]},
+        one entry per configuration that has swept, updated after each of its sweeps (the others kept). A dropped
+        configuration keeps its entry, marked "dropped" (or "finished" when it trained all its steps)."""
+        sweep = v.state.get("sweep")
+        if sweep is None:
+            return
+        entries = self.__dict__.setdefault("race_sweep_entries", {})
+        entry = entries.get(v.idx, {"index": v.idx, "config": v.name})
+        if row is not None:
+            entry.update(row)
+            entry.update(line=regionsweep.describe(row),
+                         history=[{k: r[k] for k in ("step", "train", "held")} for r in sweep.history[-200:]])
+        if sweep.failed:
+            entry["failed"] = True
+        entry.update(flags)
+        if len(entry) > 2:
+            entries[v.idx] = entry
+        self.status.update(region_sweep_race={"configs": [entries[i] for i in sorted(entries)]})
 
     def _sweep_after(self, row: dict, injected, step: int, state: dict | None = None, where: str = "",
                      split: dict | None = None) -> None:
@@ -4316,6 +4553,8 @@ class Trainer(RaceParallelMixin):
         rows = [r[1] for r in self.race_rows] if self.race_rows is not None else [cfg]
         attn, align = any(c.attn_localize for c in rows), any(c.id_align or c.body_align for c in rows)
         if not (attn or align):
+            if self.race_rows is None and getattr(self, "resumed_alignment", None) is not None:
+                log.info("Alignment is off; saved projectors start fresh")
             if (any((effective_optimizer(c)[0] in KEEL and c.keel_face_gain > 0) or c.wants_parts() for c in rows)
                     and self.ft is None and not self.race_parallel):
                 for m, _, _ in self.replicas:
@@ -4360,6 +4599,7 @@ class Trainer(RaceParallelMixin):
         if align:
             if self.race_rows is None:
                 self.id_aligner, self.id_align_opt = self._make_id_aligner(cfg)
+                self._restore_alignment(cfg)
             dim = A.model_dim(model)
             for on, what, weight, out in ((any(c.id_align for c in rows), "face tokens", cfg.id_align_weight,
                                            "photo's ArcFace embedding", ),
@@ -4367,7 +4607,33 @@ class Trainer(RaceParallelMixin):
                                            cfg.body_align_weight, "photo's DINOv2 body-window embedding")):
                 if on:
                     log.info("Alignment: weight %g, the %s after block %d mapped onto each %s by a projector that is "
-                             "not saved", weight, what, self.align_layer, out)
+                             "saved in training states but not in the LoRA", weight, what, self.align_layer, out)
+
+    def _restore_alignment(self, cfg) -> None:
+        if getattr(self, "resumed_alignment", None) is None:
+            return
+        state, opt_state, layer, saved_cfg = self.resumed_alignment
+        if self.id_aligner is None:
+            log.info("Alignment is off; saved projectors start fresh")
+            return
+        if layer != self.align_layer or any(saved_cfg.get(k) != getattr(cfg, k)
+                                            for k in ("face_model", "id_align", "body_align")):
+            log.info("Alignment settings changed; projectors start fresh")
+            return
+        import copy
+
+        fresh = copy.deepcopy(self.id_aligner.state_dict())
+        try:
+            self.id_aligner.load_state_dict(state)
+        except Exception:  # noqa: BLE001
+            self.id_aligner.load_state_dict(fresh)
+            log.exception("Could not restore alignment projectors; starting fresh")
+            return
+        if opt_state is not None and self.id_align_opt is not None:
+            try:
+                self.id_align_opt.load_state_dict(opt_state)
+            except Exception:  # noqa: BLE001
+                log.exception("Could not restore alignment optimizer; starting it fresh")
 
     def _make_id_aligner(self, cfg):
         """(projectors, their AdamW) for face / body alignment, or (None, None)."""
@@ -4418,10 +4684,11 @@ class Trainer(RaceParallelMixin):
         return sorted(t for t in triggers if t)
 
     # ------------------------------------------------------------ training maps (trainmaps.py)
-    def _maps_epoch_steps(self) -> tuple[int, int]:
-        """(steps in one epoch, images per step) for the batcher training reads now."""
+    def _maps_epoch_steps(self, copies: int | None = None) -> tuple[int, int]:
+        """(steps in one epoch, images per step) for the batcher training reads now. copies: the model copies one step
+        trains over (None: all of them; a parallel race's configuration trains on one copy's batches)."""
         cfg = self.cfg
-        per_step = max(1, cfg.batch_size * cfg.gradient_accumulation * len(self.replicas))
+        per_step = max(1, cfg.batch_size * cfg.gradient_accumulation * (len(self.replicas) if copies is None else copies))
         images = 0
         if self.batcher is not None:  # (the capped epoch: samples; with its regularisation pictures, which wait
             sizes = getattr(self.batcher, "bucket_sizes", None)  # outside the buckets)
@@ -6525,7 +6792,7 @@ class Trainer(RaceParallelMixin):
             self.status.update(gold_gap_warning=step)
 
     def _save_history(self, state: str = "running") -> None:
-        """Keep this run's likeness scores in output/_history (never fails a run)."""
+        """Keep this run's likeness scores in the history folder (never fails a run)."""
         try:
             history.save_run(self.cfg, self.run_id, self.run_started, self.status.data, state)
         except Exception as e:  # noqa: BLE001

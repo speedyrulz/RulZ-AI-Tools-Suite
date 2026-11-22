@@ -176,7 +176,7 @@ def test_open_folder_makes_the_folder_and_asks_the_system_to_show_it(tmp_path, m
 def test_region_data_reads_a_downloaded_job_folder(tmp_path):
     import json
 
-    assert webui.region_data(tmp_path) == {"rw": None, "ba": None, "rs": None}
+    assert webui.region_data(tmp_path) == {"rw": None, "ba": None, "rs": None, "race": []}
     assert webui.region_signature(tmp_path) == ()
     status = {"region_watch": {"epoch": 2, "step": 40, "frozen": False, "baseline": 3, "baseline_min": 8, "rows": []},
               "block_audit": {"step": 40, "line": "audit line"}}

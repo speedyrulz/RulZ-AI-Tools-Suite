@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import random
 import re
 from dataclasses import dataclass, field
@@ -515,9 +516,9 @@ def load_clip_fit(path: Path, frames: int, w: int, h: int, cfg: TrainConfig, fps
     """A clip's frames resized and centre-cropped to its bucket: [3, F, H, W] in [-1, 1]."""
     from . import clips
 
-    pics = clips.read_frames(path, frames, fps, cfg.train_video_mode)
-    arr = np.stack([np.asarray(ImageOps.fit(to_rgb(im), (w, h), method=Image.Resampling.LANCZOS,
-                                            centering=(0.5, 0.5))) for im in pics])  # [F, H, W, 3]
+    # each frame is fitted as it is decoded: holding every picked frame at source size first cost GBs on 4K clips
+    arr = np.stack(clips.read_frames(path, frames, fps, cfg.train_video_mode, transform=lambda im: np.asarray(
+        ImageOps.fit(to_rgb(im), (w, h), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)))))  # [F, H, W, 3]
     return torch.from_numpy(arr).permute(3, 0, 1, 2).float() / 127.5 - 1.0
 
 
@@ -635,7 +636,10 @@ def cache_latents(items: list[Item], cfg: TrainConfig, vae, progress=None, vaes:
     def prepare(it):
         if it.frames > 1:  # a video clip: [3, F, H, W]
             return load_clip_fit(it.image, it.frames, it.width, it.height, cfg, arch.video_fps)
-        img = load_image_fit(it.image, it.width, it.height, it.src_box)
+        try:
+            img = load_image_fit(it.image, it.width, it.height, it.src_box)
+        except OSError as e:  # a truncated file passes the header scan and fails here, inside a worker thread
+            raise OSError(f"The picture {it.image} cannot be read ({e}): remove or replace it, then start again") from e
         return torch.from_numpy(np.asarray(img).copy()).permute(2, 0, 1).float() / 127.5 - 1.0
 
     def enc(v, t):
@@ -650,8 +654,9 @@ def cache_latents(items: list[Item], cfg: TrainConfig, vae, progress=None, vaes:
         v = worker[0]
         it = todo[i]
         t = prefetch.get(i)
-        lat = enc(v, t)
-        save_safetensors({"latent": lat.contiguous()}, it.latent_path)
+        if cfg.recache or not it.latent_path.exists():  # (picked for its missing flip latent alone: keep the plain one)
+            lat = enc(v, t)
+            save_safetensors({"latent": lat.contiguous()}, it.latent_path)
         if it.latent_flip_path:
             lat_f = enc(v, t.flip(-1))
             save_safetensors({"latent": lat_f.contiguous()}, it.latent_flip_path)
@@ -810,7 +815,26 @@ def text_cache_path(cfg: TrainConfig, prompt: str) -> Path:
         from .pan2.loading import text_length  # reused (the key names the length encoded)
 
         length = text_length(length)
+    if arch == "sdxl":
+        tag += _sdxl_text_tag(cfg)
     return cfg.resolved_cache_dir() / "text" / f"{_hash(prompt)}_{length}{tag}.safetensors"
+
+
+def _sdxl_text_tag(cfg: TrainConfig) -> str:
+    """SDXL's CLIP-L / CLIP-G come from the checkpoint file in files mode, and fine-tunes (Pony, Illustrious) ship their
+    own: a short tag from the file's path and size, so a cache made with one checkpoint is not reused with another
+    (fine-tunes of one architecture can match in size, so the size alone does not tell them apart). "" for a Hugging
+    Face folder (named by model_path, one text encoder per repo as before)."""
+    from .sdxl.loading import _checkpoint
+
+    path = _checkpoint(cfg, "text_encoder_file")
+    if not path:
+        return ""
+    try:
+        size = Path(path).stat().st_size
+    except OSError:
+        size = 0
+    return "_" + _hash(f"{os.path.normcase(os.path.abspath(path))}|{size}")[:6]
 
 
 # ---------------------------------------------------------------- batching

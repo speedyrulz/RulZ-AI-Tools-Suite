@@ -1,8 +1,9 @@
 import { CircleAlert, CircleCheck, FolderOpen, FolderSearch, RefreshCw } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
 import type { LoadConfig, SamplingParams } from '@shared/types'
-import { ThinkingFields } from '../components/chat/InferencePanel'
+import { ThinkingFields, VarietyFields } from '../components/chat/InferencePanel'
 import { LoadSettingsForm } from '../components/models/LoadSettingsForm'
+import { PhoneAccessSection } from '../components/settings/PhoneAccessSection'
 import { Button, Field, Input, Kbd, Select, Switch, Textarea } from '../components/ui'
 import { SHORTCUTS } from '../hooks/useShortcuts'
 import { invoke } from '../lib/api'
@@ -120,6 +121,34 @@ export function SettingsPage() {
           </Field>
         </Card>
 
+        <Card title="Writing" description="Folder that holds your novel projects, one folder per project. They are plain Markdown files you can also edit in other apps.">
+          <Field label="Projects folder" hint="Default: Documents\RulZ Novels">
+            <div className="flex gap-2">
+              <PathInput value={settings.writingRoot} placeholder="Default: Documents\RulZ Novels" onCommit={(v) => void update({ writingRoot: v })} />
+              <Button
+                onClick={async () => {
+                  const dir = await invoke('dialog:pickFolder', { title: 'Choose the folder for your novel projects', defaultPath: settings.writingRoot || undefined })
+                  if (dir) await update({ writingRoot: dir })
+                }}
+              >
+                <FolderSearch size={14} /> Change…
+              </Button>
+              <Button
+                onClick={async () => {
+                  const root = await invoke('novel:root')
+                  await invoke('shell:openPath', root)
+                }}
+              >
+                <FolderOpen size={14} /> Open folder
+              </Button>
+            </div>
+          </Field>
+        </Card>
+
+        <Card title="Phone access" description="Write in the Writing mode from the RulZ Writer app on your Android phone. The computer does the work; the phone is the screen.">
+          <PhoneAccessSection />
+        </Card>
+
         <Card title="Default load settings" description="Used for models without their own saved settings.">
           {loadDefaults && <LoadSettingsForm model={null} config={loadDefaults} onChange={setLoadDefaults} />}
           <div className="flex justify-end">
@@ -144,6 +173,13 @@ export function SettingsPage() {
             <NumberSetting label="Min P" value={settings.defaultSampling.minP} step={0.01} onChange={(v) => void update({ defaultSampling: withSampling(settings.defaultSampling, 'minP', v) })} />
             <NumberSetting label="Repeat penalty" value={settings.defaultSampling.repeatPenalty} step={0.01} onChange={(v) => void update({ defaultSampling: withSampling(settings.defaultSampling, 'repeatPenalty', v) })} />
           </div>
+          <VarietyFields
+            sampling={{ ...settings.defaultSampling, ...thinking }}
+            onChange={(key, v) => {
+              setThinking((t) => ({ ...t, [key]: v }))
+              void update({ defaultSampling: { ...useApp.getState().settings!.defaultSampling, ...thinking, [key]: v } })
+            }}
+          />
           <ThinkingFields
             sampling={{ ...settings.defaultSampling, ...thinking }}
             onChange={(key, v) => {

@@ -52,6 +52,12 @@ export function EstimateView({ estimate }: { estimate: MemoryEstimate | null }) 
           sub={estimate.contextLength ? `${estimate.contextLength.toLocaleString()} tokens` : 'sized by llama.cpp'}
         />
       </div>
+      {estimate.adapterBytes > 0 && (
+        <div className="mt-2 flex items-baseline justify-between text-xs">
+          <span className="text-faint">Adapters</span>
+          <span className="font-medium tabular-nums">{formatBytes(estimate.adapterBytes)}</span>
+        </div>
+      )}
       {estimate.perGpu.length > 0 && (
         <div className="mt-3 space-y-2 border-t border-border pt-2.5">
           {estimate.perGpu.map((g) => (

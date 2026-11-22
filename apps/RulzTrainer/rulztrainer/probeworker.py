@@ -38,6 +38,9 @@ from .multigpu import norm_device, parse_devices
 
 log = logging.getLogger("rulztrainer")
 
+CONNECT_TIMEOUT = 600.0  # seconds the probe process gets to start and connect back (a hung import never does; a
+# throttled vast.ai CPU or a cold virus scan can make a healthy torch import take minutes)
+
 
 def pick_device(probe_device: str, devices: str, train_device, n_gpus: int) -> tuple[str, str]:
     """(the GPU that renders the probes, "") or ("", why there is none): probe_device, else the first GPU of
@@ -128,12 +131,18 @@ class ProbeProcess:
         accepted = []
         t = threading.Thread(target=lambda: accepted.append(listener.accept()), daemon=True)
         t.start()
+        end = time.monotonic() + CONNECT_TIMEOUT
         try:
             while t.is_alive():
                 t.join(0.5)
                 if self.proc.poll() is not None:
                     raise ProbeProcessError(f"the probe process exited (code {self.proc.returncode}) before "
                                             f"connecting; see {log_path}")
+                if time.monotonic() > end and not accepted:  # alive but hung: it would otherwise hold the trainer here for ever
+                    self.proc.kill()
+                    self.log_file.close()
+                    raise ProbeProcessError(f"the probe process did not connect within {CONNECT_TIMEOUT:.0f} s; "
+                                            f"see {log_path}")
         finally:
             listener.close()
         if not accepted:
