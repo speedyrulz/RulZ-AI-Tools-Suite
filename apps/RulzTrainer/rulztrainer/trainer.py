@@ -769,7 +769,7 @@ class Trainer(RaceParallelMixin):
         cap_cpu_threads()
         cfg.save(self.job_dir / "config.yaml")
         self.status = Status(self.job_dir / "status.json")
-        self.run_id = history.new_run_id(cfg.job_name)  # this run's file in output/_history (Previous Runs tab)
+        self.run_id = history.new_run_id(cfg.job_name)  # this run's file in the history folder (Previous Runs tab)
         self.status.update(run_id=self.run_id)  # whose files the job folder holds (Previous Runs' downloads)
         self.run_started = time.time()
         self.stop_file = self.job_dir / "STOP"
@@ -6792,7 +6792,7 @@ class Trainer(RaceParallelMixin):
             self.status.update(gold_gap_warning=step)
 
     def _save_history(self, state: str = "running") -> None:
-        """Keep this run's likeness scores in output/_history (never fails a run)."""
+        """Keep this run's likeness scores in the history folder (never fails a run)."""
         try:
             history.save_run(self.cfg, self.run_id, self.run_started, self.status.data, state)
         except Exception as e:  # noqa: BLE001
