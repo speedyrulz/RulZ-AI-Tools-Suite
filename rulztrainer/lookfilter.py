@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import statistics
 from pathlib import Path
@@ -126,7 +127,10 @@ def save_scores(folder, baselines, scores, kind: str = "face") -> Path:
                "scores": {_rel(folder, p): s for p, s in scores.items()},
                "stamps": {_rel(folder, p): _stamp(p) for p in scores}}
     path = folder / scores_file(kind)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    from .atomic import writing
+
+    with writing(path) as tmp:  # whole or not at all: a killed save must not leave a torn scores file
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
 
 
@@ -187,6 +191,29 @@ def _move(src: Path, dest: Path) -> Path:
     return target
 
 
+def _move_captions(p: Path, target: Path) -> None:
+    """The caption / json of image `p` (just moved to `target`) go along. Another image of the same stem still in p's
+    folder (a.png and a.jpg both captioned by a.txt) shares them, so they are copied then and moved with the last."""
+    from .dataset import IMAGE_EXTS
+
+    key = os.path.normcase(p.stem)  # (on Windows a.png and A.jpg share a.txt)
+    shared = any(q.is_file() and os.path.normcase(q.stem) == key and q != p and q.suffix.lower() in IMAGE_EXTS
+                 for q in p.parent.iterdir())
+    for ext in CAPTION_EXTS:
+        cap = p.with_suffix(ext)
+        if not cap.is_file():
+            continue
+        dest = target.with_suffix(ext)
+        if shared:
+            if not dest.exists():
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(cap), str(dest))
+        elif dest.exists() and dest.read_bytes() == cap.read_bytes():  # the copy an earlier sibling left
+            cap.unlink()
+        else:
+            _move(cap, dest)
+
+
 def move_out(folder, paths) -> tuple[list[str], list[str]]:
     """Move images and their captions into <folder>/excluded_by_look/ (same sub-folders); nothing is deleted.
     Returns (moved images, errors)."""
@@ -205,10 +232,7 @@ def move_out(folder, paths) -> tuple[list[str], list[str]]:
             continue
         try:
             target = _move(p, folder / EXCLUDED_DIR / rel)
-            for ext in CAPTION_EXTS:
-                cap = p.with_suffix(ext)
-                if cap.is_file():
-                    _move(cap, target.with_suffix(ext))
+            _move_captions(p, target)
             moved.append(str(p))
         except OSError as e:
             errors.append(f"{p.name}: {e}")
@@ -232,10 +256,7 @@ def move_back(folder) -> tuple[list[str], list[str]]:
         rel = p.relative_to(root)
         try:
             target = _move(p, folder / rel)
-            for ext in CAPTION_EXTS:
-                cap = p.with_suffix(ext)
-                if cap.is_file():
-                    _move(cap, target.with_suffix(ext))
+            _move_captions(p, target)
             moved.append(str(target))
         except OSError as e:
             errors.append(f"{p.name}: {e}")

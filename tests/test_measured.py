@@ -18,7 +18,7 @@ GPU16, GPU24 = [{"total": 16311}], [{"total": 24564}]
 PER_BLOCK = 13.5 / 28  # Krea 2 int8: the estimate's own figures (webui.MODEL_GB, 28 blocks), GB of 10^9 bytes
 BLOCK = PER_BLOCK * 1e9 / 2 ** 30  # the same block in the card's unit: 0.449 GiB
 KEEP_FREE = 2.0  # on that card: the trainer's 1.5 GB margin and the 0.5 GB spare
-ESTIMATE = "the model and a step's memory do not fit 16 GB: 5 blocks' frozen weights (2.4 GB) wait in system RAM and " \
+ESTIMATE = "the model and a step's memory do not fit 16 GB: 7 blocks' frozen weights (3.4 GB) wait in system RAM and " \
            "stream in as each block runs"
 
 
@@ -446,7 +446,7 @@ def test_without_a_record_the_wizard_is_what_it_was(kw, gpus, monkeypatch):
 
 
 def test_the_estimate_s_own_words_are_unchanged():
-    assert wizard(krea())["block_swap"] == (5, ESTIMATE)  # 13.5 + 4.5 - 15.93 = 2.07 GB over: 5 of 28 blocks
+    assert wizard(krea())["block_swap"] == (7, ESTIMATE)  # 13.5 + 4.5 - 15.93 = 2.07 GB over: 5 of 28 blocks, plus the 2 in flight
     assert wizard(krea(), GPU24)["block_swap"] == (0, "the model fits 24 GB as it is; swapping only slows the steps")
 
 
@@ -516,7 +516,7 @@ def test_the_wizard_warns_when_the_measured_run_was_close_to_its_card():
 
 def test_with_a_record_but_no_comparable_run_the_wizard_says_it_estimated():
     record(krea(job_name="big", block_swap=8, batch_size=4))
-    assert wizard(krea())["block_swap"] == (5, ESTIMATE + "; estimated (no comparable finished run of yours yet)")
+    assert wizard(krea())["block_swap"] == (7, ESTIMATE + "; estimated (no comparable finished run of yours yet)")
     other = wizard(TrainConfig(model_arch="moss_image"), [{"total": 8192}])["block_swap"]
     assert other[1].endswith("estimated (no comparable finished run of yours yet)")
     assert "block_swap" not in wizard(krea(), [])  # no GPU found: no plan, nothing to say
@@ -558,10 +558,10 @@ def test_the_h3_plan_uses_a_measured_run_with_its_own_block_size():
 
 def test_a_record_the_lookup_cannot_use_leaves_the_estimate(monkeypatch):
     M.RECORD_FILE.write_text("{broken", encoding="utf-8")
-    assert wizard(krea())["block_swap"] == (5, ESTIMATE)
+    assert wizard(krea())["block_swap"] == (7, ESTIMATE)
     M.add(row())
     monkeypatch.setattr(M, "find", lambda *a, **k: 1 / 0)
-    assert wizard(krea())["block_swap"] == (5, ESTIMATE)
+    assert wizard(krea())["block_swap"] == (7, ESTIMATE)
 
 
 # ---------------------------------------------------------------- the trainer's hooks
@@ -866,13 +866,13 @@ def test_two_writers_at_once_both_keep_their_rows(tmp_path):
 # The wizard's block swap pick as the code before the lookup gave it (3.20.0), written down from that code: the
 # plan with no record must stay exactly this.
 BEFORE = [
-    ("krea2", {}, 16311, (5, ESTIMATE)),
-    ("krea2", {}, 12288, (13, "the model and a step's memory do not fit 12 GB: 13 blocks' frozen weights (6.3 GB) "
+    ("krea2", {}, 16311, (7, ESTIMATE)),
+    ("krea2", {}, 12288, (15, "the model and a step's memory do not fit 12 GB: 15 blocks' frozen weights (7.2 GB) "
                               "wait in system RAM and stream in as each block runs")),
-    ("moss_image", {}, 8192, (16, "the model and a step's memory do not fit 8 GB: 16 blocks' frozen weights (2.1 GB) "
+    ("moss_image", {}, 8192, (18, "the model and a step's memory do not fit 8 GB: 18 blocks' frozen weights (2.4 GB) "
                                  "wait in system RAM and stream in as each block runs")),
     ("qwen_image21", {}, 16311, (0, "the model fits 16 GB as it is; swapping only slows the steps")),
-    ("pan2", {}, 24564, (15, "the model and a step's memory do not fit 24 GB: 15 blocks' frozen weights (10.0 GB) "
+    ("pan2", {}, 24564, (17, "the model and a step's memory do not fit 24 GB: 17 blocks' frozen weights (11.4 GB) "
                              "wait in system RAM and stream in as each block runs")),
 ]
 
@@ -1013,8 +1013,8 @@ def test_the_log_lines_read_are_the_ones_the_trainer_writes_and_the_hooks_are_ca
                             ) == (8, round(2.1 * M.GIB_PER_GB, 3))
 
 
-# MiniMax H3 on one 16 GB card, from the code before the lookup (3.20.0)
-H3_BEFORE = (25, "the 21 GB model does not fit 16 GB: 25 of the 50 blocks' frozen weights (9.7 GB) wait in pinned system RAM and stream in as each runs (an estimate; musubi-tuner swaps up to 48)")
+# MiniMax H3 on one 16 GB card, from the code before the lookup (3.20.0), plus the 2 blocks in flight (4.1.1)
+H3_BEFORE = (27, "the 21 GB model does not fit 16 GB: 27 of the 50 blocks' frozen weights (10.4 GB) wait in pinned system RAM and stream in as each runs (an estimate; musubi-tuner swaps up to 48)")
 
 
 def test_the_h3_estimate_s_words_are_the_3_20_words():

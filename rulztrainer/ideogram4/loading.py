@@ -142,7 +142,7 @@ def resolve_model_dir(model_path: str, models_dir: str = "models", download: boo
     if p.is_dir():
         return p.resolve()
     local = Path(models_dir) / model_path.replace("/", "__")
-    if component_ready(local / "transformer"):  # (an interrupted download is resumed below)
+    if all(component_ready(local / d) for d in ("transformer", "text_encoder", "vae")):  # (else resumed below)
         return local.resolve()
     if not download:
         raise FileNotFoundError(f"Model not found locally: {model_path} (looked in {local})")

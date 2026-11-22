@@ -518,7 +518,10 @@ def manifest_dir(tag: str, root: Path | None = None) -> Path:
 def save_manifest(manifest: dict, root: Path | None = None) -> Path:
     path = manifest_dir(manifest["tag"], root) / "manifest.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, indent=1, default=str), encoding="utf-8")
+    from .atomic import writing
+
+    with writing(path) as tmp:  # a kill mid-write must not leave a torn manifest
+        tmp.write_text(json.dumps(manifest, indent=1, default=str), encoding="utf-8")
     return path
 
 
@@ -583,8 +586,10 @@ def find_job(job: str, manifest: dict, roots=()) -> Path | None:
     where the fleet puts a run's fetched files (~/.rulz_vast/runs/<instance>/<job>). The newest when several hold it."""
     spots = [Path(r) / job for r in roots]
     spots.append(local_path(manifest.get("output_dir") or "output") / job)
-    pulls = Path(os.environ.get("RULZ_VAST_HOME") or Path.home() / ".rulz_vast") / "runs"
-    spots += sorted(pulls.glob(f"*/{job}")) if pulls.is_dir() else []
+    from . import storage  # the downloads folder the user chose on the Fleet page (and the default)
+
+    for pulls in storage.fleet_pull_roots():
+        spots += sorted(pulls.glob(f"*/{job}")) if pulls.is_dir() else []
     found = [p for p in spots if p.is_dir()]
     if not found:
         return None

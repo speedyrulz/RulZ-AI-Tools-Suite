@@ -47,12 +47,27 @@ APP = HERE.parents[1]
 STATE = Path(os.environ.get("RULZ_VAST_HOME") or Path.home() / ".rulz_vast")
 CONNECTION = STATE / "connection.json"
 PULLS = STATE / "runs"  # outside the checkout: pulled runs outlive a branch or a worktree
+
+
+def pulls_root() -> Path:
+    """Where downloads go now: the folder chosen on the WebUI's Fleet page (settings.pulls_dir in the fleet's
+    state.json), else PULLS. Read at each call, so the CLI and a running daemon follow a change."""
+    try:
+        chosen = json.loads((STATE / "fleet" / "state.json").read_text(encoding="utf-8"))["settings"]["pulls_dir"]
+    except (OSError, ValueError, KeyError, TypeError):
+        chosen = None
+    return Path(chosen) if isinstance(chosen, str) and chosen else PULLS
+
 REMOTE_DIR = "/workspace/RulzTrainer"
 PYTHON = '"$(test -x /venv/main/bin/python && echo /venv/main/bin/python || echo python3)"'
 AGENT_COMMANDS = {"status", "jobs", "job", "log", "probes", "config", "start", "stop", "queue", "snapshot",
                   "record", "update", "webui"}  # rulz_agent.py's
 CONFIG_SLOT = b'SENT_CONFIG = ""'  # the line of rulz_agent.py that takes a local config
 SSH_FAILED = 255  # ssh's own exit status: it could not connect, or the connection dropped
+TIMED_OUT = 124  # the exit status Remote.run reports for a call that got no answer in its timeout (as timeout(1))
+SHORT_CALL_TIMEOUT = 120  # seconds for a snapshot, status or stop: ssh alive but hung must not wait for ever
+SHORT_COMMANDS = {"status", "jobs", "job", "log", "probes", "config", "stop", "queue", "snapshot", "record", "webui",
+                  "files", "poll"}  # agent commands that only read or touch a file: they answer within seconds
 SYNC_PATHS = ("rulztrainer", "webui.py", "scripts", "requirements.txt")  # what a run needs of the code
 VASTAI_TIMEOUT = 120  # seconds for one vastai CLI call: a hung API request must not hold up every look after it
 UPLOAD_MARK = ".rulz_upload"  # in a dataset sent by rulz_fleet.py: dataset_digest() of what was sent
@@ -199,20 +214,32 @@ class Remote:
         return ssh_command(self.conn, self.key) + [f"cd {shlex.quote(self.folder)} && {shell}" if in_folder else shell]
 
     def run(self, shell: str, data: bytes | None = None, in_folder: bool = True,
-            retry: bool = True) -> subprocess.CompletedProcess:
+            retry: bool = True, timeout: float | None = None) -> subprocess.CompletedProcess:
         """The command over ssh. When ssh fails, the route is looked up again and the command runs once more, unless
-        retry=False: a connection that dropped part way may have left the command running there (an update)."""
-        done = subprocess.run(self.command(shell, in_folder), input=data, capture_output=True,
-                              stdin=subprocess.DEVNULL if data is None else None)
+        retry=False: a connection that dropped part way may have left the command running there (an update).
+        timeout (seconds) is for short calls: an ssh that is alive but hung would otherwise wait for ever. When it
+        runs out, the result is a failed one (exit 124, a message on stderr) that callers treat like any failure."""
+        def once() -> subprocess.CompletedProcess:
+            try:
+                return subprocess.run(self.command(shell, in_folder), input=data, capture_output=True,
+                                      stdin=subprocess.DEVNULL if data is None else None, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return subprocess.CompletedProcess(self.command(shell, in_folder), TIMED_OUT, b"",
+                                                   f"ssh gave no answer within {timeout:g} s".encode())
+
+        done = once()
         if done.returncode == SSH_FAILED and retry:
             self.conn = find_connection(self.instance, self.key, self.remember)
-            done = subprocess.run(self.command(shell, in_folder), input=data, capture_output=True,
-                                  stdin=subprocess.DEVNULL if data is None else None)
+            done = once()
         return done
 
-    def agent(self, *args: str, config: bytes | None = None, retry: bool = True) -> subprocess.CompletedProcess:
-        """rulz_agent.py on the instance: piped in, so it is always this one."""
-        return self.run(f"{PYTHON} - {shlex.join(args)}", agent_program(config), retry=retry)
+    def agent(self, *args: str, config: bytes | None = None, retry: bool = True,
+              timeout: float | None | str = "auto") -> subprocess.CompletedProcess:
+        """rulz_agent.py on the instance: piped in, so it is always this one. timeout="auto": the short reads and
+        stop get SHORT_CALL_TIMEOUT; start and update (which may run a while) and unknown commands get none."""
+        if timeout == "auto":
+            timeout = SHORT_CALL_TIMEOUT if args and args[0] in SHORT_COMMANDS else None
+        return self.run(f"{PYTHON} - {shlex.join(args)}", agent_program(config), retry=retry, timeout=timeout)
 
     def agent_json(self, *args: str):
         done = self.agent(*args)
@@ -336,9 +363,31 @@ def fetch(remote: Remote, base: str, files: list[str], dest: Path, *, progress=N
         raise SystemExit(f"tar on the instance ended with {proc.returncode}: the copy may be incomplete")
 
 
+def fleet_move_in_progress() -> dict | None:
+    """The journal of a move of the fleet's downloads folder when a live process is doing it, else None."""
+    try:
+        move = json.loads((STATE / "fleet" / "state.json").read_text(encoding="utf-8"))["settings"]["move"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(move, dict):
+        return None
+    if str(APP) not in sys.path:
+        sys.path.insert(0, str(APP))
+    from rulztrainer import storage
+
+    return move if storage.pid_alive(move.get("pid")) else None
+
+
 def cmd_pull(args) -> int:
     """Copy a job's files here. Files already here at the same size are skipped, so this can repeat during a run."""
-    dest = Path(args.dest) if args.dest else PULLS / str(args.remote.conn["id"])
+    if not args.dest and fleet_move_in_progress():
+        raise SystemExit("The downloads folder is being moved (from the WebUI's Fleet page). Try again when that is "
+                         "done, or pass --dest.")
+    root = pulls_root()
+    if not args.dest and root != PULLS and not root.is_dir():
+        raise SystemExit(f"The downloads folder {root} was not found (is the drive connected?). Change it on the "
+                         "WebUI's Fleet page, or pass --dest.")
+    dest = Path(args.dest) if args.dest else root / str(args.remote.conn["id"])
     extra = [a for what in args.what or [] for a in ("--what", what)]
     if args.step is not None:
         extra += ["--step", str(args.step)]
@@ -414,9 +463,16 @@ def send(remote: Remote, items: list[tuple[Path, str]], target: str, hidden: boo
     if staged:
         incoming = f"{target}/.rulz_incoming"
         stage = f"{incoming}/{uuid.uuid4().hex[:12]}"
-        moves = " && ".join(f"rm -rf {shlex.quote(f'{target}/{name}')} && "
-                            f"mv {shlex.quote(f'{stage}/{name}')} {shlex.quote(f'{target}/{name}')}"
-                            for _, name in items) or "true"
+        # The old copy is moved aside, not deleted first: a drop between the delete and the move would lose the
+        # remote copy. The aside folder sits in the stage folder, so it is cleaned up with it if the drop comes later.
+        # When the new copy cannot be moved in, the old one goes back (the stage folder is removed after this).
+        moves = " && ".join(f"{{ [ ! -e {shlex.quote(f'{target}/{name}')} ] && [ ! -L {shlex.quote(f'{target}/{name}')} ] || "
+                            f"mv {shlex.quote(f'{target}/{name}')} {shlex.quote(f'{stage}/.old-{i}')}; }} && "
+                            f"{{ mv {shlex.quote(f'{stage}/{name}')} {shlex.quote(f'{target}/{name}')} || "
+                            f"{{ [ ! -e {shlex.quote(f'{stage}/.old-{i}')} ] || "
+                            f"mv {shlex.quote(f'{stage}/.old-{i}')} {shlex.quote(f'{target}/{name}')}; false; }}; }} && "
+                            f"rm -rf {shlex.quote(f'{stage}/.old-{i}')}"
+                            for i, (_, name) in enumerate(items)) or "true"
         shell = (f"{{ find {shlex.quote(incoming)} -mindepth 1 -maxdepth 1 -mmin +360 -exec rm -rf {{}} + "
                  f"2>/dev/null || true; }} && mkdir -p {shlex.quote(stage)} && "
                  f"{{ tar -xf - -C {shlex.quote(stage)} && {moves}; }}; rc=$?; rm -rf {shlex.quote(stage)}; exit $rc")
@@ -493,7 +549,7 @@ def cmd_wait(args) -> int:
             done = args.remote.agent("poll", *([args.name] if args.name else []))
         except Unreachable:
             done = None
-        if done is None or done.returncode == SSH_FAILED:
+        if done is None or done.returncode in (SSH_FAILED, TIMED_OUT):  # (a hung poll counts as down too)
             down_since = down_since or time.time()
             if time.time() - down_since > args.max_down:
                 print(f"[unreachable] for {args.max_down} s", file=sys.stderr)
@@ -595,7 +651,9 @@ def main(argv=None) -> int:
     try:
         if rest and rest[0] in AGENT_COMMANDS:
             words, config = agent_args(rest)
-            once = words[0] == "update" and "--check" not in words  # never run twice by a reconnect
+            # never run twice by a reconnect: an update, a start, and a stop (a Stop that was delivered but whose
+            # answer was lost would otherwise hit the next job of the queue; a Kill that worked would be refused)
+            once = words[0] in ("start", "stop") or (words[0] == "update" and "--check" not in words)
             return forward(Remote(opts.instance, opts.key, opts.dir).agent(*words, config=config, retry=not once))
         args = parser().parse_args(argv)
         if args.func is not cmd_connect:

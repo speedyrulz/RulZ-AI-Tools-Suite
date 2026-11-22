@@ -1015,7 +1015,7 @@ def test_stop_reaches_the_instance_that_runs_the_job(world):
     world.machines["2"].run("b")
     world.tick()
     assert world.fleet.stop_run("b") == {"job": "b", "state": "stopping", "instance": 2}
-    assert world.machines["2"].calls[-1] == ("stop",)
+    assert world.machines["2"].calls[-1] == ("stop", "--job", "b")  # (a job replaced meanwhile is not stopped)
     assert world.fleet.stop_run("2", kill=True)["instance"] == 2 and world.machines["2"].calls[-1] == ("stop", "--kill")
     with pytest.raises(Refused, match="No running job"):
         world.fleet.stop_run("nothing")

@@ -11,6 +11,10 @@ weights of the configuration that trains there, the same storage on the GPU it l
 saves) goes through the shared code: the configuration's weight average is loaded into the first copy's wrappers and
 mirrored to the others (_rp_load_render), and the trainer's per-run attributes are bound to it (_rp_bound).
 
+Region sweeps and held-out photos work here as in a one-at-a-time race (report only): every configuration has its own
+sweep (_race_make_sweep), run on its own step count after a step of its lane, and once before it trains (its step 0);
+the sweep reads the configuration's weights the way its probe does (_rp_load_render, on the first GPU).
+
 Not supported here: the identity loss (one shared module), torch.compile (the copies' threads would trace at once),
 saved training states."""
 from __future__ import annotations
@@ -157,15 +161,47 @@ class RaceParallelMixin:
     def _rp_place(self, lanes) -> None:
         """Bring each lane's configuration to its GPU (its parameters, optimizer state and weight average), start it on
         its first turn, and make its model copies carry its weights."""
+        fresh = []
         for v, reps in lanes:
             v.move_master(self.replicas[reps[0]][2])
             if not v.started:
                 with self._rp_bound(v, writeback=False):
                     self._race_start_variant(v)
+                fresh.append(v)
             for r in reps:
                 race_mod.swap_in(v, self.replicas[r][1])
             race_mod.configure_backward(v.cfg, [self.replicas[r][0] for r in reps])
         self.rp_lanes = list(lanes)
+        if fresh and self._rp_first_sweeps(fresh):  # their sweeps loaded their weights into the copies: carry the lanes' again
+            for v, reps in lanes:
+                for r in reps:
+                    race_mod.swap_in(v, self.replicas[r][1])
+
+    def _rp_first_sweeps(self, fresh: list) -> bool:
+        """Configurations that just started: each one's first region sweep, at its own step 0 (a sweep of the
+        configuration before it trains). True when any ran."""
+        ran = False
+        for v in fresh:
+            sweep = v.state.get("sweep")
+            if sweep is not None and sweep.due(v.state["step"]):
+                self._rp_sweep(v, v.state["step"])
+                ran = True
+        return ran
+
+    def _rp_sweep(self, v, step: int) -> None:
+        """A region sweep of configuration v at its own step: its (averaged) weights are loaded into the first copy's
+        wrappers by _rp_load_render, as for its probe, and the sweep reads them on the first GPU. Report only. The
+        copies' wrappers carry other weights afterwards: the caller places the lanes again."""
+        def job():
+            try:
+                self._rp_load_render(v)
+            except Exception as e:  # noqa: BLE001  (report only: a failed load turns this configuration's sweeps off)
+                self._race_sweep_failed(v, step, e)
+                return
+            self._race_sweep_run(v, self.replicas[0][0], step)
+
+        with self._rp_bound(v, writeback=False):
+            self._side_job(f"The region sweep of {v.name} at step {step}", job)
 
     def _rp_park(self, v) -> None:
         """A configuration that is not training: its parameters, optimizer state and average on the CPU."""
@@ -293,6 +329,8 @@ class RaceParallelMixin:
                         g["lr"] = lr0
                 if st["ema"] is not None:
                     st["ema"].update(step_images[v.idx])
+                if cfg.weight_noise > 0:  # on the configuration's own LoRA, before attach hands it to the replicas
+                    self._apply_weight_noise(cfg, st["injected"], st["step"], False)
             st["optimizer"].zero_grad(set_to_none=True)
             st["scheduler"].step()
             for r in reps:
@@ -350,6 +388,10 @@ class RaceParallelMixin:
             with self._rp_bound(v):
                 self._rp_load_render(v)
                 self._side_job(f"Sampling at step {step}", lambda: self.sample_images(self.replicas[0][0], step))
+            hit = True
+        sweep = st.get("sweep")  # its own region sweep, on its own step count (report only)
+        if sweep is not None and sweep.due(step, last=step >= cfg.steps):
+            self._rp_sweep(v, step)
             hit = True
         return hit
 

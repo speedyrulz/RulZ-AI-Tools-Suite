@@ -97,7 +97,8 @@ def test_a_fine_tune_lokr_and_automagic_change_the_training_recommendations(tmp_
 def test_adapter_timesteps_and_isolation_recommendations(tmp_path):
     cfg = _identity(tmp_path)
     char = webui.wizard_recommendations(cfg, "character", [], None)
-    assert char["network_type"][0] == "lora" and char["isolation"][0] is True and "timestep_sampling" not in char
+    assert char["network_type"][0] == "lora" and char["isolation"][0] is True
+    assert char["timestep_sampling"][0] == "reference"  # MOSS-Image character runs (3.54.0): its own high-noise curve
     fibo = TrainConfig.from_dict({**cfg.to_dict(), "model_path": "Bria/FIBO-2.0-dev"})
     assert webui.wizard_recommendations(fibo, "character", [], None)["network_type"][0] == "lora"  # no LoKr loader
     krea = TrainConfig.from_dict({**cfg.to_dict(), "model_path": "krea/Krea-2"})

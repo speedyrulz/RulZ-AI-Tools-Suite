@@ -59,9 +59,29 @@ def video_info(path: str | Path) -> tuple[int, int, int, float]:
                 float(c.duration) / 1e6 if c.duration else 0.0)
             n = int(round(dur * fps))
         rot = _rotation(st)
+        # modern FFmpeg and PyAV keep a phone clip's rotation as a display matrix, which only the decoded frames
+        # report (frame.rotation): the first one tells
+        try:
+            for frame in c.decode(st):
+                rot = _frame_rotation(frame, rot)
+                break
+        except Exception:  # noqa: BLE001  (a damaged first frame: the size from the header, as before)
+            pass
     if rot in (90, 270):
         w, h = h, w
     return w, h, max(1, n), fps
+
+
+def _frame_rotation(frame, fallback: int = 0) -> int:
+    """The clockwise display rotation (0, 90, 180, 270) a decoded frame carries, else `fallback` (an older PyAV has no
+    VideoFrame.rotation). PyAV reports it counter-clockwise."""
+    rot = getattr(frame, "rotation", None)
+    if rot is None:
+        return fallback
+    try:  # (0: nothing in the display matrix, so a rotation the stream's tag or side data gave still counts)
+        return int(round(-float(rot))) % 360 or fallback
+    except (TypeError, ValueError):
+        return fallback
 
 
 def _rotation(stream) -> int:
@@ -93,9 +113,10 @@ def pick_frames(total: int, src_fps: float, frames: int, fps: float, mode: str =
     return [min(int(round(i * step)), last) for i in range(frames)]
 
 
-def _decode(path: str | Path, need: list[int]) -> tuple[dict, int]:
-    """The frames at the indices `need` (ascending) as upright PIL RGB pictures, and how many frames were decoded:
-    all of the video's when it ended before need[-1]."""
+def _decode(path: str | Path, need: list[int], transform=None) -> tuple[dict, int]:
+    """The frames at the indices `need` (ascending) as upright PIL RGB pictures (or what `transform` makes of each, so
+    a caller can shrink a frame as it is read instead of holding every picked frame at full size), and how many
+    frames were decoded: all of the video's when it ended before need[-1]."""
     import av
 
     got: dict[int, Image.Image] = {}
@@ -108,29 +129,31 @@ def _decode(path: str | Path, need: list[int]) -> tuple[dict, int]:
         for frame in c.decode(st):
             if k in wanted:
                 img = frame.to_image().convert("RGB")
-                if rot in (90, 180, 270):  # counter-clockwise in PIL: the display turns it clockwise
-                    img = img.rotate(-rot, expand=True)
-                got[k] = img
+                r = _frame_rotation(frame, rot)
+                if r in (90, 180, 270):  # counter-clockwise in PIL: the display turns it clockwise
+                    img = img.rotate(-r, expand=True)
+                got[k] = transform(img) if transform else img
             k += 1
             if k > need[-1]:
                 break
     return got, k
 
 
-def read_frames(path: str | Path, frames: int, fps: float, mode: str = "fps") -> list:
+def read_frames(path: str | Path, frames: int, fps: float, mode: str = "fps", transform=None) -> list:
     """A clip of `frames` frames (PIL RGB pictures, upright) from a video file. A container that holds fewer frames
     than its header said (a WebM or MKV without a frame count, whose duration includes a longer audio track) is read
     again with the frames picked from the ones it has: else every index past its end was its last frame, a frozen
-    tail in "spread" mode."""
+    tail in "spread" mode. transform: applied to each upright frame as it is decoded (the result is returned in its
+    place)."""
     _, _, total, src_fps = video_info(path)
     want = pick_frames(total, src_fps, frames, fps, mode)
     need = sorted(set(want))
-    got, decoded = _decode(path, need)
+    got, decoded = _decode(path, need, transform)
     if got and 1 < decoded <= need[-1]:  # the video ended before the last frame asked for
         want = pick_frames(decoded, src_fps, frames, fps, mode)
         need = sorted(set(want))
         if any(i not in got for i in need):
-            got, _ = _decode(path, need)
+            got, _ = _decode(path, need, transform)
     if not got:
         raise ValueError(f"no video frames could be read from {path}")
     last_read = max(got)
