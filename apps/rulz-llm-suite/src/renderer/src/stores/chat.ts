@@ -21,6 +21,7 @@ import { uid } from '../lib/format'
 import { type QueuedNote, takeQueued } from '../lib/interject'
 import { editMessages, idsToDelete, removeMessages, restoreMessages } from '../lib/messages'
 import { once } from '../lib/once'
+import { WBENCH_BUSY, wbenchRunning } from '../lib/wbenchFlag'
 import { buildWire } from '../lib/wire'
 import { useApp } from './app'
 import { availableTools, effectiveToolMode, tokensOf, toolBudget, toolRequestFor } from './mcp'
@@ -933,6 +934,7 @@ export const useChat = create<ChatState>((set, get) => {
 
     send: async (text, attachments) => {
       if (isChatBusy(get())) return
+      if (wbenchRunning()) return void toast(WBENCH_BUSY)
       const cur = get().current ?? (await get().newChat())
       await appendAndGenerate(cur, text, attachments)
     },
@@ -974,6 +976,7 @@ export const useChat = create<ChatState>((set, get) => {
     regenerate: async (messageId) => {
       const cur = get().current
       if (!cur || isChatBusy(get())) return
+      if (wbenchRunning()) return void toast(WBENCH_BUSY)
       const idx = cur.messages.findIndex((m) => m.id === messageId)
       if (idx < 0) return
       const keep = cur.messages[idx].role === 'assistant' ? idx : idx + 1
@@ -983,6 +986,7 @@ export const useChat = create<ChatState>((set, get) => {
     continueMessage: async (messageId) => {
       const cur = get().current
       if (!cur || isChatBusy(get())) return
+      if (wbenchRunning()) return void toast(WBENCH_BUSY)
       const last = cur.messages.at(-1)
       if (last?.id !== messageId || last.role !== 'assistant') return
       // A turn that called tools is complete; writing more into it would mix new calls with the
@@ -996,6 +1000,7 @@ export const useChat = create<ChatState>((set, get) => {
       const target = cur.messages.find((m) => m.id === messageId)
       if (!target) return
       if (resend && target.role === 'user' && !isChatBusy(get())) {
+        if (wbenchRunning()) return void toast(WBENCH_BUSY)
         await startGeneration({ ...cur, messages: editMessages(cur.messages, messageId, content, true) }, 'new')
       } else {
         get().mutateCurrent((c) => ({ ...c, messages: editMessages(c.messages, messageId, content, false) }))
@@ -1172,6 +1177,7 @@ export const useChat = create<ChatState>((set, get) => {
       const conv = get().current
       set({ handoffConfirm: null })
       if (!conv || get().generation || get().handoff || get().autoLoadingModelId) return
+      if (wbenchRunning()) return void toast(WBENCH_BUSY)
       if (!conv.messages.length) {
         toast('There is nothing to hand off yet.')
         return
@@ -1216,6 +1222,10 @@ export const useChat = create<ChatState>((set, get) => {
     },
 
     startRe: async (input) => {
+      if (wbenchRunning()) {
+        if (!input.background) toast(WBENCH_BUSY)
+        return null
+      }
       if (isChatBusy(get()) || get().handoff) {
         if (!input.background) toast('Wait for the current reply to finish first.')
         return null

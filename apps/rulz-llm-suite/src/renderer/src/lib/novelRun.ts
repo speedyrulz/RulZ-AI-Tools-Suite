@@ -625,6 +625,10 @@ export interface PendingChange {
   newSticky: string[]
   /** Request that made it, for Regenerate. */
   again: { action: NovelAction; variant?: RewriteVariant; note: string; selection: { from: number; to: number } | null; cursor: number; count: number }
+  /** Stage 4: the id of the record this run writes (16 hex); absent = not recorded. */
+  recId?: string
+  /** Stage 4: the alternatives the user displayed (the first active one included). */
+  viewed?: number[]
 }
 
 /** True when the buffer moved since the pending change was made: Accept must be refused. */
@@ -642,6 +646,8 @@ export interface GenResult {
   text: string
   error: string | null
   stopped: boolean
+  /** The chat path's stop reason ('length' = cut at max tokens), when it gave one. */
+  stopReason?: string
 }
 
 export interface GenHandle {
@@ -713,7 +719,7 @@ export function startGeneration(input: GenInput): GenHandle {
         input.onDelta?.(text)
       }
     } else if (e.type === 'error') end({ text, error: e.error, stopped: false })
-    else if (e.type === 'done') end({ text, error: null, stopped: e.stats.stopReason === 'stopped' })
+    else if (e.type === 'done') end({ text, error: null, stopped: e.stats.stopReason === 'stopped', stopReason: e.stats.stopReason })
   })
   const req: ChatRequest = {
     requestId,

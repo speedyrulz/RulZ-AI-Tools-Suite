@@ -1,6 +1,6 @@
 # Writing mode: design
 
-Status: stage 1 shipped in 0.20.0, stage 2 in 0.21.0; stage 3 built for 0.22.0 (2026-11-22); stage 4 still planned. Covers the
+Status: stage 1 shipped in 0.20.0, stage 2 in 0.21.0; stage 3 in 0.22.0; stage 4 built for 0.23.0 (2026-11-22). Covers the
 novel-writing features planned for LLM Suite 0.21.0 to 0.23.0. Stage 1 (0.20.0, fiction samplers: DRY, XTC, avoid
 words) is separate and landed first.
 
@@ -450,20 +450,124 @@ interview transcripts on disk; fuzzy quote matching; a setting for the state sha
 - `writeBytesAtomic` re-runs its last-moment check before every rename attempt, which also protects scene saves
   during Windows lock retries.
 
-## Stage 4 outline
+## Stage 4 design (0.23.0)
 
-- **Recording** (on by default per project, switch in Project panel): every AI action's request (assembled
-  messages + sampling + model + adapters) and every alternative, plus what the user did (accepted which, rejected,
-  edited after accepting: final text after 60 s or scene switch) → `.rulz\records\<date>.jsonl`.
-- **Export**: `train.jsonl` (chat format, accepted final text as the assistant turn) and `pairs.jsonl`
-  (`prompt`, `chosen`, `rejected` from alternatives where one was accepted and another rejected), plus
-  `manifest.json`; written to a folder the user picks.
-- **Style adapter per project**: project.json `adapters` already in stage 2; stage 4 adds "use with" hints after
-  converting a PEFT adapter.
-- **Writing benchmark**: a set of scene prompts (bundled defaults + user-made) × candidates (model + adapter
-  strengths + sampling preset); each candidate's output generated with the same seed set; blind A/B rounds pick
-  winners; Elo-style scoreboard; kept in `%APPDATA%\RulZ LLM Suite\writing-bench.json`. Reuses the batch-run
-  pattern (one task at a time, Stop after this / Stop now).
+Recording of writing AI actions, export as SFT / DPO training data, a "use with" hint for style adapters, and a
+writing benchmark with blind A/B votes and Elo. (Revised after the principal engineer's read: region geometry,
+reverted finals, idle finals, missing-final flag, finish reasons and viewed alts, delete race, lock retry, one file
+per benchmark run, a global busy check, streamed export, card actions recorded but not exported.)
+
+### Recording
+
+**What is recorded.** Prose actions (continue, rewrite, expand, condense, dialogue, draftScene) and card actions
+(summarizeScene, summarizeChapter, outlineChapters, outlineScenes). Card lines are recorded but not exported in
+0.23. Not recorded: checkScene, updateState, interview.
+
+**Switch.** `project.json` `recording?: boolean`; absent means on (also for 0.21 / 0.22 projects). Project panel:
+a **Recording** switch, the line "Saves each AI request and what you did with it in .rulz\records, for training
+data. Nothing leaves this PC.", the records' total size, **Export training data…** and **Delete records…** (asks
+first; moves the records folder to the Windows Recycle Bin). Main is
+authoritative: it checks the flag on every append.
+
+**Files.** `.rulz/records/<YYYY-MM-DD>.jsonl` (local date of the event), one JSON object per line, `format: 1`.
+Event lines joined by `id` at export. `id` = 16 lowercase hex chars made in the renderer when a run starts
+(not `uid()` unless it matches), carried on `PendingChange` / the proposal.
+
+- `request` — once when a run ends with at least one alternative (no line when none was produced):
+  `{format, type:'request', id, at, app, action, variant?, sceneId|null, chapterId|null, model:{id,name},
+  sampling (the values actually sent), adapters:[{name,scale}], messages (exactly as sent),
+  alts:[{index, seed, generated, finish:'stop'|'length'|'stopped'|'error'}]}`. `length` = cut off at max tokens
+  (from the chat result's finish reason; if the chat path cannot report it, the renderer marks an alt `length`
+  when it ended without the user stopping and the reply reached maxTokens by token count, else `stop`). Prose:
+  `generated` is the new text only (PendingAlt.generated). Cards: the raw reply text.
+- `viewed` — prose: `{type:'viewed', id, at, alts:[indexes the user displayed]}` written with the outcome (the
+  first active alt counts as viewed; selectAlt adds).
+- `outcome` — when the user resolves it:
+  - prose: `{type:'outcome', id, at, kind, alt, region}`; kind `accepted` (final == the active alt's document),
+    `mixed` (some hunks kept), `rejected` (final == base), `abandoned` (regenerate, close, open another project,
+    stale refusal: alt null, region null). `region` = `{start, end}` of the generated text in the accepted document,
+    from the apply geometry (where the alt's generated text was placed: for rewrite the selection start, for
+    continue the cursor plus any lead), not from a diff. For `mixed`, `start` is the same and `end` = final length
+    minus the length of the text after the region in the alt document (all hunks lie inside it).
+  - cards: kind `accepted` | `edited` (with `text`) | `rejected` | `abandoned`.
+- `final` — prose only, after `accepted` / `mixed`: the region text after the user's later edits.
+  `{type:'final', id, at, text|null, reason:'idle'|'left'|'action'|'close'|'reloaded'|'outside'}`.
+  Written when the scene has been idle 10 s after an edit since the accept (repeats allowed; **the last final for
+  an id wins** at export), and on leaving the scene, a new action on it, project close or quit flush. Tracking ends
+  when the scene is left, a new action starts on it, or the project closes. Located by rule: if the later document
+  starts with accepted[0:start] and ends with accepted[end:], text = later[start : later.length - (accepted.length -
+  end)]; else text null, reason `outside`. Reloads from disk, journal restore and conflict "Reload" write text null,
+  reason `reloaded`, and end tracking.
+
+**Writing a line.** Renderer → `novel:record(folder, line)` returns boolean. Main:
+- drops it (false) when the project is not open, blocked, or recording is off;
+- validates shape per type (fields and types as above; `id` /^[0-9a-f]{16}$/; serialized length <= 8 MB);
+- builds the path from the local date; `assertAppPath` + `guard`; `serialized(path)`; re-checks that the project
+  is still open right before `mkdir`; `fs.appendFile(line + '\n')` wrapped in a transient-error retry (EBUSY,
+  EPERM, EACCES; ~2 s total); prepends `\n` if the file's last byte is not `\n`;
+- tracks in-flight appends per project; `closeProject` (and so delete project) awaits them;
+- never throws for I/O: returns false and logs; the renderer shows one quiet toast per session and carries on.
+
+### Export
+
+**Export training data…** → folder picker → `novel:exportRecords(folder, outDir, opts)`.
+- `outDir` inside the project folder (realpath, case-insensitive) is refused.
+- Writes a new subfolder `<outDir>\<project-slug>-<YYYYMMDD-HHMMSS>\`: `train.jsonl`, `pairs.jsonl`,
+  `manifest.json`, each written to a temp name and renamed.
+- Streams: first pass reads every records file line by line and keeps only outcome / viewed / final lines per id
+  (last final wins; first outcome wins); second pass reads request lines one at a time and writes output lines as
+  it goes. Strict UTF-8 per line; bad, torn or wrongly shaped lines are counted as dropped, never fatal.
+- **train.jsonl** `{messages:[...recorded messages, {role:'assistant', content}], meta:{id, action, at, model,
+  kind, final:true|false}}`: prose `accepted` / `mixed` only; content = the last final's text if present and not
+  reverted, else (accepted) the alt's `generated` with `meta.final: false`, else (mixed, no final) dropped.
+  A final whose text equals the base region (the text the region replaced: the selection for rewrite, '' for
+  continue) is **reverted** and exported as rejected (dropped from train). Assistant text shorter than 20
+  characters after trimming is dropped.
+- **pairs.jsonl** `{prompt:[messages], chosen, rejected, meta:{id, source:'alts'|'edit'}}`: prose `accepted` only,
+  chosen = the accepted alt's generated; one pair per other alt that was **viewed**, finished with `stop`, and
+  differs after trimming. Alts with finish `length` are never in pairs. Option **Edit pairs** (off by default):
+  chosen = final text, rejected = accepted generated, only when a final with `meta.final` exists, differs, is not
+  reverted, and is not just the accepted text with more text added at the end.
+- `manifest.json`: format 1, app version, created, project title, date range, counts per file and per action,
+  dropped reasons with counts (including `noFinal`), the options.
+- Cards are not exported in 0.23. Text is written as recorded.
+
+### Style adapter "use with" hint
+
+- Adapter convert dialog success: "Trained on <base or 'an unknown base model'>. Add it to a chat's adapters or a
+  Writing project's **Adapters**."
+- Writing Project panel adapter list: "Trained on X" in `muted` per adapter, and a `warn` badge "Different base
+  model" when `adapterBaseMatch` says mismatch against the project model.
+
+### Writing benchmark
+
+**Benchmark** on the Writing page start view (no project needed) opens the benchmark view.
+
+- **Prompts**: 8 bundled scene briefs (original, 2-4 sentences, varied genres) plus the user's own (add, edit,
+  delete).
+- **Candidates** (2-6 per run): model, adapters with strengths, sampling (current defaults or a preset), label.
+- **Run**: chosen prompts × candidates × seeds (1-3; one seed list per run shared by all candidates), max tokens
+  per output (default 600). Requests: fixed benchmark system prompt + the brief; thinking off.
+- **Loop** in the renderer with injected deps (the `runBatchLoop` pattern): one output at a time, grouped by
+  candidate so each model / adapter set loads once; Stop after this / Stop now (a "now" output goes back to
+  pending). Finish reason recorded per output.
+- **Busy**: one shared check, `aiBusy()` in `lib/aiBusy.ts`, true while a Writing generation, a chat reply, a
+  batch run, a hardware benchmark or a writing benchmark runs. The benchmark refuses to start or continue a step
+  while anything else is busy; Writing AI actions refuse while a benchmark generates.
+- **Voting**: blind pairs (same prompt and seed, two different candidates), shown as A / B in a stored random
+  order; **A is better**, **B is better**, **Tie**, **Skip**; names shown after the vote; each pair voted once.
+- **Scoreboard per run**: Elo from the run's votes in vote order (start 1000, K 32, tie 0.5), plus wins / losses /
+  ties; a pure function, never stored as the source of truth.
+- **Storage**: `%APPDATA%\RulZ LLM Suite\writing-bench\runs\<id>.json` (one file per run) and
+  `writing-bench\prompts.json`. Written atomically, serialized per file, saved after every output and vote.
+  A run file that cannot be read or validated is listed as damaged and never rewritten or deleted by the app (the
+  user can delete it). Runs still `running` on load are shown as `stopped` (written back only on the next change).
+  No automatic cap.
+
+### Out of scope for stage 4
+
+Training inside the app; uploading anything; exporting card actions; recording checks, state updates or
+interviews; LLM-as-judge voting; benchmark prompts with project context.
 
 ## Module plan (stage 2)
 

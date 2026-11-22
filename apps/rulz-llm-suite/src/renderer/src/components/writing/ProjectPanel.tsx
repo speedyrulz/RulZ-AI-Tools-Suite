@@ -1,17 +1,20 @@
 import * as Collapsible from '@radix-ui/react-collapsible'
-import { ChevronRight, History as HistoryIcon, ListTree } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
-import type { NovelBudget } from '@shared/novel'
-import { MAX_ADAPTER_SCALE, MIN_ADAPTER_SCALE } from '@shared/adapters'
+import { ChevronRight, Download, History as HistoryIcon, ListTree, Trash2 } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { toast } from 'sonner'
+import type { NovelBudget, RecordsInfo } from '@shared/novel'
+import { MAX_ADAPTER_SCALE, MIN_ADAPTER_SCALE, adapterBaseMatch } from '@shared/adapters'
 import type { LoadAdapter, SamplingParams } from '@shared/types'
 import { chatAdapters, formatScale, onScale, withChatScale } from '../../lib/adapters'
+import { errorMessage, invoke } from '../../lib/api'
+import { formatBytes } from '../../lib/format'
 import { STYLE_PATH, useNovel } from '../../stores/novel'
 import { useModels } from '../../stores/models'
 import { VarietyFields } from '../chat/InferencePanel'
-import { Button, Field, IconButton, NumberInput, Select, Slider, Switch } from '../ui'
+import { Badge, Button, Field, IconButton, NumberInput, Select, Slider, Switch } from '../ui'
 import { BufferBanners } from './Banners'
 import { CodeEditor } from './CodeEditor'
-import { DraftInput, PanelSection } from './common'
+import { ConfirmDialog, DraftInput, PanelSection } from './common'
 import { HistoryDialog } from './HistoryDialog'
 
 function SliderRow({ label, hint, value, min, max, step, onChange }: { label: string; hint?: string; value: number; min: number; max: number; step: number; onChange: (v: number) => void }) {
@@ -32,6 +35,8 @@ export function ProjectPanel() {
   const models = useModels((s) => s.models)
   const instances = useModels((s) => s.instances)
   const activeModelId = useModels((s) => s.activeModelId)
+  const adapterLibrary = useModels((s) => s.adapters)
+  const folder = useNovel((s) => s.folder)
   const [varietyOpen, setVarietyOpen] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
   const [chapters, setChapters] = useState<number | null>(8)
@@ -50,6 +55,25 @@ export function ProjectPanel() {
     if (s) clearTimeout(s)
     if (b) clearTimeout(b)
   }, [])
+
+  // Stage 4: the size of the records, read when the panel opens and again after an export or a delete.
+  const [records, setRecords] = useState<RecordsInfo | null>(null)
+  const [exportDir, setExportDir] = useState<string | null>(null)
+  const [editPairs, setEditPairs] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const refreshRecords = useCallback(async (): Promise<void> => {
+    if (!folder) return setRecords(null)
+    try {
+      setRecords(await invoke('novel:recordsInfo', folder))
+    } catch {
+      setRecords(null)
+    }
+  }, [folder])
+  useEffect(() => {
+    setExportDir(null)
+    void refreshRecords()
+  }, [refreshRecords])
 
   if (!project) return <div className="p-4 text-xs text-faint">Open a project to change its settings.</div>
   const store = useNovel.getState()
@@ -73,6 +97,51 @@ export function ProjectPanel() {
   const loaded = inst?.adapters ?? []
   const rows = chatAdapters(loaded, project.adapters)
   const setAdapter = (id: string, scale: number): void => void store.patchProject({ adapters: withChatScale(loaded, project.adapters, id, scale) as LoadAdapter[] })
+  const modelEntry = models.find((m) => m.id === modelId)
+  const libraryEntry = (id: string) => adapterLibrary.find((a) => a.id === id)
+  const pickExportFolder = async (): Promise<void> => {
+    try {
+      const dir = await invoke('dialog:pickFolder', { title: 'Folder for the training data' })
+      if (dir) {
+        setEditPairs(false)
+        setExportDir(dir)
+      }
+    } catch (e) {
+      toast.error(`Could not open the folder picker: ${errorMessage(e)}`)
+    }
+  }
+  const doExport = async (): Promise<void> => {
+    if (!folder || !exportDir) return
+    setExporting(true)
+    try {
+      const r = await invoke('novel:exportRecords', folder, exportDir, { editPairs })
+      const dropped = Object.entries(r.dropped)
+        .map(([why, n]) => `${n} × ${why}`)
+        .join('\n')
+      toast.success(`Exported ${r.train} training sample${r.train === 1 ? '' : 's'} and ${r.pairs} pair${r.pairs === 1 ? '' : 's'}.`, {
+        description: dropped ? `Left out:\n${dropped}` : undefined,
+        duration: 15000,
+        action: { label: 'Show', onClick: () => void invoke('shell:showItem', r.outDir) }
+      })
+      setExportDir(null)
+    } catch (e) {
+      toast.error(`Export failed: ${errorMessage(e)}`)
+    } finally {
+      setExporting(false)
+      void refreshRecords()
+    }
+  }
+  const deleteRecords = async (): Promise<void> => {
+    if (!folder) return
+    try {
+      await invoke('novel:deleteRecords', folder)
+      toast.success('The records are in the Recycle Bin.')
+    } catch (e) {
+      toast.error(`Nothing was deleted: ${errorMessage(e)}`)
+    } finally {
+      void refreshRecords()
+    }
+  }
   const varietyOn = (sp.dryMultiplier > 0 ? 1 : 0) + (sp.xtcProbability > 0 ? 1 : 0) + (sp.avoidWords.length > 0 ? 1 : 0)
 
   return (
@@ -128,15 +197,26 @@ export function ProjectPanel() {
           <p className="text-[11px] text-faint">{inst ? 'This model was loaded without adapters.' : 'The model is not loaded.'} Adapters are chosen when you load the model (Ctrl+L).</p>
         ) : (
           <>
-            {rows.map((a) => (
+            {rows.map((a) => {
+              const entry = libraryEntry(a.id)
+              const base = entry?.info?.baseModelName
+              const mismatch = !!entry && !!modelEntry && adapterBaseMatch(entry, modelEntry) === 'mismatch'
+              return (
               <Field key={a.id} label={<span className="break-all">{a.name}</span>} hint={<span className="tabular-nums">Default {formatScale(a.defaultScale)}</span>}>
+                {(base || mismatch) && (
+                  <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
+                    {base && <span className="text-[11px] text-muted">Trained on {base}</span>}
+                    {mismatch && <Badge tone="warn">Different base model</Badge>}
+                  </div>
+                )}
                 <div className="flex items-center gap-2.5">
                   <Switch checked={a.scale !== 0} onCheckedChange={(on) => setAdapter(a.id, on ? onScale(a) : 0)} />
                   <Slider value={Math.min(2, Math.max(0, a.scale))} min={0} max={2} step={0.05} onChange={(v) => setAdapter(a.id, v)} />
                   <NumberInput className="w-18" value={a.scale} min={MIN_ADAPTER_SCALE} max={MAX_ADAPTER_SCALE} step={0.05} onChange={(v) => setAdapter(a.id, v ?? a.defaultScale)} />
                 </div>
               </Field>
-            ))}
+              )
+            })}
             <div className="flex items-start justify-between gap-2">
               <p className="text-[11px] text-faint">Strengths for this project; changing them makes the model read the prompt again.</p>
               <Button size="sm" variant="ghost" disabled={project.adapters === null} onClick={() => void store.patchProject({ adapters: null })}>
@@ -181,6 +261,46 @@ export function ProjectPanel() {
             <ListTree size={14} /> Plan chapters
           </Button>
         </div>
+      </PanelSection>
+
+      <PanelSection title="Recording">
+        <Field inline label="Record AI actions">
+          <Switch checked={project.recording !== false} onCheckedChange={(on) => void store.patchProject({ recording: on })} />
+        </Field>
+        <p className="text-[11px] text-faint">Saves each AI request and what you did with it in .rulz\records, for training data. Nothing leaves this PC.</p>
+        <p className="text-[11px] text-faint tabular-nums">{records === null ? 'Records: not read' : records.files === 0 ? 'No records yet.' : `Records: ${formatBytes(records.bytes)} in ${records.files} file${records.files === 1 ? '' : 's'}`}</p>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button size="sm" disabled={exporting} onClick={() => void pickExportFolder()}>
+            <Download size={14} /> Export training data…
+          </Button>
+          <Button size="sm" variant="ghost" disabled={!records?.files} onClick={() => setConfirmDelete(true)}>
+            <Trash2 size={14} /> Delete records…
+          </Button>
+        </div>
+        {exportDir && (
+          <div className="space-y-2 rounded-lg border border-border bg-panel-2 p-3">
+            <p className="text-[13px] break-all text-body">Export to {exportDir}</p>
+            <label className="flex items-center gap-2 text-[13px] text-body">
+              <input type="checkbox" checked={editPairs} onChange={(e) => setEditPairs(e.target.checked)} /> Also make pairs from my edits
+            </label>
+            <div className="flex items-center justify-end gap-2">
+              <Button size="sm" variant="ghost" disabled={exporting} onClick={() => setExportDir(null)}>
+                Cancel
+              </Button>
+              <Button size="sm" variant="primary" disabled={exporting} onClick={() => void doExport()}>
+                {exporting ? 'Exporting…' : 'Export'}
+              </Button>
+            </div>
+          </div>
+        )}
+        <ConfirmDialog
+          open={confirmDelete}
+          onOpenChange={setConfirmDelete}
+          title="Delete the records?"
+          body={<p>The records of this project move to the Windows Recycle Bin. Your scenes and notes are not touched.</p>}
+          confirm="Delete records"
+          onConfirm={() => void deleteRecords()}
+        />
       </PanelSection>
     </div>
   )

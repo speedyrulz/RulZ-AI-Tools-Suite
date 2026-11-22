@@ -6,6 +6,7 @@ import type { BenchmarkRequest, BenchmarkRun } from '@shared/benchmark'
 import { insertRunIfAbsent, mergeRun } from '../lib/bench'
 import { errorMessage, invoke, on } from '../lib/api'
 import { once } from '../lib/once'
+import { WBENCH_BUSY, wbenchRunning } from '../lib/wbenchFlag'
 
 interface BenchState {
   loaded: boolean
@@ -44,6 +45,10 @@ export const useBench = create<BenchState>((set, get) => ({
 
   start: async (req) => {
     if (get().starting || activeBenchRun(get().runs)) return null
+    if (wbenchRunning()) {
+      toast(WBENCH_BUSY)
+      return null
+    }
     set({ starting: true })
     try {
       const run = await invoke('bench:start', req)

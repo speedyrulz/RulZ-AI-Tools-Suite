@@ -22,12 +22,16 @@ import type {
   OutlineOp,
   OutlineScenesReply,
   ProjectPatch,
+  RecordAlt,
+  RecordFinalReason,
+  RecordLine,
+  RecordRegion,
   RewriteVariant,
   StateFact,
   StateOp,
   SummaryReply
 } from '@shared/novel'
-import type { WireMessage } from '@shared/types'
+import type { SamplingParams, WireMessage } from '@shared/types'
 import { parseEntry } from '@shared/frontMatter'
 import { findingKey, locateQuote } from '@shared/novelChecks'
 import { newId } from '@shared/novelOutline'
@@ -50,6 +54,23 @@ import { errorMessage, invoke, on } from '../lib/api'
 import { uid } from '../lib/format'
 import type { EditorHandle } from '../lib/novelEditor'
 import { once } from '../lib/once'
+import { aiBusyReason } from '../lib/aiBusy'
+import { chatAdapters } from '../lib/adapters'
+import {
+  appVersionNow,
+  appVersionText,
+  classifyOutcome,
+  finalLine,
+  finishOf,
+  locateFinal,
+  outcomeLine,
+  outcomeRegion,
+  recordId,
+  regionOf,
+  requestLine,
+  sendRecord,
+  viewedLine
+} from '../lib/novelRecord'
 import {
   ACTION_LABELS,
   STALE_PENDING,
@@ -66,6 +87,7 @@ import {
   pendingStale,
   resolveSceneRefs,
   resolveStateChanges,
+  samplingFor,
   scenePath,
   seedsFor,
   startGeneration,
@@ -142,6 +164,8 @@ export interface Proposal {
   summaryOf: string
   /** For Retry. */
   again: { count: number; note: string }
+  /** Stage 4: the id of the record this run writes (16 hex). */
+  recId?: string
 }
 
 /** The card of an Update state request: changes to accept or reject; nothing is written before Apply. */
@@ -326,6 +350,196 @@ let activeGen: GenHandle | null = null
 let stopRequested = false
 /** Counts project opens and closes; a run started in an earlier one must not touch the current one. */
 let epoch = 0
+
+// ---- stage 4: recording (docs/writing-mode-design.md, "Recording") -----------------------------
+// Every send is fire-and-forget: nothing on the writing path waits for it, and a failure is ignored
+// (sendRecord tells the user once, quietly).
+
+/** How long a scene must be left alone after an edit before its region's text is recorded as a final. */
+export const FINAL_IDLE_MS = 10_000
+
+interface FinalTracker {
+  recId: string
+  folder: string
+  path: string
+  /** The document as accepted, and where the generated text sits in it. */
+  accepted: string
+  region: RecordRegion
+  timer: ReturnType<typeof setTimeout> | null
+}
+
+/** One tracker per scene path, from an accept until the scene is left, a new action starts, or the project closes. */
+const trackers = new Map<string, FinalTracker>()
+/** Runs (record ids) whose request line was sent, and those whose outcome was sent: nothing more is written for them. */
+const requestedRuns = new Set<string>()
+const resolvedRuns = new Set<string>()
+
+const nowIso = (): string => new Date().toISOString()
+
+/** Sends a line for `folder` if that project is still the open one and its recording is on. Never awaited on the writing path. */
+function recordTo(folder: string, line: RecordLine): Promise<boolean> {
+  const s = useNovel.getState()
+  if (s.folder !== folder || s.state?.project.recording === false) return Promise.resolve(false)
+  return sendRecord(folder, line)
+}
+
+function writeFinal(t: FinalTracker, reason: RecordFinalReason, forceNull: boolean): Promise<boolean> | null {
+  const b = useNovel.getState().buffers[t.path]
+  let text: string | null = null
+  let why = reason
+  if (!forceNull) {
+    // The scene's buffer is gone (deleted): there is no text to read, so no line.
+    if (!b) return null
+    text = locateFinal(t.accepted, t.region, b.text)
+    if (text === null) why = 'outside'
+  }
+  return recordTo(t.folder, finalLine(t.recId, nowIso(), text, why))
+}
+
+/** Ends the tracking of a scene and writes its last final with `reason`. Returns the send, or null when nothing was tracked or sent. */
+function endTracker(path: string, reason: RecordFinalReason, forceNull = false): Promise<boolean> | null {
+  const t = trackers.get(path)
+  if (!t) return null
+  trackers.delete(path)
+  if (t.timer) clearTimeout(t.timer)
+  return writeFinal(t, reason, forceNull)
+}
+
+/** A user edit of a tracked scene: the idle timer starts again. */
+function touchTracker(path: string): void {
+  const t = trackers.get(path)
+  if (!t) return
+  if (t.timer) clearTimeout(t.timer)
+  t.timer = setTimeout(() => {
+    t.timer = null
+    if (trackers.get(path) === t) void writeFinal(t, 'idle', false)
+  }, FINAL_IDLE_MS)
+}
+
+function startTracker(t: Omit<FinalTracker, 'timer'>): void {
+  const old = trackers.get(t.path)
+  if (old?.timer) clearTimeout(old.timer)
+  trackers.set(t.path, { ...t, timer: null })
+}
+
+/**
+ * Writes the current final of every tracked scene (reason 'close'). Tracking goes on: a close that succeeds drops
+ * the trackers, and one that fails (unsaved text) leaves the project open and still followed. The promise settles
+ * when the sends did.
+ */
+function flushFinals(): Promise<unknown> {
+  const sends: Promise<boolean>[] = []
+  for (const t of [...trackers.values()]) {
+    if (t.timer) clearTimeout(t.timer)
+    t.timer = null
+    const p = writeFinal(t, 'close', false)
+    if (p) sends.push(p)
+  }
+  return Promise.all(sends)
+}
+
+function dropTrackers(): void {
+  for (const t of trackers.values()) if (t.timer) clearTimeout(t.timer)
+  trackers.clear()
+}
+
+/** The outcome 'abandoned' for a prose change or card the user never resolved. Once per run. */
+function abandonRun(folder: string | null, recId: string | undefined): void {
+  if (!folder || !recId || !requestedRuns.has(recId) || resolvedRuns.has(recId)) return
+  resolvedRuns.add(recId)
+  void recordTo(folder, outcomeLine(recId, nowIso(), 'abandoned', { alt: null, region: null }))
+}
+
+/**
+ * Writes viewed + outcome for a prose change the user resolved (accepted, mixed or rejected) and, for the
+ * first two, starts following the region. Once per run; nothing for a run whose request was not recorded.
+ */
+function recordProseOutcome(p: PendingChange, finalText: string): void {
+  const folder = useNovel.getState().folder
+  const id = p.recId
+  if (!folder || !id || !requestedRuns.has(id) || resolvedRuns.has(id)) return
+  resolvedRuns.add(id)
+  const alt = p.alts[p.active]
+  const kind = alt ? classifyOutcome(p.baseText, finalText, alt.text) : finalText === p.baseText ? 'rejected' : 'mixed'
+  const at = nowIso()
+  const viewed = p.viewed ?? []
+  void recordTo(folder, viewedLine(id, at, viewed.includes(p.active) ? viewed : [...viewed, p.active]))
+  if (kind === 'rejected' || !alt) {
+    void recordTo(folder, outcomeLine(id, at, 'rejected', { alt: null, region: null }))
+    return
+  }
+  const geo = regionOf(p.action, p.baseText, p.again.cursor, p.again.selection, alt.generated)
+  const region = outcomeRegion(kind, geo, alt.text.length, finalText.length)
+  void recordTo(folder, outcomeLine(id, at, kind, { alt: p.active, region, replaced: geo.replaced }))
+  startTracker({ recId: id, folder, path: p.path, accepted: finalText, region })
+}
+
+/** Outcome of a card the user resolved: accepted, edited (with the text) or rejected. Once per run. */
+function recordCardOutcome(recId: string | undefined, kind: 'accepted' | 'edited' | 'rejected', text?: string): void {
+  const folder = useNovel.getState().folder
+  if (!folder || !recId || !requestedRuns.has(recId) || resolvedRuns.has(recId)) return
+  resolvedRuns.add(recId)
+  void recordTo(folder, outcomeLine(recId, nowIso(), kind, kind === 'edited' ? { text } : {}))
+}
+
+/** What a card holds, as text, to tell an edited proposal from the one the model wrote. */
+function cardText(p: Pick<Proposal, 'summary' | 'chapters' | 'scenes'>): string {
+  if (p.summary) return p.summary.summary
+  return JSON.stringify(p.chapters ?? p.scenes ?? null)
+}
+
+/** The adapters a request goes out with: each loaded adapter at the project's strength. */
+function requestAdapters(instanceId: string, project: NovelProject): { name: string; scale: number }[] {
+  const inst = useModels.getState().instances.find((i) => i.instanceId === instanceId)
+  return chatAdapters(inst?.adapters ?? [], project.adapters).map((a) => ({ name: a.name, scale: a.scale }))
+}
+
+interface RequestRecord {
+  recId: string
+  action: NovelAction
+  variant?: string
+  sceneId: string | null
+  chapterId: string | null
+  model: { instanceId: string; modelId: string }
+  project: NovelProject
+  /** The sampling actually sent for the first alternative (each alternative's own seed is in alts). */
+  sampling: SamplingParams
+  messages: { role: string; content: unknown }[]
+  alts: RecordAlt[]
+}
+
+/** Sends the request line of a run that ended with at least one alternative. Marks the run as recorded at once, so its outcome follows. */
+function sendRequestRecord(folder: string, r: RequestRecord): void {
+  if (useNovel.getState().state?.project.recording === false) return
+  requestedRuns.add(r.recId)
+  // Built and sent now, with no wait before it, so it cannot land after a close or in a reopened project.
+  void appVersionText()
+  {
+    const app = appVersionNow()
+    void recordTo(
+      folder,
+      requestLine({
+        id: r.recId,
+        at: nowIso(),
+        app,
+        action: r.action,
+        variant: r.variant,
+        sceneId: r.sceneId,
+        chapterId: r.chapterId,
+        model: { id: r.model.modelId, name: modelName(r.model.modelId) },
+        sampling: r.sampling,
+        adapters: requestAdapters(r.model.instanceId, r.project),
+        messages: r.messages,
+        alts: r.alts
+      })
+    )
+  }
+}
+
+function modelName(modelId: string): string {
+  const m = useModels.getState()
+  return m.models.find((x) => x.id === modelId)?.name ?? m.instances.find((i) => i.modelId === modelId)?.modelName ?? modelId
+}
 
 export function registerEditor(path: string, handle: EditorHandle | null): void {
   if (handle) editors.set(path, handle)
@@ -584,6 +798,7 @@ export const useNovel = create<NovelState>((set, get) => {
     if (path.startsWith('manuscript/')) set((s) => ({ hashes: { ...s.hashes, [path]: file.hash } }))
     const stillWorking = working || cur.dirty || cur.saving || !!cur.conflict || (path === STYLE_PATH && (!!get().gen || !!get().pending)) || get().pending?.path === path || get().gen?.path === path
     if (stillWorking) return patchBuffer(path, () => ({ changedOnDisk: true }))
+    void endTracker(path, 'reloaded', true)
     patchBuffer(path, (x) => ({
       text: file.text,
       savedText: file.text,
@@ -745,7 +960,11 @@ export const useNovel = create<NovelState>((set, get) => {
     meta: { targetId: string | null; title: string; summaryOf: string; again: { count: number; note: string } }
   ): Promise<void> => {
     if (busy() || get().pending) return void toast.message('Wait for the current request to finish first.')
-    const proposal: Proposal = { id: uid(), kind, targetId: meta.targetId, title: meta.title, status: 'running', raw: '', error: null, summaryOf: meta.summaryOf, again: meta.again }
+    const why = aiBusyReason('writing')
+    if (why) return void toast.message(why)
+    // A card still on screen is replaced: it is abandoned.
+    abandonRun(get().folder, get().proposal?.recId)
+    const proposal: Proposal = { id: uid(), kind, targetId: meta.targetId, title: meta.title, status: 'running', raw: '', error: null, summaryOf: meta.summaryOf, again: meta.again, recId: recordId() }
     set({ proposal, gen: { path: null, action, label: ACTION_LABELS[action], phase: 'preparing', alt: 1, of: 1, progress: null, text: '' }, panelOpen: true, panelTab: 'scene' })
     stopRequested = false
     // The project open now: a result that arrives after it was closed is dropped.
@@ -771,14 +990,16 @@ export const useNovel = create<NovelState>((set, get) => {
       }
       const schema = action === 'outlineChapters' ? OUTLINE_CHAPTERS_SCHEMA : action === 'outlineScenes' ? OUTLINE_SCENES_SCHEMA : SUMMARY_SCHEMA
       const sampling = base.ctx.project.sampling
+      const seed = seedsFor(sampling.seed, 1)[0]
+      const maxTokens = Math.max(1024, base.ctx.project.budget.replyTokens)
       const gen = startGeneration({
         modelId: model.modelId,
         messages: fit.built.result.messages,
         sampling,
         adapters: base.ctx.project.adapters,
         action,
-        seed: seedsFor(sampling.seed, 1)[0],
-        maxTokens: Math.max(1024, base.ctx.project.budget.replyTokens),
+        seed,
+        maxTokens,
         schema,
         onProgress: (p) => set((s) => (s.gen ? { gen: { ...s.gen, phase: 'waiting', progress: p } } : s)),
         onDelta: pushStreamText
@@ -788,6 +1009,20 @@ export const useNovel = create<NovelState>((set, get) => {
       if (epoch === epoch0) activeGen = null
       if (stale() || get().proposal?.id !== proposal.id) return done(null)
       if (res.stopped && !res.text.trim()) return done(null)
+      // The run's request: one alternative, the raw reply (also an unreadable one: it is what the model wrote).
+      if (res.text.trim() && proposal.recId && folder0) {
+        sendRequestRecord(folder0, {
+          recId: proposal.recId,
+          action,
+          sceneId: over.sceneId ?? null,
+          chapterId: over.chapterId ?? null,
+          model,
+          project: base.ctx.project,
+          sampling: samplingFor(sampling, { seed, maxTokens, schema, action }),
+          messages: fit.built.result.messages,
+          alts: [{ index: 0, seed, generated: res.text, finish: finishOf(res.stopReason, res) }]
+        })
+      }
       if (res.error) return done({ status: 'invalid', raw: res.text, error: res.error })
       const raw = res.text.trim()
       if (kind === 'chapters') {
@@ -1003,6 +1238,7 @@ export const useNovel = create<NovelState>((set, get) => {
         void flushAll().finally(() => void invoke('novel:flushDone').catch(() => undefined))
       })
       window.addEventListener('focus', recheckOpen)
+      void appVersionText()
       set({ ready: true })
     }),
 
@@ -1067,6 +1303,10 @@ export const useNovel = create<NovelState>((set, get) => {
         toast.error('Some unsaved text could not be saved or kept, so the project stays open: ' + flushed.failed.join(', '))
         return false
       }
+      // A change or card still waiting for the user's answer is abandoned (flushAll wrote the finals).
+      abandonRun(folder, get().pending?.recId)
+      abandonRun(folder, get().proposal?.recId)
+      dropTrackers()
       epoch++
       activeGen = null
       clearAllTimers()
@@ -1110,7 +1350,10 @@ export const useNovel = create<NovelState>((set, get) => {
       if (!(await ensureBuffer(path))) return
       set({ target: { kind: 'scene', id: sceneId }, lastSceneId: sceneId, selection: { from: 0, to: 0 } })
       remember(sceneKey(s.folder), sceneId)
-      if (old && old !== path) dropIfIdle(old)
+      if (old && old !== path) {
+        void endTracker(old, 'left')
+        dropIfIdle(old)
+      }
     },
 
     selectEntry: async (entryId) => {
@@ -1121,7 +1364,10 @@ export const useNovel = create<NovelState>((set, get) => {
       if (old && old !== path) void get().save(old)
       if (!(await ensureBuffer(path))) return
       set({ target: { kind: 'entry', id: entryId } })
-      if (old && old !== path) dropIfIdle(old)
+      if (old && old !== path) {
+        void endTracker(old, 'left')
+        dropIfIdle(old)
+      }
     },
 
     edit: (path, text) => {
@@ -1134,6 +1380,7 @@ export const useNovel = create<NovelState>((set, get) => {
       const inflight = b.saving || saving.has(path)
       const dirty = text !== b.savedText || inflight
       patchBuffer(path, (x) => ({ text, version: x.version + 1, dirty }))
+      touchTracker(path)
       if (dirty) {
         scheduleJournal(path)
         if (!b.conflict) scheduleAutosave(path)
@@ -1169,6 +1416,7 @@ export const useNovel = create<NovelState>((set, get) => {
         clearTimer(autosaveTimers, path)
         clearTimer(journalTimers, path)
         clearTimer(retryTimers, path)
+        void endTracker(path, 'reloaded', true)
         patchBuffer(path, (x) => ({
           text: f.text,
           savedText: f.text,
@@ -1193,6 +1441,7 @@ export const useNovel = create<NovelState>((set, get) => {
       const b = get().buffers[path]
       if (!b?.journal) return
       const j = b.journal
+      void endTracker(path, 'reloaded', true)
       // Based on the hash the journal was made against: if the file moved on since, the save asks first.
       patchBuffer(path, (x) => ({ text: j.text, version: x.version + 1, dirty: j.text !== x.savedText, baseHash: j.baseHash || x.baseHash, journal: null }))
       scheduleAutosave(path)
@@ -1210,6 +1459,7 @@ export const useNovel = create<NovelState>((set, get) => {
       if (!folder || !b) return
       try {
         const text = await invoke('novel:readSnapshot', folder, snapshot)
+        void endTracker(path, 'reloaded', true)
         patchBuffer(path, (x) => ({ text, version: x.version + 1, dirty: text !== x.savedText }))
         const ok = await get().save(path, { snapshot: true })
         if (ok) toast.success('Restored. The text from before is in the history.')
@@ -1387,6 +1637,8 @@ export const useNovel = create<NovelState>((set, get) => {
       const path = scenePath(found.scene)
       const handle = editors.get(path)
       if (!handle) return
+      const why = aiBusyReason('writing')
+      if (why) return void toast.message(why)
       // Where to work is read now, before anything is awaited: the user may move on meanwhile.
       const sel = handle.selection()
       const at = opts.at ?? { cursor: sel.from, selection: sel.from === sel.to ? null : sel }
@@ -1399,6 +1651,9 @@ export const useNovel = create<NovelState>((set, get) => {
       const folder0 = s.folder
       const stale = (): boolean => epoch !== epoch0 || get().folder !== folder0 || !get().buffers[path]
       stopRequested = false
+      // A new action on the scene ends the tracking of the last accepted change in it.
+      void endTracker(path, 'action')
+      const recId = recordId()
       // gen is set first: it holds the text still (no edits, no reload) from here to the end.
       set({ gen: { path, action: opts.action, label, phase: 'preparing', alt: 1, of: alternatives, progress: null, text: '' }, pendingRefused: false })
       const finish = (): void => {
@@ -1447,9 +1702,12 @@ export const useNovel = create<NovelState>((set, get) => {
         const project = base.ctx.project
         const seeds = seedsFor(project.sampling.seed, alternatives)
         const alts: PendingAlt[] = []
+        const finishes: RecordAlt['finish'][] = []
         let failure: string | null = null
         const mk = (): PendingChange => ({
           id: uid(),
+          recId,
+          viewed: [0],
           path,
           sceneId: t.id,
           action: opts.action,
@@ -1490,10 +1748,26 @@ export const useNovel = create<NovelState>((set, get) => {
             break
           }
           alts.push({ text: applyResult(opts.action, buf.text, Math.min(at.cursor, buf.text.length), at.selection, generated), generated, seed: seeds[i] })
+          finishes.push(finishOf(res.stopReason, res))
           set((x) => ({ pending: x.pending ? { ...x.pending, alts: [...alts] } : mk() }))
           if (res.stopped) break
         }
         if (failure && !stale()) toast.error(alts.length ? `Stopped after ${alts.length} of ${alternatives}: ${failure}` : failure)
+        // The run's request, once, when it produced at least one alternative.
+        if (alts.length && folder0 && !stale()) {
+          sendRequestRecord(folder0, {
+            recId,
+            action: opts.action,
+            variant: opts.variant,
+            sceneId: t.id,
+            chapterId: found.chapterId,
+            model,
+            project,
+            sampling: samplingFor(project.sampling, { seed: seeds[0], maxTokens: project.budget.replyTokens, action: opts.action }),
+            messages: fit.built.result.messages,
+            alts: alts.map((a, i) => ({ index: i, seed: a.seed, generated: a.generated, finish: finishes[i] ?? 'stop' }))
+          })
+        }
       } catch (e) {
         toast.error(errorMessage(e))
       } finally {
@@ -1507,7 +1781,11 @@ export const useNovel = create<NovelState>((set, get) => {
     },
 
     selectAlt: (index) => {
-      set((s) => (s.pending && index >= 0 && index < s.pending.alts.length ? { pending: { ...s.pending, active: index } } : s))
+      set((s) =>
+        s.pending && index >= 0 && index < s.pending.alts.length
+          ? { pending: { ...s.pending, active: index, viewed: s.pending.viewed && !s.pending.viewed.includes(index) ? [...s.pending.viewed, index] : s.pending.viewed } }
+          : s
+      )
     },
 
     acceptAll: async () => {
@@ -1528,15 +1806,24 @@ export const useNovel = create<NovelState>((set, get) => {
       const p = get().pending
       if (!p) return
       const b = get().buffers[p.path]
-      if (!b) return void set({ pending: null })
-      if (finalText === p.baseText) return void set({ pending: null, pendingRefused: false })
+      if (!b) {
+        abandonRun(get().folder, p.recId)
+        return void set({ pending: null })
+      }
+      if (finalText === p.baseText) {
+        recordProseOutcome(p, finalText)
+        return void set({ pending: null, pendingRefused: false })
+      }
       if (pendingStale(p, b)) {
+        // The change can no longer be accepted: abandoned (once; Regenerate or Reject after it add nothing).
+        abandonRun(get().folder, p.recId)
         toast.error(STALE_PENDING)
         return void set({ pendingRefused: true })
       }
       // The buffer takes the text, then one save with a history snapshot (Accept, data safety rule 5).
       set((s) => ({ pending: null, pendingRefused: false, buffers: { ...s.buffers, [p.path]: { ...b, text: finalText, version: b.version + 1, dirty: finalText !== b.savedText } } }))
       clearTimer(autosaveTimers, p.path)
+      recordProseOutcome(p, finalText)
       // The accepted text is in the journal at once, even if the save has to wait behind another one.
       const folder = get().folder
       if (folder) void invoke('novel:journal', folder, p.path, finalText, b.baseHash).catch(() => undefined)
@@ -1556,6 +1843,7 @@ export const useNovel = create<NovelState>((set, get) => {
       const p = get().pending
       if (!p) return
       const again = p.again
+      abandonRun(get().folder, p.recId)
       set({ pending: null, pendingRefused: false })
       await get().runAction({ action: again.action, variant: again.variant, note: again.note, alternatives: again.count, at: { cursor: again.cursor, selection: again.selection } })
     },
@@ -1642,6 +1930,10 @@ export const useNovel = create<NovelState>((set, get) => {
       if (!ops.length) return void set({ proposal: null })
       const ok = await get().patch(ops)
       if (!ok) return
+      // Resolved: accepted as written, or edited (the edited text is recorded).
+      const original = get().proposal
+      if (edited && original && cardText(edited) !== cardText(original)) recordCardOutcome(original.recId, 'edited', cardText(edited))
+      else recordCardOutcome((original ?? p).recId, 'accepted')
       set({ proposal: null })
       const queue = get().summarizeQueue
       if (queue.length) {
@@ -1650,11 +1942,15 @@ export const useNovel = create<NovelState>((set, get) => {
       }
     },
 
-    rejectProposal: () => set({ proposal: null, summarizeQueue: [] }),
+    rejectProposal: () => {
+      recordCardOutcome(get().proposal?.recId, 'rejected')
+      set({ proposal: null, summarizeQueue: [] })
+    },
 
     retryProposal: async () => {
       const p = get().proposal
       if (!p) return
+      abandonRun(get().folder, p.recId)
       set({ proposal: null })
       if (p.kind === 'summaryScene' && p.targetId) await get().summarizeScene(p.targetId)
       else if (p.kind === 'summaryChapter' && p.targetId) await get().summarizeChapter(p.targetId)
@@ -1708,6 +2004,8 @@ export const useNovel = create<NovelState>((set, get) => {
       const found = sceneOf(s.state, sceneId)
       if (!s.state || !found) return
       if (busy() || s.pending) return void toast.message('Wait for the current request to finish first.')
+      const why = aiBusyReason('writing')
+      if (why) return void toast.message(why)
       stopRequested = false
       const r = await checkOne(sceneId, `Check: ${found.scene.title}`)
       if (r === 'empty') return void toast.message('The scene has no text to check.')
@@ -1723,6 +2021,8 @@ export const useNovel = create<NovelState>((set, get) => {
       const chapter = s.state?.outline.chapters.find((c) => c.id === chapterId)
       if (!chapter) return
       if (busy() || s.pending) return void toast.message('Wait for the current request to finish first.')
+      const why = aiBusyReason('writing')
+      if (why) return void toast.message(why)
       const ids = chapter.scenes.map((sc) => sc.id)
       const epoch0 = epoch
       stopRequested = false
@@ -1802,6 +2102,8 @@ export const useNovel = create<NovelState>((set, get) => {
       if (s.state.blocked) return void toast.error('The project is read-only.')
       if (s.state.state?.problem) return void toast.error(`state.json cannot be used: ${s.state.state.problem}`)
       if (busy() || s.pending) return void toast.message('Wait for the current request to finish first.')
+      const why = aiBusyReason('writing')
+      if (why) return void toast.message(why)
       if (s.stateProposal && (s.stateProposal.status === 'ready' || s.stateProposal.status === 'running')) return void toast.message('Apply or reject the state update on the card first.')
       const id = uid()
       set({
@@ -1885,6 +2187,11 @@ export const useNovel = create<NovelState>((set, get) => {
       }
       if (busy()) {
         toast.message('Wait for the current request to finish first.')
+        return false
+      }
+      const why = aiBusyReason('writing')
+      if (why) {
+        toast.message(why)
         return false
       }
       const key = interviewKey(characterId, sceneId)
@@ -1987,6 +2294,7 @@ export const useNovel = create<NovelState>((set, get) => {
   // Opens a state the main process returned: buffers for style.md, last scene or first scene.
   async function enterProject(st: NovelProjectState): Promise<void> {
     epoch++
+    dropTrackers()
     clearAllTimers()
     clearCountCache()
     set({
@@ -2063,6 +2371,8 @@ export async function flushAll(): Promise<FlushResult> {
   const left = (): number => deadline - Date.now()
   clearAllTimers()
   if (!useNovel.getState().folder) return { ok: true, failed: [] }
+  // The last final of every followed scene goes out at once (fire and forget; awaited only briefly at the end).
+  const finals = flushFinals()
   const safe = new Map<string, string>()
   for (let round = 0; round < 3 && left() > 0; round++) {
     const { folder, buffers } = useNovel.getState()
@@ -2083,6 +2393,7 @@ export async function flushAll(): Promise<FlushResult> {
     )
     clearAllTimers()
   }
+  await within(finals, Math.min(500, Math.max(0, left())), null)
   const { buffers } = useNovel.getState()
   const failed = Object.values(buffers)
     .filter((b) => b.dirty && !b.readOnly && safe.get(b.path) !== b.text)

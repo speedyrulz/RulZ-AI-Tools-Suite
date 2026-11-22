@@ -4,6 +4,7 @@ import type { AdapterEntry, HardwareSnapshot, LoadConfig, LoadedInstance, ModelE
 import { errorMessage, invoke, on } from '../lib/api'
 import { pickActive } from '../lib/activeModel'
 import { once } from '../lib/once'
+import { WBENCH_BUSY, wbenchRunning } from '../lib/wbenchFlag'
 
 interface ModelsState {
   models: ModelEntry[]
@@ -102,10 +103,12 @@ export const useModels = create<ModelsState>((set, get) => {
     ensure: (modelId) => loadWith(modelId, () => invoke('instances:ensure', modelId)),
 
     unload: async (instanceId) => {
+      if (wbenchRunning()) return void toast(WBENCH_BUSY)
       await invoke('instances:unload', instanceId).catch((e) => toast.error(errorMessage(e)))
     },
 
     unloadAll: async () => {
+      if (wbenchRunning()) return void toast(WBENCH_BUSY)
       await invoke('instances:unloadAll').catch((e) => toast.error(errorMessage(e)))
     },
 

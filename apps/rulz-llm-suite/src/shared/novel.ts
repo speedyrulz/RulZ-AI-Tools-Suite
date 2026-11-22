@@ -32,6 +32,8 @@ export interface NovelProject {
   budget: NovelBudget
   /** Free-form POV/tense line shown to the model next to style.md, e.g. "Close third, past tense". */
   povTense: string
+  /** Stage 4: record AI actions in .rulz/records. Absent = on. */
+  recording?: boolean
 }
 
 export type SceneStatus = 'idea' | 'beats' | 'draft' | 'revised'
@@ -289,7 +291,7 @@ export type OutlineOp =
   /** Adds an orphan file from manuscript\ as a scene. */
   | { op: 'adoptFile'; file: string; chapterId: string; sceneId: string; index: number | null }
 
-export type ProjectPatch = Partial<Pick<NovelProject, 'title' | 'modelId' | 'sampling' | 'adapters' | 'budget' | 'povTense'>>
+export type ProjectPatch = Partial<Pick<NovelProject, 'title' | 'modelId' | 'sampling' | 'adapters' | 'budget' | 'povTense' | 'recording'>>
 
 // ---------------------------------------------------------------------------------------------
 // Request assembly (pure: src/shared/novelAssembly.ts)
@@ -407,6 +409,120 @@ export interface SummaryReply {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Stage 4: recording (.rulz/records/<YYYY-MM-DD>.jsonl) and training-data export.
+// Design: docs/writing-mode-design.md, "Stage 4 design".
+// ---------------------------------------------------------------------------------------------
+
+export const RECORD_FORMAT = 1
+
+/** 'length' = cut off at max tokens; 'stopped' = the user pressed Stop. */
+export type RecordFinish = 'stop' | 'length' | 'stopped' | 'error'
+
+export interface RecordMessage {
+  role: 'system' | 'user' | 'assistant'
+  content: string
+}
+
+export interface RecordAlt {
+  index: number
+  seed: number
+  /** Prose: the new text only (PendingAlt.generated). Cards: the raw reply. */
+  generated: string
+  finish: RecordFinish
+}
+
+/** Written once when a run ends with at least one alternative. */
+export interface RecordRequestLine {
+  format: 1
+  type: 'request'
+  /** 16 lowercase hex characters, made by the renderer when the run starts. */
+  id: string
+  /** ISO time. */
+  at: string
+  /** App version. */
+  app: string
+  action: NovelAction
+  variant?: string
+  sceneId: string | null
+  chapterId: string | null
+  model: { id: string; name: string }
+  /** The sampling values actually sent. */
+  sampling: SamplingParams
+  adapters: { name: string; scale: number }[]
+  /** Exactly as sent. */
+  messages: RecordMessage[]
+  alts: RecordAlt[]
+}
+
+/** Prose: the alternatives the user displayed (the first active one included). Written with the outcome. */
+export interface RecordViewedLine {
+  format: 1
+  type: 'viewed'
+  id: string
+  at: string
+  alts: number[]
+}
+
+/** Prose: accepted | mixed | rejected | abandoned. Cards: accepted | edited | rejected | abandoned. */
+export type RecordOutcomeKind = 'accepted' | 'mixed' | 'rejected' | 'abandoned' | 'edited'
+
+export interface RecordRegion {
+  /** Offsets of the generated text in the accepted document (from the apply geometry, not a diff). */
+  start: number
+  end: number
+}
+
+export interface RecordOutcomeLine {
+  format: 1
+  type: 'outcome'
+  id: string
+  at: string
+  kind: RecordOutcomeKind
+  /** Prose: the accepted (or, for mixed, active) alt index; null when rejected or abandoned. */
+  alt?: number | null
+  /** Prose accepted / mixed: where the generated text sits in the accepted document. */
+  region?: RecordRegion | null
+  /** Prose accepted / mixed: the base text the region replaced (the selection for rewrite, '' for continue). */
+  replaced?: string
+  /** Cards, kind 'edited': the edited proposal. */
+  text?: string
+}
+
+export type RecordFinalReason = 'idle' | 'left' | 'action' | 'close' | 'reloaded' | 'outside'
+
+/** Prose after accepted / mixed: the region after the user's later edits. Repeats allowed; the last one wins. */
+export interface RecordFinalLine {
+  format: 1
+  type: 'final'
+  id: string
+  at: string
+  /** null when the region could not be located ('outside') or the text was reloaded ('reloaded'). */
+  text: string | null
+  reason: RecordFinalReason
+}
+
+export type RecordLine = RecordRequestLine | RecordViewedLine | RecordOutcomeLine | RecordFinalLine
+
+export interface RecordsInfo {
+  files: number
+  bytes: number
+}
+
+export interface RecordsExportOptions {
+  /** Pairs of (final text, accepted text). Off by default. */
+  editPairs: boolean
+}
+
+export interface RecordsExportResult {
+  /** The new subfolder that was written. */
+  outDir: string
+  train: number
+  pairs: number
+  /** Reason → count. */
+  dropped: Record<string, number>
+}
+
+// ---------------------------------------------------------------------------------------------
 // IPC (merged into IpcInvoke / IpcEvents in ipc.ts). `folder` is the project's absolute folder.
 // ---------------------------------------------------------------------------------------------
 
@@ -444,6 +560,13 @@ export interface NovelIpcInvoke {
   'novel:statePatch': (folder: string, ops: StateOp[]) => NovelStatePatchResult
   /** Stage 3: (un)dismisses a check finding for a scene in .rulz/checks.json. */
   'novel:dismissFinding': (folder: string, sceneId: string, key: string, dismissed: boolean) => NovelProjectState
+  /** Stage 4: appends one record line; false when not written (not open, blocked, recording off, I/O error). */
+  'novel:record': (folder: string, line: RecordLine) => boolean
+  'novel:recordsInfo': (folder: string) => RecordsInfo
+  /** Writes train.jsonl, pairs.jsonl and manifest.json into a new subfolder of outDir. */
+  'novel:exportRecords': (folder: string, outDir: string, opts: RecordsExportOptions) => RecordsExportResult
+  /** Moves .rulz/records to the Recycle Bin. */
+  'novel:deleteRecords': (folder: string) => void
   /** Token count of a text on the loaded model (cached per instance); null if the model can't count. */
   'chat:countText': (modelId: string, text: string) => number | null
 }

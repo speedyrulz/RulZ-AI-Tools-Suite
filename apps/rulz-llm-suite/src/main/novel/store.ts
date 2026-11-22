@@ -21,7 +21,11 @@ import {
   type NovelTextFile,
   type NovelTrashItem,
   type OutlineOp,
-  type ProjectPatch
+  type ProjectPatch,
+  type RecordLine,
+  type RecordsExportOptions,
+  type RecordsExportResult,
+  type RecordsInfo
 } from '@shared/novel'
 import { scenePositions } from '@shared/novelState'
 import { defaultProject } from '@shared/novelPrompts'
@@ -32,6 +36,7 @@ import { listHistory, takeSnapshot } from './history'
 import { deleteJournal, discardJournal, readJournal, writeJournal } from './journal'
 import { listTrash, moveToTrash, readManifest, removeTrashFolder, restoreFiles, returnToTrash, trashRoot, undoTrash, type TrashManifest, type TrashOutline } from './trash'
 import { ProjectWatcher } from './watch'
+import { LineSink, MAX_RECORD_BYTES, appendRecordText, bump, exportRequest, isCardAction, localDate, localStamp, parseRecordBytes, readRawLines, RecordJoin, retryLock, validateRecordLine } from './records'
 import { applyStateOps, emptyChecks, emptyDoc, parseChecksBytes, parseStateBytes, serializeChecks, serializeDoc, stateFileOf, type ChecksDoc, type StateDoc } from './state'
 
 export interface StoreOptions {
@@ -45,6 +50,10 @@ export interface StoreOptions {
   emit: (change: NovelChange) => void
   /** Turn the folder watcher off (tests). */
   watch?: boolean
+  /** The app's version, written to the training-data manifest (app.getVersion()). */
+  appVersion?: () => string
+  /** The clock (tests): names the day's records file and the export folder. */
+  now?: () => Date
 }
 
 interface OpenProject {
@@ -71,6 +80,12 @@ interface OpenProject {
   /** .rulz/checks.json as last read or written. */
   checks: ChecksDoc
   checksProblem: string | null
+  /** Record appends that are running (stage 4); close and delete wait for them. */
+  records: Set<Promise<unknown>>
+  /** Set while the records folder is being moved to the Recycle Bin: new appends wait for it. */
+  recordHold: Promise<void> | null
+  /** The project is closing or being deleted: no more appends. */
+  recordsOff: boolean
 }
 
 const RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i
@@ -328,7 +343,10 @@ export class NovelStore {
       stateCanReset: false,
       stateExisted: false,
       checks: emptyChecks(),
-      checksProblem: null
+      checksProblem: null,
+      records: new Set(),
+      recordHold: null,
+      recordsOff: false
     }
     await this.loadJson(p, false)
     this.projects.set(key, p)
@@ -345,6 +363,11 @@ export class NovelStore {
     if (!p) return
     p.watcher?.stop()
     this.projects.delete(key)
+    p.recordsOff = true
+    // Appends admitted before this point finish (in order, behind each other); none is admitted after it.
+    // A Delete records that is running finishes first.
+    while (p.recordHold) await p.recordHold
+    await Promise.allSettled([...p.records])
     await p.chain.catch(() => undefined)
   }
 
@@ -508,6 +531,7 @@ export class NovelStore {
       if (patch.sampling !== undefined) next.sampling = { ...next.sampling, ...patch.sampling }
       if (patch.adapters !== undefined) next.adapters = Array.isArray(patch.adapters) ? patch.adapters : null
       if (patch.povTense !== undefined) next.povTense = String(patch.povTense)
+      if (patch.recording !== undefined) next.recording = patch.recording !== false
       if (patch.budget !== undefined) {
         const b = { ...next.budget, ...patch.budget }
         const share = (v: unknown, d: number): number => (typeof v === 'number' && Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : d)
@@ -1075,13 +1099,245 @@ export class NovelStore {
     // The watcher holds the folder open; Windows can refuse to move a folder that is being watched.
     open?.watcher?.stop()
     try {
+      if (open) {
+        open.recordsOff = true
+        while (open.recordHold) await open.recordHold
+        await Promise.allSettled([...open.records])
+      }
       await open?.chain.catch(() => undefined)
       await this.opts.trashItem(dir)
     } catch (err) {
+      if (open) open.recordsOff = false
       open?.watcher?.start()
       throw new Error(`Could not move the project folder to the Recycle Bin: ${errText(err)} Nothing was deleted.`)
     }
     this.projects.delete(projectKey(dir))
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Records (stage 4): recording of Writing AI actions, and the training-data export
+  // ---------------------------------------------------------------------------------------------
+
+  /** True while appends are allowed: the project is the open one, not blocked, not closing, recording not off. */
+  private recordsLive(p: OpenProject): boolean {
+    return this.projects.get(projectKey(p.folder)) === p && !p.blocked && !p.recordsOff && p.project.recording !== false
+  }
+
+  /** For an append already admitted (tracked): the project may close meanwhile, but it is never written when blocked or recording is off. */
+  private recordsAllowed(p: OpenProject): boolean {
+    return !p.blocked && p.project.recording !== false
+  }
+
+  /** Runs `fn` as a tracked append: it waits while the records are being deleted, and close / delete wait for it. */
+  private async trackRecord<T>(p: OpenProject, fn: () => Promise<T>, refused: T): Promise<T> {
+    while (p.recordHold) await p.recordHold
+    // The project may have been closed or deleted while this waited: then it is not admitted.
+    if (!this.recordsLive(p)) return refused
+    // No await between the check above and the add below: deleteRecords sets the hold and then looks at the set.
+    const run = fn()
+    p.records.add(run)
+    try {
+      return await run
+    } finally {
+      p.records.delete(run)
+    }
+  }
+
+  /** Appends one line to today's records file. False when it was not written; never throws for I/O. */
+  async record(folder: string, line: RecordLine): Promise<boolean> {
+    try {
+      const p = typeof folder === 'string' ? this.projects.get(projectKey(folder)) : undefined
+      if (!p || !this.recordsLive(p)) return false
+      const clean = validateRecordLine(line)
+      if (!clean) return false
+      const text = JSON.stringify(clean)
+      if (Buffer.byteLength(text, 'utf8') > MAX_RECORD_BYTES) return false
+      const dir = join(p.folder, '.rulz', 'records')
+      const target = join(dir, `${localDate((this.opts.now ?? (() => new Date()))())}.jsonl`)
+      return await this.trackRecord(p, () =>
+        serialized(target, async (): Promise<boolean> => {
+          try {
+            await assertAppPath(p.folder, target)
+            await this.guard(p, dir, target)
+            // Right before the folder is created. An admitted append still finishes when the project is closing:
+            // close and delete await it, and appends that arrive after the close are refused before they are admitted.
+            if (!this.recordsAllowed(p)) return false
+            await retryLock(() => fs.mkdir(dir, { recursive: true }))
+            await assertAppPath(p.folder, target)
+            await this.guard(p, dir, target)
+            if (!this.recordsAllowed(p)) return false
+            await appendRecordText(target, text)
+            return true
+          } catch (err) {
+            console.warn('Writing: could not record a line:', err)
+            return false
+          }
+        }),
+        false
+      )
+    } catch (err) {
+      console.warn('Writing: could not record a line:', err)
+      return false
+    }
+  }
+
+  /** The .jsonl files of a project's records folder, sorted by name. */
+  private async recordFiles(p: OpenProject): Promise<{ name: string; path: string; size: number }[]> {
+    const dir = join(p.folder, '.rulz', 'records')
+    await assertAppPath(p.folder, dir)
+    await this.guard(p, dir)
+    const out: { name: string; path: string; size: number }[] = []
+    const missing = (err: unknown): boolean => (err as NodeJS.ErrnoException)?.code === 'ENOENT'
+    const entries = await retryLock(() => fs.readdir(dir, { withFileTypes: true })).catch((err) => {
+      if (missing(err)) return []
+      throw err
+    })
+    for (const e of entries) {
+      if (!e.isFile() || !/\.jsonl$/i.test(e.name)) continue
+      const path = join(dir, e.name)
+      await assertAppPath(p.folder, path)
+      const st = await retryLock(() => fs.lstat(path)).catch((err) => {
+        if (missing(err)) return null
+        throw err
+      })
+      if (st?.isFile()) out.push({ name: e.name, path, size: st.size })
+    }
+    return out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+  }
+
+  async recordsInfo(folder: string): Promise<RecordsInfo> {
+    const p = this.get(folder)
+    const files = await this.recordFiles(p)
+    return { files: files.length, bytes: files.reduce((n, f) => n + f.size, 0) }
+  }
+
+  /** Moves .rulz/records to the Recycle Bin. Waits for running appends and holds new ones off meanwhile. */
+  async deleteRecords(folder: string): Promise<void> {
+    const p = this.get(folder)
+    if (p.blocked) throw new Error(`${p.blocked} The project is read-only until that file is fixed.`)
+    while (p.recordHold) await p.recordHold
+    let release: () => void = () => undefined
+    p.recordHold = new Promise<void>((r) => (release = r))
+    try {
+      await Promise.allSettled([...p.records])
+      const dir = join(p.folder, '.rulz', 'records')
+      await assertAppPath(p.folder, dir)
+      await assertNoLinks(dir)
+      if (!(await fs.stat(dir).catch(() => null))) return
+      await this.opts.trashItem(dir)
+    } finally {
+      p.recordHold = null
+      release()
+    }
+  }
+
+  /**
+   * Writes train.jsonl, pairs.jsonl and manifest.json into a new subfolder of `outDir`. Two passes over the records
+   * files, line by line: pass 1 keeps the outcome / viewed / final lines per id, pass 2 joins each request and
+   * writes its rows. Bad lines are counted, never fatal.
+   */
+  async exportRecords(folder: string, outDir: string, opts: RecordsExportOptions): Promise<RecordsExportResult> {
+    const p = this.get(folder)
+    if (typeof outDir !== 'string' || !isAbsolute(outDir)) throw new Error('Choose a folder to export to.')
+    const options: RecordsExportOptions = { editPairs: opts?.editPairs === true }
+    const outReal = await fs.realpath(outDir).catch(() => null)
+    if (!outReal || !(await fs.stat(outReal)).isDirectory()) throw new Error('That export folder does not exist.')
+    const projectReal = await fs.realpath(p.folder).catch(() => resolve(p.folder))
+    if (isInside(projectReal, outReal) || isInside(p.folder, resolve(outDir))) throw new Error('Choose a folder outside the project: the export cannot go inside it.')
+    const files = await this.recordFiles(p)
+
+    const now = (this.opts.now ?? (() => new Date()))()
+    const base = `${slugify(p.project.title)}-${localStamp(now)}`
+    let sub = ''
+    for (let n = 1; ; n++) {
+      const candidate = join(outReal, n === 1 ? base : `${base}-${n}`)
+      try {
+        await fs.mkdir(candidate)
+        sub = candidate
+        break
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+        if (n > 500) throw new Error('Could not find a free folder name for the export.')
+      }
+    }
+
+    const dropped: Record<string, number> = {}
+    const joined = new RecordJoin()
+    const tag = Math.random().toString(16).slice(2, 10)
+    const train = new LineSink(join(sub, 'train.jsonl'), join(sub, `.train.jsonl.${tag}.tmp`))
+    const pairs = new LineSink(join(sub, 'pairs.jsonl'), join(sub, `.pairs.jsonl.${tag}.tmp`))
+    const mf = new LineSink(join(sub, 'manifest.json'), join(sub, `.manifest.json.${tag}.tmp`))
+    const actions: Record<string, { train: number; pairs: number }> = {}
+    try {
+      // Pass 1: outcome / viewed / final lines per id, and every bad line counted once.
+      for (const f of files) {
+        await assertAppPath(p.folder, f.path)
+        for await (const raw of readRawLines(f.path)) {
+          const r = parseRecordBytes(raw)
+          if (r.ok === 'blank') continue
+          if (!r.ok) bump(dropped, r.reason)
+          else joined.add(r.line)
+        }
+      }
+      // Pass 2: request lines, one at a time.
+      await train.open()
+      await pairs.open()
+      const seen = new Set<string>()
+      for (const f of files) {
+        await assertAppPath(p.folder, f.path)
+        for await (const raw of readRawLines(f.path)) {
+          const r = parseRecordBytes(raw)
+          if (r.ok !== true || r.line.type !== 'request') continue
+          const req = r.line
+          if (seen.has(req.id)) {
+            bump(dropped, 'duplicate')
+            continue
+          }
+          seen.add(req.id)
+          if (isCardAction(req.action)) {
+            bump(dropped, 'cards')
+            continue
+          }
+          const row = exportRequest(req, joined.get(req.id), options)
+          if (row.drop) bump(dropped, row.drop)
+          const a = (actions[req.action] ??= { train: 0, pairs: 0 })
+          if (row.train) {
+            await train.write(JSON.stringify(row.train))
+            a.train++
+          }
+          for (const pr of row.pairs) {
+            await pairs.write(JSON.stringify(pr))
+            a.pairs++
+          }
+        }
+      }
+      const orphans = joined.ids().filter((id) => !seen.has(id)).length
+      if (orphans) bump(dropped, 'noRequest', orphans)
+      for (const k of Object.keys(actions)) if (!actions[k].train && !actions[k].pairs) delete actions[k]
+      await train.commit()
+      await pairs.commit()
+      const manifest = {
+        format: 1,
+        app: this.opts.appVersion?.() ?? 'unknown',
+        created: now.toISOString(),
+        project: p.project.title,
+        dateRange: { from: files[0]?.name.replace(/\.jsonl$/i, '') ?? null, to: files.length ? files[files.length - 1].name.replace(/\.jsonl$/i, '') : null },
+        files: { 'train.jsonl': train.count, 'pairs.jsonl': pairs.count },
+        actions,
+        dropped,
+        options
+      }
+      await mf.open()
+      await mf.write(JSON.stringify(manifest, null, 2))
+      await mf.commit()
+    } catch (err) {
+      await Promise.all([train.abort(), pairs.abort(), mf.abort()])
+      // Leave nothing half-written behind; the subfolder is ours and new.
+      for (const n of ['train.jsonl', 'pairs.jsonl', 'manifest.json']) await fs.rm(join(sub, n), { force: true }).catch(() => undefined)
+      await fs.rmdir(sub).catch(() => undefined)
+      throw new Error(`The export failed: ${errText(err)}`)
+    }
+    return { outDir: sub, train: train.count, pairs: pairs.count, dropped }
   }
 
   // ---------------------------------------------------------------------------------------------

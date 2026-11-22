@@ -22,6 +22,7 @@ import { API_RE_PREFIX, CLONE_FILE_TOOLS, extractAnswer } from '@shared/re'
 import { BatchStore } from './re/batches'
 import { BenchmarkRunner } from './bench/runner'
 import { BenchStore } from './bench/store'
+import { WritingBenchStore } from './wbench/store'
 import { gradePractice, listPractice, preparePractice } from './re/practice'
 import { buildOverview, MAX_OVERVIEW_SESSIONS } from './re/overview'
 import { findPython, type PythonCommand } from './re/python'
@@ -217,6 +218,7 @@ async function main(): Promise<void> {
   const batches = new BatchStore(join(userData, 're-batches.json'))
   const apiRe = (id: string): string => API_RE_PREFIX + id
   const benchStore = new BenchStore(join(userData, 'benchmarks.json'))
+  const writingBenchStore = new WritingBenchStore(userData)
   const bench = new BenchmarkRunner({
     instances,
     getModel: (id) => library.get(id),
@@ -482,6 +484,11 @@ async function main(): Promise<void> {
   handle('re:deleteBatch', (id) => batches.delete(id))
 
   handle('bench:list', () => benchStore.list())
+  handle('wbench:list', () => writingBenchStore.list())
+  handle('wbench:save', (run) => writingBenchStore.save(run))
+  handle('wbench:delete', (id) => writingBenchStore.delete(id))
+  handle('wbench:prompts', () => writingBenchStore.prompts())
+  handle('wbench:savePrompts', (prompts) => writingBenchStore.savePrompts(prompts))
   handle('bench:start', (req) => bench.start(req))
   handle('bench:stop', () => bench.stop())
   handle('bench:delete', (id) => benchStore.delete(id))
@@ -491,7 +498,8 @@ async function main(): Promise<void> {
     rootSetting: () => settings.get().writingRoot,
     documents: () => app.getPath('documents'),
     trashItem: (path) => shell.trashItem(path),
-    emit: (change) => broadcast('novel:changed', change)
+    emit: (change) => broadcast('novel:changed', change),
+    appVersion: () => app.getVersion()
   })
   // The close-time handshake (data safety rule 4): the renderer saves or journals its dirty buffers and answers.
   let flushTimeoutMs = 3000

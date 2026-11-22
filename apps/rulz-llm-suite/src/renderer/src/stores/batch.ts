@@ -11,6 +11,7 @@ import { uid } from '../lib/format'
 import { once } from '../lib/once'
 import { useApp } from './app'
 import { isChatBusy, isGrading, onTurnEnd, useChat } from './chat'
+import { WBENCH_BUSY, wbenchRunning } from '../lib/wbenchFlag'
 import { readyInstance, useModels } from './models'
 
 interface BatchState {
@@ -133,6 +134,7 @@ export const useBatch = create<BatchState>((set, get) => {
 
     start: async (tasks, options, label, kitDir) => {
       if (get().activeId || get().starting) return
+      if (wbenchRunning()) return void toast(WBENCH_BUSY)
       const settings = useApp.getState().settings
       if (!settings) return
       const opts = cleanBatchOptions(options)
@@ -170,6 +172,7 @@ export const useBatch = create<BatchState>((set, get) => {
 
     resume: async (id) => {
       if (get().activeId || get().starting) return
+      if (wbenchRunning()) return void toast(WBENCH_BUSY)
       const run = get().runs.find((r) => r.id === id)
       if (!run || !run.items.some((i) => i.status === 'pending')) return
       set({ starting: true, stopping: null })
