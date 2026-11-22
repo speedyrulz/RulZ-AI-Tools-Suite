@@ -1,6 +1,6 @@
 # Writing mode: design
 
-Status: stage 1 shipped in 0.20.0; stage 2 built for 0.21.0 (2026-11-22); stages 3 and 4 still planned. Covers the
+Status: stage 1 shipped in 0.20.0, stage 2 in 0.21.0; stage 3 built for 0.22.0 (2026-11-22); stage 4 still planned. Covers the
 novel-writing features planned for LLM Suite 0.21.0 to 0.23.0. Stage 1 (0.20.0, fiction samplers: DRY, XTC, avoid
 words) is separate and landed first.
 
@@ -267,18 +267,188 @@ Writing page, nav rail item with a Feather icon, **Ctrl+7**:
 Design: RulZ guide tokens already used by the app's Tailwind theme; one primary button per view (**Draft scene** or
 **Accept all** when a change is pending); sentence case; Lucide icons; no emoji.
 
-## Stage 3 outline
+## Stage 3 design (0.22.0)
 
-- **Check scene/chapter**: request with bible + summaries + the text; JSON findings
-  `{type: continuity|character|timeline|pov|tense|other, quote, problem, conflictsWith, suggestion}`; quotes are
-  located in the text (fuzzy) and shown as gutter marks; dismissing one is remembered per scene in `.rulz\checks.json`.
-- **Tracked state**: `state.json` with per-entity facts (location, knows, carries, condition, relationships), as of a
-  scene id. After a scene is accepted as draft, **Update state** asks the model for a JSON patch; the user approves
-  each change (same pattern as tool approval). The state as of the previous scene goes into assembly as its own part.
-- **Character interview**: a chat-like panel whose system prompt is the entry body + state as of the current scene
-  + "you know only what you would know by now"; answers can be appended to the entry's voice notes.
-- **Voice notes**: a `voice:` section in character entries; when the action is dialogue or the selection contains
-  that character's speech, their voice notes are given top priority.
+Four features: consistency check, tracked state, character interview, voice notes. Same rules as stage 2: the
+user's files are never written without an explicit action, AI output is a proposal until accepted, main owns the
+JSON files and applies validated ops, a damaged file is never overwritten. Read by the principal engineer before
+building; its fixes are folded in below. The contract types are in `src/shared/novel.ts` (section "Stage 3").
+
+### Files
+
+| File | Owner |
+| --- | --- |
+| `state.json` (project root, next to outline.json) | main, through `novel:statePatch` ops |
+| `.rulz/checks.json` | main, through `novel:dismissFinding` |
+| character entries `bible/<id>.md` | user text; the renderer edits the body like any entry |
+
+`state.json`:
+
+```json
+{ "format": 1, "facts": [ { "id": "f1a2b3", "entity": "mara-venn", "kind": "location", "value": "the lighthouse",
+  "about": null, "from": "s9x8y7", "until": null } ] }
+```
+
+- `kind`: `location | knows | carries | condition | relationship | other`. `about`: the other entry's id, only for
+  `relationship` (required there), else null. `value`: trimmed, one line, 1-300 characters.
+- `from`: the scene where the fact became true. `until`: the scene where it stopped being true, or null.
+- Unknown keys on the file and on each fact are kept when main rewrites it.
+- **A fact that does not validate on read** (bad kind, empty value, missing id, …) is kept verbatim in the file on
+  every rewrite and reported in `stateInvalid` (index + reason); the State tab lists it as "could not be read" with
+  **Remove** (op `removeInvalid` by index + its JSON hash). It is never silently dropped.
+
+**Damaged / missing**
+
+- No `state.json` when the project opens: empty state; the file is created by the first write.
+- The file disappears while the project is open, is 0 bytes, is not JSON, has `format` > 1 or no `facts` array:
+  `stateProblem` (message), state read-only, never written. Offered: **Show in folder**, and for a missing/0-byte
+  file **Start empty state** (an explicit op `reset` that writes `{format:1,facts:[]}`; refused if the file has
+  content).
+- `.rulz/checks.json` unreadable: dismissals ignored and not written (`checksProblem`).
+
+**Writes** (state.json): atomic, under the project chain after `loadJson`, stale check like outline.json (re-read
+and re-apply the ops if the file changed on disk), the same re-check-before-rename guard as `saveFile`, a history
+snapshot before each write (gap rule as for text files; `state.json` is allowed in history), and watched
+(`onExternalChange` reloads it and emits `state`). Blocked project → refused.
+
+### Reading-order semantics
+
+Scenes are ordered by their position in the outline (chapter order, then scene order). `pos(s)` is that index.
+
+- **State after scene S**: facts with `pos(from) <= pos(S)` and (`until` null or `pos(until) > pos(S)`).
+- **State before scene S** (used by assembly, Update state and the interview): facts with `pos(from) < pos(S)` and
+  (`until` null or `pos(until) >= pos(S)`).
+- **Location is single-valued**: for each entity, only the `location` fact with the latest `from` holds; older ones
+  are superseded even without an `until`. Other kinds may hold several values.
+- A fact's **status**: `ok`, `detached` (its entity, about, from or until names something not in the bible/outline),
+  or `inverted` (`pos(until) < pos(from)`, after a scene move). Only `ok` facts are used in requests. The State tab
+  lists detached and inverted facts with **Edit** (any field, including entity, from, until) and **Remove**, and the
+  tab label shows their count. Deleting a scene, chapter or entry does not touch state.json, so restoring it from the
+  trash re-attaches its facts.
+
+### Ops (`novel:statePatch(folder, ops)` → `NovelStatePatchResult`)
+
+```ts
+type StateOp =
+  | { op: 'add'; fact: StateFact }       // id made by the renderer ('f' + random); must be new
+  | { op: 'end'; factId: string; until: string }
+  | { op: 'edit'; factId: string; changes: Partial<Omit<StateFact, 'id'>> }
+  | { op: 'remove'; factId: string }
+  | { op: 'removeInvalid'; index: number; hash: string }
+  | { op: 'reset' }
+```
+
+Main validates each op against the current outline, bible and state and **applies the valid ones, returning the
+rejected ones with a reason** (`{ state, rejected: [{ index, reason }] }`); one bad op does not sink a card. Rules:
+entity/about are existing entry ids (`edit` may set them to fix a detached fact), from/until existing scene ids,
+`pos(until) >= pos(from)` for new values, value rules; an `add` identical to an existing fact (entity, kind, value,
+about, from) is refused as a duplicate; `end` on a fact that already has an `until` is refused.
+
+### Tracked state in requests
+
+Two placements, so the prompt-cache prefix only changes when the scene changes:
+
+- **State of fixed entities** (always / POV / present): new part `state`, right after **Story so far** and before
+  **This scene**: system → fixed entries → story so far → **state** → this scene → triggered entries → prose → task.
+- **State of triggered entities**: under each triggered entry inside **Also relevant**, as part of that entry's text
+  (cut and dropped with it).
+
+Format: `### Mara Venn` then `- location: the lighthouse`, `- relationship (Oskar): distrusts him`. Cap: a constant
+8% of the available context (no setting); fitted **before** story so far, charging its actual cost; over the cap
+whole entity groups are dropped, POV kept first, then present, then by entry priority. Shown in the Context tab.
+
+### Update state
+
+Scene toolbar **Update state** (needs scene text). Request: the bible entries in the scene (ids listed, as in
+outline replies), the state before the scene with fact ids, **the facts already recorded from or ended at this
+scene** (so a re-run does not repeat them), and the whole scene text (if it does not fit, the request is refused
+with the reason). JSON reply:
+
+```json
+{ "changes": [ { "op": "add", "entity": "Mara Venn", "kind": "carries", "value": "the brass key", "about": null },
+               { "op": "end", "factId": "f1a2b3", "reason": "she left the lighthouse" } ] }
+```
+
+Refs resolve with `resolveEntryRef`; unresolved names and unknown fact ids are shown on the card and left out. The
+card is tied to the scene's text hash: if the text changed since the request, **Apply** is refused (regenerate).
+Each change has **Accept** / **Reject**; **Apply accepted** sends one `statePatch` with `from` / `until` = this
+scene and shows any rejected ops with their reason. Nothing is written before that.
+
+### Consistency check
+
+Scene toolbar **Check**; chapter context menu **Check chapter** (one request per scene in order, stoppable). Request:
+style, bible entries matched for the scene, story so far, state before the scene, the scene text. JSON reply, at
+most 20 findings:
+
+```json
+{ "findings": [ { "type": "continuity", "quote": "exact words from the scene", "problem": "...",
+  "conflictsWith": "what it contradicts", "suggestion": "..." } ] }
+```
+
+`type`: `continuity | character | timeline | pov | tense | other`. Findings live in memory per scene with the text
+hash they were made from (not on disk). `locateQuote(text, quote)`: exact match on a normalised copy (curly quotes
+and dashes folded, whitespace collapsed, case-insensitive) mapped back to original offsets; else "not found in the
+text" (finding listed, no mark). Located findings get a gutter mark and an underline; edits remap ranges; a range
+that is deleted drops its mark. **Checks** side-panel tab: type, quote, problem, conflicts with, suggestion,
+**Jump**, **Fix** (Rewrite → Custom on the quote's range with the suggestion as the note: a normal pending change),
+**Dismiss**.
+
+Dismissed: `findingKey = hash(type + normalised quote)`; `.rulz/checks.json` is
+`{ format: 1, dismissed: { [sceneId]: string[] } }`, written by `novel:dismissFinding(folder, sceneId, key,
+dismissed)` (refused on a blocked project). Later checks hide dismissed findings for that scene.
+
+### Voice notes
+
+A character entry's body may have a section headed `## Voice` (level 2 or 3, case-insensitive), up to the next
+heading of the same or a higher level. Helpers: `voiceSection(body)` and `appendVoiceNote(body, note)`: edits the
+given text (the renderer's buffer, never re-formatted through `formatEntry`), creates the section at the end if
+missing, appends `- <note>` with the body's line endings; the note is collapsed to one line, a leading `#` removed,
+capped at 500 characters.
+
+**Voice targets** (characters only): for **Dialogue**, the POV and present characters; for any action with a
+selection, characters whose name or alias appears in the selection. A voice target gets `voice: true` on its
+`AssemblyEntry` (its `reason` is unchanged), is sorted first within its own group (fixed or triggered; groups never
+move), and its short form keeps the first paragraph plus the voice section capped at about 400 tokens.
+
+### Character interview
+
+Side-panel tab **Interview**: pick a character (default: the scene's POV). System prompt:
+
+- "You are <name>. Answer in character, in your own voice. You know only what <name> knows by this point in the
+  story; if asked about later events, you do not know them."
+- The entry body, labelled "The author's notes about you (they may mention things you have not lived yet; do not
+  reveal those)".
+- The character's state before the current scene.
+- Summaries only of earlier scenes where the character is POV or present.
+
+Chat with the project's model and sampling; history in memory **per character and scene** (cleared on project
+close; **Clear**). The whole request is counted before sending; the oldest turns are dropped to fit (never the
+system prompt). Each answer has **Add to voice notes** (the answer, or the selected part): `appendVoiceNote` on the
+entry buffer, which saves through the normal entry path; disabled with the reason when the entry has a pending
+change or a conflict.
+
+### Out of scope for stage 3
+
+Automatic state updates without approval; checks across the whole book in one request; storing check results or
+interview transcripts on disk; fuzzy quote matching; a setting for the state share.
+
+### What stage 3 changed from this design
+
+- State groups are fitted after the fixed entries and before the triggered entries, so tracked state outranks
+  triggered entries (the design only said "before story so far").
+- The whole-scene refusal for Check and Update state also fires on a "whole scene" warning, since one oversized
+  paragraph gives a warning with `proseStart` 0.
+- The reply parsers come in two forms: `parseCheckReply` / `parseUpdateStateReply` throw on bad JSON; the renderer
+  uses the non-throwing `...Result` forms to show the raw reply with Retry.
+- The State tab has a third view, **All**, so facts that start later or already ended stay reachable; the Checks tab
+  can bring back dismissed findings; findings with the same type and quote are shown once.
+- Untouched facts are written back exactly as read. A value with leading or trailing spaces or a line break is
+  invalid on read (kept verbatim and listed), not trimmed.
+- `state.json` and `.rulz/checks.json` are decoded as strict UTF-8; invalid bytes make the file a problem.
+- A 0-byte `.rulz/checks.json` counts as empty (it holds only dismissals). Outside edits to `checks.json` are picked
+  up at the next load, not live: the watcher ignores everything under `.rulz`.
+- `writeBytesAtomic` re-runs its last-moment check before every rename attempt, which also protects scene saves
+  during Windows lock retries.
 
 ## Stage 4 outline
 

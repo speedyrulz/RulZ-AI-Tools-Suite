@@ -17,11 +17,13 @@ import {
   type NovelSaveRequest,
   type NovelSaveResult,
   type NovelScene,
+  type NovelStatePatchResult,
   type NovelTextFile,
   type NovelTrashItem,
   type OutlineOp,
   type ProjectPatch
 } from '@shared/novel'
+import { scenePositions } from '@shared/novelState'
 import { defaultProject } from '@shared/novelPrompts'
 import { applyOutlineOps, emptyOutline, validSceneFile, findChapter, findScene, newId, removeChapter, removeScene, reinsert, sceneFileName, slugify } from '@shared/novelOutline'
 import { wordCount } from '@shared/novelText'
@@ -30,6 +32,7 @@ import { listHistory, takeSnapshot } from './history'
 import { deleteJournal, discardJournal, readJournal, writeJournal } from './journal'
 import { listTrash, moveToTrash, readManifest, removeTrashFolder, restoreFiles, returnToTrash, trashRoot, undoTrash, type TrashManifest, type TrashOutline } from './trash'
 import { ProjectWatcher } from './watch'
+import { applyStateOps, emptyChecks, emptyDoc, parseChecksBytes, parseStateBytes, serializeChecks, serializeDoc, stateFileOf, type ChecksDoc, type StateDoc } from './state'
 
 export interface StoreOptions {
   /** The writingRoot setting ('' = default). */
@@ -59,6 +62,15 @@ interface OpenProject {
   chain: Promise<unknown>
   entryCache: Map<string, { key: string; entry: BibleEntry }>
   wordCache: Map<string, { key: string; words: number }>
+  /** state.json as last read or written (stage 3). */
+  stateDoc: StateDoc
+  stateProblem: string | null
+  stateCanReset: boolean
+  /** state.json was present at some read in this session (so missing later is a problem, not an empty state). */
+  stateExisted: boolean
+  /** .rulz/checks.json as last read or written. */
+  checks: ChecksDoc
+  checksProblem: string | null
 }
 
 const RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i
@@ -310,7 +322,13 @@ export class NovelStore {
       sessionSnapped: new Set(),
       chain: Promise.resolve(),
       entryCache: new Map(),
-      wordCache: new Map()
+      wordCache: new Map(),
+      stateDoc: emptyDoc(),
+      stateProblem: null,
+      stateCanReset: false,
+      stateExisted: false,
+      checks: emptyChecks(),
+      checksProblem: null
     }
     await this.loadJson(p, false)
     this.projects.set(key, p)
@@ -373,8 +391,71 @@ export class NovelStore {
       }
     }
     p.blocked = p.jsonErr['project.json'] ?? p.jsonErr['outline.json']
+    if (await this.loadStateFile(p)) changed = true
+    if (await this.loadChecksFile(p)) changed = true
     if (changed && announce) this.opts.emit({ kind: 'state', folder: p.folder, state: await this.state(p) })
     return changed
+  }
+
+  /** Reads state.json when it differs from what the app last saw. A damaged file sets a problem; it is never replaced. */
+  private async loadStateFile(p: OpenProject): Promise<boolean> {
+    const target = join(p.folder, 'state.json')
+    let bytes: Buffer | null
+    try {
+      // A link out of the project must not be read (assertAppPath only checks paths under .rulz).
+      await this.guard(p, target)
+      bytes = await readBytes(p.folder, target)
+    } catch (err) {
+      // Still locked after the retries, or a link out of the project: say so, and look again next time.
+      const msg = `state.json could not be read: ${errText(err)}`
+      const changed = p.stateProblem !== msg
+      p.stateDoc = emptyDoc()
+      p.stateProblem = msg
+      p.stateCanReset = false
+      p.hashes.delete('state.json')
+      p.lastSnap.delete('state.json')
+      // readBytes turns a missing file into null, not an error, so the file is there: a later disappearance is a problem.
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') p.stateExisted = true
+      return changed
+    }
+    const hash = bytes ? sha256(bytes) : ''
+    const known = p.hashes.get('state.json')
+    if (known !== undefined && known === hash) return false
+    p.hashes.set('state.json', hash)
+    // A change made outside: the next write must snapshot this version first.
+    if (known !== undefined) p.lastSnap.delete('state.json')
+    const parsed = parseStateBytes(bytes, p.stateExisted)
+    if (bytes) p.stateExisted = true
+    p.stateDoc = parsed.doc
+    p.stateProblem = parsed.problem
+    p.stateCanReset = parsed.canReset
+    return true
+  }
+
+  /** Reads .rulz/checks.json when it differs from what the app last saw. An unreadable file means dismissals are ignored and never written. */
+  private async loadChecksFile(p: OpenProject): Promise<boolean> {
+    const key = '.rulz/checks.json'
+    const target = join(p.folder, '.rulz', 'checks.json')
+    let bytes: Buffer | null
+    try {
+      await this.guard(p, target, join(p.folder, '.rulz'))
+      bytes = await readBytes(p.folder, target)
+    } catch (err) {
+      const msg = `.rulz/checks.json could not be read: ${errText(err)}`
+      const changed = p.checksProblem !== msg
+      p.checks = emptyChecks()
+      p.checksProblem = msg
+      p.hashes.delete(key)
+      return changed
+    }
+    const hash = bytes ? sha256(bytes) : ''
+    const known = p.hashes.get(key)
+    if (known !== undefined && known === hash) return false
+    p.hashes.set(key, hash)
+    const parsed = parseChecksBytes(bytes)
+    p.checks = parsed.doc
+    p.checksProblem = parsed.problem
+    return true
   }
 
   /** Writes a JSON file after snapshotting what is on disk. The caller holds the project's exclusive lock. */
@@ -431,6 +512,7 @@ export class NovelStore {
         const b = { ...next.budget, ...patch.budget }
         const share = (v: unknown, d: number): number => (typeof v === 'number' && Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : d)
         next.budget = {
+          ...next.budget,
           replyTokens: Number.isFinite(b.replyTokens) ? Math.max(16, Math.round(b.replyTokens)) : next.budget.replyTokens,
           proseShare: share(b.proseShare, next.budget.proseShare),
           bibleShare: share(b.bibleShare, next.budget.bibleShare)
@@ -497,7 +579,125 @@ export class NovelStore {
       orphans.push(`manuscript/${name}`)
       words[`manuscript/${name}`] = await this.wordsOf(p, `manuscript/${name}`)
     }
-    return { folder: p.folder, project: p.project, outline: p.outline, bible, style, words, missing, orphans: orphans.sort(), blocked: p.blocked }
+    return {
+      folder: p.folder,
+      project: p.project,
+      outline: p.outline,
+      bible,
+      style,
+      words,
+      missing,
+      orphans: orphans.sort(),
+      blocked: p.blocked,
+      state: stateFileOf(p.stateDoc, p.stateProblem, p.stateCanReset),
+      dismissed: p.checks.dismissed,
+      checksProblem: p.checksProblem
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Tracked state (state.json) and dismissed check findings (.rulz/checks.json)
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * Applies the valid ops to state.json and returns the rejected ones with reasons. Runs under the project chain
+   * on fresh data; if the file changed on disk before the write, the ops are applied again to the new content.
+   */
+  async statePatch(folder: string, ops: unknown): Promise<NovelStatePatchResult> {
+    const p = this.get(folder)
+    if (!Array.isArray(ops)) throw new Error('The state changes must be a list.')
+    if (ops.length > 1000) throw new Error('Too many state changes in one request.')
+    const target = join(p.folder, 'state.json')
+    const result = await this.exclusive(p, async () => {
+      for (let attempt = 0; ; attempt++) {
+        await this.loadJson(p, true)
+        if (p.blocked) {
+          const reason = `${p.blocked} The project is read-only until that file is fixed.`
+          return { rejected: ops.map((_, index) => ({ index, reason })) }
+        }
+        const bible = await this.readBible(p)
+        const ctx = { pos: scenePositions(p.outline), entryIds: new Set(bible.map((b) => b.id)) }
+        const out = applyStateOps({ doc: p.stateDoc, problem: p.stateProblem, canReset: p.stateCanReset }, ops, ctx)
+        if (out.applied === 0) return { rejected: out.rejected }
+        const doc: StateDoc = { top: p.stateDoc.top, items: out.items }
+        const bytes = json(serializeDoc(doc))
+        const stale = await serialized(target, async (): Promise<boolean> => {
+          if (p.blocked) throw new Error(p.blocked)
+          await this.guard(p, target)
+          const disk = await readBytes(p.folder, target)
+          const diskHash = disk ? sha256(disk) : ''
+          if (diskHash !== (p.hashes.get('state.json') ?? '')) return true
+          if (disk && disk.length > 0) await this.snapshot(p, 'state.json', disk, SNAPSHOT_GAP_MS)
+          if (p.blocked) throw new Error(p.blocked)
+          const unchanged = async (): Promise<boolean> => {
+            const now = await readBytes(p.folder, target)
+            return (now ? sha256(now) : '') === diskHash
+          }
+          if (!(await writeBytesAtomic(p.folder, target, join(p.folder, '.rulz', 'tmp'), bytes, unchanged))) return true
+          p.hashes.set('state.json', sha256(bytes))
+          p.stateExisted = true
+          // Parse what was written, so the indexes of unreadable items match the file again.
+          const parsed = parseStateBytes(bytes, true)
+          p.stateDoc = parsed.doc
+          p.stateProblem = parsed.problem
+          p.stateCanReset = parsed.canReset
+          return false
+        })
+        if (stale) {
+          if (attempt >= 2) throw new Error('state.json keeps changing on disk. Try again in a moment.')
+          // The disk differs from what the app last saw: forget the hash so the next loop reads it and applies the ops again.
+          p.hashes.delete('state.json')
+          p.lastSnap.delete('state.json')
+          continue
+        }
+        return { rejected: out.rejected }
+      }
+    })
+    return { state: await this.state(p), rejected: result.rejected }
+  }
+
+  /** Adds or removes a dismissed finding key for a scene in .rulz/checks.json. */
+  async dismissFinding(folder: string, sceneId: string, key: string, dismissed: boolean): Promise<NovelProjectState> {
+    const p = this.get(folder)
+    if (typeof sceneId !== 'string' || !sceneId) throw new Error('The scene is missing.')
+    if (typeof key !== 'string' || !key || key.length > 64) throw new Error('That finding key is not valid.')
+    if (typeof dismissed !== 'boolean') throw new Error('Dismissed must be true or false.')
+    const target = join(p.folder, '.rulz', 'checks.json')
+    await this.exclusive(p, async () => {
+      for (let attempt = 0; ; attempt++) {
+        await this.loadJson(p, true)
+        if (p.blocked) throw new Error(`${p.blocked} The project is read-only until that file is fixed.`)
+        if (p.checksProblem) throw new Error(`${p.checksProblem} Dismissals are not saved until that file is fixed.`)
+        if (!findScene(p.outline, sceneId)) throw new Error('That scene no longer exists.')
+        const list = Object.prototype.hasOwnProperty.call(p.checks.dismissed, sceneId) ? p.checks.dismissed[sceneId] : []
+        const has = list.includes(key)
+        if (dismissed === has) return
+        const next: Record<string, string[]> = {}
+        for (const [k, v] of Object.entries(p.checks.dismissed)) Object.defineProperty(next, k, { value: v.slice(), enumerable: true, writable: true, configurable: true })
+        const updated = dismissed ? [...list, key] : list.filter((x) => x !== key)
+        if (updated.length) Object.defineProperty(next, sceneId, { value: updated, enumerable: true, writable: true, configurable: true })
+        else delete next[sceneId]
+        const bytes = json(serializeChecks({ top: p.checks.top, dismissed: next }))
+        const stale = await serialized(target, async (): Promise<boolean> => {
+          if (p.blocked) throw new Error(p.blocked)
+          const disk = await readBytes(p.folder, target)
+          const diskHash = disk ? sha256(disk) : ''
+          if (diskHash !== (p.hashes.get('.rulz/checks.json') ?? '')) return true
+          const unchanged = async (): Promise<boolean> => {
+            const now = await readBytes(p.folder, target)
+            return (now ? sha256(now) : '') === diskHash
+          }
+          if (!(await writeBytesAtomic(p.folder, target, join(p.folder, '.rulz', 'tmp'), bytes, unchanged))) return true
+          p.hashes.set('.rulz/checks.json', sha256(bytes))
+          p.checks = parseChecksBytes(bytes).doc
+          return false
+        })
+        if (!stale) return
+        if (attempt >= 2) throw new Error('.rulz/checks.json keeps changing on disk. Try again in a moment.')
+        p.hashes.delete('.rulz/checks.json')
+      }
+    })
+    return this.state(p)
   }
 
   private async wordsOf(p: OpenProject, rel: string): Promise<number> {
@@ -890,7 +1090,7 @@ export class NovelStore {
 
   private historyPath(p: OpenProject, rel: unknown): string {
     const clean = cleanRelPath(p.folder, rel)
-    if (/^(project|outline)\.json$/i.test(clean)) return clean.toLowerCase()
+    if (/^(project|outline|state)\.json$/i.test(clean)) return clean.toLowerCase()
     if (!USER_PATH.test(clean)) throw new Error(`There is no history for "${clean}".`)
     return clean
   }
@@ -921,7 +1121,7 @@ export class NovelStore {
     if (!p) return
     const rel = relIn.replace(/\\/g, '/')
     const key = lc(rel)
-    if (key === 'project.json' || key === 'outline.json') {
+    if (key === 'project.json' || key === 'outline.json' || key === 'state.json') {
       await this.exclusive(p, () => this.loadJson(p, true))
       return
     }

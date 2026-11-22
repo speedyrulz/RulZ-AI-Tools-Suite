@@ -162,14 +162,16 @@ export async function writeBytesAtomic(folder: string, target: string, tmpDir: s
   } finally {
     await fh.close()
   }
-  // The last look before the rename: if the target changed while the temp file was written, give up.
-  // What remains is the few microseconds between this check and the rename, which no file API closes.
-  if (stillValid && !(await stillValid().catch(() => false))) {
-    await fs.rm(tmp, { force: true }).catch(() => undefined)
-    return false
-  }
   let source = tmp
   for (let attempt = 0; ; attempt++) {
+    // The last look before each rename attempt: if the target changed while the temp file was written, or during
+    // a retry wait, give up. What remains is the few microseconds between this check and the rename, which no
+    // file API closes.
+    if (stillValid && !(await stillValid().catch(() => false))) {
+      await fs.rm(source, { force: true }).catch(() => undefined)
+      if (source !== tmp) await fs.rm(tmp, { force: true }).catch(() => undefined)
+      return false
+    }
     try {
       await fs.rename(source, target)
       return true

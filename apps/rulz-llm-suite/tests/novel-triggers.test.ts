@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { matchEntries } from '../src/shared/novelTriggers'
+import { matchEntries, voiceTargets } from '../src/shared/novelTriggers'
 import type { BibleEntry, NovelScene } from '../src/shared/novel'
 
 function entry(id: string, name: string, over: Partial<BibleEntry> = {}): BibleEntry {
@@ -216,5 +216,42 @@ describe('matchEntries sticky entries', () => {
       ['a', 'sticky', false],
       ['b', 'via: Anna', false]
     ])
+  })
+})
+
+describe('voiceTargets', () => {
+  const bible = [
+    entry('mara', 'Mara Venn', { aliases: ['the Salt Witch'] }),
+    entry('oskar', 'Oskar Lind'),
+    entry('ferry', 'The ferry', { kind: 'place' }),
+    entry('tilda', 'Tilda', { aliases: ['Til'] })
+  ]
+
+  it('gives the POV and present characters for dialogue, in bible order', () => {
+    const s = scene({ pov: 'oskar', present: ['tilda', 'mara'] })
+    expect(voiceTargets('dialogue', s, '', bible)).toEqual(['mara', 'oskar', 'tilda'])
+    // The selection does not matter for dialogue.
+    expect(voiceTargets('dialogue', s, 'Tilda', bible)).toEqual(['mara', 'oskar', 'tilda'])
+  })
+
+  it('leaves out places and entries that are not characters, and ids that do not exist', () => {
+    const s = scene({ pov: 'ferry', present: ['ghost', 'mara'] })
+    expect(voiceTargets('dialogue', s, '', bible)).toEqual(['mara'])
+    expect(voiceTargets('dialogue', null, '', bible)).toEqual([])
+    expect(voiceTargets('dialogue', scene(), '', bible)).toEqual([])
+  })
+
+  it('finds characters named in the selection for other actions (whole word, any case, aliases)', () => {
+    const s = scene({ pov: 'oskar' })
+    expect(voiceTargets('rewrite', s, 'MARA VENN looked at the ferry.', bible)).toEqual(['mara'])
+    expect(voiceTargets('expand', s, 'Til said the salt witch was late.', bible)).toEqual(['mara', 'tilda'])
+    expect(voiceTargets('condense', s, 'Tilda’s boat; Oskar Lindgren waved.', bible)).toEqual(['tilda'])
+    expect(voiceTargets('rewrite', s, 'Maraud and Until', bible)).toEqual([])
+  })
+
+  it('gives nothing without a selection, or for a place named in it', () => {
+    expect(voiceTargets('rewrite', scene({ pov: 'mara' }), '   ', bible)).toEqual([])
+    expect(voiceTargets('rewrite', null, 'The ferry creaked.', bible)).toEqual([])
+    expect(voiceTargets('continue', scene({ pov: 'mara' }), '', bible)).toEqual([])
   })
 })

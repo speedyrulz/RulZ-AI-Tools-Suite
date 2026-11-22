@@ -1,4 +1,4 @@
-import { Check, ChevronDown, Feather, History as HistoryIcon, LoaderCircle, MessageSquareQuote, Minimize2, Maximize2, PenLine, Play, RefreshCw, Square, TriangleAlert, X } from 'lucide-react'
+import { Check, ChevronDown, Database, Feather, History as HistoryIcon, LoaderCircle, MessageSquareQuote, Minimize2, Maximize2, PenLine, Play, RefreshCw, ScanSearch, Square, TriangleAlert, X } from 'lucide-react'
 import { useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import type { NovelAction, RewriteVariant } from '@shared/novel'
@@ -8,6 +8,7 @@ import { cn } from '../../lib/format'
 import { sceneOf, useNovel } from '../../stores/novel'
 import { Button, DropdownMenu, IconButton, Input, Select } from '../ui'
 import { BufferBanners } from './Banners'
+import { useVisibleFindings } from './ChecksPanel'
 import { CodeEditor, type PendingProps } from './CodeEditor'
 import { HistoryDialog } from './HistoryDialog'
 
@@ -22,6 +23,8 @@ export function SceneEditor({ sceneId }: { sceneId: string }) {
   const gen = useNovel((s) => s.gen)
   const pending = useNovel((s) => s.pending)
   const selection = useNovel((s) => s.selection)
+  const checkRun = useNovel((s) => s.checkRun)
+  const { specs } = useVisibleFindings(sceneId)
   const [historyOpen, setHistoryOpen] = useState(false)
 
   const mine = !!pending && pending.path === path
@@ -54,7 +57,7 @@ export function SceneEditor({ sceneId }: { sceneId: string }) {
   return (
     <div className="flex h-full min-h-0 flex-col">
       <BufferBanners path={path} />
-      {mine ? <PendingBar path={path} /> : <Toolbar empty={!buffer.text.trim()} hasSelection={selection.from !== selection.to} disabled={blocked || buffer.readOnly || missing || !!gen} onHistory={() => setHistoryOpen(true)} />}
+      {mine ? <PendingBar path={path} /> : <Toolbar sceneId={sceneId} empty={!buffer.text.trim()} hasSelection={selection.from !== selection.to} disabled={blocked || buffer.readOnly || missing || !!gen || !!checkRun} onHistory={() => setHistoryOpen(true)} />}
       {generating && <GenStrip />}
       <div className="min-h-0 flex-1">
         <CodeEditor
@@ -65,6 +68,7 @@ export function SceneEditor({ sceneId }: { sceneId: string }) {
           register
           cursorAtEnd
           pending={pv}
+          findings={specs}
           placeholder={scene.beats.trim() ? 'Write here, or choose Draft scene to write it from the beats.' : 'Write here. Add beats in the Scene tab to plan the scene.'}
           onChange={(t) => useNovel.getState().edit(path, t)}
           onSelection={(s) => useNovel.getState().setSelection(s)}
@@ -75,7 +79,7 @@ export function SceneEditor({ sceneId }: { sceneId: string }) {
   )
 }
 
-function Toolbar({ empty, hasSelection, disabled, onHistory }: { empty: boolean; hasSelection: boolean; disabled: boolean; onHistory: () => void }) {
+function Toolbar({ sceneId, empty, hasSelection, disabled, onHistory }: { sceneId: string; empty: boolean; hasSelection: boolean; disabled: boolean; onHistory: () => void }) {
   const [note, setNote] = useState('')
   const [alts, setAlts] = useState(1)
   const noteRef = useRef<HTMLInputElement>(null)
@@ -112,6 +116,12 @@ function Toolbar({ empty, hasSelection, disabled, onHistory }: { empty: boolean;
       </Button>
       <Button size="sm" disabled={disabled} title="Write dialogue for the current beat" onClick={() => run('dialogue')}>
         <MessageSquareQuote size={14} /> Dialogue
+      </Button>
+      <Button size="sm" disabled={disabled || empty} title={empty ? 'The scene has no text to check' : 'Check the scene against the bible and what is known so far'} onClick={() => void useNovel.getState().checkScene(sceneId)}>
+        <ScanSearch size={14} /> Check
+      </Button>
+      <Button size="sm" disabled={disabled || empty} title={empty ? 'The scene has no text to read' : 'Find changes to the tracked state in this scene'} onClick={() => void useNovel.getState().updateState(sceneId)}>
+        <Database size={14} /> Update state
       </Button>
       <div className="mx-1 hidden h-5 w-px bg-border lg:block" />
       <Input

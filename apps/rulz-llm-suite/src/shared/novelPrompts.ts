@@ -4,6 +4,9 @@ import { z } from 'zod'
 import { DEFAULT_SAMPLING } from './defaults'
 import type {
   BibleEntry,
+  CheckFinding,
+  CheckReply,
+  FindingType,
   NovelAction,
   NovelChapter,
   NovelProject,
@@ -11,7 +14,10 @@ import type {
   OutlineChaptersReply,
   OutlineScenesReply,
   RewriteVariant,
-  SummaryReply
+  StateKind,
+  SummaryReply,
+  UpdateStateChange,
+  UpdateStateReply
 } from './novel'
 import { NOVEL_FORMAT } from './novel'
 import { splitParagraphs } from './novelText'
@@ -131,6 +137,10 @@ export interface TaskOptions {
   targetWords?: number | null
   /** Outline actions: how many chapters or scenes. Alternatives for prose actions are not in the prompt. */
   count?: number
+  /** updateState: the state before the scene, one fact per line with its id, e.g. "[f1a2b3] Mara Venn - location: the lighthouse". */
+  stateBeforeText?: string
+  /** updateState: facts already added or ended at this scene, same format. */
+  recordedText?: string
 }
 
 export function taskText(action: NovelAction, opts: TaskOptions): string {
@@ -196,8 +206,41 @@ export function taskText(action: NovelAction, opts: TaskOptions): string {
         'use null for pov when no entry fits. ' +
         'Reply as JSON: {"scenes": [{"title": "...", "beats": "...", "pov": null, "present": []}]}.'
       break
+    case 'checkScene':
+      task =
+        'Check the scene for inconsistencies with the style notes, the story bible, the story so far and the ' +
+        'state before the scene. Look for: continuity (facts, objects, places, who knows what), character ' +
+        '(behaviour or voice that does not fit the entry), timeline, point of view slips, and tense slips. ' +
+        'Report only real problems, at most 20, most serious first. For each, "quote" is the exact words from the ' +
+        'scene (copy them, a short run of words, not a whole paragraph), "problem" says what is wrong, ' +
+        '"conflictsWith" says what it contradicts, and "suggestion" is a short fix. "type" is one of ' +
+        'continuity, character, timeline, pov, tense, other. If there are no problems, reply with an empty list. ' +
+        'Reply as JSON: {"findings": [{"type": "continuity", "quote": "...", "problem": "...", ' +
+        '"conflictsWith": "...", "suggestion": "..."}]}.'
+      break
+    case 'updateState':
+      task =
+        'Update the tracked state from the scene. Report what became true in this scene and what stopped being ' +
+        'true in it, as the characters\' situation changes (where they are, what they know or carry, their ' +
+        'condition, how they stand with each other). Only report changes the scene itself shows; do not repeat ' +
+        'anything in the state before the scene or already recorded for this scene. ' +
+        '"add" gives entity (the name of a bible entry), kind (location, knows, carries, condition, relationship ' +
+        'or other), value (one short line) and about (the other entry\'s name for a relationship, otherwise null). ' +
+        '"end" gives the factId from the state before the scene, in brackets, and a short reason. ' +
+        'If nothing changed, reply with an empty list. ' +
+        'Reply as JSON: {"changes": [{"op": "add", "entity": "...", "kind": "location", "value": "...", ' +
+        '"about": null}, {"op": "end", "factId": "...", "reason": "..."}]}.'
+      break
+    case 'interview':
+      // The interview is a chat with its own system prompt (interviewSystem); there is no task text.
+      task = "Answer the author's question in character."
+      break
   }
   const sections = [task]
+  if (action === 'updateState') {
+    sections.push(`State before this scene (fact ids in brackets):\n${opts.stateBeforeText?.trim() || '(none)'}`)
+    sections.push(`Already recorded at this scene:\n${opts.recordedText?.trim() || '(none)'}`)
+  }
   const selection = opts.selection?.trim()
   if (selection) sections.push(`Selected passage:\n${selection}`)
   const note = opts.note?.trim()
@@ -384,6 +427,171 @@ export function parseOutlineScenes(raw: string): Parsed<OutlineScenesReply> {
 
 export function parseSummary(raw: string): Parsed<SummaryReply> {
   return parseReply(raw, summaryReply)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 3: checks and tracked state
+// ---------------------------------------------------------------------------------------------
+
+const FINDING_TYPES: FindingType[] = ['continuity', 'character', 'timeline', 'pov', 'tense', 'other']
+const STATE_KINDS: StateKind[] = ['location', 'knows', 'carries', 'condition', 'relationship', 'other']
+const MAX_FINDINGS = 20
+const VALUE_MAX = 300
+
+export const CHECK_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['findings'],
+  properties: {
+    findings: {
+      type: 'array',
+      minItems: 0,
+      maxItems: MAX_FINDINGS,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['type', 'quote', 'problem', 'conflictsWith', 'suggestion'],
+        properties: {
+          type: { type: 'string', enum: FINDING_TYPES },
+          quote: STRING,
+          problem: STRING,
+          conflictsWith: STRING,
+          suggestion: STRING
+        }
+      }
+    }
+  }
+}
+
+export const UPDATE_STATE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['changes'],
+  properties: {
+    changes: {
+      type: 'array',
+      minItems: 0,
+      items: {
+        anyOf: [
+          {
+            type: 'object',
+            additionalProperties: false,
+            required: ['op', 'entity', 'kind', 'value', 'about'],
+            properties: {
+              op: { type: 'string', enum: ['add'] },
+              entity: STRING,
+              kind: { type: 'string', enum: STATE_KINDS },
+              value: STRING,
+              about: { type: ['string', 'null'] }
+            }
+          },
+          {
+            type: 'object',
+            additionalProperties: false,
+            required: ['op', 'factId', 'reason'],
+            properties: {
+              op: { type: 'string', enum: ['end'] },
+              factId: STRING,
+              reason: STRING
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+
+// Replies are read leniently item by item: a bad item is left out, it does not sink the others.
+const lenientReply = (key: string): z.ZodType<unknown[]> =>
+  z.object({ [key]: z.array(z.unknown()) }).transform((value) => value[key] as unknown[])
+
+const str = (value: unknown): string => (typeof value === 'string' ? value : '')
+const oneLine = (value: unknown, max: number): string => str(value).replace(/\s+/g, ' ').trim().slice(0, max).trim()
+const record = (value: unknown): Record<string, unknown> | null =>
+  value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null
+
+function findingOf(item: unknown): CheckFinding | null {
+  const obj = record(item)
+  if (!obj) return null
+  const type = str(obj.type).trim().toLowerCase() as FindingType
+  if (!FINDING_TYPES.includes(type)) return null
+  const quote = str(obj.quote).trim()
+  const problem = str(obj.problem).trim()
+  if (!quote || !problem) return null
+  return { type, quote, problem, conflictsWith: str(obj.conflictsWith).trim(), suggestion: str(obj.suggestion).trim() }
+}
+
+function changeOf(item: unknown): UpdateStateChange | null {
+  const obj = record(item)
+  if (!obj) return null
+  const op = str(obj.op).trim().toLowerCase()
+  if (op === 'add') {
+    const kind = str(obj.kind).trim().toLowerCase() as StateKind
+    if (!STATE_KINDS.includes(kind)) return null
+    const entity = str(obj.entity).trim()
+    const value = oneLine(obj.value, VALUE_MAX)
+    if (!entity || !value) return null
+    // 'about' means something for a relationship only.
+    const about = kind === 'relationship' ? str(obj.about).trim() || null : null
+    return { op: 'add', entity, kind, value, about }
+  }
+  if (op === 'end') {
+    const factId = str(obj.factId).trim().replace(/^\[+|\]+$/g, '').trim()
+    if (!factId) return null
+    return { op: 'end', factId, reason: oneLine(obj.reason, VALUE_MAX) }
+  }
+  return null
+}
+
+/** Like parseCheckReply but with the error instead of a throw. */
+export function parseCheckReplyResult(raw: string): Parsed<CheckReply> {
+  const parsed = parseReply(raw, lenientReply('findings'))
+  if (!parsed.ok) return parsed
+  const findings = parsed.value.map(findingOf).filter((finding): finding is CheckFinding => finding !== null)
+  return { ok: true, value: { findings: findings.slice(0, MAX_FINDINGS) } }
+}
+
+/** At most 20 findings, values trimmed, unknown types and empty quote/problem dropped. Throws when the reply is not the expected JSON. */
+export function parseCheckReply(text: string): CheckReply {
+  const result = parseCheckReplyResult(text)
+  if (!result.ok) throw new Error(result.error)
+  return result.value
+}
+
+/** Like parseUpdateStateReply but with the error instead of a throw. */
+export function parseUpdateStateReplyResult(raw: string): Parsed<UpdateStateReply> {
+  const parsed = parseReply(raw, lenientReply('changes'))
+  if (!parsed.ok) return parsed
+  const changes = parsed.value.map(changeOf).filter((change): change is UpdateStateChange => change !== null)
+  return { ok: true, value: { changes } }
+}
+
+/** Unknown ops and kinds dropped, values one line and at most 300 characters. Throws when the reply is not the expected JSON. */
+export function parseUpdateStateReply(text: string): UpdateStateReply {
+  const result = parseUpdateStateReplyResult(text)
+  if (!result.ok) throw new Error(result.error)
+  return result.value
+}
+
+/** The system prompt of a character interview (stage 3). */
+export function interviewSystem(input: { name: string; body: string; stateLines: string; summaries: string[] }): string {
+  const name = input.name.trim() || 'the character'
+  const parts = [
+    `You are ${name}. Answer in character, in your own voice. You know only what ${name} knows by this point in the story; if asked about later events, you do not know them. Stay in character: do not mention that you are a character in a novel.`
+  ]
+  const body = input.body.trim()
+  if (body) {
+    parts.push(
+      "The author's notes about you (they may mention things you have not lived yet; do not reveal those):\n" + body
+    )
+  }
+  const state = input.stateLines.trim()
+  if (state) parts.push(`What is true of you at this point in the story:\n${state}`)
+  const summaries = input.summaries.map((summary) => summary.trim()).filter(Boolean)
+  if (summaries.length > 0) {
+    parts.push(`What has happened so far, in the scenes you were in:\n${summaries.join('\n\n')}`)
+  }
+  return parts.join('\n\n')
 }
 
 // ---------------------------------------------------------------------------------------------

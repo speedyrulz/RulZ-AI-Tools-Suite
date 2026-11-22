@@ -117,6 +117,20 @@ Discover/downloads, RAG and a CLI are planned.
     back after a crash; a conflict banner when another program changed the file; snapshots in **History**; deleted
     scenes, chapters and entries in **Trash**; a project whose `project.json` or `outline.json` can't be read is
     opened read-only instead of being reset. Closing the window first saves or journals open text.
+  - **Check** (scene toolbar) and **Check chapter** (chapter menu) ask the model to read a scene against the bible,
+    the story so far and the tracked state, and list problems: continuity, character, timeline, POV, tense. Each
+    problem quotes the scene and is marked in the margin; **Jump**, **Fix** (a Rewrite you accept or reject) or
+    **Dismiss** (remembered per scene in `.rulz\checks.json`) in the **Checks** tab.
+  - **Tracked state** (`state.json`): facts per character or thing (location, what they know or carry, condition,
+    relationships), each true from one scene until another in reading order. **Update state** asks the model what
+    changed in a scene; you accept or reject each change before anything is written. The **State** tab shows the state
+    before or after the current scene and lets you add, edit, end or remove facts; facts whose scene or entry was
+    deleted, or that end before they start after a scene move, are listed for repair. The state before the scene goes
+    into every request.
+  - **Interview** tab: chat with a character, in their voice, who knows only what they know by the current scene
+    (their entry, their state and summaries of the scenes they were in). **Add to voice notes** appends an answer to a
+    `## Voice` section in the character's entry. For **Dialogue**, or a selection that names a character, that
+    character's voice notes come first in the request.
   - Not yet tried with a real model.
 - **Reverse Engineering mode** (`Ctrl+6`) — runs a local model as a reverse engineer with the REA MCP tools, and
   collects fine-tuning data while it works. Tuned first for Ornith 1.5 35B-A3B (Heretic MTP APEX I-Mini).

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { createEditor, type EditorHandle, type PendingView } from '../../lib/novelEditor'
+import { createEditor, type EditorHandle, type FindingSpec, type PendingView } from '../../lib/novelEditor'
 import { registerEditor } from '../../stores/novel'
 
 /** True while the app is in its dark theme (the root element carries the `dark` class). */
@@ -32,6 +32,7 @@ export function CodeEditor({
   register,
   cursorAtEnd,
   pending,
+  findings,
   onChange,
   onSelection,
   className
@@ -45,6 +46,8 @@ export function CodeEditor({
   register?: boolean
   cursorAtEnd?: boolean
   pending?: PendingProps | null
+  /** Check findings to underline (keep the array stable between renders). */
+  findings?: FindingSpec[]
   onChange: (text: string) => void
   onSelection?: (sel: { from: number; to: number }) => void
   className?: string
@@ -99,6 +102,12 @@ export function CodeEditor({
     if (!h || showing.current) return
     if (text !== h.lastText && (h.view.state.doc.length !== text.length || h.view.state.doc.toString() !== text)) h.setText(text)
   }, [text, path])
+
+  useEffect(() => {
+    handle.current?.setFindings(findings ?? [])
+    // A new array is a new set of findings; a new path is a new editor.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [findings, path])
 
   useEffect(() => {
     handle.current?.setReadOnly(readOnly)

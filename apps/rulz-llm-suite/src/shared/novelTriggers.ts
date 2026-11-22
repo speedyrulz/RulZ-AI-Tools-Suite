@@ -1,5 +1,5 @@
 // Bible retrieval by keyword (no embeddings). Pure; the renderer calls it with the scan text.
-import type { BibleEntry, NovelScene } from './novel'
+import type { BibleEntry, NovelAction, NovelScene } from './novel'
 
 export interface TriggerCandidate {
   entry: BibleEntry
@@ -90,4 +90,27 @@ export function matchEntries(
   }
 
   return [...found.values()].sort(byOrder)
+}
+
+/**
+ * Voice targets (stage 3), character entries only: for Dialogue the scene's POV and present characters; for
+ * any other action with a selection, the characters whose name or alias appears in it (whole word, any case).
+ * Returns entry ids in bible order.
+ */
+export function voiceTargets(
+  action: NovelAction,
+  scene: NovelScene | null,
+  selection: string,
+  bible: BibleEntry[]
+): string[] {
+  const characters = bible.filter((entry) => entry.kind === 'character')
+  if (action === 'dialogue') {
+    if (!scene) return []
+    const wanted = new Set<string>([...(scene.pov ? [scene.pov] : []), ...scene.present])
+    return characters.filter((entry) => wanted.has(entry.id)).map((entry) => entry.id)
+  }
+  if (!selection.trim()) return []
+  return characters
+    .filter((entry) => [entry.name, ...entry.aliases].some((value) => mentions(selection, value)))
+    .map((entry) => entry.id)
 }

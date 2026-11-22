@@ -1,4 +1,4 @@
-import { AlertTriangle, ArrowDown, ArrowUp, ChevronRight, Ellipsis, FilePlus2, FolderInput, GripVertical, Pencil, Plus, Trash2 } from 'lucide-react'
+import { AlertTriangle, ArrowDown, ArrowUp, ChevronRight, Ellipsis, FilePlus2, FolderInput, GripVertical, Pencil, Plus, ScanSearch, Trash2 } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
 import type { NovelChapter, NovelScene } from '@shared/novel'
 import { cn, formatNumber } from '../../lib/format'
@@ -18,6 +18,9 @@ export function OutlineTree() {
   const orphans = useNovel((s) => s.state?.orphans ?? [])
   const blocked = useNovel((s) => !!s.state?.blocked)
   const target = useNovel((s) => s.target)
+  const checkRun = useNovel((s) => s.checkRun)
+  const pending = useNovel((s) => s.pending)
+  const checking = useNovel((s) => !!s.gen || !!s.checkRun)
   const [renaming, setRenaming] = useState<Renaming>(null)
   const [deleting, setDeleting] = useState<Deleting>(null)
   const [adding, setAdding] = useState<{ chapterId: string | null } | null>(null)
@@ -76,6 +79,7 @@ export function OutlineTree() {
           const chapterItems: (MenuItem | 'sep')[] = [
             { label: 'Rename', icon: <Pencil size={13} />, onSelect: () => setRenaming({ kind: 'chapter', id: chapter.id }) },
             { label: 'Add scene', icon: <FilePlus2 size={13} />, onSelect: () => setAdding({ chapterId: chapter.id }) },
+            { label: 'Check chapter', icon: <ScanSearch size={13} />, disabled: checking || !!pending, onSelect: () => void store.checkChapter(chapter.id) },
             { label: 'Move up', icon: <ArrowUp size={13} />, disabled: ci === 0, onSelect: () => void store.patch([{ op: 'moveChapter', chapterId: chapter.id, index: ci - 1 }]) },
             { label: 'Move down', icon: <ArrowDown size={13} />, disabled: ci === outline.chapters.length - 1, onSelect: () => void store.patch([{ op: 'moveChapter', chapterId: chapter.id, index: ci + 1 }]) },
             'sep',
@@ -127,6 +131,14 @@ export function OutlineTree() {
                     <span className="truncate">{chapter.title}</span>
                     {chapter.act && <span className="shrink-0 text-[11px] font-normal text-faint">{chapter.act}</span>}
                   </button>
+                )}
+                {checkRun?.chapterId === chapter.id && (
+                  <span className="flex shrink-0 items-center gap-1 pr-1 text-[11px] text-muted" role="status">
+                    Checking {checkRun.index + 1} of {checkRun.sceneIds.length}
+                    <button className="rounded px-1 text-[11px] text-link hover:bg-hover" onClick={() => store.stop()}>
+                      Stop
+                    </button>
+                  </span>
                 )}
                 <ChapterWords chapter={chapter} />
                 <DropdownMenu

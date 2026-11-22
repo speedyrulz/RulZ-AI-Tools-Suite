@@ -7,6 +7,7 @@ import { toast } from 'sonner'
 import type {
   BibleEntry,
   BibleKind,
+  CheckFinding,
   NovelAction,
   NovelChange,
   NovelFileMeta,
@@ -15,18 +16,36 @@ import type {
   NovelProjectSummary,
   NovelSaveResult,
   NovelScene,
+  NovelStatePatchResult,
   NovelTextFile,
   OutlineChaptersReply,
   OutlineOp,
   OutlineScenesReply,
   ProjectPatch,
   RewriteVariant,
+  StateFact,
+  StateOp,
   SummaryReply
 } from '@shared/novel'
 import type { WireMessage } from '@shared/types'
+import { parseEntry } from '@shared/frontMatter'
+import { findingKey, locateQuote } from '@shared/novelChecks'
 import { newId } from '@shared/novelOutline'
-import { OUTLINE_CHAPTERS_SCHEMA, OUTLINE_SCENES_SCHEMA, SUMMARY_SCHEMA, parseOutlineChapters, parseOutlineScenes, parseSummary } from '@shared/novelPrompts'
+import {
+  CHECK_SCHEMA,
+  OUTLINE_CHAPTERS_SCHEMA,
+  OUTLINE_SCENES_SCHEMA,
+  SUMMARY_SCHEMA,
+  UPDATE_STATE_SCHEMA,
+  parseCheckReplyResult,
+  parseOutlineChapters,
+  parseOutlineScenes,
+  parseSummary,
+  parseUpdateStateReplyResult
+} from '@shared/novelPrompts'
+import { stateBefore } from '@shared/novelState'
 import { sceneHashKey, wordCount } from '@shared/novelText'
+import { appendVoiceNote } from '@shared/novelVoice'
 import { errorMessage, invoke, on } from '../lib/api'
 import { uid } from '../lib/format'
 import type { EditorHandle } from '../lib/novelEditor'
@@ -35,26 +54,38 @@ import {
   ACTION_LABELS,
   STALE_PENDING,
   applyResult,
+  buildInterviewSystem,
   clearCountCache,
   finishText,
+  fitInterview,
   fitRequest,
+  hashText,
+  interviewKey,
   ipcCounter,
+  makeFindingsEntry,
   pendingStale,
   resolveSceneRefs,
+  resolveStateChanges,
   scenePath,
   seedsFor,
   startGeneration,
+  stateOpsFor,
   summaryHealth,
   templateOverhead,
+  voiceNoteBlock,
+  wholeSceneProblem,
   type BuiltRequest,
+  type FindingsEntry,
   type GenHandle,
+  type InterviewTurn,
   type PendingAlt,
   type PendingChange,
-  type RunContext
+  type RunContext,
+  type StateCardItem
 } from '../lib/novelRun'
 import { readyInstance, useModels } from './models'
 
-export type PanelTab = 'scene' | 'context' | 'project'
+export type PanelTab = 'scene' | 'context' | 'checks' | 'state' | 'interview' | 'project'
 export type Target = { kind: 'scene'; id: string } | { kind: 'entry'; id: string } | null
 
 export const STYLE_PATH = 'style.md'
@@ -113,6 +144,42 @@ export interface Proposal {
   again: { count: number; note: string }
 }
 
+/** The card of an Update state request: changes to accept or reject; nothing is written before Apply. */
+export interface StateProposal {
+  id: string
+  sceneId: string
+  title: string
+  status: 'running' | 'ready' | 'invalid' | 'applied'
+  /** hashText of the scene text the request read: Apply is refused when the text is not this any more. */
+  textHash: string
+  raw: string
+  error: string | null
+  items: StateCardItem[]
+  /** Changes left out, with why (names not in the bible, unknown fact ids). */
+  left: string[]
+  /** Set when Apply was refused. */
+  refused: string | null
+  /** Ops main did not apply, with the change they belonged to. */
+  rejected: { label: string; reason: string }[]
+  applied: number
+  applying: boolean
+}
+
+/** A Check that could not be read, with what the model wrote (nothing was changed). */
+export interface CheckIssue {
+  sceneId: string
+  error: string
+  raw: string
+}
+
+/** A chapter check going scene by scene. */
+export interface CheckRun {
+  chapterId: string | null
+  sceneIds: string[]
+  /** Index of the scene being checked. */
+  index: number
+}
+
 export interface LastRequest {
   source: 'preview' | 'run'
   action: NovelAction
@@ -144,6 +211,20 @@ interface NovelState {
   /** Set when an Accept was refused; shown with Regenerate. */
   pendingRefused: boolean
   proposal: Proposal | null
+  /** Stage 3: Check findings per scene (memory only), with the text hash they were made from. */
+  findings: Record<string, FindingsEntry>
+  checkRun: CheckRun | null
+  checkIssue: CheckIssue | null
+  /** Stage 3: the Update state card. */
+  stateProposal: StateProposal | null
+  /** The scene last open in the editor, for the Interview tab while an entry is open. */
+  lastSceneId: string | null
+  /** Stage 3: interview history per character + scene (interviewKey), memory only. */
+  interviews: Record<string, InterviewTurn[]>
+  /** Turns left out of the last request of an interview, by key. */
+  interviewDropped: Record<string, number>
+  /** The interview being answered (its key), so the stream shows only under that character and scene. */
+  interviewRun: { key: string } | null
   /** Scenes still to summarize in a "Summarize all" run. */
   summarizeQueue: string[]
   lastRequest: LastRequest | null
@@ -198,6 +279,24 @@ interface NovelState {
   retryProposal: () => Promise<void>
   previewContext: () => Promise<void>
   removeSticky: (sceneId: string, entryId: string) => Promise<void>
+
+  // Stage 3
+  checkScene: (sceneId: string) => Promise<void>
+  checkChapter: (chapterId: string) => Promise<void>
+  dismissFinding: (sceneId: string, finding: CheckFinding, dismissed?: boolean) => Promise<void>
+  restoreDismissed: (sceneId: string) => Promise<void>
+  jumpToFinding: (sceneId: string, finding: CheckFinding) => void
+  fixFinding: (sceneId: string, finding: CheckFinding) => Promise<void>
+  clearCheckIssue: () => void
+  updateState: (sceneId: string) => Promise<void>
+  setStateItem: (key: number, accepted: boolean) => void
+  applyStateProposal: () => Promise<void>
+  discardStateProposal: () => void
+  /** Sends ops for state.json; null when nothing was sent. Rejected ops come back in the result. */
+  statePatch: (ops: StateOp[]) => Promise<NovelStatePatchResult | null>
+  askInterview: (characterId: string, question: string) => Promise<boolean>
+  clearInterview: (key: string) => void
+  addVoiceNote: (entryId: string, note: string) => Promise<boolean>
 }
 
 export interface RunOptions {
@@ -319,7 +418,7 @@ export const useNovel = create<NovelState>((set, get) => {
     })
   }
 
-  const busy = (): boolean => !!get().gen
+  const busy = (): boolean => !!get().gen || !!get().checkRun
 
   // ---- buffers ---------------------------------------------------------------------------
 
@@ -433,8 +532,11 @@ export const useNovel = create<NovelState>((set, get) => {
 
   const ensureBuffer = async (path: string): Promise<boolean> => {
     if (get().buffers[path]) return true
+    const epoch0 = epoch
     const b = await loadBuffer(path)
     if (!b) return false
+    // The project was closed or switched while the file was read: its buffer belongs to nobody now.
+    if (epoch !== epoch0) return false
     set((s) => ({ buffers: { ...s.buffers, [path]: s.buffers[path] ?? b } }))
     if (path.startsWith('manuscript/')) set((s) => ({ hashes: { ...s.hashes, [path]: b.baseHash } }))
     return true
@@ -608,6 +710,7 @@ export const useNovel = create<NovelState>((set, get) => {
       bible: s.state.bible,
       sceneId: null,
       sceneHashes: { ...s.hashes },
+      facts: s.state.state?.facts ?? [],
       text: '',
       cursor: 0,
       selection: null,
@@ -703,6 +806,165 @@ export const useNovel = create<NovelState>((set, get) => {
     }
   }
 
+  // ---- stage 3 helpers -------------------------------------------------------------------
+
+  const factsNow = (): StateFact[] => get().state?.state?.facts ?? []
+
+  type WholeResult =
+    | { status: 'done'; raw: string; text: string; textHash: string }
+    | { status: 'empty' }
+    | { status: 'refused' }
+    | { status: 'stopped' }
+    | { status: 'stale' }
+    | { status: 'failed'; error: string; raw: string }
+
+  /**
+   * One structured request over the whole scene (Check, Update state). The scene is held still while it runs
+   * (gen.path), every await re-checks the project open now, and the request is refused when the scene does not fit whole.
+   */
+  const runWholeScene = async (sceneId: string, action: 'checkScene' | 'updateState', label: string): Promise<WholeResult> => {
+    const s0 = get()
+    const found = sceneOf(s0.state, sceneId)
+    if (!s0.state || !s0.folder || !found) return { status: 'refused' }
+    const path = scenePath(found.scene)
+    const epoch0 = epoch
+    const folder0 = s0.folder
+    const stale = (): boolean => epoch !== epoch0 || get().folder !== folder0
+    set({ gen: { path, action, label, phase: 'preparing', alt: 1, of: 1, progress: null, text: '' } })
+    try {
+      const b0 = get().buffers[path]
+      if (b0?.dirty && !b0.readOnly && !(await get().save(path))) {
+        toast.error('Save the text first: it could not be saved, so nothing was sent.')
+        return { status: 'refused' }
+      }
+      if (stale()) return { status: 'stale' }
+      if (stopRequested) return { status: 'stopped' }
+      const src = await sceneSource(sceneId, false)
+      if (stale()) return { status: 'stale' }
+      if (stopRequested) return { status: 'stopped' }
+      if (!src) return { status: 'refused' }
+      if (!src.text.trim()) return { status: 'empty' }
+      const version = get().buffers[path]?.version
+      // The text moved since it was read: what was sent (or is about to be) is not what is in the scene.
+      const moved = (): boolean => {
+        const b = get().buffers[path]
+        return !!b && (b.version !== version || b.text !== src.text)
+      }
+      const model = await resolveModel()
+      if (stale()) return { status: 'stale' }
+      if (stopRequested) return { status: 'stopped' }
+      if (!model) return { status: 'refused' }
+      await get().ensureHashes()
+      if (stale()) return { status: 'stale' }
+      if (stopRequested) return { status: 'stopped' }
+      const estimated = { value: false }
+      const base = await baseContext(model, { action, sceneId, text: src.text, cursor: src.text.length }, estimated)
+      if (!base || stale()) return { status: 'stale' }
+      if (stopRequested) return { status: 'stopped' }
+      const fit = await fitRequest(base.ctx, base.count, countWhole(model.modelId), estimated)
+      if (stale() || moved()) return { status: 'stale' }
+      if (stopRequested) return { status: 'stopped' }
+      set({ lastRequest: { source: 'run', action, at: Date.now(), built: fit.built, actual: fit.actual, tooBig: fit.tooBig, contextLength: model.contextLength } })
+      if (fit.tooBig) {
+        set({ panelOpen: true, panelTab: 'context' })
+        toast.error('This request does not fit in the context. The Context tab shows what is using it.')
+        return { status: 'refused' }
+      }
+      const problem = wholeSceneProblem(fit.built)
+      if (problem) {
+        set({ panelOpen: true, panelTab: 'context' })
+        toast.error(problem)
+        return { status: 'refused' }
+      }
+      const sampling = base.ctx.project.sampling
+      if (stopRequested) return { status: 'stopped' }
+      const gen = startGeneration({
+        modelId: model.modelId,
+        messages: fit.built.result.messages,
+        sampling,
+        adapters: base.ctx.project.adapters,
+        action,
+        seed: seedsFor(sampling.seed, 1)[0],
+        maxTokens: Math.max(1024, base.ctx.project.budget.replyTokens),
+        schema: action === 'checkScene' ? CHECK_SCHEMA : UPDATE_STATE_SCHEMA,
+        onProgress: (p) => set((x) => (x.gen ? { gen: { ...x.gen, phase: 'waiting', progress: p } } : x)),
+        onDelta: pushStreamText
+      })
+      activeGen = gen
+      const res = await gen.done
+      if (epoch === epoch0) activeGen = null
+      if (stale() || moved()) return { status: 'stale' }
+      if (res.stopped) return { status: 'stopped' }
+      if (res.error) return { status: 'failed', error: res.error, raw: res.text }
+      return { status: 'done', raw: res.text.trim(), text: src.text, textHash: hashText(src.text) }
+    } catch (e) {
+      return { status: 'failed', error: errorMessage(e), raw: '' }
+    } finally {
+      if (epoch === epoch0) {
+        activeGen = null
+        set({ gen: null })
+      }
+    }
+  }
+
+  /** Checks one scene and keeps its findings. 'refused' leaves the scene unchecked (already told); 'failed' / 'stopped' end a chapter run. */
+  const checkOne = async (sceneId: string, label: string): Promise<'done' | 'empty' | 'refused' | 'failed' | 'stopped'> => {
+    const epoch0 = epoch
+    const r = await runWholeScene(sceneId, 'checkScene', label)
+    if (epoch !== epoch0) return 'stopped'
+    if (r.status === 'stale' || r.status === 'stopped') return 'stopped'
+    if (r.status === 'empty' || r.status === 'refused') return r.status
+    if (r.status === 'failed') {
+      set({ checkIssue: { sceneId, error: r.error, raw: r.raw }, panelOpen: true, panelTab: 'checks' })
+      toast.error(`The check failed: ${r.error}`)
+      return 'failed'
+    }
+    const parsed = parseCheckReplyResult(r.raw)
+    if (!parsed.ok) {
+      set({ checkIssue: { sceneId, error: parsed.error, raw: r.raw }, panelOpen: true, panelTab: 'checks' })
+      return 'failed'
+    }
+    const entry = makeFindingsEntry(r.text, parsed.value.findings)
+    set((s) => ({ findings: { ...s.findings, [sceneId]: entry }, checkIssue: s.checkIssue?.sceneId === sceneId ? null : s.checkIssue }))
+    return 'done'
+  }
+
+  /** Where a finding's quote is now: the editor's mark (it follows edits), else found again in the buffer. */
+  const findingRange = (sceneId: string, finding: CheckFinding): { from: number; to: number } | null => {
+    const found = sceneOf(get().state, sceneId)
+    if (!found) return null
+    const path = scenePath(found.scene)
+    const live = editors.get(path)?.findingRange(findingKey(finding))
+    if (live) return live
+    const b = get().buffers[path]
+    return b ? locateQuote(b.text, finding.quote) : null
+  }
+
+  const sendStatePatch = async (ops: StateOp[]): Promise<NovelStatePatchResult | null> => {
+    const s = get()
+    if (!s.folder || !s.state || ops.length === 0) return null
+    if (s.state.blocked) {
+      toast.error('The project is read-only, so the state was not changed.')
+      return null
+    }
+    const st = s.state.state
+    const onlyReset = ops.length === 1 && ops[0].op === 'reset'
+    if (st?.problem && !(onlyReset && st.canReset)) {
+      toast.error(`state.json cannot be used: ${st.problem}`)
+      return null
+    }
+    const folder0 = s.folder
+    const epoch0 = epoch
+    try {
+      const res = await invoke('novel:statePatch', folder0, ops)
+      if (epoch === epoch0 && get().folder === folder0) applyState(res.state)
+      return res
+    } catch (e) {
+      toast.error(errorMessage(e))
+      return null
+    }
+  }
+
   // ---- the store -------------------------------------------------------------------------
 
   return {
@@ -723,6 +985,14 @@ export const useNovel = create<NovelState>((set, get) => {
     pending: null,
     pendingRefused: false,
     proposal: null,
+    findings: {},
+    checkRun: null,
+    checkIssue: null,
+    stateProposal: null,
+    lastSceneId: null,
+    interviews: {},
+    interviewDropped: {},
+    interviewRun: null,
     summarizeQueue: [],
     lastRequest: null,
     contextBusy: false,
@@ -801,7 +1071,7 @@ export const useNovel = create<NovelState>((set, get) => {
       activeGen = null
       clearAllTimers()
       editors.clear()
-      set({ folder: null, state: null, target: null, buffers: {}, hashes: {}, gen: null, pending: null, pendingRefused: false, proposal: null, summarizeQueue: [], lastRequest: null })
+      set({ folder: null, state: null, target: null, buffers: {}, hashes: {}, gen: null, pending: null, pendingRefused: false, proposal: null, findings: {}, checkRun: null, checkIssue: null, stateProposal: null, lastSceneId: null, interviews: {}, interviewDropped: {}, interviewRun: null, summarizeQueue: [], lastRequest: null })
       await invoke('novel:closeProject', folder).catch(() => undefined)
       return true
     },
@@ -838,7 +1108,7 @@ export const useNovel = create<NovelState>((set, get) => {
       const old = targetPath(s.target, s.state)
       if (old && old !== path) void get().save(old)
       if (!(await ensureBuffer(path))) return
-      set({ target: { kind: 'scene', id: sceneId }, selection: { from: 0, to: 0 } })
+      set({ target: { kind: 'scene', id: sceneId }, lastSceneId: sceneId, selection: { from: 0, to: 0 } })
       remember(sceneKey(s.folder), sceneId)
       if (old && old !== path) dropIfIdle(old)
     },
@@ -1429,6 +1699,288 @@ export const useNovel = create<NovelState>((set, get) => {
       const found = sceneOf(get().state, sceneId)
       if (!found) return
       await get().setScene(sceneId, 'sticky', found.scene.sticky.filter((id) => id !== entryId))
+    },
+
+    // ---- stage 3: checks -----------------------------------------------------------------
+
+    checkScene: async (sceneId) => {
+      const s = get()
+      const found = sceneOf(s.state, sceneId)
+      if (!s.state || !found) return
+      if (busy() || s.pending) return void toast.message('Wait for the current request to finish first.')
+      stopRequested = false
+      const r = await checkOne(sceneId, `Check: ${found.scene.title}`)
+      if (r === 'empty') return void toast.message('The scene has no text to check.')
+      if (r === 'done') {
+        set({ panelOpen: true, panelTab: 'checks' })
+        const n = get().findings[sceneId]?.items.length ?? 0
+        if (n === 0) toast.success('No problems found in this scene.')
+      }
+    },
+
+    checkChapter: async (chapterId) => {
+      const s = get()
+      const chapter = s.state?.outline.chapters.find((c) => c.id === chapterId)
+      if (!chapter) return
+      if (busy() || s.pending) return void toast.message('Wait for the current request to finish first.')
+      const ids = chapter.scenes.map((sc) => sc.id)
+      const epoch0 = epoch
+      stopRequested = false
+      set({ checkRun: { chapterId, sceneIds: ids, index: 0 } })
+      let checked = 0
+      const tooLong: string[] = []
+      try {
+        for (let i = 0; i < ids.length; i++) {
+          if (stopRequested || epoch !== epoch0) break
+          set((x) => (x.checkRun ? { checkRun: { ...x.checkRun, index: i } } : x))
+          const title = sceneOf(get().state, ids[i])?.scene.title ?? ''
+          const r = await checkOne(ids[i], `Check ${i + 1} of ${ids.length}: ${title}`)
+          if (r === 'done') checked++
+          else if (r === 'refused') tooLong.push(title)
+          else if (r === 'failed' || r === 'stopped') break
+        }
+      } finally {
+        if (epoch === epoch0) set({ checkRun: null })
+      }
+      if (epoch !== epoch0) return
+      if (checked > 0) set({ panelOpen: true, panelTab: 'checks' })
+      const total = Object.entries(get().findings).filter(([id]) => ids.includes(id)).reduce((n, [, e]) => n + e.items.length, 0)
+      toast.message(`Checked ${checked} of ${ids.length} scenes in "${chapter.title}": ${total} ${total === 1 ? 'finding' : 'findings'}.${tooLong.length ? ` Not sent: ${tooLong.join(', ')}.` : ''}`)
+    },
+
+    dismissFinding: async (sceneId, finding, dismissed = true) => {
+      const { folder, state } = get()
+      if (!folder || !state) return
+      if (state.blocked || state.checksProblem) return void toast.error(state.checksProblem ? `Dismissals cannot be saved: ${state.checksProblem}` : 'The project is read-only.')
+      const epoch0 = epoch
+      try {
+        const next = await invoke('novel:dismissFinding', folder, sceneId, findingKey(finding), dismissed)
+        if (epoch === epoch0 && get().folder === folder) applyState(next)
+      } catch (e) {
+        toast.error(errorMessage(e))
+      }
+    },
+
+    restoreDismissed: async (sceneId) => {
+      const { folder, state } = get()
+      if (!folder || !state || state.blocked || state.checksProblem) return
+      const keys = state.dismissed?.[sceneId] ?? []
+      const epoch0 = epoch
+      try {
+        let last: NovelProjectState | null = null
+        for (const key of keys) last = await invoke('novel:dismissFinding', folder, sceneId, key, false)
+        if (last && epoch === epoch0 && get().folder === folder) applyState(last)
+      } catch (e) {
+        toast.error(errorMessage(e))
+      }
+    },
+
+    jumpToFinding: (sceneId, finding) => {
+      const found = sceneOf(get().state, sceneId)
+      const range = findingRange(sceneId, finding)
+      if (!found || !range) return void toast.message('That text is not in the scene any more.')
+      editors.get(scenePath(found.scene))?.reveal(range.from, range.to)
+    },
+
+    fixFinding: async (sceneId, finding) => {
+      const s = get()
+      if (s.target?.kind !== 'scene' || s.target.id !== sceneId) return void toast.message('Open the scene first.')
+      const range = findingRange(sceneId, finding)
+      if (!range) return void toast.message('That text is not in the scene any more.')
+      // A normal Rewrite → Custom: it becomes a pending change to accept or reject.
+      await get().runAction({ action: 'rewrite', variant: 'custom', note: finding.suggestion.trim() || finding.problem, alternatives: 1, at: { cursor: range.from, selection: range } })
+    },
+
+    clearCheckIssue: () => set({ checkIssue: null }),
+
+    // ---- stage 3: tracked state ----------------------------------------------------------
+
+    updateState: async (sceneId) => {
+      const s = get()
+      const found = sceneOf(s.state, sceneId)
+      if (!s.state || !found) return
+      if (s.state.blocked) return void toast.error('The project is read-only.')
+      if (s.state.state?.problem) return void toast.error(`state.json cannot be used: ${s.state.state.problem}`)
+      if (busy() || s.pending) return void toast.message('Wait for the current request to finish first.')
+      if (s.stateProposal && (s.stateProposal.status === 'ready' || s.stateProposal.status === 'running')) return void toast.message('Apply or reject the state update on the card first.')
+      const id = uid()
+      set({
+        stateProposal: { id, sceneId, title: `State update for "${found.scene.title}"`, status: 'running', textHash: '', raw: '', error: null, items: [], left: [], refused: null, rejected: [], applied: 0, applying: false },
+        panelOpen: true
+      })
+      stopRequested = false
+      const epoch0 = epoch
+      const r = await runWholeScene(sceneId, 'updateState', `Update state: ${found.scene.title}`)
+      if (epoch !== epoch0 || get().stateProposal?.id !== id) return
+      const patch = (p: Partial<StateProposal>): void => set((x) => (x.stateProposal?.id === id ? { stateProposal: { ...x.stateProposal, ...p } } : x))
+      if (r.status === 'done') {
+        const parsed = parseUpdateStateReplyResult(r.raw)
+        if (!parsed.ok) return patch({ status: 'invalid', raw: r.raw, error: parsed.error })
+        const st = get().state
+        const before = st ? stateBefore(factsNow(), sceneId, st.outline, st.bible) : []
+        const res = resolveStateChanges(parsed.value.changes, st?.bible ?? [], before)
+        return patch({ status: 'ready', textHash: r.textHash, raw: r.raw, items: res.items, left: res.left })
+      }
+      if (r.status === 'failed') return patch({ status: 'invalid', raw: r.raw, error: r.error })
+      set({ stateProposal: null })
+    },
+
+    setStateItem: (key, accepted) => {
+      set((s) => (s.stateProposal ? { stateProposal: { ...s.stateProposal, items: s.stateProposal.items.map((i) => (i.key === key ? { ...i, accepted } : i)) } } : s))
+    },
+
+    applyStateProposal: async () => {
+      const p = get().stateProposal
+      if (!p || p.status !== 'ready' || p.applying) return
+      const patch = (x: Partial<StateProposal>): void => set((s) => (s.stateProposal?.id === p.id ? { stateProposal: { ...s.stateProposal, ...x } } : s))
+      if (!p.items.some((i) => i.accepted)) return void toast.message('Nothing is accepted. Accept at least one change, or reject the card.')
+      // Locked and identified before anything is awaited: a second click does nothing, and a close or switch during the read sends nothing.
+      const epoch0 = epoch
+      const folder0 = get().folder
+      patch({ applying: true, refused: null })
+      const gone = (): boolean => epoch !== epoch0 || get().folder !== folder0 || get().stateProposal?.id !== p.id
+      // The card belongs to the scene text it read: if that moved, nothing is written.
+      const src = await sceneSource(p.sceneId, false)
+      if (gone()) return
+      if (!src || hashText(src.text) !== p.textHash) {
+        const msg = 'The scene text changed since this was made. Run Update state again.'
+        toast.error(msg)
+        return patch({ refused: msg, applying: false })
+      }
+      const { ops, labels } = stateOpsFor(p.items, p.sceneId)
+      const res = await sendStatePatch(ops)
+      if (epoch !== epoch0 || get().stateProposal?.id !== p.id) return
+      if (!res) return patch({ applying: false })
+      const rejected = res.rejected.map((r) => ({ label: labels[r.index] ?? 'A change', reason: r.reason }))
+      if (rejected.length === 0) {
+        set({ stateProposal: null })
+        return void toast.success(`State updated: ${ops.length} ${ops.length === 1 ? 'change' : 'changes'}.`)
+      }
+      patch({ status: 'applied', applying: false, rejected, applied: ops.length - rejected.length })
+    },
+
+    discardStateProposal: () => {
+      const p = get().stateProposal
+      if (p?.status === 'running') {
+        stopRequested = true
+        activeGen?.abort()
+      }
+      set({ stateProposal: null })
+    },
+
+    statePatch: (ops) => sendStatePatch(ops),
+
+    // ---- stage 3: interview and voice notes ----------------------------------------------
+
+    askInterview: async (characterId, question) => {
+      const s = get()
+      const q = question.trim()
+      const st = s.state
+      const entry = st?.bible.find((e) => e.id === characterId)
+      const sceneId = s.target?.kind === 'scene' ? s.target.id : s.lastSceneId
+      if (!st || !q || !entry) return false
+      if (!sceneId || !sceneOf(st, sceneId)) {
+        toast.message('Open a scene first: the character knows what happened before it.')
+        return false
+      }
+      if (busy()) {
+        toast.message('Wait for the current request to finish first.')
+        return false
+      }
+      const key = interviewKey(characterId, sceneId)
+      const epoch0 = epoch
+      const folder0 = s.folder
+      const stale = (): boolean => epoch !== epoch0 || get().folder !== folder0
+      stopRequested = false
+      // Its own request: no scene buffer is held or touched, and no pending change is made. The key says whose answer is streaming.
+      set({ gen: { path: null, action: 'interview', label: `Interview: ${entry.name}`, phase: 'preparing', alt: 1, of: 1, progress: null, text: '' }, interviewRun: { key } })
+      try {
+        const model = await resolveModel()
+        if (!model || stale() || stopRequested) return false
+        const cur = get().state
+        if (!cur) return false
+        const buf = get().buffers[entryPath(characterId)]
+        const body = buf ? parseEntry(characterId, buf.text).body : entry.body
+        const system = buildInterviewSystem({ entry, body, facts: factsNow(), sceneId, outline: cur.outline, bible: cur.bible })
+        const project = cur.project
+        const limit = model.contextLength - project.budget.replyTokens - Math.max(256, Math.ceil(model.contextLength * 0.03))
+        const fit = await fitInterview(system, get().interviews[key] ?? [], q, countWhole(model.modelId), limit)
+        if (stale() || stopRequested) return false
+        if (fit.tooBig) {
+          toast.error('This does not fit in the context. Shorten the character notes, or load a model with a longer context.')
+          return false
+        }
+        const gen = startGeneration({
+          modelId: model.modelId,
+          messages: fit.messages,
+          sampling: project.sampling,
+          adapters: project.adapters,
+          action: 'interview',
+          prose: true,
+          seed: seedsFor(project.sampling.seed, 1)[0],
+          maxTokens: project.budget.replyTokens,
+          onProgress: (p) => set((x) => (x.gen ? { gen: { ...x.gen, phase: 'waiting', progress: p } } : x)),
+          onDelta: pushStreamText
+        })
+        activeGen = gen
+        const res = await gen.done
+        if (epoch === epoch0) activeGen = null
+        if (stale()) return false
+        if (res.error) {
+          toast.error(res.error)
+          return false
+        }
+        const answer = res.text.trim()
+        if (!answer) {
+          if (!res.stopped) toast.error('The model returned no text.')
+          return false
+        }
+        set((x) => ({
+          interviews: { ...x.interviews, [key]: [...(x.interviews[key] ?? []), { role: 'user', content: q }, { role: 'assistant', content: answer }] },
+          interviewDropped: { ...x.interviewDropped, [key]: fit.dropped }
+        }))
+        return true
+      } catch (e) {
+        if (!stale()) toast.error(errorMessage(e))
+        return false
+      } finally {
+        if (epoch === epoch0) {
+          activeGen = null
+          set({ gen: null, interviewRun: null })
+        }
+      }
+    },
+
+    clearInterview: (key) => {
+      set((s) => {
+        const { [key]: _a, ...rest } = s.interviews
+        const { [key]: _b, ...dropped } = s.interviewDropped
+        return { interviews: rest, interviewDropped: dropped }
+      })
+    },
+
+    addVoiceNote: async (entryId, note) => {
+      const path = entryPath(entryId)
+      if (!get().folder || !note.trim()) return false
+      const refuse = (): boolean => {
+        const why = voiceNoteBlock(get(), path)
+        if (why) toast.error(`Not added to the voice notes. ${why}`)
+        return !!why
+      }
+      if (refuse()) return false
+      const epoch0 = epoch
+      const folder0 = get().folder
+      if (!(await ensureBuffer(path))) return false
+      if (epoch !== epoch0 || get().folder !== folder0) return false
+      if (refuse()) return false
+      const b = get().buffers[path]
+      if (!b) return false
+      const next = appendVoiceNote(b.text, note)
+      if (next === b.text) return false
+      // The entry's own buffer and its normal save path (journal, autosave, conflict checks).
+      get().edit(path, next)
+      toast.success('Added to the voice notes.')
+      return true
     }
   }
 
@@ -1447,6 +1999,14 @@ export const useNovel = create<NovelState>((set, get) => {
       pending: null,
       pendingRefused: false,
       proposal: null,
+      findings: {},
+      checkRun: null,
+      checkIssue: null,
+      stateProposal: null,
+      lastSceneId: null,
+      interviews: {},
+      interviewDropped: {},
+      interviewRun: null,
       summarizeQueue: [],
       lastRequest: null,
       openError: null,

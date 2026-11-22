@@ -14,7 +14,8 @@ const PART_LABELS: Record<AssemblyPartKind, string> = {
   prose: 'The text so far',
   fixedEntries: 'Always-on entries',
   triggeredEntries: 'Triggered entries',
-  storySoFar: 'Story so far'
+  storySoFar: 'Story so far',
+  state: 'State of fixed entities'
 }
 
 // Neutral shades, so the bar reads by position and legend; red stays for state.
@@ -25,7 +26,8 @@ const PART_SWATCH: Record<AssemblyPartKind, string> = {
   prose: 'bg-link/70',
   fixedEntries: 'bg-ok/70',
   triggeredEntries: 'bg-ok/45',
-  storySoFar: 'bg-warn/60'
+  storySoFar: 'bg-warn/60',
+  state: 'bg-link/45'
 }
 
 const WHY: Record<string, string> = { always: 'always on', pov: 'point of view', present: 'present', sticky: 'kept for this scene' }
