@@ -11,6 +11,7 @@ import { cn, formatBytes, relativeTime } from '../lib/format'
 import { useApp } from '../stores/app'
 import { useBatch } from '../stores/batch'
 import { isChatBusy, useChat } from '../stores/chat'
+import { practiceRecords, useReTraces } from '../stores/reTraces'
 import { useMcp } from '../stores/mcp'
 import { useModels } from '../stores/models'
 
@@ -357,18 +358,21 @@ function Practice({ re, setRe }: { re: ReSettings; setRe: <K extends keyof ReSet
   }, [re.kitDir])
   useEffect(refresh, [refresh])
 
+  // Other apps' practice sessions have no chat here; they come from the recorded sessions.
+  const traces = useReTraces((s) => s.traces)
+  useEffect(() => useReTraces.getState().init(), [])
+
   // Per task: how many sessions, and whether one solved it.
   const byTask = useMemo(() => {
     const m = new Map<string, { attempts: number; solved: boolean }>()
-    for (const s of summaries) {
-      if (!s.rePracticeTask) continue
-      const e = m.get(s.rePracticeTask) ?? { attempts: 0, solved: false }
+    for (const r of practiceRecords(summaries, traces)) {
+      const e = m.get(r.taskId) ?? { attempts: 0, solved: false }
       e.attempts++
-      if (s.reOutcome === 'solved') e.solved = true
-      m.set(s.rePracticeTask, e)
+      if (r.outcome === 'solved') e.solved = true
+      m.set(r.taskId, e)
     }
     return m
-  }, [summaries])
+  }, [summaries, traces])
 
   const families = useMemo(() => {
     const out = new Map<string, { total: number; tried: number; solved: number }>()
