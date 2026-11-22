@@ -39,6 +39,14 @@ export interface BenchOutput {
   finish: BenchFinish | null
   error: string | null
   ms: number | null
+  /** Generation speed the server measured, tokens per second; null when not measured (or an old run file). */
+  tokensPerSecond: number | null
+  /** Prompt processing speed, tokens per second; null when not measured. */
+  promptTokensPerSecond: number | null
+  /** Tokens generated; null when not measured. */
+  tokens: number | null
+  /** Prompt tokens actually processed (cached ones left out); weights the prompt speed average. Null when not measured. */
+  promptTokens: number | null
 }
 
 export type BenchVote = 'a' | 'b' | 'tie' | 'skip'
@@ -122,7 +130,7 @@ export function newRun(input: { label: string; prompts: BenchPrompt[]; candidate
   return { format: 1, id, ...snapshot, createdAt: now, updatedAt: now, status: 'pending', pairs: [],
     outputs: snapshot.candidates.flatMap((c) => snapshot.prompts.flatMap((p) => snapshot.seeds.map((seed) => ({
       key: outputKey(p.id, c.id, seed), promptId: p.id, candidateId: c.id, seed, status: 'pending' as const,
-      text: '', finish: null, error: null, ms: null
+      text: '', finish: null, error: null, ms: null, tokensPerSecond: null, promptTokensPerSecond: null, tokens: null, promptTokens: null
     })))) }
 }
 export function nextOutput(run: WritingBenchRun): BenchOutput | null { return run.outputs.find((o) => o.status === 'pending') ?? null }
@@ -152,6 +160,39 @@ export function scores(run: WritingBenchRun): BenchScore[] {
     if (actual === 0.5) { a.ties++; b.ties++ } else if (actual === 1) { a.wins++; b.losses++ } else { b.wins++; a.losses++ }
   }
   return result
+}
+export interface BenchSpeed {
+  candidateId: string
+  /** Plain mean of the outputs' generation tokens/s; null when none was measured. */
+  tokensPerSecond: number | null
+  /** Plain mean of the outputs' prompt tokens/s; null when none was measured. */
+  promptTokensPerSecond: number | null
+  /** Done outputs with a generation speed. */
+  measured: number
+}
+/**
+ * Average speeds per candidate over its done outputs, weighted by tokens: total tokens / total time (time = tokens / rate).
+ * Weighting matters for the prompt speed: after the first output the server reuses the cached prompt, so later outputs
+ * process a few tokens in a few milliseconds, and a plain mean of those rates would mean little. Outputs without a token
+ * count (older run files) fall back to a plain mean.
+ */
+export function speedByCandidate(run: WritingBenchRun): BenchSpeed[] {
+  const average = (items: { rate: number | null | undefined; n: number | null | undefined }[]): number | null => {
+    const rated = items.filter((i): i is { rate: number; n: number | null | undefined } => typeof i.rate === 'number' && i.rate > 0)
+    const counted = rated.filter((i): i is { rate: number; n: number } => typeof i.n === 'number' && i.n > 0)
+    if (counted.length) {
+      const tokens = counted.reduce((s, i) => s + i.n, 0)
+      const seconds = counted.reduce((s, i) => s + i.n / i.rate, 0)
+      return seconds > 0 ? tokens / seconds : null
+    }
+    return rated.length ? rated.reduce((s, i) => s + i.rate, 0) / rated.length : null
+  }
+  return run.candidates.map((c) => {
+    const done = run.outputs.filter((o) => o.candidateId === c.id && o.status === 'done')
+    const gen = done.map((o) => ({ rate: o.tokensPerSecond, n: o.tokens }))
+    const prompt = done.map((o) => ({ rate: o.promptTokensPerSecond, n: o.promptTokens }))
+    return { candidateId: c.id, tokensPerSecond: average(gen), promptTokensPerSecond: average(prompt), measured: gen.filter((g) => typeof g.rate === 'number' && g.rate > 0).length }
+  })
 }
 export function randomSeeds(n: number, rand: () => number): number[] {
   const seeds: number[] = [], used = new Set<number>()
@@ -204,7 +245,10 @@ export function cleanRun(raw: unknown): { ok: true; run: WritingBenchRun } | { o
   const keys = new Map<string, BenchOutput>()
   for (const o of raw.outputs) {
     if (!obj(o) || !str(o.key) || !str(o.promptId) || !str(o.candidateId) || !integer(o.seed) || o.key !== outputKey(o.promptId, o.candidateId, o.seed) || keys.has(o.key) || !prompts.some((p) => p.id === o.promptId) || !candidates.some((c) => c.id === o.candidateId) || !seeds.includes(o.seed) || !str(o.status) || !['pending', 'running', 'done', 'failed'].includes(o.status) || !str(o.text) || !(o.finish === null || (str(o.finish) && ['stop', 'length', 'stopped', 'error'].includes(o.finish))) || !(o.error === null || str(o.error)) || !(o.ms === null || (typeof o.ms === 'number' && Number.isFinite(o.ms) && o.ms >= 0))) return bad()
-    keys.set(o.key, o as unknown as BenchOutput)
+    // Speeds: absent in run files from before they were measured (read as null); present ones must be numbers >= 0 or null.
+    const speed = (v: unknown): boolean => v === undefined || v === null || (finite(v) && v >= 0)
+    if (!speed(o.tokensPerSecond) || !speed(o.promptTokensPerSecond) || !speed(o.tokens) || !speed(o.promptTokens)) return bad()
+    keys.set(o.key, { ...o, tokensPerSecond: o.tokensPerSecond ?? null, promptTokensPerSecond: o.promptTokensPerSecond ?? null, tokens: o.tokens ?? null, promptTokens: o.promptTokens ?? null } as unknown as BenchOutput)
   }
   if (keys.size !== prompts.length * candidates.length * seeds.length) return bad()
   const ids = new Set<string>(), pairKeys = new Set<string>()
@@ -216,5 +260,6 @@ export function cleanRun(raw: unknown): { ok: true; run: WritingBenchRun } | { o
   }
   // Run files from before per-candidate load settings have no `load`: that means the model's saved settings.
   const cleaned = candidates.map((c) => ({ ...c, load: c.load ? ({ ...DEFAULT_LOAD_CONFIG, ...c.load } as LoadConfig) : null }))
-  return { ok: true, run: { ...(raw as unknown as WritingBenchRun), candidates: cleaned } }
+  const outputs = (raw.outputs as unknown[]).map((o) => keys.get((o as { key: string }).key) as BenchOutput)
+  return { ok: true, run: { ...(raw as unknown as WritingBenchRun), candidates: cleaned, outputs } }
 }

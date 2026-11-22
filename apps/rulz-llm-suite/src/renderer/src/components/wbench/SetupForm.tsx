@@ -8,7 +8,6 @@ import type { LoadAdapter, LoadConfig, ModelEntry, SamplingParams } from '@share
 import { BUILTIN_PROMPTS, randomSeeds, type BenchCandidate, type BenchPrompt } from '@shared/writingBench'
 import { invoke } from '../../lib/api'
 import { uid } from '../../lib/format'
-import { candidateSettings, sameLoadConfig } from '../../lib/wbenchRunner'
 import { useApp } from '../../stores/app'
 import { useChat } from '../../stores/chat'
 import { useModels } from '../../stores/models'
@@ -32,13 +31,70 @@ interface CandidateDraft {
   adapters: LoadAdapter[]
   /** 'writing', 'app' or `preset:<id>`. */
   sampling: string
-  /** Sampling values edited for this candidate; null = whatever `sampling` resolves to. */
-  custom: SamplingParams | null
-  /** Load settings edited for this candidate; null = the model's saved load settings. */
-  load: LoadConfig | null
+  /** Only the settings this candidate changed in its own Adjust settings; they win over "all candidates". */
+  own: SettingsEdit
 }
 
-const newDraft = (modelId = ''): CandidateDraft => ({ id: uid(), label: '', labelEdited: false, modelId, adapters: [], sampling: 'writing', custom: null, load: null })
+/** Settings the user changed, field by field: sampling and load settings. */
+export interface SettingsEdit {
+  sampling: Partial<SamplingParams>
+  load: Partial<LoadConfig>
+}
+
+export const EMPTY_EDIT: SettingsEdit = { sampling: {}, load: {} }
+
+const newDraft = (modelId = ''): CandidateDraft => ({ id: uid(), label: '', labelEdited: false, modelId, adapters: [], sampling: 'writing', own: EMPTY_EDIT })
+
+const LOAD_INTEGER_KEYS = ['contextLength', 'threads', 'batchSize', 'ubatchSize', 'draftTokens', 'draftMinTokens', 'seed'] as const
+
+/** Whole numbers, as the main process keeps them, so a ready instance compares equal and is not reloaded. */
+export function roundLoad(config: LoadConfig): LoadConfig {
+  const out = { ...config } as Record<string, unknown>
+  for (const k of LOAD_INTEGER_KEYS) {
+    if (typeof out[k] === 'number') out[k] = Math.round(out[k] as number)
+  }
+  return out as unknown as LoadConfig
+}
+
+/** The sampling a candidate runs with: its select's choice, then "all candidates", then its own edits. */
+export function effectiveSampling(base: SamplingParams, all: Partial<SamplingParams>, own: Partial<SamplingParams>): SamplingParams {
+  return { ...base, ...all, ...own }
+}
+
+/** The load settings a candidate runs with, or null (the model's saved settings) when nobody changed any. Adapters are never part of it. */
+export function effectiveLoad(saved: LoadConfig, all: Partial<LoadConfig>, own: Partial<LoadConfig>): LoadConfig | null {
+  if (Object.keys(all).length === 0 && Object.keys(own).length === 0) return null
+  return roundLoad({ ...saved, ...all, ...own, adapters: [] })
+}
+
+const sameValue = (a: unknown, b: unknown): boolean => {
+  const norm = (v: unknown): unknown =>
+    Array.isArray(v) ? v.map(norm) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, norm((v as Record<string, unknown>)[k])])) : v
+  return JSON.stringify(norm(a)) === JSON.stringify(norm(b))
+}
+
+/** The fields of a load edit that differ from the settings shown (rounded as the main process keeps them); adapters are ignored. */
+export function diffLoad(next: LoadConfig, shown: LoadConfig): Partial<LoadConfig> {
+  const a = roundLoad(next) as unknown as Record<string, unknown>
+  const b = shown as unknown as Record<string, unknown>
+  const out: Record<string, unknown> = {}
+  for (const k of Object.keys(a)) {
+    if (k !== 'adapters' && !sameValue(a[k], b[k])) out[k] = a[k]
+  }
+  return out as Partial<LoadConfig>
+}
+
+const SETTING_NAMES: Record<string, string> = { sampling: 'model sampling', drySequenceBreakers: 'DRY breakers' }
+
+/** A setting key as words: contextLength -> context length. */
+export function settingName(key: string): string {
+  return SETTING_NAMES[key] ?? key.replace(/([A-Z])/g, ' $1').toLowerCase()
+}
+
+/** The settings a candidate changed itself, as words, for the closed section's hint. */
+export function ownNames(own: SettingsEdit): string[] {
+  return [...Object.keys(own.sampling), ...Object.keys(own.load)].map(settingName)
+}
 
 /** The sampling a select choice stands for: 'writing', 'app' or `preset:<id>`. */
 export function resolveSampling(key: string, settings: { defaultSampling: SamplingParams } | null | undefined, presets: { id: string; sampling: SamplingParams }[]): SamplingParams {
@@ -58,8 +114,20 @@ function SliderRow({ label, hint, value, min, max, step, onChange }: { label: st
   )
 }
 
-/** The load settings of one candidate: the model's saved settings until the user changes something. */
-function CandidateLoad({ model, load, adapters, onChange }: { model: ModelEntry; load: LoadConfig | null; adapters: LoadAdapter[]; onChange: (load: LoadConfig | null, adapters: LoadAdapter[]) => void }) {
+/** The load settings of one candidate: the model's saved settings, then "all candidates", then its own changes. */
+function CandidateLoad({
+  model,
+  allLoad,
+  own,
+  adapters,
+  onChange
+}: {
+  model: ModelEntry
+  allLoad: Partial<LoadConfig>
+  own: Partial<LoadConfig>
+  adapters: LoadAdapter[]
+  onChange: (own: Partial<LoadConfig>, adapters: LoadAdapter[]) => void
+}) {
   const appDefault = useApp((s) => s.settings?.defaultLoadConfig) ?? DEFAULT_LOAD_CONFIG
   // null until the model's saved settings are read: edits must start from them, not from the app default.
   const [saved, setSaved] = useState<LoadConfig | null>(null)
@@ -76,19 +144,13 @@ function CandidateLoad({ model, load, adapters, onChange }: { model: ModelEntry;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model.id])
   // The form's own adapter list is the candidate's: adapters stay chosen in one place, whichever picker is used.
-  const config: LoadConfig = { ...(load ?? saved ?? appDefault), adapters }
+  const config: LoadConfig = { ...(saved ?? appDefault), ...allLoad, ...own, adapters }
   const estimate = useEstimate(model.id, config)
   const change = (next: LoadConfig): void => {
     const nextAdapters = next.adapters ?? []
-    // Whole numbers, as the main process keeps them, so a ready instance compares equal and is not reloaded.
-    const rounded = { ...next } as Record<string, unknown>
-    for (const k of ['contextLength', 'threads', 'batchSize', 'ubatchSize', 'draftTokens', 'draftMinTokens', 'seed'] as const) {
-      if (typeof rounded[k] === 'number') rounded[k] = Math.round(rounded[k] as number)
-    }
-    const cfg = { ...(rounded as unknown as LoadConfig), adapters: [] }
-    // Only the adapters changed (the form's own adapter picker): still the model's saved settings.
-    if (!load && saved && sameLoadConfig(cfg, saved)) return onChange(null, nextAdapters)
-    onChange(cfg, nextAdapters)
+    // Only the fields that differ from what is shown become this candidate's own: an adapter-only change from the form's own picker is none.
+    const diff = diffLoad(next, config)
+    onChange(Object.keys(diff).length ? { ...own, ...diff } : own, nextAdapters)
   }
   if (!saved) return <p className="text-[11px] text-faint">Reading the model's saved load settings…</p>
   return (
@@ -96,20 +158,20 @@ function CandidateLoad({ model, load, adapters, onChange }: { model: ModelEntry;
       <div className="flex items-center gap-2">
         <span className="text-[11px] font-semibold tracking-wide text-faint uppercase">Load settings</span>
         <div className="flex-1" />
-        {load && (
+        {Object.keys(own).length > 0 && (
           <button
             type="button"
             className="flex items-center gap-1 text-xs text-muted hover:text-text"
             onClick={() => {
               setResets((n) => n + 1)
-              onChange(null, adapters)
+              onChange({}, adapters)
             }}
           >
-            <RotateCcw size={12} aria-hidden /> Use the model's saved settings
+            <RotateCcw size={12} aria-hidden /> Use the settings for all candidates
           </button>
         )}
       </div>
-      <LoadSettingsForm key={resets} model={model} config={config} onChange={change} estimate={estimate} />
+      <LoadSettingsForm key={`${resets}|${JSON.stringify(allLoad)}`} model={model} config={config} onChange={change} estimate={estimate} />
       <EstimateView estimate={estimate} />
     </div>
   )
@@ -172,16 +234,87 @@ function PromptDialog({ prompt, onClose }: { prompt: BenchPrompt | 'new' | null;
   )
 }
 
+/** The sampling sliders and variety fields, shared by a candidate and the "all candidates" section. */
+function SamplingFields({ sp, onSet }: { sp: SamplingParams; onSet: <K extends keyof SamplingParams>(key: K, value: SamplingParams[K]) => void }) {
+  const varietyOn = (sp.dryMultiplier > 0 ? 1 : 0) + (sp.xtcProbability > 0 ? 1 : 0) + (sp.avoidWords.length > 0 ? 1 : 0)
+  return (
+    <div className="space-y-3">
+      <span className="text-[11px] font-semibold tracking-wide text-faint uppercase">Sampling</span>
+      <SliderRow label="Temperature" value={sp.temperature} min={0} max={2} step={0.01} onChange={(v) => onSet('temperature', v)} />
+      <SliderRow label="Min P" value={sp.minP} min={0} max={1} step={0.01} onChange={(v) => onSet('minP', v)} />
+      <SliderRow label="Top P" value={sp.topP} min={0} max={1} step={0.01} onChange={(v) => onSet('topP', v)} />
+      <SliderRow label="Top K" hint="0 = off" value={sp.topK} min={0} max={200} step={1} onChange={(v) => onSet('topK', Math.round(v))} />
+      <SliderRow label="Repeat penalty" value={sp.repeatPenalty} min={0.8} max={2} step={0.01} onChange={(v) => onSet('repeatPenalty', v)} />
+      <p className="text-[11px] text-faint">Every output gets its own seed from the run, so there is no seed to set here.</p>
+      <div className="text-[11px] font-semibold tracking-wide text-faint uppercase">
+        Repetition and variety
+        {varietyOn > 0 && <span className="font-normal normal-case"> · {varietyOn} on</span>}
+      </div>
+      <VarietyFields sampling={sp} onChange={onSet} />
+    </div>
+  )
+}
+
+/** Settings that every candidate uses, unless it changed the same setting itself. Collapsed until opened. */
+function AllCandidatesSettings({ all, onChange }: { all: SettingsEdit; onChange: (all: SettingsEdit) => void }) {
+  const appDefault = useApp((s) => s.settings?.defaultLoadConfig) ?? DEFAULT_LOAD_CONFIG
+  const [open, setOpen] = useState(false)
+  // Bumped on "Clear" so the load form's uncontrolled fields show the starting values again.
+  const [resets, setResets] = useState(0)
+  const sp: SamplingParams = { ...FICTION_SAMPLING, ...all.sampling }
+  const config: LoadConfig = { ...appDefault, ...all.load, adapters: [] }
+  const setS = <K extends keyof SamplingParams>(key: K, value: SamplingParams[K]): void => onChange({ ...all, sampling: { ...all.sampling, [key]: value } })
+  const change = (next: LoadConfig): void => {
+    // Adapters belong to each candidate: whatever the form says about them is ignored.
+    const diff = diffLoad(next, config)
+    if (Object.keys(diff).length) onChange({ ...all, load: { ...all.load, ...diff } })
+  }
+  const count = Object.keys(all.sampling).length + Object.keys(all.load).length
+  return (
+    <Collapsible.Root open={open} onOpenChange={setOpen} className="rounded-lg border border-border bg-panel-2/50 p-3">
+      <Collapsible.Trigger className="flex w-full items-center gap-1 text-[11px] font-semibold tracking-wide text-faint uppercase hover:text-text">
+        <ChevronRight size={14} className={open ? 'rotate-90 transition-transform' : 'transition-transform'} />
+        Settings for all candidates
+        {!open && count > 0 && <span className="font-normal normal-case"> · {count === 1 ? '1 setting set' : `${count} settings set`}</span>}
+      </Collapsible.Trigger>
+      <Collapsible.Content className="mt-3 space-y-4">
+        <div className="flex items-center gap-2">
+          <p className="flex-1 text-[11px] text-faint">Every candidate uses these, unless it changed the same setting in its own Adjust settings. Only for this run.</p>
+          {count > 0 && (
+            <button
+              type="button"
+              className="flex items-center gap-1 text-xs text-muted hover:text-text"
+              onClick={() => {
+                setResets((n) => n + 1)
+                onChange(EMPTY_EDIT)
+              }}
+            >
+              <RotateCcw size={12} aria-hidden /> Clear
+            </button>
+          )}
+        </div>
+        <SamplingFields sp={sp} onSet={setS} />
+        <div className="space-y-3">
+          <span className="text-[11px] font-semibold tracking-wide text-faint uppercase">Load settings</span>
+          <LoadSettingsForm key={resets} model={null} config={config} onChange={change} />
+        </div>
+      </Collapsible.Content>
+    </Collapsible.Root>
+  )
+}
+
 function CandidateCard({
   draft,
   index,
   canRemove,
+  all,
   onChange,
   onRemove
 }: {
   draft: CandidateDraft
   index: number
   canRemove: boolean
+  all: SettingsEdit
   onChange: (d: CandidateDraft) => void
   onRemove: () => void
 }) {
@@ -192,11 +325,12 @@ function CandidateCard({
   const [open, setOpen] = useState(false)
   const model = models.find((m) => m.id === draft.modelId)
   const names = useMemo(() => new Map(allAdapters.map((a) => [a.id, a.name])), [allAdapters])
-  // The values the sampling fields show: the edited ones, else what the select stands for.
-  const sp = draft.custom ?? resolveSampling(draft.sampling, settings, presets)
-  const setS = <K extends keyof SamplingParams>(key: K, value: SamplingParams[K]): void => apply({ custom: { ...sp, [key]: value } })
-  const varietyOn = (sp.dryMultiplier > 0 ? 1 : 0) + (sp.xtcProbability > 0 ? 1 : 0) + (sp.avoidWords.length > 0 ? 1 : 0)
-  const changed = [draft.custom ? 'Custom sampling' : '', draft.load ? 'Custom load settings' : ''].filter(Boolean)
+  // The values the sampling fields show: the select's choice, then "all candidates", then this candidate's own edits.
+  const sp = effectiveSampling(resolveSampling(draft.sampling, settings, presets), all.sampling, draft.own.sampling)
+  const ownSampling = Object.keys(draft.own.sampling).length > 0
+  const setS = <K extends keyof SamplingParams>(key: K, value: SamplingParams[K]): void =>
+    apply({ own: { ...draft.own, sampling: { ...draft.own.sampling, [key]: value } } })
+  const ownList = ownNames(draft.own)
   const apply = (patch: Partial<CandidateDraft>): void => {
     const next = { ...draft, ...patch }
     if (!next.labelEdited) next.label = autoLabel(models.find((m) => m.id === next.modelId), next.adapters, names)
@@ -215,7 +349,7 @@ function CandidateCard({
       </div>
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
         <Field label="Model">
-          <Select value={draft.modelId} onChange={(e) => apply({ modelId: e.target.value, adapters: [], load: null })}>
+          <Select value={draft.modelId} onChange={(e) => apply({ modelId: e.target.value, adapters: [], own: { ...draft.own, load: {} } })}>
             <option value="">Choose a model…</option>
             {models.map((m) => (
               <option key={m.id} value={m.id}>
@@ -225,8 +359,11 @@ function CandidateCard({
           </Select>
         </Field>
         <Field label="Sampling">
-          <Select value={draft.custom ? 'custom' : draft.sampling} onChange={(e) => e.target.value !== 'custom' && apply({ sampling: e.target.value, custom: null })}>
-            {draft.custom && <option value="custom">Custom</option>}
+          <Select
+            value={ownSampling ? 'custom' : draft.sampling}
+            onChange={(e) => e.target.value !== 'custom' && apply({ sampling: e.target.value, own: { ...draft.own, sampling: {} } })}
+          >
+            {ownSampling && <option value="custom">Custom</option>}
             <option value="writing">Writing defaults</option>
             <option value="app">App defaults (Chat settings)</option>
             {presets.map((p) => (
@@ -245,25 +382,30 @@ function CandidateCard({
         <Collapsible.Trigger className="flex w-full items-center gap-1 text-[11px] font-semibold tracking-wide text-faint uppercase hover:text-text">
           <ChevronRight size={14} className={open ? 'rotate-90 transition-transform' : 'transition-transform'} />
           Adjust settings
-          {!open && changed.length > 0 && <span className="font-normal normal-case"> · {changed.join(', ')}</span>}
+          {!open && ownList.length > 0 && <span className="font-normal normal-case"> · Own: {ownList.join(', ')}</span>}
         </Collapsible.Trigger>
         <Collapsible.Content className="mt-3 space-y-4">
-          <p className="text-[11px] text-faint">Only for this run. Presets and the model's saved settings are not changed.</p>
-          <div className="space-y-3">
-            <span className="text-[11px] font-semibold tracking-wide text-faint uppercase">Sampling</span>
-            <SliderRow label="Temperature" value={sp.temperature} min={0} max={2} step={0.01} onChange={(v) => setS('temperature', v)} />
-            <SliderRow label="Min P" value={sp.minP} min={0} max={1} step={0.01} onChange={(v) => setS('minP', v)} />
-            <SliderRow label="Top P" value={sp.topP} min={0} max={1} step={0.01} onChange={(v) => setS('topP', v)} />
-            <SliderRow label="Top K" hint="0 = off" value={sp.topK} min={0} max={200} step={1} onChange={(v) => setS('topK', Math.round(v))} />
-            <SliderRow label="Repeat penalty" value={sp.repeatPenalty} min={0.8} max={2} step={0.01} onChange={(v) => setS('repeatPenalty', v)} />
-            <p className="text-[11px] text-faint">Every output gets its own seed from the run, so there is no seed to set here.</p>
-            <div className="text-[11px] font-semibold tracking-wide text-faint uppercase">
-              Repetition and variety
-              {varietyOn > 0 && <span className="font-normal normal-case"> · {varietyOn} on</span>}
+          <p className="text-[11px] text-faint">Only for this run. Presets and the model's saved settings are not changed. Settings you change here win over the settings for all candidates.</p>
+          {ownSampling && (
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-faint">Own sampling: {Object.keys(draft.own.sampling).map(settingName).join(', ')}</span>
+              <div className="flex-1" />
+              <button type="button" className="flex items-center gap-1 text-xs text-muted hover:text-text" onClick={() => apply({ own: { ...draft.own, sampling: {} } })}>
+                <RotateCcw size={12} aria-hidden /> Use the settings for all candidates
+              </button>
             </div>
-            <VarietyFields sampling={sp} onChange={setS} />
-          </div>
-          {model && <CandidateLoad key={model.id} model={model} load={draft.load} adapters={draft.adapters} onChange={(load, adapters) => apply({ load, adapters })} />}
+          )}
+          <SamplingFields sp={sp} onSet={setS} />
+          {model && (
+            <CandidateLoad
+              key={model.id}
+              model={model}
+              allLoad={all.load}
+              own={draft.own.load}
+              adapters={draft.adapters}
+              onChange={(load, adapters) => apply({ own: { ...draft.own, load }, adapters })}
+            />
+          )}
         </Collapsible.Content>
       </Collapsible.Root>
     </div>
@@ -289,6 +431,7 @@ export function SetupForm({ onCancel }: { onCancel: () => void }) {
   const [maxTokens, setMaxTokens] = useState(DEFAULT_TOKENS)
   const [editing, setEditing] = useState<BenchPrompt | 'new' | null>(null)
   const [starting, setStarting] = useState(false)
+  const [all, setAll] = useState<SettingsEdit>(EMPTY_EDIT)
 
   const allPrompts = useMemo(() => [...BUILTIN_PROMPTS, ...userPrompts], [userPrompts])
   const chosen = allPrompts.filter((p) => picked.has(p.id))
@@ -321,16 +464,25 @@ export function SetupForm({ onCancel }: { onCancel: () => void }) {
 
   const start = async (): Promise<void> => {
     if (problem || running || starting) return
-    const candidates: BenchCandidate[] = labelled.map((d) => ({
-      id: d.id,
-      label: d.label.trim(),
-      modelId: d.modelId,
-      modelName: models.find((m) => m.id === d.modelId)?.name ?? d.modelId,
-      adapters: d.adapters,
-      ...candidateSettings({ sampling: d.custom, load: d.load }, resolveSampling(d.sampling, settings, presets))
-    }))
     setStarting(true)
     try {
+      const appDefault = settings?.defaultLoadConfig ?? DEFAULT_LOAD_CONFIG
+      // Everything is settled here: each candidate is stored with its full sampling and, when anyone changed a load setting, its full load settings.
+      const candidates: BenchCandidate[] = await Promise.all(
+        labelled.map(async (d) => {
+          const needsLoad = Object.keys(all.load).length > 0 || Object.keys(d.own.load).length > 0
+          const saved = needsLoad ? await invoke('models:getDefaults', d.modelId).then((r) => r?.config ?? appDefault).catch(() => appDefault) : appDefault
+          return {
+            id: d.id,
+            label: d.label.trim(),
+            modelId: d.modelId,
+            modelName: models.find((m) => m.id === d.modelId)?.name ?? d.modelId,
+            adapters: d.adapters,
+            sampling: effectiveSampling(resolveSampling(d.sampling, settings, presets), all.sampling, d.own.sampling),
+            load: effectiveLoad(saved, all.load, d.own.load)
+          }
+        })
+      )
       await create({ label, prompts: chosen, candidates, seeds: randomSeeds(seedCount, Math.random), maxTokens })
     } catch (e) {
       toast.error(e instanceof Error ? e.message : String(e))
@@ -385,10 +537,12 @@ export function SetupForm({ onCancel }: { onCancel: () => void }) {
           <h2 className="text-[11px] font-semibold tracking-wide text-faint uppercase">Candidates</h2>
           <span className="text-[11.5px] text-faint">2 to {MAX_CANDIDATES}. The same model with different adapters or sampling counts as separate candidates.</span>
         </div>
+        <AllCandidatesSettings all={all} onChange={setAll} />
         {drafts.map((d, i) => (
           <CandidateCard
             key={d.id}
             draft={labelled[i]}
+            all={all}
             index={i}
             canRemove={drafts.length > 2}
             onChange={(next) => setDrafts((l) => l.map((x) => (x.id === next.id ? next : x)))}

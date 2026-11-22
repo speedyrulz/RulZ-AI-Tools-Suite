@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_LOAD_CONFIG, DEFAULT_SAMPLING } from '@shared/defaults'
-import { addPairs, BUILTIN_PROMPTS, cleanRun, newRun, nextOutput, nextPair, randomSeeds, scores } from '@shared/writingBench'
+import { addPairs, BUILTIN_PROMPTS, cleanRun, newRun, nextOutput, nextPair, randomSeeds, scores, speedByCandidate } from '@shared/writingBench'
 
 function fixture() {
   return newRun({ label: 'test', prompts: BUILTIN_PROMPTS.slice(0, 2), candidates: ['a', 'b'].map((id) => ({ id, label: id, modelId: id, modelName: id, adapters: [], sampling: DEFAULT_SAMPLING, load: null })), seeds: [1, 2], maxTokens: 600 }, '2026-01-01', 'run')
@@ -55,5 +55,46 @@ describe('writing benchmark', () => {
     // "Auto (fit)" context and empty draft tokens are stored as null and must still load next time.
     const auto = { ...run, candidates: [{ ...run.candidates[0], load: { ...load, contextLength: null, draftTokens: null } }, run.candidates[1]] }
     expect(cleanRun(auto).ok).toBe(true)
+  })
+  it('reads an old output without speed fields as null and rejects a bad speed', () => {
+    const run = fixture()
+    const old = { ...run, outputs: run.outputs.map(({ tokensPerSecond: _a, promptTokensPerSecond: _b, tokens: _c, ...rest }) => rest) }
+    const cleaned = cleanRun(old)
+    expect(cleaned.ok).toBe(true)
+    if (cleaned.ok) expect(cleaned.run.outputs.every((o) => o.tokensPerSecond === null && o.promptTokensPerSecond === null && o.tokens === null)).toBe(true)
+    const withSpeed = { ...run, outputs: run.outputs.map((o, i) => (i === 0 ? { ...o, tokensPerSecond: 12.5, promptTokensPerSecond: 300, tokens: 80 } : o)) }
+    expect(cleanRun(withSpeed)).toEqual({ ok: true, run: withSpeed })
+    for (const bad of [-1, Number.NaN, Infinity, '5'])
+      expect(cleanRun({ ...run, outputs: run.outputs.map((o, i) => (i === 0 ? { ...o, tokensPerSecond: bad } : o)) }).ok).toBe(false)
+    expect(cleanRun({ ...run, outputs: run.outputs.map((o, i) => (i === 0 ? { ...o, promptTokensPerSecond: -3 } : o)) }).ok).toBe(false)
+    expect(cleanRun({ ...run, outputs: run.outputs.map((o, i) => (i === 0 ? { ...o, tokens: -3 } : o)) }).ok).toBe(false)
+  })
+  it('starts new outputs with null speeds', () => {
+    expect(fixture().outputs.every((o) => o.tokensPerSecond === null && o.promptTokensPerSecond === null && o.tokens === null)).toBe(true)
+  })
+  it('averages speeds per candidate over done outputs that have the value', () => {
+    const run = fixture()
+    const set = (key: string, patch: Partial<(typeof run.outputs)[number]>): void => { Object.assign(run.outputs.find((o) => o.key === key)!, patch) }
+    set('builtin-1|a|1', { status: 'done', tokensPerSecond: 10, promptTokensPerSecond: 100 })
+    set('builtin-1|a|2', { status: 'done', tokensPerSecond: 20, promptTokensPerSecond: null })
+    set('builtin-2|a|1', { status: 'failed', tokensPerSecond: 999 })
+    set('builtin-1|b|1', { status: 'done', tokensPerSecond: null })
+    expect(speedByCandidate(run)).toEqual([
+      { candidateId: 'a', tokensPerSecond: 15, promptTokensPerSecond: 100, measured: 2 },
+      { candidateId: 'b', tokensPerSecond: null, promptTokensPerSecond: null, measured: 0 }
+    ])
+  })
+  it('weights speeds by tokens, so a cached prompt of a few tokens does not count like a full one', () => {
+    const run = fixture()
+    const a = run.outputs.filter((o) => o.candidateId === 'a')
+    // First output: 1000 prompt tokens at 1000 t/s (1 s). Later: 5 tokens at 50 t/s (0.1 s), the cached prompt.
+    Object.assign(a[0], { status: 'done', promptTokens: 1000, promptTokensPerSecond: 1000, tokens: 100, tokensPerSecond: 20 })
+    Object.assign(a[1], { status: 'done', promptTokens: 5, promptTokensPerSecond: 50, tokens: 300, tokensPerSecond: 30 })
+    const s = speedByCandidate(run)[0]
+    expect(s.promptTokensPerSecond).toBeCloseTo(1005 / 1.1, 5)
+    expect(s.tokensPerSecond).toBeCloseTo(400 / 15, 5)
+    // Old outputs without counts: plain mean.
+    Object.assign(a[0], { promptTokens: null, tokens: null }); Object.assign(a[1], { promptTokens: null, tokens: null })
+    expect(speedByCandidate(run)[0]).toMatchObject({ promptTokensPerSecond: 525, tokensPerSecond: 25 })
   })
 })

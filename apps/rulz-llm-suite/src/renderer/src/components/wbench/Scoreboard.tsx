@@ -1,12 +1,13 @@
 import { useMemo } from 'react'
-import { scores, type WritingBenchRun } from '@shared/writingBench'
+import { scores, speedByCandidate, type WritingBenchRun } from '@shared/writingBench'
 
 /** Candidates by rating (Elo from the run's votes in vote order). */
 export function Scoreboard({ run }: { run: WritingBenchRun }) {
-  const rows = useMemo(
-    () => [...scores(run)].sort((a, b) => b.rating - a.rating).map((s) => ({ ...s, label: run.candidates.find((c) => c.id === s.candidateId)?.label ?? 'Unknown' })),
-    [run]
-  )
+  const rows = useMemo(() => {
+    const speeds = new Map(speedByCandidate(run).map((s) => [s.candidateId, s]))
+    return [...scores(run)].sort((a, b) => b.rating - a.rating).map((s) => ({ ...s, label: run.candidates.find((c) => c.id === s.candidateId)?.label ?? 'Unknown', speed: speeds.get(s.candidateId) }))
+  }, [run])
+  const rate = (v: number | null | undefined): string => (v === null || v === undefined ? '—' : v.toFixed(1))
   return (
     <div className="overflow-hidden rounded-lg border border-border">
       <table className="w-full text-[13px]">
@@ -17,6 +18,8 @@ export function Scoreboard({ run }: { run: WritingBenchRun }) {
             <th className="w-16 px-2 py-1.5 text-right font-medium">Wins</th>
             <th className="w-16 px-2 py-1.5 text-right font-medium">Losses</th>
             <th className="w-16 px-2 py-1.5 text-right font-medium">Ties</th>
+            <th className="w-20 px-2 py-1.5 text-right font-medium">Tokens/s</th>
+            <th className="w-24 px-2 py-1.5 text-right font-medium">Prompt t/s</th>
           </tr>
         </thead>
         <tbody>
@@ -27,6 +30,8 @@ export function Scoreboard({ run }: { run: WritingBenchRun }) {
               <td className="px-2 py-1.5 text-right tabular-nums">{r.wins}</td>
               <td className="px-2 py-1.5 text-right tabular-nums">{r.losses}</td>
               <td className="px-2 py-1.5 text-right tabular-nums">{r.ties}</td>
+              <td className="px-2 py-1.5 text-right tabular-nums">{rate(r.speed?.tokensPerSecond)}</td>
+              <td className="px-2 py-1.5 text-right tabular-nums">{rate(r.speed?.promptTokensPerSecond)}</td>
             </tr>
           ))}
         </tbody>

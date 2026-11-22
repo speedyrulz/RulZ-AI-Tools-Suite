@@ -49,6 +49,14 @@ describe('interpretChunk', () => {
     const stats = statsFromTimings({ predicted_per_second: 42, predicted_n: 10, prompt_n: 5, cache_n: 3 }, {})
     expect(stats).toEqual({ tokensPerSecond: 42, predictedTokens: 10, promptTokens: 8, cachedTokens: 3 })
   })
+  it('fills the prompt speed from prompt_n / prompt_ms, cached tokens excluded', () => {
+    const stats = statsFromTimings({ prompt_n: 200, prompt_ms: 400, predicted_per_second: 30, predicted_n: 60, cache_n: 50 }, {})
+    expect(stats.promptTokensPerSecond).toBeCloseTo(500, 6)
+    expect(stats.promptTokens).toBe(250)
+    expect(statsFromTimings({ prompt_n: 0, prompt_ms: 5 }, {}).promptTokensPerSecond).toBeUndefined()
+    expect(statsFromTimings({ prompt_n: 5, prompt_ms: 0 }, {}).promptTokensPerSecond).toBeUndefined()
+    expect(statsFromTimings(undefined, {}).promptTokensPerSecond).toBeUndefined()
+  })
   it('reads error bodies', () => {
     expect(errorFromBody(400, '{"error":{"message":"context exceeded"}}')).toBe('context exceeded')
     expect(errorFromBody(500, '')).toBe('HTTP 500')

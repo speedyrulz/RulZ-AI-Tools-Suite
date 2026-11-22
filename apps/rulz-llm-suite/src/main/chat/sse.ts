@@ -102,7 +102,8 @@ export function statsFromTimings(t: Timings | undefined, extra: GenerationStats)
     tokensPerSecond: t?.predicted_per_second ?? extra.tokensPerSecond,
     predictedTokens: t?.predicted_n ?? extra.predictedTokens,
     promptTokens: t?.prompt_n !== undefined ? t.prompt_n + (t.cache_n ?? 0) : extra.promptTokens,
-    cachedTokens: t?.cache_n ?? extra.cachedTokens
+    cachedTokens: t?.cache_n ?? extra.cachedTokens,
+    promptTokensPerSecond: t?.prompt_n && t.prompt_ms && t.prompt_n > 0 && t.prompt_ms > 0 ? (t.prompt_n / t.prompt_ms) * 1000 : extra.promptTokensPerSecond
   }
 }
 
