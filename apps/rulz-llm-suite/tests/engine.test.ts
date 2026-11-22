@@ -5,7 +5,7 @@ import { buildServerArgs } from '../src/main/engine/args'
 import { parseLoadConfig } from '../src/main/settings/schema'
 import { parseDevices, parseVersion } from '../src/main/engine/engine'
 import { parseNvidiaSmi } from '../src/main/engine/hardware'
-import { describeExitCode, splitArgs } from '../src/main/engine/process'
+import { describeExitCode, describeLoadLog, splitArgs } from '../src/main/engine/process'
 import { LogLineSplitter, nextProgress, progressFromDots } from '../src/main/engine/progress'
 import { estimateMemory, gpuShares, kvCacheBytes } from '../src/main/models/estimate'
 import { parseTensorSplit, rebalanceSplit } from '../src/shared/split'
@@ -187,6 +187,24 @@ describe('describeExitCode', () => {
     expect(describeExitCode(3221225781)).toMatch(/DLL .* could not be found/)
     expect(describeExitCode(-1073741515)).toMatch(/0xC0000135/)
     expect(describeExitCode(1)).toBeUndefined()
+  })
+})
+
+describe('describeLoadLog', () => {
+  it('names an architecture the llama.cpp build does not know', () => {
+    const log = [
+      '0.00.225.842 E common_fit_params: encountered an error while trying to fit params to free device memory: failed to load model',
+      "0.00.392.753 E llama_model_load: error loading model: unknown model architecture: 'lfm3'",
+      '0.00.394.010 E srv  llama_server: exiting due to model loading error'
+    ]
+    const msg = describeLoadLog(log)
+    expect(msg).toContain("model type 'lfm3'")
+    expect(msg).toMatch(/Update llama\.cpp and rebuild/)
+  })
+
+  it('leaves other failures to the raw log', () => {
+    expect(describeLoadLog(['E llama_model_load: error loading model: out of memory'])).toBeUndefined()
+    expect(describeLoadLog([])).toBeUndefined()
   })
 })
 
