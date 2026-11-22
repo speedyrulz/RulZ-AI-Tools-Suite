@@ -276,6 +276,13 @@ const remoteLoadPatchSchema = z
         minP: z.number().min(0).max(1).nullable(),
         repeatPenalty: z.number().min(0).max(5).nullable(),
         presencePenalty: z.number().min(-2).max(2).nullable(),
+        dryMultiplier: z.number().min(0).max(5).nullable(),
+        dryBase: z.number().min(1).max(10).nullable(),
+        dryAllowedLength: z.number().int().min(1).max(1000).nullable(),
+        dryPenaltyLastN: z.number().int().min(-1).nullable(),
+        drySequenceBreakers: z.array(z.string().max(64)).max(64).nullable(),
+        xtcProbability: z.number().min(0).max(1).nullable(),
+        xtcThreshold: z.number().min(0).max(1).nullable(),
         override: z.boolean()
       })
       .partial()
@@ -429,5 +436,12 @@ export function overrideSampling(body: Record<string, unknown>, s: ModelSampling
   if (s.minP !== null) out.min_p = s.minP
   if (s.repeatPenalty !== null) out.repeat_penalty = s.repeatPenalty
   if (s.presencePenalty !== null) out.presence_penalty = s.presencePenalty
+  if (s.dryMultiplier !== null) out.dry_multiplier = s.dryMultiplier
+  if (s.dryBase !== null) out.dry_base = s.dryBase
+  if (s.dryAllowedLength !== null) out.dry_allowed_length = s.dryAllowedLength
+  if (s.dryPenaltyLastN !== null) out.dry_penalty_last_n = s.dryPenaltyLastN
+  if (s.drySequenceBreakers !== null) out.dry_sequence_breakers = s.drySequenceBreakers
+  if (s.xtcProbability !== null) out.xtc_probability = s.xtcProbability
+  if (s.xtcThreshold !== null) out.xtc_threshold = s.xtcThreshold
   return out
 }

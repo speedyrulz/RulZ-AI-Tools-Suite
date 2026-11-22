@@ -58,7 +58,9 @@ Discover/downloads, RAG and a CLI are planned.
   after it; tok/s, time-to-first-token and token stats; context usage meter with "truncate middle" or "stop" overflow
   policy; folders, pinning, search; per-chat system prompt, sampling and thinking settings (on/off, reasoning effort,
   thinking budget); presets; JSON-schema structured output. A message sent while its model is still loading waits for
-  that load.
+  that load. Samplers for fiction: DRY (stops the model repeating earlier passages, with sequence breakers such as
+  character names), XTC (now and then skips the likeliest tokens for fresher wording) and an avoid-words list (sent as
+  logit bias, so use distinctive words); DRY and XTC can also be set as a model's API defaults.
 - **Chat handoff** — at 85% context (or any time via the header button) the model writes a handoff summary and
   a new chat with the same settings continues from it.
 - **MCP tools** — configure servers in `mcp.json` (same format as LM Studio / Cursor; stdio `command` or remote

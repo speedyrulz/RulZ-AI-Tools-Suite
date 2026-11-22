@@ -153,6 +153,27 @@ describe('sampling default arguments', () => {
     expect(args).toContain('--temp 0.6 --top-k 20 --min-p 0')
     expect(args).not.toContain('--top-p')
   })
+  it('passes DRY and XTC defaults only when set', () => {
+    const none = buildServerArgs({ model, config: DEFAULT_LOAD_CONFIG, port: 1, alias: 'q' }).join(' ')
+    expect(none).not.toMatch(/--dry-|--xtc-/)
+    const sampling = {
+      ...DEFAULT_LOAD_CONFIG.sampling,
+      dryMultiplier: 0.8,
+      dryBase: 1.5,
+      dryAllowedLength: 3,
+      dryPenaltyLastN: 2048,
+      drySequenceBreakers: ['\n', 'Aria'],
+      xtcProbability: 0.5,
+      xtcThreshold: 0.1
+    }
+    const args = buildServerArgs({ model, config: { ...DEFAULT_LOAD_CONFIG, sampling }, port: 1, alias: 'q' })
+    expect(args.join(' ')).toContain('--dry-multiplier 0.8 --dry-base 1.5 --dry-allowed-length 3 --dry-penalty-last-n 2048')
+    expect(args.join(' ')).toContain('--xtc-probability 0.5 --xtc-threshold 0.1')
+    const at = args.indexOf('--dry-sequence-breaker')
+    expect(args.slice(at, at + 4)).toEqual(['--dry-sequence-breaker', '\n', '--dry-sequence-breaker', 'Aria'])
+    const off = buildServerArgs({ model, config: { ...DEFAULT_LOAD_CONFIG, sampling: { ...sampling, dryMultiplier: 0 } }, port: 1, alias: 'q' })
+    expect(off).not.toContain('--dry-sequence-breaker')
+  })
 })
 
 describe('describeExitCode', () => {

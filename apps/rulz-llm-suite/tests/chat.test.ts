@@ -26,7 +26,7 @@ describe('DeltaBatcher', () => {
   })
 })
 import { errorFromBody, interpretChunk, SseParser, statsFromTimings } from '../src/main/chat/sse'
-import { parseSettings } from '../src/main/settings/schema'
+import { parseSampling, parseSettings } from '../src/main/settings/schema'
 import { openAfterThinking } from '../src/renderer/src/lib/thinking'
 
 describe('SseParser', () => {
@@ -80,6 +80,50 @@ describe('buildRequestBody', () => {
       thinking_budget_tokens: 1024,
       reasoning_budget_message: 'Time to answer.'
     })
+  })
+  it('sends nothing for DRY, XTC or avoided words with the default settings', () => {
+    const plain = buildRequestBody('m', [], DEFAULT_SAMPLING)
+    for (const key of Object.keys(plain)) expect(key).not.toMatch(/^dry_|^xtc_|^logit_bias$/)
+  })
+  it('sends DRY, XTC and the avoid list when they are on', () => {
+    const body = buildRequestBody('m', [], {
+      ...DEFAULT_SAMPLING,
+      dryMultiplier: 0.8,
+      dryAllowedLength: 3,
+      drySequenceBreakers: ['\n', 'Aria'],
+      xtcProbability: 0.5,
+      xtcThreshold: 0.15,
+      avoidWords: ['tapestry', ' ', 'tapestry', 'testament'],
+      avoidStrength: 7
+    })
+    expect(body).toMatchObject({
+      dry_multiplier: 0.8,
+      dry_base: 1.75,
+      dry_allowed_length: 3,
+      dry_penalty_last_n: -1,
+      dry_sequence_breakers: ['\n', 'Aria'],
+      xtc_probability: 0.5,
+      xtc_threshold: 0.15
+    })
+    expect(body.logit_bias).toEqual([
+      ['tapestry', -7],
+      [' tapestry', -7],
+      ['testament', -7],
+      [' testament', -7]
+    ])
+  })
+  it('leaves DRY settings out while DRY is off, and XTC settings while XTC is off', () => {
+    const body = buildRequestBody('m', [], { ...DEFAULT_SAMPLING, dryMultiplier: 0, dryBase: 3, xtcProbability: 0, xtcThreshold: 0.3 })
+    expect(body).not.toHaveProperty('dry_base')
+    expect(body).not.toHaveProperty('dry_sequence_breakers')
+    expect(body).not.toHaveProperty('xtc_threshold')
+  })
+  it('loads sampling saved before DRY, XTC and avoid words existed', () => {
+    const { dryMultiplier: _a, xtcProbability: _b, avoidWords: _c, ...old } = DEFAULT_SAMPLING
+    expect(parseSampling(old)).toEqual(DEFAULT_SAMPLING)
+    expect(parseSampling({ ...old, dryMultiplier: 'x', avoidWords: [1], xtcProbability: 7, drySequenceBreakers: 'no' })).toEqual(DEFAULT_SAMPLING)
+    expect(parseSampling({ ...old, dryMultiplier: 0.8, avoidWords: ['tapestry'] })).toMatchObject({ dryMultiplier: 0.8, avoidWords: ['tapestry'] })
+    expect(parseSettings({}).defaultSampling).toMatchObject({ dryMultiplier: 0, xtcProbability: 0, avoidWords: [], avoidStrength: 5 })
   })
   it('turns thinking off, including when a handoff asks for it', () => {
     const off = buildRequestBody('m', [], { ...DEFAULT_SAMPLING, thinking: 'off', reasoningEffort: 'high', thinkingBudget: 10 })
