@@ -1,5 +1,6 @@
 // The Writing mode's project store: every file operation of the novel feature, with the data safety rules of
 // docs/writing-mode-design.md. No Electron imports: the app passes in what it needs (paths, trashItem, emit).
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { promises as fs } from 'node:fs'
 import { basename, isAbsolute, join, resolve } from 'node:path'
 import { parseEntry, formatEntry } from '@shared/frontMatter'
@@ -46,8 +47,12 @@ export interface StoreOptions {
   documents: () => string
   /** shell.trashItem. */
   trashItem: (path: string) => Promise<void>
-  /** Sends a novel:changed event. */
-  emit: (change: NovelChange) => void
+  /**
+   * Sends a novel:changed event to every listener (the window and the phones). `origin` is the owner whose request
+   * caused the change ('window', 'phone:<id>'), or undefined when it came from outside the app or from the app itself:
+   * the window leaves out its own origin, since its own saves come back in the reply.
+   */
+  emit: (change: NovelChange, origin?: string) => void
   /** Turn the folder watcher off (tests). */
   watch?: boolean
   /** The app's version, written to the training-data manifest (app.getVersion()). */
@@ -56,8 +61,19 @@ export interface StoreOptions {
   now?: () => Date
 }
 
+/** The owner of the window's open projects; each phone connection is 'phone:<clientId>'. */
+export const WINDOW_OWNER = 'window'
+
+const originStore = new AsyncLocalStorage<string | undefined>()
+/** Runs `fn` as the request of `owner`: changes it makes are announced with that origin. */
+export function runAs<T>(owner: string | undefined, fn: () => T): T {
+  return originStore.run(owner, fn)
+}
+
 interface OpenProject {
   folder: string
+  /** Who has the project open (see WINDOW_OWNER); the project is dropped when the last owner closes it. */
+  owners: Set<string>
   project: NovelProject
   outline: NovelOutline
   blocked: string | null
@@ -254,7 +270,7 @@ export class NovelStore {
     }
   }
 
-  async createProject(title: string): Promise<NovelProjectState> {
+  async createProject(title: string, owner: string = WINDOW_OWNER): Promise<NovelProjectState> {
     const clean = typeof title === 'string' ? title.trim() : ''
     if (!clean) throw new Error('The project needs a title.')
     const root = await this.root()
@@ -297,7 +313,7 @@ export class NovelStore {
     await writeBytesAtomic(folder, join(folder, 'outline.json'), tmp, json(outline))
     await writeBytesAtomic(folder, join(folder, 'style.md'), tmp, Buffer.alloc(0))
     await writeBytesAtomic(folder, join(folder, 'manuscript', file), tmp, Buffer.alloc(0))
-    return this.openProject(folder)
+    return this.openProject(folder, owner)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -308,17 +324,45 @@ export class NovelStore {
     return this.projects.size > 0
   }
 
+  /** Tells every listener about a change, tagged with who caused it. A failing listener never fails the change. */
+  private announce(change: NovelChange): void {
+    try {
+      this.opts.emit(change, originStore.getStore())
+    } catch (err) {
+      console.warn('Writing: change listener failed:', err)
+    }
+  }
+
+  /** The new outline/project/bible state, announced and returned. */
+  private async publish(p: OpenProject): Promise<NovelProjectState> {
+    const state = await this.state(p)
+    this.announce({ kind: 'state', folder: p.folder, state })
+    return state
+  }
+
+  /** Text-file hash of a user file, for announcing a restored file. */
+  private async hashOf(p: OpenProject, rel: string): Promise<string> {
+    const bytes = await readBytes(p.folder, join(p.folder, ...rel.split('/'))).catch(() => null)
+    return bytes ? sha256(bytes) : ''
+  }
+
   private get(folder: string): OpenProject {
     const p = typeof folder === 'string' ? this.projects.get(projectKey(folder)) : undefined
     if (!p) throw new Error('That project is not open.')
     return p
   }
 
-  async openProject(folder: string): Promise<NovelProjectState> {
+  /** The state of an open project (for phone writing runs). */
+  async projectState(folder: string): Promise<NovelProjectState> {
+    return this.state(this.get(folder))
+  }
+
+  async openProject(folder: string, owner: string = WINDOW_OWNER): Promise<NovelProjectState> {
     if (typeof folder !== 'string' || !isAbsolute(folder)) throw new Error('The project folder must be a full path.')
     const key = projectKey(folder)
     const open = this.projects.get(key)
     if (open) {
+      open.owners.add(owner)
       await this.exclusive(open, () => this.loadJson(open, false))
       return this.state(open)
     }
@@ -327,6 +371,7 @@ export class NovelStore {
     if (!(await readBytes(folder, join(folder, 'project.json')))) throw new Error('That folder is not a RulZ novel project (there is no project.json in it).')
     const p: OpenProject = {
       folder: resolve(folder),
+      owners: new Set(),
       project: defaultProject(basename(folder)),
       outline: emptyOutline(),
       blocked: null,
@@ -349,18 +394,29 @@ export class NovelStore {
       recordsOff: false
     }
     await this.loadJson(p, false)
+    // Another owner may have opened the same folder while this one was reading it.
+    const raced = this.projects.get(key)
+    if (raced) {
+      raced.owners.add(owner)
+      return this.state(raced)
+    }
+    p.owners.add(owner)
     this.projects.set(key, p)
     if (this.opts.watch !== false) {
-      p.watcher = new ProjectWatcher(p.folder, (rel) => void this.onExternalChange(p.folder, rel).catch((err) => console.warn('Writing: watcher event failed:', err)))
+      // A watcher event is not anybody's request, whatever request happened to start the watcher.
+      p.watcher = new ProjectWatcher(p.folder, (rel) => runAs(undefined, () => void this.onExternalChange(p.folder, rel).catch((err) => console.warn('Writing: watcher event failed:', err))))
       p.watcher.start()
     }
     return this.state(p)
   }
 
-  async closeProject(folder: string): Promise<void> {
+  /** Removes `owner` from the project; the watcher stops and the project is dropped only when nobody else has it open. */
+  async closeProject(folder: string, owner: string = WINDOW_OWNER): Promise<void> {
     const key = projectKey(folder)
     const p = this.projects.get(key)
     if (!p) return
+    p.owners.delete(owner)
+    if (p.owners.size > 0) return
     p.watcher?.stop()
     this.projects.delete(key)
     p.recordsOff = true
@@ -369,6 +425,18 @@ export class NovelStore {
     while (p.recordHold) await p.recordHold
     await Promise.allSettled([...p.records])
     await p.chain.catch(() => undefined)
+  }
+
+  /** Closes every project `owner` holds (a phone connection that ended). */
+  async releaseOwner(owner: string): Promise<void> {
+    for (const p of [...this.projects.values()]) {
+      if (p.owners.has(owner)) await this.closeProject(p.folder, owner)
+    }
+  }
+
+  /** Who has a project open (tests and diagnostics). */
+  ownersOf(folder: string): string[] {
+    return [...(this.projects.get(projectKey(folder))?.owners ?? [])]
   }
 
   dispose(): void {
@@ -416,7 +484,7 @@ export class NovelStore {
     p.blocked = p.jsonErr['project.json'] ?? p.jsonErr['outline.json']
     if (await this.loadStateFile(p)) changed = true
     if (await this.loadChecksFile(p)) changed = true
-    if (changed && announce) this.opts.emit({ kind: 'state', folder: p.folder, state: await this.state(p) })
+    if (changed && announce) this.announce({ kind: 'state', folder: p.folder, state: await this.state(p) })
     return changed
   }
 
@@ -521,7 +589,7 @@ export class NovelStore {
 
   async projectPatch(folder: string, patch: ProjectPatch): Promise<NovelProject> {
     const p = this.get(folder)
-    return this.mutate(p, async () => {
+    const saved = await this.mutate(p, async () => {
       const next: NovelProject = { ...p.project }
       if (patch.title !== undefined) {
         if (typeof patch.title !== 'string' || !patch.title.trim()) throw new Error('The project title cannot be empty.')
@@ -546,6 +614,8 @@ export class NovelStore {
       p.project = next
       return { result: next, project: true }
     })
+    await this.publish(p)
+    return saved
   }
 
   async outlinePatch(folder: string, ops: OutlineOp[]): Promise<NovelProjectState> {
@@ -566,7 +636,7 @@ export class NovelStore {
       p.outline = outline
       return { result: undefined, outline: true }
     })
-    return this.state(p)
+    return this.publish(p)
   }
 
   private async manuscriptFiles(p: OpenProject): Promise<string[]> {
@@ -677,7 +747,9 @@ export class NovelStore {
         return { rejected: out.rejected }
       }
     })
-    return { state: await this.state(p), rejected: result.rejected }
+    const state = await this.state(p)
+    if (!result.rejected || result.rejected.length < ops.length) this.announce({ kind: 'state', folder: p.folder, state })
+    return { state, rejected: result.rejected }
   }
 
   /** Adds or removes a dismissed finding key for a scene in .rulz/checks.json. */
@@ -721,7 +793,7 @@ export class NovelStore {
         p.hashes.delete('.rulz/checks.json')
       }
     })
-    return this.state(p)
+    return this.publish(p)
   }
 
   private async wordsOf(p: OpenProject, rel: string): Promise<number> {
@@ -857,7 +929,12 @@ export class NovelStore {
     if (typeof req.text !== 'string') throw new Error('The text to save is missing.')
     if (p.blocked) return { ok: false, reason: 'blocked' }
     const target = join(p.folder, ...rel.split('/'))
-    return serialized(target, async (): Promise<NovelSaveResult> => {
+    // The desktop editor's crash-recovery journal is the desktop's: a save made by a phone leaves it alone (the
+    // recovery offers a journal whose text differs from the disk).
+    const origin = originStore.getStore()
+    const keepJournal = origin !== undefined && origin !== WINDOW_OWNER
+    let wrote = false
+    const result = await serialized(target, async (): Promise<NovelSaveResult> => {
       try {
         // The project can have become blocked while this save waited in the queue.
         if (p.blocked) return { ok: false, reason: 'blocked' }
@@ -882,8 +959,11 @@ export class NovelStore {
         // An unedited document is never written (it would only change timestamps and wake sync clients). The
         // comparison is of text, so a file with mixed line endings is left alone too.
         if (d && disk && req.text.replace(/\r\n/g, '\n') === d.text) {
+          const before = p.hashes.get(key)
           p.hashes.set(key, diskHash)
-          await deleteJournal(p.folder, rel)
+          if (!keepJournal) await deleteJournal(p.folder, rel)
+          // Nothing was written, but if this is the first the app hears of the disk version, others should too.
+          if (before !== diskHash) this.announce({ kind: 'text', folder: p.folder, path: rel, hash: diskHash })
           return { ok: true, hash: diskHash }
         }
         const bytes = encodeText(req.text, d?.meta ?? NEW_FILE_META)
@@ -903,12 +983,21 @@ export class NovelStore {
         }
         const hash = sha256(bytes)
         p.hashes.set(key, hash)
-        await deleteJournal(p.folder, rel)
+        if (!keepJournal) await deleteJournal(p.folder, rel)
+        // The watcher's event for this write is ignored (the hash is known now), so announce it here.
+        this.announce({ kind: 'text', folder: p.folder, path: rel, hash })
+        wrote = true
         return { ok: true, hash }
       } catch (err) {
         return { ok: false, reason: 'error', error: errText(err) }
       }
     })
+    // The window gets its own saves back in the reply; everyone else also needs what follows from the text
+    // (word counts, a bible entry's name, aliases and triggers), which the suppressed watcher event would have sent.
+    if (wrote && keepJournal && this.projects.get(projectKey(p.folder)) === p) {
+      await this.publish(p).catch((err) => console.warn('Writing: state after save failed:', err))
+    }
+    return result
   }
 
   async journal(folder: string, rel: string, text: string, baseHash: string): Promise<void> {
@@ -942,7 +1031,7 @@ export class NovelStore {
     const clean = typeof name === 'string' ? name.trim() : ''
     if (!clean) throw new Error('The entry needs a name.')
     const entryKind: BibleKind = (['character', 'place', 'lore', 'other'] as const).includes(kind) ? kind : 'other'
-    return this.exclusive(p, async () => {
+    const entry = await this.exclusive(p, async () => {
       if (p.blocked) throw new Error(p.blocked)
       const taken = new Set((await fs.readdir(join(p.folder, 'bible')).catch(() => [])).map((n) => lc(n)))
       const base = slugify(clean)
@@ -954,6 +1043,8 @@ export class NovelStore {
       p.hashes.set(lc(`bible/${id}.md`), sha256(bytes))
       return parseEntry(id, text)
     })
+    await this.publish(p)
+    return entry
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -994,9 +1085,10 @@ export class NovelStore {
       const removed = removeScene(p.outline, sceneId) // throws for the last scene of a chapter
       const rels = [`manuscript/${found.scene.file}`]
       await this.withFileLocks(p, rels, () => this.trashThenWrite(p, rels, `Scene "${found.scene.title}"`, { kind: 'scene', chapterId: removed.chapterId, index: removed.index, scene: removed.scene }, () => removed.outline))
+      for (const rel of rels) this.announce({ kind: 'deleted', folder: p.folder, path: rel })
       return { result: undefined }
     })
-    return this.state(p)
+    return this.publish(p)
   }
 
   async deleteChapter(folder: string, chapterId: string): Promise<NovelProjectState> {
@@ -1009,9 +1101,10 @@ export class NovelStore {
       const label = `Chapter "${found.chapter.title}" (${n} ${n === 1 ? 'scene' : 'scenes'})`
       const rels = found.chapter.scenes.map((s) => `manuscript/${s.file}`)
       await this.withFileLocks(p, rels, () => this.trashThenWrite(p, rels, label, { kind: 'chapter', index: removed.index, chapter: removed.chapter }, () => removed.outline))
+      for (const rel of rels) this.announce({ kind: 'deleted', folder: p.folder, path: rel })
       return { result: undefined }
     })
-    return this.state(p)
+    return this.publish(p)
   }
 
   async deleteEntry(folder: string, entryId: string): Promise<NovelProjectState> {
@@ -1027,8 +1120,9 @@ export class NovelStore {
         p.hashes.set(lc(rel), '')
         p.entryCache.delete(lc(rel))
       })
+      this.announce({ kind: 'deleted', folder: p.folder, path: rel })
     })
-    return this.state(p)
+    return this.publish(p)
   }
 
   async trash(folder: string): Promise<NovelTrashItem[]> {
@@ -1037,6 +1131,7 @@ export class NovelStore {
 
   async restoreTrash(folder: string, id: string): Promise<NovelProjectState> {
     const p = this.get(folder)
+    const restored: string[] = []
     await this.mutate(p, async () => {
       const manifest: TrashManifest = await readManifest(p.folder, id)
       let next: NovelOutline | null = null
@@ -1052,6 +1147,7 @@ export class NovelStore {
       await this.withFileLocks(p, lockRels, async () => {
         await this.guard(p, join(p.folder, '.rulz'), ...lockRels.map((r) => join(p.folder, ...r.split('/'))))
         await restoreFiles(p.folder, manifest)
+        restored.push(...lockRels.filter((r) => USER_PATH.test(r)))
         for (const f of manifest.files) p.hashes.delete(lc(f.from))
         if (next) {
           const before = p.outline
@@ -1073,7 +1169,11 @@ export class NovelStore {
       await removeTrashFolder(p.folder, id)
       return { result: undefined }
     })
-    return this.state(p)
+    for (const rel of restored) {
+      const hash = await this.hashOf(p, rel)
+      if (hash) this.announce({ kind: 'text', folder: p.folder, path: rel, hash })
+    }
+    return this.publish(p)
   }
 
   async emptyTrash(folder: string): Promise<void> {
@@ -1402,10 +1502,10 @@ export class NovelStore {
       p.hashes.set(key, hash)
       // The next save must snapshot this outside version before it overwrites it (rule 5).
       p.lastSnap.delete(key)
-      if (hash) this.opts.emit({ kind: 'text', folder: p.folder, path: rel, hash })
-      else if (known) this.opts.emit({ kind: 'deleted', folder: p.folder, path: rel })
+      if (hash) this.announce({ kind: 'text', folder: p.folder, path: rel, hash })
+      else if (known) this.announce({ kind: 'deleted', folder: p.folder, path: rel })
       // The outline tree (words, missing, orphans) and the bible list follow the files.
-      this.opts.emit({ kind: 'state', folder: p.folder, state: await this.state(p) })
+      this.announce({ kind: 'state', folder: p.folder, state: await this.state(p) })
     })
   }
 }

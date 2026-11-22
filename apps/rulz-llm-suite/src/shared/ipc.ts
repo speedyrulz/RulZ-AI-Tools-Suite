@@ -2,6 +2,7 @@
 import type { BatchRun } from './batch'
 import type { BenchmarkRequest, BenchmarkRun } from './benchmark'
 import type { NovelIpcEvents, NovelIpcInvoke } from './novel'
+import type { PhoneIpcEvents, PhoneIpcInvoke, WritingIpcEvents, WritingIpcInvoke } from './phone'
 import type { WritingBenchIpcInvoke } from './writingBench'
 import type {
   AdapterConvertRequest,
@@ -48,7 +49,7 @@ export interface AppInfo {
 }
 
 /** Request/response channels (ipcRenderer.invoke ↔ ipcMain.handle). */
-export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke {
+export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke, PhoneIpcInvoke, WritingIpcInvoke {
   'app:info': () => AppInfo
   'settings:get': () => AppSettings
   'settings:update': (patch: Partial<AppSettings>) => AppSettings
@@ -156,7 +157,7 @@ export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke {
 }
 
 /** Push channels (webContents.send → ipcRenderer.on). */
-export interface IpcEvents extends NovelIpcEvents {
+export interface IpcEvents extends NovelIpcEvents, PhoneIpcEvents, WritingIpcEvents {
   'models:changed': ModelEntry[]
   'adapters:changed': AdapterEntry[]
   /** One output line of the running adapter conversion. */

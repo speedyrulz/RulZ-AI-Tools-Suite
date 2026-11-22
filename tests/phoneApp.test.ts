@@ -1,6 +1,14 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { getFetch, setFetch } from '../src/main/github'
-import { forgetPhoneApp, latestPhoneApp, PHONE_TAG_PREFIX } from '../src/main/phoneApp'
+import {
+  forgetPhoneApp,
+  latestPhoneApp,
+  PHONE_APP_SOURCES,
+  PHONE_OLD_REPO,
+  PHONE_TAG_PREFIX,
+  WRITER_TAG_PREFIX
+} from '../src/main/phoneApp'
+import { SUITE_REPO } from '../src/shared/catalog'
 
 const original = getFetch()
 afterEach(() => {
@@ -69,10 +77,52 @@ describe('latestPhoneApp', () => {
 
   it('keeps the last answer when GitHub is down, and fails before there is one', async () => {
     serve({ 's/d': 'down' })
-    await expect(latestPhoneApp([['s/d', PHONE_TAG_PREFIX]])).rejects.toThrow()
+    await expect(latestPhoneApp('coding-agent-android', [['s/d', PHONE_TAG_PREFIX]])).rejects.toThrow()
     serve({ 's/e': [release('coding-agent-android-v0.6.0', ['RulZ-Agent-0.6.0.apk'])] })
-    await latestPhoneApp([['s/e', PHONE_TAG_PREFIX]])
+    await latestPhoneApp('coding-agent-android', [['s/e', PHONE_TAG_PREFIX]])
     serve({ 's/f': 'down' })
-    expect((await latestPhoneApp([['s/f', PHONE_TAG_PREFIX]]))?.version).toBe('v0.6.0')
+    expect((await latestPhoneApp('coding-agent-android', [['s/f', PHONE_TAG_PREFIX]]))?.version).toBe('v0.6.0')
+  })
+
+  it('configures writer-android with the suite repo only (no old-repo fallback)', () => {
+    expect(PHONE_APP_SOURCES['coding-agent-android']).toEqual([
+      [SUITE_REPO, PHONE_TAG_PREFIX],
+      [PHONE_OLD_REPO, 'v']
+    ])
+    expect(PHONE_APP_SOURCES['writer-android']).toEqual([[SUITE_REPO, WRITER_TAG_PREFIX]])
+  })
+
+  it('looks up and caches writer-android independently from coding-agent-android', async () => {
+    serve({
+      's/w1': [
+        release('coding-agent-android-v0.6.0', ['RulZ-Agent-0.6.0.apk']),
+        release('writer-android-v0.2.0', ['RulZ-Writer-0.2.0.apk'], { draft: true }),
+        release('writer-android-v0.1.0', ['SHA256SUMS', 'RulZ-Writer-0.1.0.apk'])
+      ]
+    })
+    const writer = await latestPhoneApp('writer-android', [['s/w1', WRITER_TAG_PREFIX]])
+    expect(writer).toEqual({
+      version: 'v0.1.0',
+      tag: 'writer-android-v0.1.0',
+      url: 'https://github.com/x/download/writer-android-v0.1.0/RulZ-Writer-0.1.0.apk',
+      size: 4_679_802,
+      date: '2026-11-09T13:40:08Z',
+      releaseUrl: 'https://github.com/x/releases/tag/writer-android-v0.1.0'
+    })
+
+    // coding-agent-android has not been fetched yet, so a down network rejects for it while writer-android returns its cached release.
+    serve({ 's/w2': 'down' })
+    await expect(latestPhoneApp('coding-agent-android', [['s/w2', PHONE_TAG_PREFIX]])).rejects.toThrow()
+    expect((await latestPhoneApp('writer-android', [['s/w2', WRITER_TAG_PREFIX]]))?.version).toBe('v0.1.0')
+  })
+
+  it('returns null for writer-android when no writer release exists yet', async () => {
+    serve({
+      's/w3': [
+        release('v1.18.1', ['RulZ-AI-Tools-Suite-Setup-1.18.1.exe']),
+        release('coding-agent-android-v0.6.0', ['RulZ-Agent-0.6.0.apk'])
+      ]
+    })
+    expect(await latestPhoneApp('writer-android', [['s/w3', WRITER_TAG_PREFIX]])).toBeNull()
   })
 })

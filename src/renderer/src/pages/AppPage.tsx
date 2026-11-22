@@ -435,9 +435,9 @@ export function AppPage({
             </SideCard>
           )}
 
-          {app.id === 'coding-agent' && (
+          {app.phoneApp && (
             <SideCard title="Phone app">
-              <PhoneAppQr variant="card" />
+              <PhoneAppQr appId={app.phoneApp} variant="card" />
             </SideCard>
           )}
 

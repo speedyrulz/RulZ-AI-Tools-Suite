@@ -191,6 +191,22 @@
       "wiki": { "pages": ["Coding-Agent-Android-App.md", "Coding-Agent-Phone-Access.md", "Coding-Agent.md"] }
     },
     {
+      "id": "writer-android",
+      "name": "RulZ Writer for Android",
+      "paths": ["apps/rulz-writer-android/**"],
+      "version": {
+        "source": "files",
+        "files": [
+          { "path": "apps/rulz-writer-android/package.json", "json": "version" },
+          { "path": "apps/rulz-writer-android/package-lock.json", "json": "version" },
+          { "path": "apps/rulz-writer-android/package-lock.json", "json": ["packages", "", "version"] },
+          { "path": "apps/rulz-writer-android/android/app/build.gradle", "regex": "versionName\\s+\"([^\"]+)\"" }
+        ]
+      },
+      "release": { "expectAssets": ["RulZ-Writer-*.apk", "SHA256SUMS"] },
+      "wiki": { "pages": ["Writer-Android-App.md", "LLM-Suite.md"] }
+    },
+    {
       "id": "clip-extractor",
       "name": "RulZ Simple Video Clip Extractor",
       "paths": ["apps/rulz-simple-video-clip-extractor/**"],

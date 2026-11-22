@@ -160,7 +160,8 @@ export const CATALOG: CatalogApp[] = [
     description:
       'A desktop app for running local LLMs in your own llama.cpp build. Browse your GGUF models, load them with a ' +
       'memory estimate (MoE experts can stay in system RAM), chat with streaming and reasoning blocks, use MCP ' +
-      'tools, analyse or clone programs on the Reverse Engineering page, and serve OpenAI- and ' +
+      'tools, write novels in Writing mode (and from your phone with RulZ Writer for Android, the QR code in the ' +
+      'Phone app box on this page), analyse or clone programs on the Reverse Engineering page, and serve OpenAI- and ' +
       'Anthropic-compatible APIs.',
     category: 'LLM',
     repo: SUITE_REPO,
@@ -182,8 +183,11 @@ export const CATALOG: CatalogApp[] = [
     notes: [
       'Needs a llama.cpp build with llama-server.exe; set its folder in the app under Settings ▸ Engine.',
       'Models are read from C:\\LLM unless you pick another folder under Settings ▸ Models.',
+      'The Writing mode phone app (RulZ Writer for Android) needs Tailscale on this computer and the phone (same ' +
+        'account), and "Let my phone connect" turned on under Settings ▸ Phone access.',
       'Installs with its own setup program (silently), and can be removed from Windows Settings too.'
     ],
+    phoneApp: 'writer-android',
     highlights: ['GGUF model library', 'Chat with tools (MCP)', 'Speculative decoding', 'Local OpenAI/Anthropic API']
   },
   {
@@ -216,6 +220,7 @@ export const CATALOG: CatalogApp[] = [
         'connect" switch turned on under Settings ▸ Phone access.',
       'Installs with its own setup program (silently), and can be removed from Windows Settings too.'
     ],
+    phoneApp: 'coding-agent-android',
     highlights: ['Plain-English app building', 'Asks before risky steps', 'Undo and task history', 'Runs fully local']
   },
   {

@@ -28,7 +28,13 @@ import { buildOverview, MAX_OVERVIEW_SESSIONS } from './re/overview'
 import { findPython, type PythonCommand } from './re/python'
 import { exportDataset, TraceStore, type ExportSession } from './re/traces'
 import { registerNovelIpc } from './novel/ipc'
-import { NovelStore } from './novel/store'
+import { NovelStore, runAs, WINDOW_OWNER } from './novel/store'
+import { createPhoneService, type PhoneService } from './phone/host'
+import { settingsForRenderer, settingsPatchFromRenderer } from './phone/settings'
+import { ChatEventTap, chatAdapter, chatBusyReason, modelsAdapter, storeAdapter } from './writing/adapters'
+import { WritingEvents, writingHandlers } from './writing/ipc'
+import { WritingRuns } from './writing/runs'
+import { PHONE_WRITING_CHANNELS } from '@shared/phone'
 
 const MiB = 1024 * 1024
 const isDev = !app.isPackaged && !!process.env.ELECTRON_RENDERER_URL
@@ -40,6 +46,7 @@ if (!isPrimaryInstance) app.quit()
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
+let phone!: PhoneService
 /** Set once the app is really exiting, so close-to-tray lets the window close. */
 let quitting = false
 
@@ -280,7 +287,12 @@ async function main(): Promise<void> {
     }
   })
 
-  const chat = new ChatService(instances, (e) => broadcast('chat:event', e), (req) => {
+  // Phone writing runs wait for their own requests' events through this tap.
+  const chatTap = new ChatEventTap()
+  const chat = new ChatService(instances, (e) => {
+    broadcast('chat:event', e)
+    chatTap.push(e)
+  }, (req) => {
     const disabled = new Set(settings.get().disabledTools)
     // The write/read file tools exist only in clone sessions.
     if (!req.files) for (const n of CLONE_FILE_TOOLS) disabled.add(n)
@@ -299,10 +311,13 @@ async function main(): Promise<void> {
 
   // ---- IPC ----
   handle('app:info', () => ({ version: app.getVersion(), userData, platform: process.platform }))
-  handle('settings:get', () => settings.get())
+  // The pairing code never goes to the window (only phone:pairing carries it); phone access is switched by phone:*.
+  handle('settings:get', () => settingsForRenderer(settings.get()))
   handle('settings:update', async (patch) => {
     const before = settings.get()
-    const next = await settings.update(patch)
+    const saved = await settings.update(settingsPatchFromRenderer(patch))
+    const next = settingsForRenderer(saved)
+    if (saved.phonePort !== before.phonePort) void phone.access.start()
     if (next.modelsDir !== before.modelsDir) void library.scan()
     if (next.enginePath !== before.enginePath) void engine.getInfo(true)
     if (next.theme !== before.theme) mainWindow?.setBackgroundColor(windowBackground(next.theme))
@@ -498,7 +513,12 @@ async function main(): Promise<void> {
     rootSetting: () => settings.get().writingRoot,
     documents: () => app.getPath('documents'),
     trashItem: (path) => shell.trashItem(path),
-    emit: (change) => broadcast('novel:changed', change),
+    // The window already has the result of its own requests; everything else (a phone's save, an outside edit)
+    // goes to the window and to the phones.
+    emit: (change, origin) => {
+      if (origin !== WINDOW_OWNER) broadcast('novel:changed', change)
+      phone.emit('novel:changed', change)
+    },
     appVersion: () => app.getVersion()
   })
   // The close-time handshake (data safety rule 4): the renderer saves or journals its dirty buffers and answers.
@@ -523,6 +543,38 @@ async function main(): Promise<void> {
     return flushing
   }
   registerNovelIpc(novel, () => flushDone?.())
+
+  // ---- Phone access (RulZ Writer for Android) ----
+  // `phone` is read by the novel store's emit above, which only runs after startup.
+  phone = createPhoneService({
+    settings,
+    novel,
+    version: app.getVersion(),
+    emitStatus: (status) => broadcast('phone:changed', status)
+  })
+  handle('phone:status', () => phone.access.status())
+  handle('phone:setEnabled', (enabled) => phone.access.setEnabled(enabled === true))
+  handle('phone:pairing', () => phone.access.pairing())
+  handle('phone:newToken', () => phone.access.newToken())
+  handle('phone:disconnect', (clientId) => phone.access.disconnect(clientId))
+  // Writing runs: AI actions started from the phone, run here (docs/phone-access-design.md, "Writing runs").
+  const writingEvents = new WritingEvents()
+  const writingRuns = new WritingRuns({
+    store: storeAdapter(novel),
+    chat: chatAdapter(chat, chatTap),
+    models: modelsAdapter(library, instances),
+    busyReason: chatBusyReason(chat),
+    // A phone may use a project's jobs while it holds the project open (a reconnected phone has a new id).
+    holds: (owner, folder) => novel.ownersOf(folder).includes(owner),
+    emit: writingEvents.emit
+  })
+  writingEvents.subscribe((job) => phone.emit('writing:job', job))
+  const writing = writingHandlers(writingRuns)
+  for (const channel of PHONE_WRITING_CHANNELS) {
+    // runAs: a state patch from Apply is announced as the phone's change, so the window hears about it.
+    phone.handlers.register(channel, ((owner: string, ...args: unknown[]) => runAs(owner, () => writing[channel](owner, ...args))) as never)
+  }
+  void phone.access.start()
 
   handle('presets:list', () => settings.listPresets())
   handle('presets:save', (p) => settings.savePreset(p))
@@ -582,6 +634,7 @@ async function main(): Promise<void> {
     }
     destroyTray()
     novel.dispose()
+    void phone.access.dispose()
     hardware.stop()
     library.dispose()
     // The benchmark first: it sets its stop flag and starts unloading before the servers are killed.

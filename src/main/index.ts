@@ -175,7 +175,7 @@ async function main(): Promise<void> {
   handle('apps:openFolder', (id) => apps.openFolder(id))
   handle('apps:log', (id) => apps.getLog(id))
 
-  handle('phone:latest', () => latestPhoneApp())
+  handle('phone:latest', (id) => latestPhoneApp(id))
 
   handle('self:check', (force) => checkSelfUpdate(store, !!force).catch(() => null))
   handle('self:install', async (u) => {

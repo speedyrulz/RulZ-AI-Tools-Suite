@@ -81,6 +81,8 @@ export interface CatalogApp {
   detect?: string[]
   /** Things to know before installing (download size, first-run behaviour). */
   notes?: string[]
+  /** Companion Android app shown as a download QR code on this app's page. */
+  phoneApp?: PhoneAppId
   highlights: string[]
 }
 
@@ -216,7 +218,9 @@ export interface SelfUpdate {
   assetName?: string
 }
 
-/** The newest RulZ Coding Agent for Android release with an APK, for the launcher's download QR code. */
+export type PhoneAppId = 'coding-agent-android' | 'writer-android'
+
+/** The newest Android companion app release with an APK, for the launcher's download QR code. */
 export interface PhoneApp {
   /** "v0.5.0" */
   version: string

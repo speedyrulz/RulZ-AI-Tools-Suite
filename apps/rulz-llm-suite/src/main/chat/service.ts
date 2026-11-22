@@ -194,6 +194,11 @@ export type RoundRecorder = (conversationId: string, round: RecordedRound) => vo
 /** Streams chat completions from a loaded instance and forwards them to the renderer. */
 export class ChatService {
   private active = new Map<string, AbortController>()
+
+  /** True while any chat request is running (the window's, the API's or a phone job's). */
+  get busy(): boolean {
+    return this.active.size > 0
+  }
   /** Releases for models kept in use between tool rounds, by the request that asked for the tools. */
   private turnHolds = new Map<string, () => void>()
 
