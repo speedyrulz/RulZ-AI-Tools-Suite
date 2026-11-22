@@ -439,7 +439,8 @@ export function overrideSampling(body: Record<string, unknown>, s: ModelSampling
   if (s.dryMultiplier !== null) out.dry_multiplier = s.dryMultiplier
   if (s.dryBase !== null) out.dry_base = s.dryBase
   if (s.dryAllowedLength !== null) out.dry_allowed_length = s.dryAllowedLength
-  if (s.dryPenaltyLastN !== null) out.dry_penalty_last_n = s.dryPenaltyLastN
+  // -1 is the server's default and some llama-server builds refuse it in a request: left out.
+  if (s.dryPenaltyLastN !== null && s.dryPenaltyLastN >= 0) out.dry_penalty_last_n = s.dryPenaltyLastN
   if (s.drySequenceBreakers !== null) out.dry_sequence_breakers = s.drySequenceBreakers
   if (s.xtcProbability !== null) out.xtc_probability = s.xtcProbability
   if (s.xtcThreshold !== null) out.xtc_threshold = s.xtcThreshold
