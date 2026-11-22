@@ -93,6 +93,16 @@ export interface ModelSampling {
   minP: number | null
   repeatPenalty: number | null
   presencePenalty: number | null
+  /** DRY: penalises text that would repeat an earlier passage; multiplier 0 = off. */
+  dryMultiplier: number | null
+  dryBase: number | null
+  dryAllowedLength: number | null
+  /** -1 = the whole context, 0 = off. */
+  dryPenaltyLastN: number | null
+  drySequenceBreakers: string[] | null
+  /** XTC: now and then drops the likeliest tokens; probability 0 = off. */
+  xtcProbability: number | null
+  xtcThreshold: number | null
   /** Also replace the values API requests send (e.g. Claude Code's temperature), not only fill in missing ones. */
   override: boolean
 }
@@ -105,6 +115,22 @@ export interface SamplingParams {
   repeatPenalty: number
   presencePenalty: number
   frequencyPenalty: number
+  /** DRY: penalises text that would repeat an earlier passage; 0 = off (typical 0.8). */
+  dryMultiplier: number
+  dryBase: number
+  dryAllowedLength: number
+  /** -1 = the whole context, 0 = off. */
+  dryPenaltyLastN: number
+  /** Tokens that reset DRY's repeat matching, e.g. newline, colon, quote, asterisk. */
+  drySequenceBreakers: string[]
+  /** XTC: now and then drops the likeliest tokens; 0 = off (typical 0.5). */
+  xtcProbability: number
+  /** Tokens above this chance are candidates for XTC; above 0.5 disables XTC. */
+  xtcThreshold: number
+  /** Words to discourage, sent as logit_bias. */
+  avoidWords: string[]
+  /** Bias applied to each avoided word: 5 means -5, 100 means effectively banned. */
+  avoidStrength: number
   /** null = generate until the model stops or the context is full. */
   maxTokens: number | null
   stop: string[]

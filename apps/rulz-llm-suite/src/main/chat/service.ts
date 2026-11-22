@@ -81,6 +81,26 @@ export function limiter(n: number): Limiter {
   }
 }
 
+/**
+ * logit_bias entries that discourage each word, with and without a leading space (llama-server biases
+ * every token of a string key). Empty and duplicate entries are skipped; strength 0 sends nothing.
+ */
+export function avoidWordsBias(words: string[], strength: number): [string, number][] {
+  if (!(strength > 0)) return []
+  const out: [string, number][] = []
+  const seen = new Set<string>()
+  for (const raw of words) {
+    const w = raw.trim()
+    if (!w) continue
+    for (const key of [w, ' ' + w]) {
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push([key, -strength])
+    }
+  }
+  return out
+}
+
 export function buildRequestBody(
   alias: string,
   messages: WireMessage[],
@@ -106,6 +126,20 @@ export function buildRequestBody(
   if (s.maxTokens !== null) body.max_tokens = s.maxTokens
   if (s.stop.length) body.stop = s.stop
   if (s.seed !== null) body.seed = s.seed
+  // Fiction samplers: only sent when on, so requests of people who never touch them stay as they were.
+  if (s.dryMultiplier > 0) {
+    body.dry_multiplier = s.dryMultiplier
+    body.dry_base = s.dryBase
+    body.dry_allowed_length = s.dryAllowedLength
+    body.dry_penalty_last_n = s.dryPenaltyLastN
+    if (s.drySequenceBreakers.length) body.dry_sequence_breakers = s.drySequenceBreakers
+  }
+  if (s.xtcProbability > 0) {
+    body.xtc_probability = s.xtcProbability
+    body.xtc_threshold = s.xtcThreshold
+  }
+  const bias = avoidWordsBias(s.avoidWords, s.avoidStrength)
+  if (bias.length) body.logit_bias = bias
   const thinking = disableThinking ? 'off' : s.thinking
   if (thinking !== 'auto') body.chat_template_kwargs = { enable_thinking: thinking === 'on' }
   if (thinking !== 'off') {

@@ -1,7 +1,7 @@
 import { CircleAlert, CircleCheck, FolderOpen, FolderSearch, RefreshCw } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
 import type { LoadConfig, SamplingParams } from '@shared/types'
-import { ThinkingFields } from '../components/chat/InferencePanel'
+import { ThinkingFields, VarietyFields } from '../components/chat/InferencePanel'
 import { LoadSettingsForm } from '../components/models/LoadSettingsForm'
 import { Button, Field, Input, Kbd, Select, Switch, Textarea } from '../components/ui'
 import { SHORTCUTS } from '../hooks/useShortcuts'
@@ -144,6 +144,13 @@ export function SettingsPage() {
             <NumberSetting label="Min P" value={settings.defaultSampling.minP} step={0.01} onChange={(v) => void update({ defaultSampling: withSampling(settings.defaultSampling, 'minP', v) })} />
             <NumberSetting label="Repeat penalty" value={settings.defaultSampling.repeatPenalty} step={0.01} onChange={(v) => void update({ defaultSampling: withSampling(settings.defaultSampling, 'repeatPenalty', v) })} />
           </div>
+          <VarietyFields
+            sampling={{ ...settings.defaultSampling, ...thinking }}
+            onChange={(key, v) => {
+              setThinking((t) => ({ ...t, [key]: v }))
+              void update({ defaultSampling: { ...useApp.getState().settings!.defaultSampling, ...thinking, [key]: v } })
+            }}
+          />
           <ThinkingFields
             sampling={{ ...settings.defaultSampling, ...thinking }}
             onChange={(key, v) => {

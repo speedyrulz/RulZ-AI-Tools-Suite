@@ -3,6 +3,7 @@ import { ChevronRight, FolderSearch } from 'lucide-react'
 import { useState } from 'react'
 import { draftFiles, fileName, resolveDraft } from '@shared/draft'
 import { isQuantizedKv } from '@shared/kv'
+import { breakersToText, textToBreakers } from '@shared/variety'
 import { parseTensorSplit, rebalanceSplit, toPercents } from '@shared/split'
 import { KV_CACHE_TYPES, type DraftKind, type KvCacheType, type LoadConfig, type MemoryEstimate, type ModelEntry, type ModelSampling, type SidecarFile } from '@shared/types'
 import { invoke } from '../../lib/api'
@@ -42,7 +43,7 @@ export function LoadSettingsForm({
   const [samplingOpen, setSamplingOpen] = useState(false)
   const setSampling = <K extends keyof ModelSampling>(key: K, value: ModelSampling[K]): void =>
     set('sampling', { ...config.sampling, [key]: value })
-  const samplingSet = SAMPLING_FIELDS.filter((f) => config.sampling[f.key] !== null).length
+  const samplingSet = SAMPLING_FIELDS.filter((f) => config.sampling[f.key] !== null).length + (config.sampling.drySequenceBreakers !== null ? 1 : 0)
   const set = <K extends keyof LoadConfig>(key: K, value: LoadConfig[K]): void => onChange({ ...config, [key]: value })
   const kvAll = (t: KvCacheType): boolean =>
     config.cacheTypeK === t && config.cacheTypeV === t && config.draftCacheTypeK === t && config.draftCacheTypeV === t
@@ -334,6 +335,18 @@ export function LoadSettingsForm({
               />
             </Field>
           ))}
+          <Field label="DRY sequence breakers" hint="One per line; empty = llama.cpp's own. Names added here are never penalised by DRY. Write a newline as \n">
+            <Textarea
+              rows={2}
+              className="font-mono text-xs"
+              placeholder={'\\n\n:\n"\n*'}
+              defaultValue={breakersToText(config.sampling.drySequenceBreakers ?? [])}
+              onBlur={(e) => {
+                const list = textToBreakers(e.target.value)
+                setSampling('drySequenceBreakers', list.length ? list : null)
+              }}
+            />
+          </Field>
           <Field
             inline
             label="Override what programs send"
@@ -413,14 +426,20 @@ export function LoadSettingsForm({
   )
 }
 
-type SamplingKey = Exclude<keyof ModelSampling, 'override'>
+type SamplingKey = Exclude<keyof ModelSampling, 'override' | 'drySequenceBreakers'>
 const SAMPLING_FIELDS: { key: SamplingKey; label: string; hint: string; placeholder: string; min: number; max: number; step: number; integer?: boolean }[] = [
   { key: 'temperature', label: 'Temperature', hint: 'Higher = more varied, lower = more predictable', placeholder: '0.8', min: 0, max: 5, step: 0.05 },
   { key: 'topK', label: 'Top K', hint: 'Pick only from this many likeliest tokens; 0 = off', placeholder: '40', min: 0, max: 1000, step: 1, integer: true },
   { key: 'topP', label: 'Top P', hint: 'Pick from the likeliest tokens that add up to this share', placeholder: '0.95', min: 0, max: 1, step: 0.01 },
   { key: 'minP', label: 'Min P', hint: 'Drop tokens far less likely than the top one', placeholder: '0.05', min: 0, max: 1, step: 0.01 },
   { key: 'repeatPenalty', label: 'Repeat penalty', hint: '1 = off; higher discourages repeating recent text', placeholder: '1.0', min: 0, max: 5, step: 0.05 },
-  { key: 'presencePenalty', label: 'Presence penalty', hint: 'Above 0 nudges toward new topics', placeholder: '0', min: -2, max: 2, step: 0.1 }
+  { key: 'presencePenalty', label: 'Presence penalty', hint: 'Above 0 nudges toward new topics', placeholder: '0', min: -2, max: 2, step: 0.1 },
+  { key: 'dryMultiplier', label: 'DRY multiplier', hint: '0 = off; around 0.8 stops the model repeating earlier phrases', placeholder: '0', min: 0, max: 5, step: 0.1 },
+  { key: 'dryBase', label: 'DRY base', hint: 'How fast the penalty grows with the length of the repeat', placeholder: '1.75', min: 1, max: 10, step: 0.05 },
+  { key: 'dryAllowedLength', label: 'DRY allowed length', hint: 'Repeats up to this many tokens are not penalised', placeholder: '2', min: 1, max: 1000, step: 1, integer: true },
+  { key: 'dryPenaltyLastN', label: 'DRY look-back', hint: 'Tokens to look back over; -1 = the whole context', placeholder: '-1', min: -1, max: 1000000, step: 1, integer: true },
+  { key: 'xtcProbability', label: 'XTC probability', hint: '0 = off; around 0.5 now and then skips the likeliest tokens for fresher wording', placeholder: '0', min: 0, max: 1, step: 0.05 },
+  { key: 'xtcThreshold', label: 'XTC threshold', hint: 'Only tokens above this chance can be skipped; above 0.5 turns XTC off', placeholder: '0.1', min: 0, max: 1, step: 0.01 }
 ]
 
 /** One slider per GPU; moving one rescales the others so the split always adds up to 100%. */

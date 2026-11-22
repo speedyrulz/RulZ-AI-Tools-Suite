@@ -85,6 +85,16 @@ export function buildServerArgs({ model, config: c, port, alias, adapters = [] }
   if (s.minP !== null) args.push('--min-p', String(s.minP))
   if (s.repeatPenalty !== null) args.push('--repeat-penalty', String(s.repeatPenalty))
   if (s.presencePenalty !== null) args.push('--presence-penalty', String(s.presencePenalty))
+  if (s.dryMultiplier !== null) args.push('--dry-multiplier', String(s.dryMultiplier))
+  if (s.dryBase !== null) args.push('--dry-base', String(s.dryBase))
+  if (s.dryAllowedLength !== null) args.push('--dry-allowed-length', String(s.dryAllowedLength))
+  if (s.dryPenaltyLastN !== null) args.push('--dry-penalty-last-n', String(s.dryPenaltyLastN))
+  // Breakers only matter while DRY is on, and a model with a multiplier of 0 or unset leaves them alone.
+  if (s.drySequenceBreakers !== null && s.dryMultiplier !== null && s.dryMultiplier > 0) {
+    for (const b of s.drySequenceBreakers) args.push('--dry-sequence-breaker', b)
+  }
+  if (s.xtcProbability !== null) args.push('--xtc-probability', String(s.xtcProbability))
+  if (s.xtcThreshold !== null) args.push('--xtc-threshold', String(s.xtcThreshold))
   if (c.extraArgs.trim()) args.push(...splitArgs(c.extraArgs))
   return args
 }

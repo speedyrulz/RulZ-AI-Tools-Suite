@@ -426,6 +426,28 @@ describe('model sampling defaults', () => {
     expect(parseRemoteLoadPatch({ sampling: { seed: 1 } }).ok).toBe(false)
   })
 
+  it('accepts, merges and returns the DRY and XTC values', () => {
+    const parsed = parseRemoteLoadPatch({ sampling: { dryMultiplier: 0.8, drySequenceBreakers: ['\n', 'Aria'], xtcProbability: 0.5, xtcThreshold: 0.1 } })
+    expect(parsed.ok).toBe(true)
+    if (!parsed.ok) return
+    const merged = applyRemoteLoadPatch({ ...DEFAULT_LOAD_CONFIG, sampling }, parsed.patch).sampling
+    expect(merged).toMatchObject({ temperature: 0.6, dryMultiplier: 0.8, drySequenceBreakers: ['\n', 'Aria'], xtcProbability: 0.5, xtcThreshold: 0.1, dryBase: null })
+    expect(parseRemoteLoadPatch({ sampling: { dryMultiplier: null } }).ok).toBe(true)
+    expect(parseRemoteLoadPatch({ sampling: { xtcProbability: 2 } }).ok).toBe(false)
+    expect(parseRemoteLoadPatch({ sampling: { dryAllowedLength: 1.5 } }).ok).toBe(false)
+    expect(overrideSampling({ model: 'x', xtc_probability: 0 }, merged)).toMatchObject({
+      dry_multiplier: 0.8,
+      dry_sequence_breakers: ['\n', 'Aria'],
+      xtc_probability: 0.5,
+      xtc_threshold: 0.1
+    })
+  })
+
+  it('gives sampling defaults saved before DRY and XTC existed empty ones', () => {
+    const old = { ...DEFAULT_LOAD_CONFIG, sampling: { temperature: 0.6 } }
+    expect(parseLoadConfig(old).sampling).toMatchObject({ temperature: 0.6, dryMultiplier: null, drySequenceBreakers: null, xtcProbability: null })
+  })
+
   it('overrides only the values that are set', () => {
     expect(overrideSampling({ model: 'x', temperature: 1, top_p: 0.5 }, sampling)).toEqual({ model: 'x', temperature: 0.6, top_k: 20, top_p: 0.5 })
   })
