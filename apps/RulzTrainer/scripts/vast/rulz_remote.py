@@ -47,6 +47,17 @@ APP = HERE.parents[1]
 STATE = Path(os.environ.get("RULZ_VAST_HOME") or Path.home() / ".rulz_vast")
 CONNECTION = STATE / "connection.json"
 PULLS = STATE / "runs"  # outside the checkout: pulled runs outlive a branch or a worktree
+
+
+def pulls_root() -> Path:
+    """Where downloads go now: the folder chosen on the WebUI's Fleet page (settings.pulls_dir in the fleet's
+    state.json), else PULLS. Read at each call, so the CLI and a running daemon follow a change."""
+    try:
+        chosen = json.loads((STATE / "fleet" / "state.json").read_text(encoding="utf-8"))["settings"]["pulls_dir"]
+    except (OSError, ValueError, KeyError, TypeError):
+        chosen = None
+    return Path(chosen) if isinstance(chosen, str) and chosen else PULLS
+
 REMOTE_DIR = "/workspace/RulzTrainer"
 PYTHON = '"$(test -x /venv/main/bin/python && echo /venv/main/bin/python || echo python3)"'
 AGENT_COMMANDS = {"status", "jobs", "job", "log", "probes", "config", "start", "stop", "queue", "snapshot",
@@ -352,9 +363,31 @@ def fetch(remote: Remote, base: str, files: list[str], dest: Path, *, progress=N
         raise SystemExit(f"tar on the instance ended with {proc.returncode}: the copy may be incomplete")
 
 
+def fleet_move_in_progress() -> dict | None:
+    """The journal of a move of the fleet's downloads folder when a live process is doing it, else None."""
+    try:
+        move = json.loads((STATE / "fleet" / "state.json").read_text(encoding="utf-8"))["settings"]["move"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(move, dict):
+        return None
+    if str(APP) not in sys.path:
+        sys.path.insert(0, str(APP))
+    from rulztrainer import storage
+
+    return move if storage.pid_alive(move.get("pid")) else None
+
+
 def cmd_pull(args) -> int:
     """Copy a job's files here. Files already here at the same size are skipped, so this can repeat during a run."""
-    dest = Path(args.dest) if args.dest else PULLS / str(args.remote.conn["id"])
+    if not args.dest and fleet_move_in_progress():
+        raise SystemExit("The downloads folder is being moved (from the WebUI's Fleet page). Try again when that is "
+                         "done, or pass --dest.")
+    root = pulls_root()
+    if not args.dest and root != PULLS and not root.is_dir():
+        raise SystemExit(f"The downloads folder {root} was not found (is the drive connected?). Change it on the "
+                         "WebUI's Fleet page, or pass --dest.")
+    dest = Path(args.dest) if args.dest else root / str(args.remote.conn["id"])
     extra = [a for what in args.what or [] for a in ("--what", what)]
     if args.step is not None:
         extra += ["--step", str(args.step)]

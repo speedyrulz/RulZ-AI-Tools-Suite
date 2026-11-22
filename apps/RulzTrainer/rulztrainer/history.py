@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import re
 import time
@@ -26,8 +27,12 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+from . import storage
+
+log = logging.getLogger(__name__)
+
 ROOT = Path(__file__).resolve().parents[1]
-HISTORY_DIR = ROOT / "output" / "_history"
+HISTORY_DIR = ROOT / "output" / "_history"  # the default; the user can choose another (history_dir())
 SCAN_DIRS = ("_history", "_crops")  # folders under output/ that are not jobs
 CONFIG_KEYS = ("job_name", "preset", "network_type", "lora_rank", "lokr_factor", "oft_block_size", "dora",
                "attn_localize", "id_align", "learning_rate", "optimizer", "lr_scheduler", "lr_min_factor",
@@ -39,6 +44,35 @@ CONFIG_KEYS = ("job_name", "preset", "network_type", "lora_rank", "lokr_factor",
                "probe_seeds", "probe_size", "probe_steps", "probe_cfg", "turbo_lora", "resolutions",
                "reward_steps", "body_align", "selftrain", "probe_ema", "body_score", "face_model", "lora_plus_ratio", "race_follow",
                "race_patience_rising", "race_pick")
+
+
+def history_dir() -> Path:
+    """Where the history is kept now: the folder the user chose (storage.json), else HISTORY_DIR. Read at every call,
+    so a change takes effect without a restart."""
+    chosen = storage.history_dir_setting()
+    return chosen if chosen is not None else HISTORY_DIR
+
+
+def missing_root() -> Path | None:
+    """The folder the user chose for the history when it is not there (an unplugged drive, an offline share), else
+    None. It is never created again silently: the page shows a banner and saves are skipped."""
+    chosen = storage.history_dir_setting()
+    if chosen is not None and not chosen.is_dir():
+        return chosen
+    return None
+
+
+def _can_write(root: Path) -> bool:
+    """False (with a warning) when the history is being moved or its chosen folder is missing: the write waits."""
+    if storage.history_move_active():
+        log.info("Run history not saved: the save folder is being moved; the next save repeats it")
+        return False
+    chosen = storage.history_dir_setting()
+    if chosen is not None and not chosen.is_dir():  # whichever root a caller names: a chosen one is never made up
+        log.warning("Run history not saved: the save folder %s was not found (is the drive connected?). "
+                    "Change it on the Previous Runs page.", chosen)
+        return False
+    return True
 
 
 def new_run_id(job_name: str, now: float | None = None) -> str:
@@ -114,11 +148,12 @@ def _source(path: str, base: Path | None = None) -> Path:
     return p if p.is_absolute() else ROOT / p
 
 
-def keep_probe_images(run_id: str, status: dict, root: Path = HISTORY_DIR, base: Path | None = None) -> list[dict]:
+def keep_probe_images(run_id: str, status: dict, root: Path | None = None, base: Path | None = None) -> list[dict]:
     """Copy the run's probe images into root/<run id>/ (JPEG, at most PROBE_THUMB_PX; already copied ones are kept)
     and return their entries: {"step", "kind", "seed", "racer", "file" (relative to root), "face", "body",
     "combined"} with that probe's scores (normalized where the run had them). base: the folder a vast.ai run was
     downloaded to (its images are looked for in base/probes/)."""
+    root = history_dir() if root is None else root
     names = race_names(status)
     out = []
     for rec in status.get("probes") or []:
@@ -311,9 +346,10 @@ MAPS_SUBDIR = "maps"  # root/<run id>/maps/: the kept copy of the job's training
 MAPS_DIRNAME = "training_maps"  # trainmaps.DIRNAME (not imported here)
 
 
-def keep_maps(run_id: str, job_dir, root: Path = HISTORY_DIR) -> bool:
+def keep_maps(run_id: str, job_dir, root: Path | None = None) -> bool:
     """Copy the job's training_maps/ files (probes.json, maps.jsonl, probe_*.jpg) into root/<run id>/maps/; a file
     already there with the same size and modification time is left alone. True when the kept copy has maps."""
+    root = history_dir() if root is None else root
     import shutil
 
     src = Path(job_dir) / MAPS_DIRNAME if job_dir else None
@@ -398,11 +434,12 @@ def _write(path: Path, record) -> None:
 
 
 def save_run(cfg, run_id: str, started: float, status: dict, state: str = "running",
-             root: Path = HISTORY_DIR) -> Path | None:
+             root: Path | None = None) -> Path | None:
     """Write (or update) this run's history file; nothing for a run that has no likeness data yet. A label the user
     gave the run is kept."""
+    root = history_dir() if root is None else root
     record = build_record(cfg.to_dict(), cfg.arch_name(), run_id, started, status, state)
-    if not has_data(record):
+    if not has_data(record) or not _can_write(root):
         return None
     path = root / f"{run_id}.json"
     record["probe_images"] = keep_probe_images(run_id, status, root)
@@ -418,11 +455,13 @@ def save_run(cfg, run_id: str, started: float, status: dict, state: str = "runni
     except (OSError, ValueError):
         pass
     _write(path, record)
+    storage.write_marker(root, "history")
     return path
 
 
-def list_runs(root: Path = HISTORY_DIR) -> list[dict]:
+def list_runs(root: Path | None = None) -> list[dict]:
     """Every saved run, newest first."""
+    root = history_dir() if root is None else root
     runs = []
     for p in sorted(root.glob("*.json")) if root.is_dir() else []:
         if p.name.startswith("_"):  # _hidden_vast.json and the like: not a run
@@ -436,17 +475,21 @@ def list_runs(root: Path = HISTORY_DIR) -> list[dict]:
     return sorted(runs, key=lambda r: r.get("started") or 0, reverse=True)
 
 
-def signature(root: Path = HISTORY_DIR) -> tuple:
+def signature(root: Path | None = None) -> tuple:
     """Changes whenever a history file is added, changed or removed (the page's cheap poll). With the size too: two
     writes can share a time stamp where the clock is coarse (Windows)."""
+    root = history_dir() if root is None else root
     if not root.is_dir():
         return ()
     return tuple((p.name, st.st_mtime_ns, st.st_size) for p, st in ((p, p.stat()) for p in sorted(root.glob("*.json"))
                                                   if not p.name.startswith("_")))
 
 
-def set_label(run_id: str, label: str, root: Path = HISTORY_DIR) -> bool:
+def set_label(run_id: str, label: str, root: Path | None = None) -> bool:
+    root = history_dir() if root is None else root
     path = root / f"{run_id}.json"
+    if not _can_write(root):
+        return False
     try:
         rec = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -456,8 +499,9 @@ def set_label(run_id: str, label: str, root: Path = HISTORY_DIR) -> bool:
     return True
 
 
-def hidden_vast(root: Path = HISTORY_DIR) -> set[str]:
+def hidden_vast(root: Path | None = None) -> set[str]:
     """The vast.ai runs the user removed from the list (the import does not bring them back)."""
+    root = history_dir() if root is None else root
     try:
         data = json.loads((root / HIDDEN_VAST).read_text(encoding="utf-8"))
         return {str(x) for x in data} if isinstance(data, list) else set()
@@ -465,11 +509,14 @@ def hidden_vast(root: Path = HISTORY_DIR) -> set[str]:
         return set()
 
 
-def delete_runs(run_ids: list[str], root: Path = HISTORY_DIR) -> int:
+def delete_runs(run_ids: list[str], root: Path | None = None) -> int:
     """Remove runs from the history (the record and the probe thumbnails). A vast.ai run's id is also put on the
     hidden list, so the next import of the Fleet's records leaves it out; the Fleet's record and the downloaded files
     are never touched."""
+    root = history_dir() if root is None else root
     n = 0
+    if not _can_write(root):
+        return 0
     vast = [r for r in run_ids if str(r).startswith(VAST_PREFIX)]
     if vast:
         _write(root / HIDDEN_VAST, sorted(hidden_vast(root) | set(vast)))
@@ -502,14 +549,17 @@ def status_files(output: Path) -> list[Path]:
     return sorted(found)
 
 
-def import_jobs(output: Path | None = None, root: Path = HISTORY_DIR) -> int:
+def import_jobs(output: Path | None = None, root: Path | None = None) -> int:
     """History for the job folders (output/**/status.json) from before the history existed: one run per folder whose
     job has no history yet and whose status.json holds likeness scores. A race run saved before the history kept each
     configuration's probes apart gets them from its folder, and a run saved before the history kept probe images or
     raw probe scores (probe_raw, for its spreadsheet) gets them when its folder still holds that same run (the same
     probe scores). Returns how many runs were added or updated."""
+    root = history_dir() if root is None else root
     import yaml
 
+    if not _can_write(root):
+        return 0
     output = output or ROOT / "output"
     runs = list_runs(root)
     have = {r["job"] for r in runs}
@@ -581,6 +631,8 @@ def import_jobs(output: Path | None = None, root: Path = HISTORY_DIR) -> int:
             _write(root / f"{record['id']}.json", record)
             have.add(job)
             added += 1
+    if added:
+        storage.write_marker(root, "history")
     return added
 
 
@@ -600,13 +652,14 @@ def _mtime(path: Path) -> int:
         return 0
 
 
-def import_fleet_runs(fleet_dir: Path = FLEET_RUNS_DIR, root: Path = HISTORY_DIR) -> int:
+def import_fleet_runs(fleet_dir: Path = FLEET_RUNS_DIR, root: Path | None = None) -> int:
     """History for the training runs the Fleet tracked on vast.ai instances (one JSON per run in the Fleet's runs
     folder): id "vast-<key>", the likeness data from the run's downloaded status.json where there is one, else from
     the Fleet's own record; probe images from the download's probes/ folder. A run is rewritten only when its Fleet
     data changed or its record was imported by an older version (VAST_IMPORT_VERSION); a label the user gave it is kept; runs the user removed (delete_runs) are not brought back.
     Returns how many runs were added or updated."""
-    if not fleet_dir.is_dir():
+    root = history_dir() if root is None else root
+    if not fleet_dir.is_dir() or not _can_write(root):
         return 0
     hidden = hidden_vast(root)
     added = 0
@@ -625,7 +678,8 @@ def import_fleet_runs(fleet_dir: Path = FLEET_RUNS_DIR, root: Path = HISTORY_DIR
             folder = None
         status_path = folder / "status.json" if folder else None
         stamp = [VAST_IMPORT_VERSION, fr.get("modified"), fr.get("step"), fr.get("state"), fr.get("ended"),
-                 _mtime(status_path) if status_path else 0, sorted(fr.get("downloaded") or [])]
+                 _mtime(status_path) if status_path else 0, sorted(fr.get("downloaded") or []),
+                 str(folder or "")]  # the folder too: moving the downloads imports the run again
         out_path = root / f"{run_id}.json"
         old: dict = {}
         try:
@@ -679,4 +733,100 @@ def import_fleet_runs(fleet_dir: Path = FLEET_RUNS_DIR, root: Path = HISTORY_DIR
         except OSError:
             continue
         added += 1
+    if added:
+        storage.write_marker(root, "history")
     return added
+
+
+# ------------------------------------------------------------------ changing the save folder
+
+def plan_save_folder(text) -> dict:
+    """Check a new history folder the user typed. Returns {"path", "old", "warnings", "files", "bytes", "has_old"};
+    raises storage.StorageError with the reason. Nothing is created or changed."""
+    old = history_dir()
+    new, warnings = storage.validate_root(text, kind="history", old=old, default=HISTORY_DIR,
+                                          output_dir=ROOT / "output")
+    files, size = storage.tree_stats(old) if old.is_dir() else (0, 0)
+    return {"path": new, "old": old, "warnings": warnings, "files": files, "bytes": size,
+            "has_old": storage.has_data(old)}
+
+
+def _switch_to(new: Path):
+    def switch():
+        storage.set_history_dir(None if storage.same_path(new, HISTORY_DIR) else new)
+    return switch
+
+
+def carry_skip_lists(old: Path, new: Path) -> int:
+    """Start fresh: the old folder's lists (files named _*.json, such as _hidden_vast.json: the vast.ai runs the user
+    removed) go along, so removed runs do not come back through the imports. Existing files in new are kept."""
+    n = 0
+    if not old.is_dir():
+        return 0
+    new.mkdir(parents=True, exist_ok=True)
+    for p in old.glob("_*.json"):
+        if p.is_file() and not (new / p.name).exists():
+            try:
+                import shutil
+
+                shutil.copy2(p, new / p.name)
+                n += 1
+            except OSError:
+                pass
+    return n
+
+
+def apply_save_folder(text, mode: str = "fresh", progress=None, blocked=None) -> dict:
+    """Switch the history to the folder `text`. mode "move": the old folder's data goes there (storage.move_folder);
+    "fresh": the old data stays where it is and the new folder starts empty (its skip lists are carried over).
+    blocked: a function that returns why now is not the time ("" when it is), asked right before anything is moved or
+    switched (the WebUI passes "a training run is going"). Raises storage.StorageError (the setting unchanged) when
+    the folder is refused or a move fails before the switch. Returns {"path", "method", "files", "bytes",
+    "leftovers"}."""
+    def check() -> None:
+        why = blocked() if blocked else ""
+        if why:
+            raise storage.StorageError(why)
+
+    with storage.move_guard("history"):
+        plan = plan_save_folder(text)
+        old, new = plan["old"], plan["path"]
+        if storage.history_move():
+            raise storage.StorageError("An earlier move of the history was not finished: resume or cancel it first.")
+        check()
+        if mode == "move" and plan["has_old"]:
+            result = storage.move_folder(old, new, kind="history", switch=_switch_to(new),
+                                         set_move=storage.set_history_move, clear_move=storage.clear_history_move,
+                                         progress=progress, check=check)
+            return {**result, "path": new}
+        if plan["has_old"]:
+            carry_skip_lists(old, new)
+            storage.write_marker(old, "history")  # adopted: its data stays there
+        new.mkdir(parents=True, exist_ok=True)
+        storage.write_marker(new, "history")
+        check()
+        _switch_to(new)()
+        return {"path": new, "method": "fresh" if plan["has_old"] else "nothing", "files": 0, "bytes": 0,
+                "leftovers": []}
+
+
+def resume_save_move(progress=None) -> dict:
+    """Finish a move that was cut off (the journal in storage.json)."""
+    with storage.move_guard("history"):
+        journal = storage.history_move()
+        if not journal:
+            raise storage.StorageError("No move to resume.")
+        if storage.pid_alive(journal.get("pid")) and int(journal.get("pid") or 0) != os.getpid():
+            raise storage.StorageError("That move is still going in another program.")
+        new = Path(journal["to"])
+        return storage.move_folder(journal["from"], new, kind="history", switch=_switch_to(new),
+                                   set_move=storage.set_history_move, clear_move=storage.clear_history_move,
+                                   journal=journal, progress=progress)
+
+
+def cancel_save_move() -> dict:
+    with storage.move_guard("history"):
+        journal = storage.history_move()
+        if not journal:
+            raise storage.StorageError("No move to cancel.")
+        return storage.cancel_move(journal, storage.clear_history_move)
