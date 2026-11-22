@@ -8,6 +8,7 @@ import type {
   AssemblyPart,
   AssemblyPartKind,
   AssemblyResult,
+  AssemblyStateGroup,
   AssemblySummary,
   Counted
 } from './novel'
@@ -26,9 +27,11 @@ const SEPARATOR = scaffoldTokens(2)
 const HEADING = {
   bible: 'Story bible',
   story: 'Story so far',
+  state: 'State before this scene',
   scene: 'This scene',
   relevant: 'Also relevant',
   prose: 'The text so far',
+  wholeScene: 'The scene text',
   after: 'Text after the cursor',
   task: 'Your task'
 } as const
@@ -95,8 +98,18 @@ interface EntryChoice {
   cut: boolean
 }
 
-// Fixed before triggered happens by group; inside a group: priority high first, then name, then id.
+/** Actions that need the whole scene text in the request (stage 3). */
+const WHOLE_SCENE_ACTIONS = ['checkScene', 'updateState']
+
+/** The share of the available context the state of fixed entities may take (no setting, see the design). */
+const STATE_SHARE = 0.08
+
+const STATE_LABEL = 'State before this scene:'
+
+// Fixed before triggered happens by group; inside a group: voice targets first, then priority high first,
+// then name, then id. (Groups never move: a voice target only goes first inside its own group.)
 function byPriority(a: AssemblyEntry, b: AssemblyEntry): number {
+  if (Boolean(a.voice) !== Boolean(b.voice)) return a.voice ? -1 : 1
   if (a.priority !== b.priority) return b.priority - a.priority
   return a.name.localeCompare(b.name, 'en') || a.id.localeCompare(b.id, 'en')
 }
@@ -150,10 +163,82 @@ function fitSummaries(summaries: AssemblySummary[], room: number, dropped: Assem
 }
 
 // ---------------------------------------------------------------------------------------------
+// Tracked state (stage 3)
+// ---------------------------------------------------------------------------------------------
+
+/** A triggered entry with its state lines appended; the short form keeps them too (they go with the entry). */
+function withState(entry: AssemblyEntry, group: AssemblyStateGroup | undefined): AssemblyEntry {
+  if (!group || !group.text.trim()) return entry
+  const extra = `\n\n${STATE_LABEL}\n${group.text}`
+  const cost = group.tokens + scaffoldTokens(extra.length - group.text.length)
+  return {
+    ...entry,
+    text: entry.text + extra,
+    tokens: entry.tokens + cost,
+    short: { text: entry.short.text + extra, tokens: entry.short.tokens + cost }
+  }
+}
+
+interface StateItem extends Counted {
+  group: AssemblyStateGroup
+  /** 0 = POV, 1 = present, 2 = anything else; then entry priority. */
+  rank: number
+  priority: number
+}
+
+function stateRank(entry: AssemblyEntry, povId?: string | null, presentIds?: string[]): number {
+  if (povId !== undefined || presentIds !== undefined) {
+    if (povId === entry.id) return 0
+    if (presentIds?.includes(entry.id)) return 1
+    return 2
+  }
+  if (entry.reason === 'pov') return 0
+  if (entry.reason === 'present') return 1
+  return 2
+}
+
+/** "### Name" then the lines; a group text that already starts with a heading is used as it is. */
+function stateItem(
+  group: AssemblyStateGroup,
+  entry: AssemblyEntry,
+  povId?: string | null,
+  presentIds?: string[]
+): StateItem {
+  const text = group.text.trimStart().startsWith('###') ? group.text : `### ${group.name}\n${group.text}`
+  const tokens = group.tokens + (text === group.text ? 0 : scaffoldTokens(text.length - group.text.length))
+  return { text, tokens, group, rank: stateRank(entry, povId, presentIds), priority: entry.priority }
+}
+
+/**
+ * Fits the state of the fixed entities into `cap`: whole groups are dropped, POV first kept, then present,
+ * then by entry priority. Returns the groups that stay, in that order.
+ */
+function fitState(items: StateItem[], cap: number, dropped: AssemblyDropped[]): StateItem[] {
+  const kept = [...items].sort(
+    (a, b) =>
+      a.rank - b.rank ||
+      b.priority - a.priority ||
+      a.group.name.localeCompare(b.group.name, 'en') ||
+      a.group.entity.localeCompare(b.group.entity, 'en')
+  )
+  while (kept.length > 0 && sectionTokens(HEADING.state, kept) > cap) {
+    const last = kept.pop() as StateItem
+    dropped.push({ kind: 'state', label: last.group.name, how: 'dropped', reason: 'budget' })
+  }
+  return kept
+}
+
+// ---------------------------------------------------------------------------------------------
 // Assembly
 // ---------------------------------------------------------------------------------------------
 
-export function assembleRequest(input: AssemblyInput): AssemblyResult {
+/**
+ * The input plus the scene POV and present entry ids, so state is ranked by who is in the scene even when an
+ * entry reason says 'always' (an always entry that is also the POV is still the POV).
+ */
+export type AssemblyRequest = AssemblyInput & { povId?: string | null; presentIds?: string[] }
+
+export function assembleRequest(input: AssemblyRequest): AssemblyResult {
   const { system, task, scene, summaries, proseBlocks, proseAfter, budget } = input
   const available =
     input.contextLength -
@@ -178,7 +263,9 @@ export function assembleRequest(input: AssemblyInput): AssemblyResult {
   const afterCost = proseAfter.text ? sectionTokens(HEADING.after, [proseAfter]) : 0
   // Each block carries the separator in front of it, so the anchor sees the real cost of a block.
   const blocks: Counted[] = proseBlocks.map((block) => ({ text: block.text, tokens: block.tokens + SEPARATOR }))
-  const blocksHeading = blocks.length > 0 ? headingTokens(HEADING.prose) : 0
+  const wholeScene = WHOLE_SCENE_ACTIONS.includes(input.action)
+  const proseHeading = wholeScene ? HEADING.wholeScene : HEADING.prose
+  const blocksHeading = blocks.length > 0 ? headingTokens(proseHeading) : 0
   const proseTotal = blocksHeading + sumTokens(blocks) + afterCost
   const floor = Math.min(800, proseTotal)
   if (base + floor > available) {
@@ -188,17 +275,43 @@ export function assembleRequest(input: AssemblyInput): AssemblyResult {
   // The room reserved for the tail while the other parts are fitted: the whole cap whenever there is
   // any prose, not the tail that happens to be chosen, so entries and summaries do not change while the
   // prose grows or steps. What the tail does not use flows back to it at the end.
-  const reserve = proseTotal > 0 ? proseCap : 0
+  // A whole-scene action (check, update state) needs all of the scene text, so all of it is reserved.
+  const reserve = proseTotal > 0 ? (wholeScene ? Math.min(proseTotal, Math.max(0, available - base)) : proseCap) : 0
   let remaining = Math.max(0, available - base - reserve)
 
   // 4 + 5. Entries share bibleShare of the available context: fixed first, triggered get the rest.
   const bibleCap = Math.max(0, Math.floor(available * budget.bibleShare))
   const fixed = input.entries.filter((entry) => entry.fixed).sort(byPriority)
-  const triggered = input.entries.filter((entry) => !entry.fixed).sort(byPriority)
+  const groupOf = new Map<string, AssemblyStateGroup>()
+  for (const group of input.stateGroups ?? []) if (!groupOf.has(group.entity)) groupOf.set(group.entity, group)
+  const triggered = input.entries
+    .filter((entry) => !entry.fixed)
+    .map((entry) => withState(entry, groupOf.get(entry.id)))
+    .sort(byPriority)
   const fixedCap = Math.max(0, Math.min(bibleCap, remaining))
   const fixedChoices = fitEntries(fixed, HEADING.bible, fixedCap, 'fixedEntries', dropped)
   const fixedCost = sectionTokens(HEADING.bible, fixedChoices.map((item) => item.piece))
   remaining -= fixedCost
+
+  // Tracked state of the fixed entries: its own cap, fitted before the triggered entries and the story so
+  // far, charged at its actual cost. A group goes when its entry did.
+  const keptFixed = new Map(fixedChoices.map((item) => [item.entry.id, item.entry]))
+  const stateItems: StateItem[] = []
+  for (const group of input.stateGroups ?? []) {
+    if (!group.text.trim()) continue
+    if (!fixed.some((entry) => entry.id === group.entity)) continue
+    const owner = keptFixed.get(group.entity)
+    if (!owner) {
+      dropped.push({ kind: 'state', label: group.name, how: 'dropped', reason: 'its entry was dropped' })
+      continue
+    }
+    stateItems.push(stateItem(group, owner, input.povId, input.presentIds))
+  }
+  const stateCap = Math.max(0, Math.min(Math.floor(available * STATE_SHARE), remaining))
+  const stateKept = fitState(stateItems, stateCap, dropped)
+  const stateCost = sectionTokens(HEADING.state, stateKept)
+  remaining -= stateCost
+
   const triggeredCap = Math.max(0, Math.min(bibleCap - fixedCost, remaining))
   const triggeredChoices = fitEntries(triggered, HEADING.relevant, triggeredCap, 'triggeredEntries', dropped)
   const triggeredCost = sectionTokens(HEADING.relevant, triggeredChoices.map((item) => item.piece))
@@ -211,14 +324,17 @@ export function assembleRequest(input: AssemblyInput): AssemblyResult {
 
   // Whatever is still unused goes back to the prose tail: the anchor is chosen again with the larger
   // budget. It does not depend on which tail was reserved above, only on what the other parts took.
-  const proseRoom = Math.max(floor, available - base - fixedCost - triggeredCost - storyCost)
+  const proseRoom = Math.max(floor, available - base - fixedCost - stateCost - triggeredCost - storyCost)
   const tailBudget = Math.max(0, proseRoom - afterCost - blocksHeading)
   const proseStart = anchorProse(blocks, tailBudget, input.anchorStep)
   const proseBlockList = proseBlocks.slice(proseStart)
   const proseCost =
-    (proseBlockList.length > 0 ? headingTokens(HEADING.prose) : 0) +
+    (proseBlockList.length > 0 ? headingTokens(proseHeading) : 0) +
     blocks.slice(proseStart).reduce((total, block) => total + block.tokens, 0) +
     afterCost
+  if (wholeScene && (proseStart > 0 || proseCost > proseRoom)) {
+    warnings.push('The whole scene does not fit in the available context; this action needs all of it.')
+  }
   if (proseStart > 0) {
     dropped.push({
       kind: 'prose',
@@ -238,6 +354,7 @@ export function assembleRequest(input: AssemblyInput): AssemblyResult {
   addPart('scene', sceneCost, null, Boolean(scene.text))
   addPart('prose', proseCost, proseRoom, proseCost > 0)
   addPart('fixedEntries', fixedCost, fixedCap, fixedChoices.length > 0)
+  addPart('state', stateCost, stateCap, stateKept.length > 0)
   addPart('triggeredEntries', triggeredCost, triggeredCap, triggeredChoices.length > 0)
   addPart('storySoFar', storyCost, storyRoom, storyKept.length > 0)
 
@@ -248,9 +365,10 @@ export function assembleRequest(input: AssemblyInput): AssemblyResult {
   }
   addSection(HEADING.bible, fixedChoices.map((item) => item.piece.text))
   addSection(HEADING.story, storyKept.map((item) => item.text))
+  addSection(HEADING.state, stateKept.map((item) => item.text))
   addSection(HEADING.scene, scene.text ? [scene.text] : [])
   addSection(HEADING.relevant, triggeredChoices.map((item) => item.piece.text))
-  addSection(HEADING.prose, proseBlockList.map((block) => block.text))
+  addSection(proseHeading, proseBlockList.map((block) => block.text))
   addSection(HEADING.after, proseAfter.text ? [proseAfter.text] : [])
   addSection(HEADING.task, task.text ? [task.text] : [])
 

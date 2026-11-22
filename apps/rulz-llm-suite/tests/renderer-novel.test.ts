@@ -238,7 +238,10 @@ function projectState(): NovelProjectState {
     words: { [PATH]: 3 },
     missing: [],
     orphans: [],
-    blocked: null
+    blocked: null,
+    state: { facts: [], invalid: [], problem: null, canReset: false },
+    dismissed: {},
+    checksProblem: null
   }
 }
 

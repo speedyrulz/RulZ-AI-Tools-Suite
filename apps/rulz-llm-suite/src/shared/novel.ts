@@ -140,6 +140,97 @@ export interface NovelProjectState {
   orphans: string[]
   /** project.json or outline.json could not be parsed: the project is read-only (data safety rule 8). */
   blocked: string | null
+  /** Tracked state (state.json), stage 3. Statuses are computed by the renderer with novelState.ts. */
+  state: NovelStateFile
+  /** Dismissed check findings per scene id (.rulz/checks.json): finding keys. */
+  dismissed: Record<string, string[]>
+  /** .rulz/checks.json could not be read: dismissals are ignored and not written. */
+  checksProblem: string | null
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 3: tracked state (state.json), checks, voice. Design: docs/writing-mode-design.md, "Stage 3 design".
+// ---------------------------------------------------------------------------------------------
+
+export type StateKind = 'location' | 'knows' | 'carries' | 'condition' | 'relationship' | 'other'
+
+export interface StateFact {
+  /** 'f' + random, made by the renderer. */
+  id: string
+  /** Bible entry id. */
+  entity: string
+  kind: StateKind
+  /** Trimmed, one line, 1-300 characters. */
+  value: string
+  /** The other entry's id; required for 'relationship', null for every other kind. */
+  about: string | null
+  /** Scene id where the fact became true. */
+  from: string
+  /** Scene id where it stopped being true, or null. */
+  until: string | null
+}
+
+/** A fact in state.json that did not validate; kept verbatim in the file, listed for removal. */
+export interface StateInvalidFact {
+  index: number
+  reason: string
+  /** sha256 of the raw JSON of the fact, so a removal hits the fact that was shown. */
+  hash: string
+  raw: string
+}
+
+export interface NovelStateFile {
+  facts: StateFact[]
+  invalid: StateInvalidFact[]
+  /** Missing mid-session, 0 bytes, not JSON, format > 1 or no facts array: read-only, never written. */
+  problem: string | null
+  /** True when problem is a missing or 0-byte file, so 'reset' is allowed. */
+  canReset: boolean
+}
+
+export type StateFactStatus = 'ok' | 'detached' | 'inverted'
+
+export type StateOp =
+  | { op: 'add'; fact: StateFact }
+  | { op: 'end'; factId: string; until: string }
+  | { op: 'edit'; factId: string; changes: Partial<Omit<StateFact, 'id'>> }
+  | { op: 'remove'; factId: string }
+  | { op: 'removeInvalid'; index: number; hash: string }
+  | { op: 'reset' }
+
+export interface NovelStatePatchResult {
+  state: NovelProjectState
+  /** Ops that were not applied, by their index in the request. */
+  rejected: { index: number; reason: string }[]
+}
+
+export type FindingType = 'continuity' | 'character' | 'timeline' | 'pov' | 'tense' | 'other'
+
+export interface CheckFinding {
+  type: FindingType
+  quote: string
+  problem: string
+  conflictsWith: string
+  suggestion: string
+}
+
+export interface CheckReply {
+  findings: CheckFinding[]
+}
+
+export type UpdateStateChange =
+  | { op: 'add'; entity: string; kind: StateKind; value: string; about: string | null }
+  | { op: 'end'; factId: string; reason: string }
+
+export interface UpdateStateReply {
+  changes: UpdateStateChange[]
+}
+
+/** State lines of one entity, before the current scene, for assembly. */
+export interface AssemblyStateGroup extends Counted {
+  /** Bible entry id. */
+  entity: string
+  name: string
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -215,10 +306,13 @@ export type NovelAction =
   | 'summarizeChapter'
   | 'outlineChapters'
   | 'outlineScenes'
+  | 'checkScene'
+  | 'updateState'
+  | 'interview'
 
 export type RewriteVariant = 'tighter' | 'vivid' | 'tone' | 'show' | 'custom'
 
-export type AssemblyPartKind = 'system' | 'task' | 'scene' | 'prose' | 'fixedEntries' | 'triggeredEntries' | 'storySoFar'
+export type AssemblyPartKind = 'system' | 'task' | 'scene' | 'prose' | 'fixedEntries' | 'triggeredEntries' | 'storySoFar' | 'state'
 
 /** A piece of text the assembler may include, with its real token count (counted by the renderer). */
 export interface Counted {
@@ -233,8 +327,10 @@ export interface AssemblyEntry extends Counted {
   /** Why it is a candidate: "always", "pov", "present", "sticky", "trigger: witch", "via: Mara Venn". */
   reason: string
   fixed: boolean
-  /** The entry cut to its first paragraph, used before dropping it. */
+  /** The entry cut to its first paragraph (plus its voice section for a voice target), used before dropping it. */
   short: Counted
+  /** Stage 3: a voice target (character for Dialogue, or named in the selection); sorted first in its group. */
+  voice?: boolean
 }
 
 export interface AssemblySummary extends Counted {
@@ -264,6 +360,11 @@ export interface AssemblyInput {
   proseAfter: Counted
   /** Anchor step in tokens (about a quarter of the tail budget) for a stable prose start. */
   anchorStep: number
+  /**
+   * Stage 3: state before the current scene, one group per entity with 'ok' facts. Groups of fixed entities go in
+   * the 'state' part; groups of triggered entities ride inside their entry. Optional: missing = no state.
+   */
+  stateGroups?: AssemblyStateGroup[]
 }
 
 export interface AssemblyPart {
@@ -339,6 +440,10 @@ export interface NovelIpcInvoke {
   'novel:deleteProject': (folder: string) => void
   /** Renderer's answer to the 'novel:flush' event: every dirty buffer is saved or journalled. */
   'novel:flushDone': () => void
+  /** Stage 3: applies the valid ops to state.json, returns the rejected ones with reasons. */
+  'novel:statePatch': (folder: string, ops: StateOp[]) => NovelStatePatchResult
+  /** Stage 3: (un)dismisses a check finding for a scene in .rulz/checks.json. */
+  'novel:dismissFinding': (folder: string, sceneId: string, key: string, dismissed: boolean) => NovelProjectState
   /** Token count of a text on the loaded model (cached per instance); null if the model can't count. */
   'chat:countText': (modelId: string, text: string) => number | null
 }

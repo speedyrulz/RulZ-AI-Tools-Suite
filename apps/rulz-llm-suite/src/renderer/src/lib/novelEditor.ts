@@ -1,17 +1,101 @@
 // CodeMirror 6 setup for the Writing page: a Markdown prose editor coloured from the app's CSS
 // variables (so dark and light both work), plus the "pending AI change" view built on the unified
 // merge view. The text is never reformatted: what the editor holds is what the store saves.
-import { Annotation, Compartment, EditorState, type Extension } from '@codemirror/state'
-import { EditorView, drawSelection, keymap, placeholder as placeholderExt } from '@codemirror/view'
+import { Annotation, Compartment, EditorState, StateEffect, StateField, type ChangeDesc, type Extension } from '@codemirror/state'
+import { Decoration, EditorView, GutterMarker, drawSelection, gutter, keymap, placeholder as placeholderExt } from '@codemirror/view'
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
 import { markdown } from '@codemirror/lang-markdown'
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language'
 import { highlightSelectionMatches, search, searchKeymap } from '@codemirror/search'
 import { getChunks, getOriginalDoc, unifiedMergeView } from '@codemirror/merge'
 import { tags as t } from '@lezer/highlight'
+import type { FindingType } from '@shared/novel'
+import { locateQuote } from '@shared/novelChecks'
 
 /** Marks transactions made by the app (loading text, showing a pending change), not by typing. */
 const External = Annotation.define<boolean>()
+
+// ---------------------------------------------------------------------------------------------
+// Check findings: an underline and a gutter mark per located quote, kept in step with edits
+// ---------------------------------------------------------------------------------------------
+
+/** A finding to show: its key, type and the quote to find in the text. */
+export interface FindingSpec {
+  id: string
+  type: FindingType
+  quote: string
+}
+
+export interface FindingMark {
+  id: string
+  type: FindingType
+  from: number
+  to: number
+}
+
+/** Where each spec's quote is in `text`; a quote that is not found has no mark. */
+export function locateMarks(text: string, specs: FindingSpec[]): FindingMark[] {
+  const out: FindingMark[] = []
+  for (const s of specs) {
+    const r = locateQuote(text, s.quote)
+    if (r && r.to > r.from) out.push({ id: s.id, type: s.type, from: r.from, to: r.to })
+  }
+  return out
+}
+
+/**
+ * The marks after an edit. Text typed at an edge stays outside; a range whose text was deleted (or replaced
+ * as a whole) is empty afterwards and is dropped.
+ */
+export function mapMarks(marks: FindingMark[], changes: ChangeDesc): FindingMark[] {
+  const out: FindingMark[] = []
+  for (const m of marks) {
+    const from = changes.mapPos(m.from, 1)
+    const to = changes.mapPos(m.to, -1)
+    if (to > from) out.push({ ...m, from, to })
+  }
+  return out
+}
+
+const setMarks = StateEffect.define<FindingMark[]>()
+
+const marksField = StateField.define<FindingMark[]>({
+  create: () => [],
+  update(value, tr) {
+    let next = tr.docChanged ? mapMarks(value, tr.changes) : value
+    for (const e of tr.effects) if (e.is(setMarks)) next = e.value
+    return next
+  },
+  provide: (f) =>
+    EditorView.decorations.compute([f], (state) =>
+      Decoration.set(
+        state
+          .field(f)
+          .filter((m) => m.to <= state.doc.length)
+          .map((m) => Decoration.mark({ class: `rz-finding rz-finding-${m.type}`, attributes: { 'data-finding': m.id } }).range(m.from, m.to)),
+        true
+      )
+    )
+})
+
+class FindingDot extends GutterMarker {
+  toDOM(): HTMLElement {
+    const el = document.createElement('span')
+    el.className = 'rz-finding-dot'
+    el.setAttribute('aria-hidden', 'true')
+    return el
+  }
+}
+const findingDot = new FindingDot()
+
+const findingGutter = gutter({
+  class: 'rz-finding-gutter',
+  lineMarker(view, line) {
+    return view.state.field(marksField).some((m) => m.from < line.to + 1 && m.to > line.from) ? findingDot : null
+  },
+  lineMarkerChange: (u) => u.docChanged || u.transactions.some((tr) => tr.effects.some((e) => e.is(setMarks))),
+  initialSpacer: () => findingDot
+})
 
 const markdownStyle = HighlightStyle.define([
   { tag: t.heading, fontWeight: '650', color: 'var(--text)' },
@@ -100,6 +184,10 @@ function themeFor(dark: boolean, wide: boolean): Extension {
       '.rz-chunk-btn:hover': { backgroundColor: 'var(--hover)', borderColor: 'var(--border-strong)' },
       '.rz-chunk-btn:focus-visible': { outline: '2px solid var(--accent)', outlineOffset: '2px' },
       '.rz-chunk-accept': { borderColor: 'color-mix(in srgb, var(--ok) 55%, transparent)' },
+      // Check findings
+      '.rz-finding': { textDecorationLine: 'underline', textDecorationStyle: 'wavy', textDecorationColor: 'var(--warn)', textUnderlineOffset: '3px' },
+      '.rz-finding-gutter': { width: '14px' },
+      '.rz-finding-dot': { display: 'block', width: '6px', height: '6px', margin: '11px 4px 0', borderRadius: '6px', backgroundColor: 'var(--warn)' },
       '.cm-changeGutter': { width: '3px', backgroundColor: 'transparent' },
       '.cm-gutters': { backgroundColor: 'transparent', border: 'none' }
     },
@@ -135,6 +223,12 @@ export interface EditorHandle {
   /** The baseline with only the changes accepted so far: what Reject all leaves. */
   pendingRejectAll: () => string
   selection: () => { from: number; to: number }
+  /** Shows the findings: each quote is located in the document now, and the marks follow later edits. */
+  setFindings: (specs: FindingSpec[]) => void
+  /** Where a finding's text is now (after edits); null when it was deleted or never found. */
+  findingRange: (id: string) => { from: number; to: number } | null
+  /** Selects a range and scrolls it into view. */
+  reveal: (from: number, to: number) => void
   focus: () => void
   destroy: () => void
 }
@@ -154,6 +248,8 @@ export function createEditor(parent: HTMLElement, opts: EditorOptions): EditorHa
   const readOnlyComp = new Compartment()
   const themeComp = new Compartment()
   const mergeComp = new Compartment()
+  const gutterComp = new Compartment()
+  let findings: FindingSpec[] = []
   let pending: PendingView | null = null
   let handle: EditorHandle
 
@@ -196,6 +292,8 @@ export function createEditor(parent: HTMLElement, opts: EditorOptions): EditorHa
       themeComp.of(themeFor(opts.dark, opts.prose)),
       readOnlyComp.of([EditorState.readOnly.of(opts.readOnly), EditorView.editable.of(!opts.readOnly)]),
       mergeComp.of([]),
+      marksField,
+      gutterComp.of([]),
       EditorView.contentAttributes.of({ 'aria-label': opts.prose ? 'Scene text' : 'Text', spellcheck: 'true' }),
       listener
     ]
@@ -244,12 +342,32 @@ export function createEditor(parent: HTMLElement, opts: EditorOptions): EditorHa
       }
     })
 
+  // The findings are located again whenever the whole text is swapped (a reload, an accepted change): the old ranges are gone then.
+  const showFindings = (): void => {
+    const marks = pending || findings.length === 0 ? [] : locateMarks(view.state.doc.toString(), findings)
+    view.dispatch({ effects: [setMarks.of(marks), gutterComp.reconfigure(marks.length ? findingGutter : [])] })
+  }
+
   handle = {
     view,
     lastText: opts.doc,
     setText(text) {
       handle.lastText = text
       view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text }, annotations: External.of(true) })
+      if (findings.length) showFindings()
+    },
+    setFindings(specs) {
+      findings = specs
+      showFindings()
+    },
+    findingRange(id) {
+      const m = view.state.field(marksField).find((x) => x.id === id)
+      return m ? { from: m.from, to: m.to } : null
+    },
+    reveal(from, to) {
+      const len = view.state.doc.length
+      view.dispatch({ selection: { anchor: Math.min(from, len), head: Math.min(to, len) }, effects: EditorView.scrollIntoView(Math.min(from, len), { y: 'center' }) })
+      view.focus()
     },
     setReadOnly(on) {
       readOnlyBase = on
@@ -262,6 +380,7 @@ export function createEditor(parent: HTMLElement, opts: EditorOptions): EditorHa
       // Off first, so the merge state restarts from this baseline instead of keeping the old one.
       view.dispatch({ effects: mergeComp.reconfigure([]) })
       pending = p
+      if (findings.length) showFindings()
       view.dispatch({
         changes: { from: 0, to: view.state.doc.length, insert: p.proposed },
         annotations: External.of(true),
@@ -277,6 +396,7 @@ export function createEditor(parent: HTMLElement, opts: EditorOptions): EditorHa
       if (view.state.doc.length !== text.length || view.state.doc.toString() !== text) {
         view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text }, annotations: External.of(true) })
       }
+      if (findings.length) showFindings()
     },
     pendingAcceptAll() {
       return view.state.doc.toString()

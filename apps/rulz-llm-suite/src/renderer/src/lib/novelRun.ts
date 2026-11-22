@@ -5,21 +5,29 @@ import type {
   AssemblyEntry,
   AssemblyInput,
   AssemblyResult,
+  AssemblyStateGroup,
   AssemblySummary,
   BibleEntry,
+  CheckFinding,
   Counted,
   NovelAction,
   NovelChapter,
   NovelOutline,
   NovelProject,
   NovelScene,
-  RewriteVariant
+  RewriteVariant,
+  StateFact,
+  StateOp,
+  UpdateStateChange
 } from '@shared/novel'
 import type { ChatRequest, LoadAdapter, SamplingParams, StreamEvent, WireMessage } from '@shared/types'
-import { assembleRequest } from '@shared/novelAssembly'
+import { assembleRequest, type AssemblyRequest } from '@shared/novelAssembly'
 import { findScene } from '@shared/novelOutline'
-import { cleanProse, entryListText, entryShortText, entryText, isProseAction, resolveEntryRef, summaryText, sceneText, taskText, systemText } from '@shared/novelPrompts'
-import { matchEntries } from '@shared/novelTriggers'
+import { cleanProse, entryListText, entryShortText, entryText, interviewSystem, isProseAction, resolveEntryRef, summaryText, sceneText, taskText, systemText } from '@shared/novelPrompts'
+import { findingKey, locateQuote } from '@shared/novelChecks'
+import { factsAtScene, formatStateLines, stateBefore } from '@shared/novelState'
+import { matchEntries, voiceTargets } from '@shared/novelTriggers'
+import { shortWithVoice } from '@shared/novelVoice'
 import { sceneHashKey, splitParagraphs } from '@shared/novelText'
 import { errorMessage, invoke, on } from './api'
 import { uid } from './format'
@@ -140,6 +148,8 @@ export interface RunContext {
   count?: number
   /** Text of the previous scene, for Draft scene on an empty scene. */
   previousText?: string
+  /** Stage 3: the tracked facts (state.json), for the state part, the voice targets and Update state. */
+  facts?: StateFact[]
   contextLength: number
   templateOverhead: number
 }
@@ -281,10 +291,45 @@ function chapterOverview(outline: NovelOutline): string {
   return ['Existing chapters:', ...outline.chapters.map((c, i) => `${i + 1}. ${c.title}${c.act ? ` (${c.act})` : ''}${c.summary.trim() ? `: ${c.summary.trim()}` : ''}`)].join('\n')
 }
 
-function entryIdList(bible: BibleEntry[]): string {
+export function entryIdList(bible: BibleEntry[], purpose: 'scene' | 'state' = 'scene'): string {
   const list = bible.filter((e) => e.kind === 'character' || e.kind === 'place')
   if (!list.length) return ''
-  return ['Bible entries (use their ids for pov and present):', entryListText(list)].join('\n')
+  const head = purpose === 'state' ? 'Bible entries (use their names or ids for entity and about):' : 'Bible entries (use their ids for pov and present):'
+  return [head, entryListText(list)].join('\n')
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 3: tracked state in requests, voice targets
+// ---------------------------------------------------------------------------------------------
+
+const nameOfEntry = (bible: BibleEntry[], id: string): string => bible.find((e) => e.id === id)?.name ?? id
+
+/** One fact as the Update state prompt and the cards show it: "[f1a2b3] Mara Venn — location: the lighthouse". */
+export function factLine(fact: StateFact, bible: BibleEntry[], withId = true): string {
+  const about = fact.kind === 'relationship' && fact.about ? ` (${nameOfEntry(bible, fact.about)})` : ''
+  return `${withId ? `[${fact.id}] ` : ''}${nameOfEntry(bible, fact.entity)} — ${fact.kind}${about}: ${fact.value}`
+}
+
+/** The state before a scene, one group per entity (order of first appearance), as the assembler takes it once counted. */
+export function stateGroupTexts(facts: StateFact[], sceneId: string, outline: NovelOutline, bible: BibleEntry[]): { entity: string; name: string; text: string }[] {
+  const held = stateBefore(facts, sceneId, outline, bible)
+  const by = new Map<string, StateFact[]>()
+  for (const f of held) by.set(f.entity, [...(by.get(f.entity) ?? []), f])
+  const out: { entity: string; name: string; text: string }[] = []
+  for (const [entity, list] of by) {
+    const text = formatStateLines(list, bible)
+    if (text.trim()) out.push({ entity, name: nameOfEntry(bible, entity), text })
+  }
+  return out
+}
+
+/** New fact ids: 'f' + random, made here, never by main. */
+export function newFactId(): string {
+  const bytes = new Uint8Array(6)
+  globalThis.crypto.getRandomValues(bytes)
+  let out = ''
+  for (const b of bytes) out += '0123456789abcdefghijklmnopqrstuvwxyz'[b % 36]
+  return `f${out}`
 }
 
 /**
@@ -363,18 +408,32 @@ export async function buildRequest(ctx: RunContext, count: CountFn, estimated: {
 
   // --- text parts
   const systemStr = systemText(action, ctx.style, project.povTense)
+  const facts = ctx.facts ?? []
+  // Update state: what held before the scene (with ids) and what is already recorded at it, so a re-run does not repeat it.
+  let stateBeforeText = ''
+  let recordedText = ''
+  if (action === 'updateState' && scene) {
+    stateBeforeText = stateBefore(facts, scene.id, outline, bible)
+      .map((f) => factLine(f, bible))
+      .join('\n')
+    const rec = factsAtScene(facts, scene.id)
+    recordedText = [...rec.added.map((f) => factLine(f, bible)), ...rec.ended.map((f) => `${factLine(f, bible)} (ended here)`)].join('\n')
+  }
   const taskStr = taskText(action, {
     variant: ctx.variant,
     note: ctx.note,
     selection: selected || undefined,
     targetWords: targetWordsFor(action, scene?.targetWords ?? null, project.budget.replyTokens),
-    count: ctx.count
+    count: ctx.count,
+    stateBeforeText,
+    recordedText
   })
   let sceneStr = ''
   if (action === 'outlineChapters') sceneStr = [chapterOverview(outline), entryIdList(bible)].filter(Boolean).join('\n\n')
   else if (action === 'outlineScenes' && chapter) sceneStr = chapterText(chapter, outline, bible)
   else if (action === 'summarizeChapter' && chapter) sceneStr = summarySource(chapter)
   else if (scene && chapter) sceneStr = sceneText(scene, chapter, entriesById)
+  if (action === 'updateState' && sceneStr) sceneStr = [sceneStr, entryIdList(bible, 'state')].filter(Boolean).join('\n\n')
 
   // --- summaries
   let raw: RawSummary[] = []
@@ -383,18 +442,23 @@ export async function buildRequest(ctx: RunContext, count: CountFn, estimated: {
   else if (scene) raw = collectSummaries(outline, ctx.sceneHashes, chapterIndex, sceneIndex)
 
   // --- entries
+  // Check and Update state read the whole scene, so the scan covers all of it.
+  const wholeScene = action === 'checkScene' || action === 'updateState'
   const scan =
     action === 'outlineChapters'
       ? [outline.chapters.map((c) => `${c.title} ${c.summary}`).join('\n'), ctx.note].join('\n')
-      : scene
-        ? scanTextFor(ctx, scene)
-        : [chapter?.title, chapter?.summary, ctx.note].filter(Boolean).join('\n')
+      : scene && wholeScene
+        ? [scene.beats, ctx.text, ctx.note].filter((x) => x.trim()).join('\n')
+        : scene
+          ? scanTextFor(ctx, scene)
+          : [chapter?.title, chapter?.summary, ctx.note].filter(Boolean).join('\n')
   const candidates = matchEntries(bible, scan, scene)
+  const voice = new Set(scene ? voiceTargets(action, scene, selected, bible) : [])
 
   // --- prose
   let proseTexts: string[] = []
   let afterStr = ''
-  if (action === 'summarizeScene') proseTexts = splitParagraphs(ctx.text)
+  if (action === 'summarizeScene' || wholeScene) proseTexts = splitParagraphs(ctx.text)
   else if (isProseAction(action)) {
     if (action === 'draftScene' && !before.trim()) proseTexts = tailBlocks(ctx.previousText ?? '', 2400)
     else proseTexts = splitParagraphs(before)
@@ -402,10 +466,15 @@ export async function buildRequest(ctx: RunContext, count: CountFn, estimated: {
   }
 
   // --- count everything that is not yet counted
-  const entryTexts = candidates.map((c) => ({ full: entryText(c.entry), short: entryShortText(c.entry) }))
+  // A voice target's short form keeps its voice section.
+  const entryTexts = candidates.map((c) => ({
+    full: entryText(c.entry),
+    short: voice.has(c.entry.id) ? entryText({ ...c.entry, body: shortWithVoice(c.entry.body) }) : entryShortText(c.entry)
+  }))
   const summaryTexts = raw.map((r) => summaryText(r.label, r.content))
+  const stateTexts = scene ? stateGroupTexts(facts, scene.id, outline, bible) : []
   const counts = await countAll(
-    [systemStr, taskStr, sceneStr, afterStr, ...entryTexts.flatMap((e) => [e.full, e.short]), ...summaryTexts, ...proseTexts],
+    [systemStr, taskStr, sceneStr, afterStr, ...entryTexts.flatMap((e) => [e.full, e.short]), ...summaryTexts, ...proseTexts, ...stateTexts.map((g) => g.text)],
     (t) => count(t)
   )
   let at = 0
@@ -422,14 +491,16 @@ export async function buildRequest(ctx: RunContext, count: CountFn, estimated: {
     fixed: c.fixed,
     text: entryTexts[i].full,
     tokens: take(),
-    short: { text: entryTexts[i].short, tokens: take() }
+    short: { text: entryTexts[i].short, tokens: take() },
+    ...(voice.has(c.entry.id) ? { voice: true } : {})
   }))
   const summaries: AssemblySummary[] = raw.map((r, i) => ({ label: r.label, kind: r.kind, fallback: r.fallback, text: summaryTexts[i], tokens: take() }))
   const proseBlocks: Counted[] = proseTexts.map((t) => ({ text: t, tokens: take() }))
+  const stateGroups: AssemblyStateGroup[] = stateTexts.map((g) => ({ ...g, tokens: take() }))
 
   const reply = project.budget.replyTokens
   const available0 = Math.max(512, ctx.contextLength - reply - Math.max(256, Math.ceil(ctx.contextLength * 0.03)))
-  const input: AssemblyInput = {
+  const input: AssemblyRequest = {
     action,
     contextLength: ctx.contextLength,
     templateOverhead: ctx.templateOverhead,
@@ -442,7 +513,11 @@ export async function buildRequest(ctx: RunContext, count: CountFn, estimated: {
     proseBlocks,
     proseAfter,
     // Depends on the model and budget only, so the prose start stays put between presses of Continue.
-    anchorStep: Math.max(128, Math.round((available0 * project.budget.proseShare) / 4))
+    anchorStep: Math.max(128, Math.round((available0 * project.budget.proseShare) / 4)),
+    ...(stateGroups.length ? { stateGroups } : {}),
+    // The scene's roles rank tracked state under its cap (POV first, then present), whatever the entry's reason.
+    povId: scene?.pov ?? null,
+    presentIds: scene?.present ?? []
   }
   const result = assembleRequest(input)
 
@@ -596,13 +671,17 @@ export interface GenInput {
   maxTokens: number
   /** JSON schema for structured actions. */
   schema?: object
+  /** Free text, no thinking (the interview): defaults to whether the action is a prose action. */
+  prose?: boolean
   onDelta?: (text: string) => void
   onProgress?: (fraction: number | null) => void
 }
 
+const wantsProse = (input: Pick<GenInput, 'action' | 'prose'>): boolean => input.prose ?? isProseAction(input.action)
+
 /** The sampling a request goes out with: project settings, a given seed and reply size, and the schema for structured actions. */
-export function samplingFor(base: SamplingParams, input: Pick<GenInput, 'seed' | 'maxTokens' | 'schema' | 'action'>): SamplingParams {
-  const structured = !isProseAction(input.action)
+export function samplingFor(base: SamplingParams, input: Pick<GenInput, 'seed' | 'maxTokens' | 'schema' | 'action' | 'prose'>): SamplingParams {
+  const structured = !wantsProse(input)
   return {
     ...base,
     seed: input.seed,
@@ -643,7 +722,7 @@ export function startGeneration(input: GenInput): GenHandle {
     sampling: samplingFor(input.sampling, input),
     adapters: input.adapters,
     overflow: 'stop',
-    disableThinking: isProseAction(input.action),
+    disableThinking: wantsProse(input),
     prefitted: true
   }
   invoke('chat:start', req).catch((e) => end({ text, error: errorMessage(e), stopped: false }))
@@ -679,7 +758,10 @@ export const ACTION_LABELS: Record<NovelAction, string> = {
   summarizeScene: 'Summarize scene',
   summarizeChapter: 'Summarize chapter',
   outlineChapters: 'Plan chapters',
-  outlineScenes: 'Plan scenes'
+  outlineScenes: 'Plan scenes',
+  checkScene: 'Check',
+  updateState: 'Update state',
+  interview: 'Interview'
 }
 
 export const VARIANT_LABELS: Record<RewriteVariant, string> = {
@@ -688,4 +770,279 @@ export const VARIANT_LABELS: Record<RewriteVariant, string> = {
   tone: 'Different tone…',
   show: "Show, don't tell",
   custom: 'Custom…'
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 3: check findings
+// ---------------------------------------------------------------------------------------------
+
+/** What a Check made for one scene: the findings and the text they were made from (hash), kept in memory only. */
+export interface FindingsEntry {
+  /** hashText of the scene text the check read; a different hash on the current text means the findings are out of date. */
+  textHash: string
+  items: CheckFinding[]
+  at: number
+  /** findingKey → the quote was found in the text when the check ended (false = listed without a mark). */
+  located: Record<string, boolean>
+}
+
+/** Findings with the same type and quote are one (the model repeats itself); the first wins. */
+export function dedupeFindings(items: CheckFinding[]): CheckFinding[] {
+  const seen = new Set<string>()
+  const out: CheckFinding[] = []
+  for (const f of items) {
+    const key = findingKey(f)
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(f)
+  }
+  return out
+}
+
+/** The findings that are not dismissed for the scene. */
+export function visibleFindings(items: CheckFinding[], dismissedKeys: string[] | undefined): CheckFinding[] {
+  if (!dismissedKeys?.length) return items
+  const hide = new Set(dismissedKeys)
+  return items.filter((f) => !hide.has(findingKey(f)))
+}
+
+/** Where each finding's quote is in the text (null = not found), by finding key. */
+export function locateFindings(text: string, items: CheckFinding[]): Record<string, { from: number; to: number } | null> {
+  const out: Record<string, { from: number; to: number } | null> = {}
+  for (const f of items) out[findingKey(f)] = locateQuote(text, f.quote)
+  return out
+}
+
+export function makeFindingsEntry(text: string, items: CheckFinding[], at = Date.now()): FindingsEntry {
+  const list = dedupeFindings(items)
+  const where = locateFindings(text, list)
+  return { textHash: hashText(text), items: list, at, located: Object.fromEntries(Object.entries(where).map(([k, v]) => [k, v !== null])) }
+}
+
+/** Why the Check cannot be sent, or null: the whole scene has to go with it. */
+export function wholeSceneProblem(built: Pick<BuiltRequest, 'result'>): string | null {
+  if (built.result.proseStart <= 0 && !built.result.warnings.some((w) => /whole scene/i.test(w))) return null
+  return 'The whole scene does not fit in the context, and Check and Update state need all of it. Load a model with a longer context, or shorten the style, entries or summaries.'
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 3: Update state card
+// ---------------------------------------------------------------------------------------------
+
+export interface PlannedAdd {
+  op: 'add'
+  entity: string
+  kind: StateFact['kind']
+  value: string
+  about: string | null
+}
+
+export interface PlannedEnd {
+  op: 'end'
+  factId: string
+}
+
+export interface StateCardItem {
+  /** Position in the list, the key for Accept / Reject. */
+  key: number
+  planned: PlannedAdd | PlannedEnd
+  /** The change in words: "Mara Venn — carries: the brass key", "ends: Mara Venn — location: the lighthouse (she left)". */
+  label: string
+  accepted: boolean
+}
+
+export interface ResolvedStateChanges {
+  items: StateCardItem[]
+  /** Changes left out, with why: unresolved names, unknown fact ids, values that cannot be stored. */
+  left: string[]
+}
+
+const oneLine = (s: string): string => s.replace(/\s+/g, ' ').trim()
+
+/**
+ * Turns the model's changes into what a card can apply: names resolved with resolveEntryRef, fact ids checked
+ * against the facts shown to the model. Anything that does not resolve is listed in `left` and not offered.
+ */
+export function resolveStateChanges(changes: UpdateStateChange[], bible: BibleEntry[], before: StateFact[]): ResolvedStateChanges {
+  const items: StateCardItem[] = []
+  const left: string[] = []
+  const ended = new Set<string>()
+  for (const c of changes) {
+    if (c.op === 'end') {
+      const fact = before.find((f) => f.id === c.factId.trim())
+      if (!fact) {
+        left.push(`Unknown fact id "${c.factId}" (ending a fact)`)
+        continue
+      }
+      if (ended.has(fact.id)) continue
+      ended.add(fact.id)
+      const why = oneLine(c.reason)
+      items.push({ key: items.length, planned: { op: 'end', factId: fact.id }, label: `Ends: ${factLine(fact, bible, false)}${why ? ` (${why})` : ''}`, accepted: true })
+      continue
+    }
+    const value = oneLine(c.value)
+    const shown = `${c.entity}: ${c.kind}: ${value}`
+    const entity = resolveEntryRef(bible, c.entity)
+    if (!entity) {
+      left.push(`Not in the bible: "${c.entity}" (${c.kind}: ${value})`)
+      continue
+    }
+    let about: string | null = null
+    if (c.kind === 'relationship') {
+      about = c.about ? resolveEntryRef(bible, c.about) : null
+      // An empty about is sent as null: main rejects it and the card shows its reason.
+      if (c.about && !about) {
+        left.push(`Not in the bible: "${c.about}" (${shown})`)
+        continue
+      }
+    }
+    if (!value) {
+      left.push(`Empty value (${c.entity}: ${c.kind})`)
+      continue
+    }
+    if (value.length > 300) {
+      left.push(`Value over 300 characters (${c.entity}: ${c.kind})`)
+      continue
+    }
+    const planned: PlannedAdd = { op: 'add', entity, kind: c.kind, value, about }
+    items.push({ key: items.length, planned, label: `Adds: ${factLine({ id: '', entity, kind: c.kind, value, about, from: '', until: null }, bible, false)}`, accepted: true })
+  }
+  return { items, left }
+}
+
+/** The ops for the accepted items, in order, with a label for each so a rejection can be shown against its change. */
+export function stateOpsFor(items: StateCardItem[], sceneId: string, makeId: () => string = newFactId): { ops: StateOp[]; labels: string[] } {
+  const ops: StateOp[] = []
+  const labels: string[] = []
+  for (const it of items) {
+    if (!it.accepted) continue
+    if (it.planned.op === 'add') {
+      const p = it.planned
+      ops.push({ op: 'add', fact: { id: makeId(), entity: p.entity, kind: p.kind, value: p.value, about: p.about, from: sceneId, until: null } })
+    } else {
+      ops.push({ op: 'end', factId: it.planned.factId, until: sceneId })
+    }
+    labels.push(it.label)
+  }
+  return { ops, labels }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 3: character interview
+// ---------------------------------------------------------------------------------------------
+
+export interface InterviewTurn {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+/** History is kept per character and scene. */
+export const interviewKey = (characterId: string, sceneId: string): string => `${characterId}::${sceneId}`
+
+/** Summaries of the scenes before this one where the character is POV or present, oldest first. Scenes without a summary are left out. */
+export function interviewSummaries(outline: NovelOutline, characterId: string, sceneId: string): string[] {
+  const out: string[] = []
+  for (const c of outline.chapters) {
+    for (const s of c.scenes) {
+      if (s.id === sceneId) return out
+      if ((s.pov === characterId || s.present.includes(characterId)) && s.summary.trim()) out.push(`${s.title}: ${s.summary.trim()}`)
+    }
+  }
+  return out
+}
+
+/** The interview's system prompt: the entry (live text), the character's state before the scene, and the scenes they were in. */
+export function buildInterviewSystem(opts: { entry: BibleEntry; body: string; facts: StateFact[]; sceneId: string; outline: NovelOutline; bible: BibleEntry[] }): string {
+  const { entry, body, facts, sceneId, outline, bible } = opts
+  const mine = stateBefore(facts, sceneId, outline, bible).filter((f) => f.entity === entry.id)
+  return interviewSystem({
+    name: entry.name,
+    body,
+    stateLines: mine.length ? formatStateLines(mine, bible) : '',
+    summaries: interviewSummaries(outline, entry.id, sceneId)
+  })
+}
+
+export interface InterviewFit {
+  messages: { role: 'system' | 'user' | 'assistant'; content: string }[]
+  /** Turns dropped from the front of the history to make it fit (never the system prompt). */
+  dropped: number
+  /** Not even the system prompt and the question fit. */
+  tooBig: boolean
+  tokens: number | null
+}
+
+/**
+ * The whole request is counted before it is sent; the oldest turns go first until it fits `limit`.
+ * `countWhole` returns null when the model cannot count: the sizes are then estimated.
+ */
+export async function fitInterview(
+  system: string,
+  turns: InterviewTurn[],
+  question: string,
+  countWhole: (messages: InterviewFit['messages']) => Promise<number | null>,
+  limit: number
+): Promise<InterviewFit> {
+  let start = 0
+  const build = (): InterviewFit['messages'] => [{ role: 'system', content: system }, ...turns.slice(start), { role: 'user', content: question }]
+  const size = async (messages: InterviewFit['messages']): Promise<number> => (await countWhole(messages)) ?? messages.reduce((n, m) => n + estimateTokens(m.content) + 8, 48)
+  let messages = build()
+  let tokens = await size(messages)
+  while (tokens > limit && start < turns.length) {
+    // Whole exchanges go, so the history still starts with the author's question.
+    start++
+    while (start < turns.length && turns[start].role !== 'user') start++
+    messages = build()
+    tokens = await size(messages)
+  }
+  return { messages, dropped: start, tooBig: tokens > limit, tokens }
+}
+
+/** Why "Add to voice notes" is not possible for an entry, or null. */
+export function voiceNoteBlock(
+  s: { state: { blocked: string | null } | null; buffers: Record<string, { conflict: unknown; readOnly: boolean } | undefined>; pending: { path: string } | null; gen: { path: string | null } | null },
+  path: string
+): string | null {
+  if (s.state?.blocked) return 'The project is read-only.'
+  if (s.pending?.path === path) return 'This entry has a change waiting to be accepted or rejected.'
+  if (s.gen?.path === path) return 'This entry is being written to.'
+  const b = s.buffers[path]
+  if (b?.conflict) return 'This entry has a save conflict. Resolve it first.'
+  if (b?.readOnly) return 'This entry is read-only.'
+  return null
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 3: the State tab's edits as ops
+// ---------------------------------------------------------------------------------------------
+
+/** The fields of the fact form (empty string = none). */
+export interface FactValues {
+  entity: string
+  kind: StateFact['kind']
+  value: string
+  about: string
+  from: string
+  until: string
+}
+
+export const factValues = (f: StateFact): FactValues => ({ entity: f.entity, kind: f.kind, value: f.value, about: f.about ?? '', from: f.from, until: f.until ?? '' })
+
+/** The edit op for what changed in the form; [] when nothing did. `about` is cleared when the kind is not a relationship. */
+export function factEditOps(f: StateFact, v: FactValues): StateOp[] {
+  const changes: Partial<Omit<StateFact, 'id'>> = {}
+  if (v.entity !== f.entity) changes.entity = v.entity
+  if (v.kind !== f.kind) changes.kind = v.kind
+  if (v.value.trim() !== f.value) changes.value = v.value.trim()
+  const about = v.kind === 'relationship' ? v.about || null : null
+  if (about !== f.about) changes.about = about
+  if (v.from !== f.from) changes.from = v.from
+  const until = v.until || null
+  if (until !== f.until) changes.until = until
+  return Object.keys(changes).length ? [{ op: 'edit', factId: f.id, changes }] : []
+}
+
+/** The add op for the form. */
+export function factAddOp(v: FactValues, makeId: () => string = newFactId): StateOp {
+  return { op: 'add', fact: { id: makeId(), entity: v.entity, kind: v.kind, value: v.value.trim(), about: v.kind === 'relationship' ? v.about || null : null, from: v.from, until: v.until || null } }
 }

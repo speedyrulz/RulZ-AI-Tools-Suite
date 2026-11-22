@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { anchorProse, assembleRequest } from '../src/shared/novelAssembly'
-import type { AssemblyEntry, AssemblyInput, AssemblySummary, Counted } from '../src/shared/novel'
+import type { AssemblyEntry, AssemblyInput, AssemblyStateGroup, AssemblySummary, Counted } from '../src/shared/novel'
 
 // Scaffolding the assembler adds (see novelAssembly.ts): each item costs one token for the blank line
 // in front of it, and each section its heading: "## Heading" + 2 characters, ceil(chars / 3).
@@ -465,5 +465,230 @@ describe('assembleRequest review fixes', () => {
   it('caps the step at half the budget', () => {
     // Step 5000 would leave only block 0; capped to 100 there are anchor points every block.
     expect(anchorProse(blocks(10, 100), 450, 5000)).toBe(6)
+  })
+})
+
+// ---------------------------------------------------------------------------------------------
+// Stage 3: tracked state, voice targets, whole-scene actions
+// ---------------------------------------------------------------------------------------------
+
+const group = (entity: string, tokens: number, name = entity): AssemblyStateGroup => ({
+  entity,
+  name,
+  text: `- location: ${entity} place`,
+  tokens
+})
+
+const fixedEntry = (id: string, reason: string, over: Partial<AssemblyEntry> = {}): AssemblyEntry =>
+  entry(id, 20, { reason, fixed: true, ...over })
+
+describe('tracked state in requests', () => {
+  it('puts the state of fixed entities after story so far and before this scene', () => {
+    const text = userText(
+      input({
+        entries: [fixedEntry('mara', 'pov')],
+        summaries: [summary('Chapter 1', 30)],
+        stateGroups: [group('mara', 20, 'Mara Venn')]
+      })
+    )
+    const at = (s: string): number => text.indexOf(s)
+    expect(at('## Story bible')).toBeGreaterThanOrEqual(0)
+    expect(at('## Story bible')).toBeLessThan(at('## Story so far'))
+    expect(at('## Story so far')).toBeLessThan(at('## State before this scene'))
+    expect(at('## State before this scene')).toBeLessThan(at('## This scene'))
+    expect(text).toContain('### Mara Venn\n- location: mara place')
+  })
+
+  it('keeps everything before "This scene" identical while the prose grows or a new trigger fires', () => {
+    const base = {
+      entries: [fixedEntry('mara', 'pov'), fixedEntry('oskar', 'present')],
+      summaries: [summary('Chapter 1', 40), summary('Scene: one', 30, 'scene')],
+      stateGroups: [group('mara', 20), group('oskar', 20)]
+    }
+    const prefix = (over: Partial<AssemblyInput>): string => {
+      const result = assembleRequest(input({ ...base, ...over }))
+      const user = result.messages[1].content
+      return result.messages[0].content + '|' + user.slice(0, user.indexOf('## This scene'))
+    }
+    const first = prefix({ proseBlocks: blocks(3, 50) })
+    expect(first).toContain('## State before this scene')
+    expect(prefix({ proseBlocks: blocks(9, 50) })).toBe(first)
+    const trigger = entry('witch', 30, { reason: 'trigger: witch', fixed: false })
+    expect(prefix({ proseBlocks: blocks(9, 50), entries: [...base.entries, trigger] })).toBe(first)
+    const withState = prefix({
+      proseBlocks: blocks(12, 50),
+      entries: [...base.entries, trigger],
+      stateGroups: [...base.stateGroups, group('witch', 15)]
+    })
+    // The state of a triggered entity rides inside that entry, so the prefix is still the same.
+    expect(withState).toBe(first)
+  })
+
+  it('appends the state of a triggered entity to that entry and charges it to the triggered part', () => {
+    const trigger = entry('witch', 30, { reason: 'trigger: witch', fixed: false, name: 'Witch' })
+    const plain = assembleRequest(input({ entries: [trigger] }))
+    const result = assembleRequest(input({ entries: [trigger], stateGroups: [group('witch', 15)] }))
+    const text = result.messages[1].content
+    expect(text).toContain('witch full\n\nState before this scene:\n- location: witch place')
+    expect(text).not.toContain('## State before this scene')
+    const tokens = (r: typeof plain, kind: string): number => r.parts.find((p) => p.kind === kind)?.tokens ?? 0
+    expect(tokens(result, 'triggeredEntries') - tokens(plain, 'triggeredEntries')).toBeGreaterThanOrEqual(15)
+    expect(result.parts.some((p) => p.kind === 'state')).toBe(false)
+  })
+
+  it('drops the state of a triggered entity together with the entry', () => {
+    const big = entry('witch', 4000, { reason: 'trigger: witch', fixed: false, short: c('witch short', 3500) })
+    const result = assembleRequest(input({ entries: [big], stateGroups: [group('witch', 15)] }))
+    expect(result.includedEntries).not.toContain('witch')
+    expect(result.messages[1].content).not.toContain('witch place')
+    expect(result.dropped.some((d) => d.kind === 'triggeredEntries' && d.label === 'witch')).toBe(true)
+  })
+
+  it('cuts the state to 8% of the available context and reports the cap in parts', () => {
+    // available = 3320, cap = floor(3320 * 0.08) = 265.
+    const result = assembleRequest(
+      input({
+        entries: [fixedEntry('a', 'pov'), fixedEntry('b', 'present'), fixedEntry('c', 'always')],
+        stateGroups: [group('a', 100), group('b', 100), group('c', 100)]
+      })
+    )
+    const part = result.parts.find((p) => p.kind === 'state')
+    expect(part?.cap).toBe(265)
+    expect(part?.tokens).toBeLessThanOrEqual(265)
+    expect(part?.tokens).toBeGreaterThan(200)
+  })
+
+  it('drops whole groups: POV is kept first, then present, then by entry priority', () => {
+    const entries = [
+      fixedEntry('pov', 'pov', { priority: 1 }),
+      fixedEntry('near', 'present', { priority: 10 }),
+      fixedEntry('far', 'present', { priority: 90 }),
+      fixedEntry('lore', 'always', { priority: 99 })
+    ]
+    const stateGroups = [group('lore', 70), group('far', 70), group('near', 70), group('pov', 70)]
+    const result = assembleRequest(input({ entries, stateGroups }))
+    const text = result.messages[1].content
+    // 265 cap: header 9 + 3 groups of 70 + 3 + 1 = 74 -> 231 fit, a fourth does not.
+    expect(text).toContain('### pov')
+    expect(text).toContain('### far')
+    expect(text).toContain('### near')
+    expect(text).not.toContain('### lore')
+    expect(result.dropped.filter((d) => d.kind === 'state').map((d) => d.label)).toEqual(['lore'])
+
+    const tighter = assembleRequest(input({ entries, stateGroups: stateGroups.map((g) => ({ ...g, tokens: 110 })) }))
+    const t = tighter.messages[1].content
+    expect(t).toContain('### pov')
+    expect(t).toContain('### far')
+    expect(t).not.toContain('### near')
+    expect(t).not.toContain('### lore')
+    expect(tighter.dropped.filter((d) => d.kind === 'state').map((d) => d.label)).toEqual(['lore', 'near'])
+  })
+
+  it('drops the state group of a fixed entry that was itself dropped', () => {
+    const huge = entry('mara', 5000, { reason: 'present', fixed: true, short: c('mara short', 4000) })
+    const result = assembleRequest(input({ entries: [huge], stateGroups: [group('mara', 20)] }))
+    expect(result.includedEntries).not.toContain('mara')
+    expect(result.messages[1].content).not.toContain('mara place')
+    expect(result.dropped.some((d) => d.kind === 'state' && d.label === 'mara')).toBe(true)
+  })
+
+  it('ignores groups of entities that are no candidates and empty groups', () => {
+    const result = assembleRequest(
+      input({
+        entries: [fixedEntry('mara', 'pov')],
+        stateGroups: [group('stranger', 20), { entity: 'mara', name: 'mara', text: '  ', tokens: 0 }]
+      })
+    )
+    expect(result.parts.some((p) => p.kind === 'state')).toBe(false)
+    expect(result.messages[1].content).not.toContain('stranger')
+  })
+
+  it('does not change a request without state groups', () => {
+    const base = input({ entries: [fixedEntry('mara', 'pov')], proseBlocks: blocks(4, 50) })
+    expect(assembleRequest({ ...base, stateGroups: [] })).toEqual(assembleRequest(base))
+  })
+})
+
+describe('voice targets', () => {
+  it('sorts a voice entry first inside its own group and never across groups', () => {
+    const entries = [
+      fixedEntry('hi', 'present', { priority: 90, name: 'Hi' }),
+      fixedEntry('lo', 'present', { priority: 10, name: 'Lo', voice: true }),
+      entry('tr-hi', 20, { reason: 'trigger: x', fixed: false, priority: 80, name: 'TrHi' }),
+      entry('tr-lo', 20, { reason: 'trigger: y', fixed: false, priority: 5, name: 'TrLo', voice: true })
+    ]
+    const result = assembleRequest(input({ entries }))
+    expect(result.includedEntries).toEqual(['lo', 'hi', 'tr-lo', 'tr-hi'])
+  })
+
+  it('cuts and drops a voice entry last', () => {
+    // Fixed cap = 0.3 * 3320 = 996 tokens; two entries of 600 do not fit, one does.
+    const entries = [
+      entry('hi', 600, { reason: 'present', fixed: true, priority: 90, short: c('hi short', 600) }),
+      entry('lo', 600, { reason: 'present', fixed: true, priority: 10, voice: true, short: c('lo short', 600) })
+    ]
+    const result = assembleRequest(input({ entries }))
+    expect(result.includedEntries).toEqual(['lo'])
+  })
+})
+
+describe('whole-scene actions', () => {
+  const longScene = blocks(20, 100)
+  const recaps = [summary('Chapter 1', 600), summary('Chapter 2', 600), summary('Chapter 3', 600)]
+
+  it('keeps the whole scene by shrinking the other parts', () => {
+    for (const action of ['checkScene', 'updateState'] as const) {
+      const result = assembleRequest(
+        input({
+          action,
+          proseBlocks: longScene,
+          summaries: recaps
+        })
+      )
+      expect(result.proseStart).toBe(0)
+      expect(result.warnings.some((w) => w.includes('whole scene'))).toBe(false)
+      expect(result.messages[1].content).toContain('## The scene text')
+      expect(result.messages[1].content).toContain('paragraph 0')
+      expect(result.messages[1].content).toContain('paragraph 19')
+      expect(result.dropped.some((d) => d.kind === 'storySoFar')).toBe(true)
+    }
+    // A continue request with the same pieces cuts the tail instead.
+    expect(assembleRequest(input({ action: 'continue', proseBlocks: longScene, summaries: recaps })).proseStart).toBeGreaterThan(0)
+  })
+
+  it('signals with proseStart > 0 and a warning when the scene cannot fit', () => {
+    const huge = blocks(60, 100)
+    for (const action of ['checkScene', 'updateState'] as const) {
+      const result = assembleRequest(input({ action, proseBlocks: huge }))
+      expect(result.proseStart).toBeGreaterThan(0)
+      expect(result.warnings.some((w) => w.includes('whole scene'))).toBe(true)
+    }
+    expect(assembleRequest(input({ action: 'continue', proseBlocks: huge })).warnings.some((w) => w.includes('whole scene'))).toBe(false)
+  })
+})
+
+describe('review fixes', () => {
+  it('warns about the whole scene for a single oversized block', () => {
+    for (const action of ['checkScene', 'updateState'] as const) {
+      const result = assembleRequest(input({ action, proseBlocks: [c('one huge paragraph', 5000)] }))
+      expect(result.proseStart).toBe(0)
+      expect(result.warnings.some((w) => w.includes('whole scene'))).toBe(true)
+    }
+    const ok = assembleRequest(input({ action: 'checkScene', proseBlocks: [c('fits', 500)] }))
+    expect(ok.warnings.some((w) => w.includes('whole scene'))).toBe(false)
+  })
+
+  it('ranks state by the scene POV and present list, not by the always reason', () => {
+    const entries = [
+      fixedEntry('near', 'present', { priority: 90 }),
+      fixedEntry('mara', 'always', { priority: 1 }),
+      fixedEntry('far', 'present', { priority: 80 })
+    ]
+    const stateGroups = [group('near', 110), group('far', 110), group('mara', 110)]
+    const result = assembleRequest({ ...input({ entries, stateGroups }), povId: 'mara', presentIds: ['near', 'far'] })
+    const text = result.messages[1].content
+    expect(text).toContain('### mara')
+    expect(text).toContain('### near')
+    expect(text).not.toContain('### far')
   })
 })

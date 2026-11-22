@@ -2,24 +2,31 @@ import { describe, expect, it } from 'vitest'
 import { DEFAULT_SAMPLING } from '../src/shared/defaults'
 import type { BibleEntry, NovelAction, NovelChapter, NovelScene } from '../src/shared/novel'
 import {
+  CHECK_SCHEMA,
   cleanProse,
   defaultProject,
   entryListText,
   entryShortText,
   entryText,
   FICTION_SAMPLING,
+  interviewSystem,
   isProseAction,
   OUTLINE_CHAPTERS_SCHEMA,
   OUTLINE_SCENES_SCHEMA,
+  parseCheckReply,
+  parseCheckReplyResult,
   parseOutlineChapters,
   parseOutlineScenes,
   parseSummary,
+  parseUpdateStateReply,
+  parseUpdateStateReplyResult,
   resolveEntryRef,
   sceneText,
   SUMMARY_SCHEMA,
   summaryText,
   systemText,
-  taskText
+  taskText,
+  UPDATE_STATE_SCHEMA
 } from '../src/shared/novelPrompts'
 
 const ACTIONS: NovelAction[] = [
@@ -413,5 +420,248 @@ describe('review fixes', () => {
     expect(taskText('rewrite', { variant: 'tone', note: '  ' })).toMatch(/noticeably different tone/)
     expect(taskText('rewrite', { variant: 'custom' })).toMatch(/to improve it/)
     expect(taskText('rewrite', { variant: 'custom' })).not.toMatch(/note asks/)
+  })
+})
+
+// ---------------------------------------------------------------------------------------------
+// Stage 3
+// ---------------------------------------------------------------------------------------------
+
+describe('stage 3 task texts', () => {
+  it('has a task for every stage 3 action, and the JSON ones are not prose', () => {
+    for (const action of ['checkScene', 'updateState', 'interview'] as NovelAction[]) {
+      expect(taskText(action, {}).length).toBeGreaterThan(20)
+    }
+    expect(isProseAction('checkScene')).toBe(false)
+    expect(isProseAction('updateState')).toBe(false)
+    expect(systemText('checkScene', '', '')).toContain('JSON')
+  })
+
+  it('check text asks for at most 20 findings with the exact quote and lists the types', () => {
+    const text = taskText('checkScene', {})
+    expect(text).toContain('at most 20')
+    expect(text).toContain('exact words')
+    for (const type of ['continuity', 'character', 'timeline', 'pov', 'tense', 'other']) expect(text).toContain(type)
+    expect(text).toContain('"findings"')
+  })
+
+  it('update-state text carries the state with ids and what is already recorded', () => {
+    const text = taskText('updateState', {
+      stateBeforeText: '[f1a2b3] Mara Venn - location: the lighthouse',
+      recordedText: '[f9z9z9] Mara Venn - carries: the brass key'
+    })
+    expect(text).toContain('"changes"')
+    expect(text).toContain('State before this scene (fact ids in brackets):\n[f1a2b3] Mara Venn - location: the lighthouse')
+    expect(text).toContain('Already recorded at this scene:\n[f9z9z9] Mara Venn - carries: the brass key')
+    expect(text.indexOf('State before')).toBeGreaterThan(text.indexOf('Reply as JSON'))
+  })
+
+  it('update-state text says (none) for empty lists, and other actions do not get the lists', () => {
+    const text = taskText('updateState', {})
+    expect(text).toContain('State before this scene (fact ids in brackets):\n(none)')
+    expect(text).toContain('Already recorded at this scene:\n(none)')
+    expect(taskText('checkScene', { stateBeforeText: 'x' })).not.toContain('State before this scene (fact')
+  })
+
+  it('keeps the author note on the stage 3 actions', () => {
+    expect(taskText('checkScene', { note: 'watch the timeline' })).toContain("The author's note: watch the timeline")
+  })
+})
+
+describe('CHECK_SCHEMA and UPDATE_STATE_SCHEMA', () => {
+  it('check: findings may be empty and are capped at 20', () => {
+    const findings = CHECK_SCHEMA.properties.findings
+    expect(findings.minItems).toBe(0)
+    expect(findings.maxItems).toBe(20)
+    expect(findings.items.required).toEqual(['type', 'quote', 'problem', 'conflictsWith', 'suggestion'])
+    expect(findings.items.properties.type.enum).toEqual(['continuity', 'character', 'timeline', 'pov', 'tense', 'other'])
+  })
+
+  it('update state: changes may be empty; add and end shapes', () => {
+    const changes = UPDATE_STATE_SCHEMA.properties.changes
+    expect(changes.minItems).toBe(0)
+    expect(changes.items.anyOf).toHaveLength(2)
+    const add = changes.items.anyOf[0] as { required: string[]; properties: { kind: { enum: string[] } } }
+    expect(add.required).toEqual(['op', 'entity', 'kind', 'value', 'about'])
+    expect(add.properties.kind.enum).toEqual([
+      'location', 'knows', 'carries', 'condition', 'relationship', 'other'
+    ])
+    expect(changes.items.anyOf[1].required).toEqual(['op', 'factId', 'reason'])
+  })
+})
+
+describe('parseCheckReply', () => {
+  const finding = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    type: 'continuity',
+    quote: 'her blue eyes',
+    problem: 'Her eyes were green.',
+    conflictsWith: 'Mara Venn: green eyes',
+    suggestion: 'Say green.',
+    ...over
+  })
+
+  it('reads findings and trims every value', () => {
+    const reply = parseCheckReply(
+      JSON.stringify({ findings: [finding({ quote: '  her blue eyes \n', problem: ' wrong ', conflictsWith: ' x ', suggestion: ' y ' })] })
+    )
+    expect(reply.findings).toEqual([
+      { type: 'continuity', quote: 'her blue eyes', problem: 'wrong', conflictsWith: 'x', suggestion: 'y' }
+    ])
+  })
+
+  it('accepts an empty list, fenced JSON and JSON after some text', () => {
+    expect(parseCheckReply('{"findings": []}')).toEqual({ findings: [] })
+    expect(parseCheckReply('```json\n{"findings": []}\n```').findings).toEqual([])
+    expect(parseCheckReply(`Here you go: ${JSON.stringify({ findings: [finding()] })}`).findings).toHaveLength(1)
+  })
+
+  it('drops unknown types, empty quote or problem, and items that are not objects', () => {
+    const reply = parseCheckReply(
+      JSON.stringify({
+        findings: [
+          finding({ type: 'grammar' }),
+          finding({ quote: '  ' }),
+          finding({ problem: '' }),
+          finding({ type: undefined }),
+          'nonsense',
+          null,
+          finding({ type: 'POV' }),
+          finding({ conflictsWith: undefined, suggestion: 5 })
+        ]
+      })
+    )
+    expect(reply.findings.map((f) => f.type)).toEqual(['pov', 'continuity'])
+    expect(reply.findings[1]).toMatchObject({ conflictsWith: '', suggestion: '' })
+  })
+
+  it('keeps at most 20 findings, the first ones', () => {
+    const many = Array.from({ length: 30 }, (_, i) => finding({ quote: `q${i}` }))
+    const reply = parseCheckReply(JSON.stringify({ findings: many }))
+    expect(reply.findings).toHaveLength(20)
+    expect(reply.findings[19].quote).toBe('q19')
+  })
+
+  it('throws for text that is not the expected JSON, and the Result variant reports it', () => {
+    expect(() => parseCheckReply('not json')).toThrow(/not valid JSON/)
+    expect(() => parseCheckReply('{"findings": "none"}')).toThrow(/wrong shape/)
+    expect(() => parseCheckReply('{"other": []}')).toThrow()
+    expect(parseCheckReplyResult('nope').ok).toBe(false)
+    expect(parseCheckReplyResult('{"findings": []}').ok).toBe(true)
+  })
+})
+
+describe('parseUpdateStateReply', () => {
+  it('reads add and end changes', () => {
+    const reply = parseUpdateStateReply(
+      JSON.stringify({
+        changes: [
+          { op: 'add', entity: ' Mara Venn ', kind: 'carries', value: ' the brass key ', about: null },
+          { op: 'end', factId: ' f1a2b3 ', reason: ' she left ' }
+        ]
+      })
+    )
+    expect(reply.changes).toEqual([
+      { op: 'add', entity: 'Mara Venn', kind: 'carries', value: 'the brass key', about: null },
+      { op: 'end', factId: 'f1a2b3', reason: 'she left' }
+    ])
+  })
+
+  it('keeps about for a relationship only', () => {
+    const reply = parseUpdateStateReply(
+      JSON.stringify({
+        changes: [
+          { op: 'add', entity: 'Mara', kind: 'relationship', value: 'distrusts him', about: ' Oskar Lind ' },
+          { op: 'add', entity: 'Mara', kind: 'location', value: 'the pier', about: 'Oskar Lind' },
+          { op: 'add', entity: 'Mara', kind: 'relationship', value: 'trusts', about: '' }
+        ]
+      })
+    )
+    expect(reply.changes).toEqual([
+      { op: 'add', entity: 'Mara', kind: 'relationship', value: 'distrusts him', about: 'Oskar Lind' },
+      { op: 'add', entity: 'Mara', kind: 'location', value: 'the pier', about: null },
+      { op: 'add', entity: 'Mara', kind: 'relationship', value: 'trusts', about: null }
+    ])
+  })
+
+  it('drops unknown ops and kinds and empty entity, value or fact id', () => {
+    const reply = parseUpdateStateReply(
+      JSON.stringify({
+        changes: [
+          { op: 'delete', factId: 'f1' },
+          { op: 'add', entity: 'Mara', kind: 'mood', value: 'sad', about: null },
+          { op: 'add', entity: '', kind: 'location', value: 'x', about: null },
+          { op: 'add', entity: 'Mara', kind: 'location', value: '  ', about: null },
+          { op: 'end', factId: ' ', reason: 'r' },
+          42,
+          { op: 'add', entity: 'Mara', kind: 'Location', value: 'the pier', about: null }
+        ]
+      })
+    )
+    expect(reply.changes).toEqual([{ op: 'add', entity: 'Mara', kind: 'location', value: 'the pier', about: null }])
+  })
+
+  it('makes values one line and caps them at 300 characters', () => {
+    const reply = parseUpdateStateReply(
+      JSON.stringify({
+        changes: [
+          { op: 'add', entity: 'Mara', kind: 'condition', value: 'tired\nand   cold', about: null },
+          { op: 'add', entity: 'Mara', kind: 'knows', value: 'x'.repeat(500), about: null },
+          { op: 'end', factId: 'f1', reason: 'y'.repeat(500) }
+        ]
+      })
+    )
+    expect(reply.changes[0]).toMatchObject({ value: 'tired and cold' })
+    expect((reply.changes[1] as { value: string }).value).toHaveLength(300)
+    expect((reply.changes[2] as { reason: string }).reason).toHaveLength(300)
+  })
+
+  it('accepts an empty list and throws for bad replies', () => {
+    expect(parseUpdateStateReply('{"changes": []}')).toEqual({ changes: [] })
+    expect(parseUpdateStateReply('```\n{"changes": []}\n```').changes).toEqual([])
+    expect(() => parseUpdateStateReply('???')).toThrow()
+    expect(() => parseUpdateStateReply('{"changes": 3}')).toThrow()
+    expect(parseUpdateStateReplyResult('{"changes": 3}').ok).toBe(false)
+  })
+})
+
+describe('interviewSystem', () => {
+  const input = {
+    name: 'Mara Venn',
+    body: 'Tall and quiet.\n\n## Voice\n- dry',
+    stateLines: '- location: the lighthouse\n- carries: the brass key',
+    summaries: ['Scene: Night crossing\nMara bribed the ferryman.', 'Chapter 1: She arrived.']
+  }
+
+  it('tells the model to answer in character and to know only what the character knows', () => {
+    const text = interviewSystem(input)
+    expect(text).toContain('You are Mara Venn. Answer in character, in your own voice.')
+    expect(text).toContain('You know only what Mara Venn knows by this point in the story')
+    expect(text).toContain('if asked about later events, you do not know them')
+  })
+
+  it("labels the author's notes, then adds state lines and summaries in that order", () => {
+    const text = interviewSystem(input)
+    const notes = text.indexOf("The author's notes about you (they may mention things you have not lived yet; do not reveal those):")
+    expect(notes).toBeGreaterThan(0)
+    expect(text.indexOf('Tall and quiet.')).toBeGreaterThan(notes)
+    const state = text.indexOf('- location: the lighthouse')
+    expect(state).toBeGreaterThan(text.indexOf('- dry'))
+    expect(text.indexOf('Mara bribed the ferryman.')).toBeGreaterThan(state)
+    expect(text.indexOf('Chapter 1: She arrived.')).toBeGreaterThan(text.indexOf('Mara bribed'))
+  })
+
+  it('leaves out sections that are empty', () => {
+    const text = interviewSystem({ name: 'Mara', body: '  ', stateLines: '', summaries: ['', '  '] })
+    expect(text).not.toContain("author's notes")
+    expect(text).not.toContain('What is true of you')
+    expect(text).not.toContain('What has happened')
+    expect(text.startsWith('You are Mara.')).toBe(true)
+  })
+})
+
+describe('review fixes', () => {
+  it('strips brackets around a fact id', () => {
+    const reply = parseUpdateStateReply(JSON.stringify({ changes: [{ op: 'end', factId: ' [f1a2b3] ', reason: 'r' }] }))
+    expect(reply.changes).toEqual([{ op: 'end', factId: 'f1a2b3', reason: 'r' }])
   })
 })

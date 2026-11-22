@@ -25,5 +25,7 @@ export function registerNovelIpc(store: NovelStore, onFlushDone: () => void): vo
   handle('novel:restoreTrash', (folder, id) => store.restoreTrash(folder, id))
   handle('novel:emptyTrash', (folder) => store.emptyTrash(folder))
   handle('novel:deleteProject', (folder) => store.deleteProject(folder))
+  handle('novel:statePatch', (folder, ops) => store.statePatch(folder, ops))
+  handle('novel:dismissFinding', (folder, sceneId, key, dismissed) => store.dismissFinding(folder, sceneId, key, dismissed))
   handle('novel:flushDone', onFlushDone)
 }
