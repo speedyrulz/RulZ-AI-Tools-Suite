@@ -4,7 +4,7 @@ import { create } from 'zustand'
 import { toast } from 'sonner'
 import { cleanBatchOptions, planBatch, summarize, type BatchOptions, type BatchRun } from '@shared/batch'
 import type { RePracticeTask } from '@shared/types'
-import { batchAdapters } from '../lib/adapters'
+import { batchAdapterLabel, batchAdapters, sameBatchAdapters } from '../lib/adapters'
 import { errorMessage, invoke } from '../lib/api'
 import { runBatchLoop, type BatchStop } from '../lib/batchRunner'
 import { uid } from '../lib/format'
@@ -180,8 +180,13 @@ export const useBatch = create<BatchState>((set, get) => {
         set({ starting: false })
       }
       if (!model || get().activeId) return
-      // The model may have been reloaded with other adapters since the run stopped: record what it has now.
-      if (!patchRun(id, (r) => ({ ...r, status: 'running', finishedAt: undefined, adapters: model.adapters }))) return
+      // Results already recorded were made with the run's adapters; resuming with others would mix them.
+      if (!sameBatchAdapters(run.adapters, model.adapters)) {
+        const used = batchAdapterLabel(run.adapters) || 'no adapters'
+        toast.error(`This run used other adapters (${used}). Load the model with the same adapters, or start a new run.`)
+        return
+      }
+      if (!patchRun(id, (r) => ({ ...r, status: 'running', finishedAt: undefined }))) return
       set({ activeId: id })
       void runBatch(id)
     },

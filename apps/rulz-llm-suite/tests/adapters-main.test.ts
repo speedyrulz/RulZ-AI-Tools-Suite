@@ -1,6 +1,6 @@
 import type { ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -404,6 +404,7 @@ describe('InstanceManager adapters', () => {
     const inst = await mgr.load(llama.id, { ...DEFAULT_LOAD_CONFIG, adapters: [{ id: 'a.gguf', scale: 0.5 }] })
     expect(inst.status).toBe('ready')
     expect(mgr.getLog(inst.instanceId).some((l) => /adapter scales not set/.test(l))).toBe(true)
+    expect(mgr.list()[0].adapters[0].scale).toBe(1)
     await mgr.unloadAll()
   })
 })
@@ -434,6 +435,7 @@ describe('converter helpers', () => {
     expect(sanitizeOutName('a..b')).toBe('a.b.gguf')
     expect(sanitizeOutName('  trailing. . ')).toBe('trailing.gguf')
     expect(sanitizeOutName('{ftype}')).toBe('ftype.gguf')
+    expect(sanitizeOutName('my,lora, v2')).toBe('mylora v2.gguf')
     for (const bad of ['', '   ', '..', '.gguf', 'CON', 'nul.gguf', 'a/', '<>']) expect(sanitizeOutName(bad)).toBe('')
   })
 
@@ -499,7 +501,7 @@ describe('converter helpers', () => {
         proc.stderr.emit('data', 'warn\n')
         proc.stdout.emit('data', 'o\n')
         writeFileSync(out, 'gguf')
-        proc.emit('exit', 0)
+        proc.emit('close', 0)
       })
       const r = await s.conv.convert(request(s.peft))
       expect(r).toMatchObject({ ok: true, outPath: join(s.modelsDir, 'style.gguf') })
@@ -507,7 +509,11 @@ describe('converter helpers', () => {
       expect(r.logTail).toContain('INFO:two')
       expect(s.converted()).toBe(1)
       expect(s.calls[0].cwd).toBe(s.dir)
-      expect(s.calls[0].args).toEqual([join(s.dir, 'convert_lora_to_gguf.py'), s.peft, '--outfile', join(s.modelsDir, 'style.gguf'), '--outtype', 'f16', '--base-model-id', 'org/m'])
+      const tmpOut = s.calls[0].args[s.calls[0].args.indexOf('--outfile') + 1]
+      expect(tmpOut).toMatch(/style.gguf.[0-9a-f]{8}.part$/)
+      expect(s.calls[0].args).toEqual([join(s.dir, 'convert_lora_to_gguf.py'), s.peft, '--outfile', tmpOut, '--outtype', 'f16', '--base-model-id', 'org/m'])
+      expect(existsSync(tmpOut)).toBe(false)
+      expect(readdirSync(s.modelsDir)).toEqual(['style.gguf'])
       expect(s.calls[0].args).not.toContain('-I')
     })
 
@@ -516,7 +522,7 @@ describe('converter helpers', () => {
       s.behave((proc, out) => {
         proc.stdout.emit('data', Array.from({ length: 100 }, (_, i) => `line ${i}`).join('\n') + '\n')
         writeFileSync(out, 'x')
-        proc.emit('exit', 0)
+        proc.emit('close', 0)
       })
       const r = await s.conv.convert(request(s.peft))
       expect(r.logTail).toHaveLength(40)
@@ -528,14 +534,55 @@ describe('converter helpers', () => {
       s.behave((proc, out) => {
         writeFileSync(out, 'partial')
         proc.stderr.emit('data', 'ModuleNotFoundError: torch\n')
-        proc.emit('exit', 1)
+        proc.emit('close', 1)
       })
       const r = await s.conv.convert(request(s.peft))
       expect(r.ok).toBe(false)
       expect(r.error).toMatch(/exit code 1/)
       expect(r.logTail).toContain('ModuleNotFoundError: torch')
-      expect(existsSync(join(s.modelsDir, 'style.gguf'))).toBe(false)
+      expect(readdirSync(s.modelsDir)).toEqual([])
       expect(s.converted()).toBe(0)
+    })
+
+    it('waits for close, so the last output line is not lost', async () => {
+      const s = setup()
+      s.behave((proc, out) => {
+        writeFileSync(out, 'x')
+        proc.emit('exit', 0)
+        proc.stderr.emit('data', 'late line')
+        proc.emit('close', 0)
+      })
+      expect((await s.conv.convert(request(s.peft))).logTail).toContain('late line')
+    })
+
+    it('never overwrites a file that appeared under the final name during the conversion', async () => {
+      const s = setup()
+      s.behave((proc, out) => {
+        writeFileSync(out, 'ours')
+        writeFileSync(join(s.modelsDir, 'style.gguf'), 'theirs')
+        proc.emit('close', 0)
+      })
+      const r = await s.conv.convert(request(s.peft))
+      expect(r.ok).toBe(false)
+      expect(r.error).toMatch(/appeared/)
+      expect(readdirSync(s.modelsDir)).toEqual(['style.gguf'])
+      expect(readFileSync(join(s.modelsDir, 'style.gguf'), 'utf8')).toBe('theirs')
+      expect(s.converted()).toBe(0)
+    })
+
+    it('honours a cancel that arrives before the process starts', async () => {
+      const s = setup()
+      const p = s.conv.convert(request(s.peft))
+      s.conv.cancel()
+      const r = await p
+      expect(r).toMatchObject({ ok: false, error: 'The conversion was cancelled.' })
+      expect(s.calls).toHaveLength(0)
+      // A later conversion is not affected.
+      s.behave((proc, out) => {
+        writeFileSync(out, 'x')
+        proc.emit('close', 0)
+      })
+      expect((await s.conv.convert(request(s.peft))).ok).toBe(true)
     })
 
     it('refuses an existing output, a bad adapter folder, a bad base folder and an empty name without starting Python', async () => {
@@ -553,7 +600,7 @@ describe('converter helpers', () => {
       const s = setup()
       s.behave((proc, out) => {
         writeFileSync(out, 'x')
-        proc.emit('exit', 0)
+        proc.emit('close', 0)
       })
       const first = s.conv.convert(request(s.peft))
       const second = await s.conv.convert(request(s.peft, { outName: 'two' }))

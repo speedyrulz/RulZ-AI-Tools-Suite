@@ -351,6 +351,8 @@ export class InstanceManager {
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
     } catch (err) {
       run.log.push(`[adapter scales not set] ${(err as Error).message}; the adapters run at strength 1`)
+      // Report what the server really does, so the UI, batch records and request defaults match.
+      for (const a of run.info.adapters) a.scale = 1
     }
   }
 

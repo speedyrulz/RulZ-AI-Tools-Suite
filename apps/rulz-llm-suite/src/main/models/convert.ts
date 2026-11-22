@@ -1,5 +1,6 @@
 // Converts a Hugging Face PEFT LoRA folder to a GGUF adapter with llama.cpp's convert_lora_to_gguf.py.
 import { spawn, type ChildProcess } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import { existsSync, promises as fs } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { AdapterConvertRequest, AdapterConvertResult, AdapterConverterStatus } from '@shared/types'
@@ -31,7 +32,7 @@ export function sanitizeOutName(name: string): string {
     .split(/[\\/]/)
     .pop()!
     // eslint-disable-next-line no-control-regex
-    .replace(/[<>:"|?*{}\u0000-\u001f]/g, '')
+    .replace(/[<>:"|?*{},\u0000-\u001f]/g, '')
     .replace(/\.{2,}/g, '.')
     .replace(/[. ]+$/, '')
     .trim()
@@ -86,6 +87,8 @@ export class AdapterConverter {
   private current: { proc: ChildProcess; cancelled: boolean } | null = null
   /** Set from the check for a running conversion until it ends, so two calls can't both pass it. */
   private busy = false
+  /** A cancel that came before the process existed. */
+  private cancelPending = false
 
   constructor(private readonly deps: ConverterDeps) {}
 
@@ -105,7 +108,10 @@ export class AdapterConverter {
   }
 
   cancel(): void {
-    if (!this.current) return
+    if (!this.current) {
+      if (this.busy) this.cancelPending = true
+      return
+    }
     this.current.cancelled = true
     killTree(this.current.proc.pid)
   }
@@ -113,10 +119,12 @@ export class AdapterConverter {
   async convert(req: AdapterConvertRequest): Promise<AdapterConvertResult> {
     if (this.busy) return fail('Another conversion is still running.')
     this.busy = true
+    this.cancelPending = false
     try {
       return await this.run(req)
     } finally {
       this.busy = false
+      this.cancelPending = false
       this.current = null
     }
   }
@@ -138,7 +146,10 @@ export class AdapterConverter {
     // Refusing instead of overwriting also means a partial file left by a failure is always ours to delete.
     if (existsSync(outPath)) return fail(`${outName} already exists in the models folder; choose another name.`)
 
-    const args = [...py.args, ...buildConvertArgs(status.script, req, outPath)]
+    // Written under a name the library watcher ignores, then linked into place, so a file that appears
+    // under the final name in the meantime is never overwritten or deleted.
+    const tmpPath = join(modelsDir, `${outName}.${randomBytes(4).toString('hex')}.part`)
+    const args = [...py.args, ...buildConvertArgs(status.script, req, tmpPath)]
     const tail: string[] = []
     const push = (line: string): void => {
       tail.push(line)
@@ -146,6 +157,7 @@ export class AdapterConverter {
       this.deps.onLog(line)
     }
     push(`$ ${py.command} ${args.join(' ')}`)
+    if (this.cancelPending) return fail('The conversion was cancelled.', tail)
 
     const cwd = dirname(status.script)
     let proc: ChildProcess
@@ -174,18 +186,26 @@ export class AdapterConverter {
 
     const code = await new Promise<number | null | Error>((resolve) => {
       proc.once('error', (e) => resolve(e))
-      proc.once('exit', (c) => resolve(c))
+      proc.once('close', (c) => resolve(c))
     })
     out.flush()
     err.flush()
 
-    const written = existsSync(outPath)
+    const written = existsSync(tmpPath)
     if (code === 0 && written && !run.cancelled) {
+      try {
+        await fs.link(tmpPath, outPath)
+      } catch (e) {
+        await fs.rm(tmpPath, { force: true }).catch(() => undefined)
+        const taken = (e as NodeJS.ErrnoException).code === 'EEXIST'
+        return fail(taken ? `${outName} appeared in the models folder during the conversion; choose another name.` : `Could not move the result into place: ${(e as Error).message}`, tail)
+      }
+      await fs.rm(tmpPath, { force: true }).catch(() => undefined)
       this.deps.onConverted()
       return { ok: true, outPath, logTail: tail }
     }
-    // The file did not exist before, so whatever is there now is a partial result.
-    if (written) await fs.rm(outPath, { force: true }).catch(() => undefined)
+    // Only our own temporary file is deleted, never the final name.
+    if (written) await fs.rm(tmpPath, { force: true }).catch(() => undefined)
     if (run.cancelled) return fail('The conversion was cancelled.', tail)
     if (code instanceof Error) return fail(`Could not start Python: ${code.message}`, tail)
     if (code === 0) return fail('The converter finished without writing the file.', tail)

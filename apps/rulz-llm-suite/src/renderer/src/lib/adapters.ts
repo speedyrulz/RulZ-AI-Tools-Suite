@@ -63,6 +63,13 @@ export function batchAdapters(loaded: InstanceAdapter[] | undefined): { name: st
   return loaded?.length ? loaded.map((a) => ({ name: a.name, scale: a.scale })) : undefined
 }
 
+/** Whether a run's recorded adapters are the ones the model has loaded now: same names and strengths, same order; both absent = equal. */
+export function sameBatchAdapters(a: { name: string; scale: number }[] | undefined, b: { name: string; scale: number }[] | undefined): boolean {
+  const x = a ?? []
+  const y = b ?? []
+  return x.length === y.length && x.every((e, i) => e.name === y[i].name && e.scale === y[i].scale)
+}
+
 /** "+ my-lora x0.8, other x1" for the runs list; empty when the run used none. */
 export function batchAdapterLabel(adapters: { name: string; scale: number }[] | undefined): string {
   if (!adapters?.length) return ''

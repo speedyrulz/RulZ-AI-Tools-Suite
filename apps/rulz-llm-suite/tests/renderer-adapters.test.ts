@@ -3,6 +3,7 @@ import type { InstanceAdapter } from '../src/shared/types'
 import {
   batchAdapterLabel,
   batchAdapters,
+  sameBatchAdapters,
   chatAdapters,
   defaultConvertName,
   formatScale,
@@ -109,5 +110,21 @@ describe('defaultConvertName', () => {
 
   it('keeps commas out, since llama.cpp cannot load such a path', () => {
     expect(defaultConvertName('C:\\x\\a,b')).toBe('a_b.gguf')
+  })
+})
+
+describe('sameBatchAdapters', () => {
+  const a = [{ name: 'x', scale: 1 }, { name: 'y', scale: 0.5 }]
+  it('is equal for the same names, strengths and order, and for both absent', () => {
+    expect(sameBatchAdapters(a, [...a.map((e) => ({ ...e }))])).toBe(true)
+    expect(sameBatchAdapters(undefined, undefined)).toBe(true)
+    expect(sameBatchAdapters(undefined, [])).toBe(true)
+  })
+  it('differs on strength, order, name or presence', () => {
+    expect(sameBatchAdapters(a, [a[0], { name: 'y', scale: 0.6 }])).toBe(false)
+    expect(sameBatchAdapters(a, [a[1], a[0]])).toBe(false)
+    expect(sameBatchAdapters(a, [a[0], { name: 'z', scale: 0.5 }])).toBe(false)
+    expect(sameBatchAdapters(a, undefined)).toBe(false)
+    expect(sameBatchAdapters(undefined, a)).toBe(false)
   })
 })
