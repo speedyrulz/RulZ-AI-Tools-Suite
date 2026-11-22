@@ -142,8 +142,10 @@ Discover/downloads, RAG and a CLI are planned.
   - **Writing benchmark** (Benchmark on the Writing start page): 2 to 6 candidates (model, adapters, sampling) write
     the same prompts with the same seeds; you vote blind on pairs (A / B / Tie / Skip, keys 1/2/3/S) and an Elo
     scoreboard ranks them. **Adjust settings** on a candidate changes its sampling and its load settings (context,
-    GPU layers, KV cache…) for that run only; presets and the model's saved settings are not touched. Bundled prompts
-    or your own; each run is one file you can resume. While a benchmark runs,
+    GPU layers, KV cache…) for that run only; presets and the model's saved settings are not touched. **Settings for
+    all candidates** sets the same values for every candidate; a setting a candidate changed itself wins for that
+    candidate. Every output's generation and prompt speed is saved, and the scoreboard shows each candidate's average
+    tokens/s (weighted by tokens). Bundled prompts or your own; each run is one file you can resume. While a benchmark runs,
     chat, batch runs, the hardware benchmark and model loading wait for it.
   - Not yet tried with a real model.
 - **Reverse Engineering mode** (`Ctrl+6`) — runs a local model as a reverse engineer with the REA MCP tools, and

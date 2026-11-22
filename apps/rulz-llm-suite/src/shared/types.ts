@@ -711,6 +711,8 @@ export interface GenerationStats {
   predictedTokens?: number
   promptTokens?: number
   cachedTokens?: number
+  /** Prompt processing speed (tokens actually processed, cached ones excluded, per second). */
+  promptTokensPerSecond?: number
   ttftMs?: number
   totalMs?: number
   stopReason?: string

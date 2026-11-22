@@ -127,7 +127,7 @@ function startBenchReply(input: BenchReplyInput): BenchReply {
       if (reason === 'stopped') return end({ text, error: null, stopped: true, finish: null })
       // The server names the reason; if it did not, a reply that used its whole budget was cut off.
       const finishReason = reason === 'length' ? 'length' : reason === 'stop' ? 'stop' : (e.stats.predictedTokens ?? 0) >= input.maxTokens ? 'length' : 'stop'
-      end({ text, error: null, stopped: false, finish: finishReason })
+      end({ text, error: null, stopped: false, finish: finishReason, stats: e.stats })
     }
   })
   invoke('chat:start', {

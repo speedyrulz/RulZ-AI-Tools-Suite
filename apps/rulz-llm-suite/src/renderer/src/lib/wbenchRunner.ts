@@ -2,7 +2,7 @@
 // it is finished. Everything it touches comes in through `WbenchDeps`, so it runs in tests without the
 // app. Also the small pure helpers the store and the views share (adapters for a request, what a vote
 // panel shows, progress).
-import type { InstanceAdapter, LoadAdapter, LoadConfig, SamplingParams } from '@shared/types'
+import type { GenerationStats, InstanceAdapter, LoadAdapter, LoadConfig, SamplingParams } from '@shared/types'
 import {
   addPairs,
   benchMessages,
@@ -24,6 +24,8 @@ export interface BenchReplyResult {
   stopped: boolean
   /** How the model ended it; null when the chat path did not say. */
   finish: 'stop' | 'length' | null
+  /** The server's speed numbers for this reply, when it sent them. */
+  stats?: GenerationStats
 }
 
 export interface BenchReply {
@@ -164,17 +166,18 @@ export async function runWbenchLoop(deps: WbenchDeps): Promise<WbenchLoopResult>
       await watcher
       deps.onText(null, '')
       const ms = Math.max(0, deps.now() - started)
+      const speeds = speedsOf(res.stats)
 
       if (res.error) {
-        await saveRun(finish(deps, out.key, { status: 'failed', text: res.text, finish: 'error', error: res.error, ms }))
+        await saveRun(finish(deps, out.key, { status: 'failed', text: res.text, finish: 'error', error: res.error, ms, ...speeds }))
       } else if (res.stopped && deps.stopping() === 'now') {
         // "Stop now" cut it off: it has not had its try, so a resumed run starts it again.
-        deps.patchRun((r) => touch(deps, { ...r, outputs: r.outputs.map((o) => (o.key === out.key ? { ...o, status: 'pending', text: '', finish: null, error: null, ms: null } : o)) }))
+        deps.patchRun((r) => touch(deps, { ...r, outputs: r.outputs.map((o) => (o.key === out.key ? { ...o, status: 'pending', text: '', finish: null, error: null, ms: null, tokensPerSecond: null, promptTokensPerSecond: null, tokens: null, promptTokens: null } : o)) }))
         break
       } else if (res.stopped) {
         await saveRun(finish(deps, out.key, { status: 'failed', text: res.text, finish: 'stopped', error: 'The reply was stopped.', ms }))
       } else {
-        await saveRun(finish(deps, out.key, { status: 'done', text: res.text, finish: res.finish ?? 'stop', error: null, ms }))
+        await saveRun(finish(deps, out.key, { status: 'done', text: res.text, finish: res.finish ?? 'stop', error: null, ms, ...speeds }))
       }
     }
   } catch (e) {
@@ -184,6 +187,14 @@ export async function runWbenchLoop(deps: WbenchDeps): Promise<WbenchLoopResult>
   const run = deps.patchRun((r) => touch(deps, { ...r, status: nextOutput(r) ? 'stopped' : 'done' }))
   await saveRun(run)
   return { run, busy, error }
+}
+
+/** The speed fields of an output from a reply's stats: only finite numbers >= 0 are kept, the rest stay null. */
+function speedsOf(stats: GenerationStats | undefined): Pick<BenchOutput, 'tokensPerSecond' | 'promptTokensPerSecond' | 'tokens' | 'promptTokens'> {
+  const num = (v: number | undefined): number | null => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null)
+  // promptTokens counts cached tokens too; the prompt speed was measured on the ones actually processed.
+  const processed = typeof stats?.promptTokens === 'number' ? stats.promptTokens - (stats.cachedTokens ?? 0) : undefined
+  return { tokensPerSecond: num(stats?.tokensPerSecond), promptTokensPerSecond: num(stats?.promptTokensPerSecond), tokens: num(stats?.predictedTokens), promptTokens: num(processed) }
 }
 
 function touch(deps: Pick<WbenchDeps, 'now'>, run: WritingBenchRun): WritingBenchRun {

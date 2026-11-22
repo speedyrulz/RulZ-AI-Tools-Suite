@@ -439,3 +439,35 @@ describe('stores', () => {
     expect(sorted.map((x) => (x.ok ? x.run.id : x.id))).toEqual(['new', 'old', 'bad'])
   })
 })
+
+describe('writing benchmark speeds', () => {
+  it('saves the reply speeds on done outputs, nulls when absent, and clears them on Stop now', async () => {
+    const withStats = (n: number): BenchReply => ({
+      done: Promise.resolve({ text: 'x', error: null, stopped: false, finish: 'stop', stats: n === 1 ? { tokensPerSecond: 42.5, promptTokensPerSecond: 800, predictedTokens: 90 } : undefined }),
+      abort: () => undefined
+    })
+    const r = rig((n) => withStats(n))
+    await runWbenchLoop(r.deps)
+    const outs = r.run().outputs
+    expect(outs[0]).toMatchObject({ status: 'done', tokensPerSecond: 42.5, promptTokensPerSecond: 800, tokens: 90 })
+    expect(outs[1]).toMatchObject({ status: 'done', tokensPerSecond: null, promptTokensPerSecond: null, tokens: null })
+  })
+
+  it('keeps speeds of a failed reply that has stats, and drops bad numbers', async () => {
+    const res = rig((n) => ({ done: Promise.resolve({ text: 'p', error: 'boom', stopped: false, finish: null, stats: { tokensPerSecond: n === 1 ? 7 : -1, predictedTokens: Number.NaN } }), abort: () => undefined }))
+    await runWbenchLoop(res.deps)
+    expect(res.run().outputs[0]).toMatchObject({ status: 'failed', tokensPerSecond: 7, tokens: null })
+    expect(res.run().outputs[1]).toMatchObject({ status: 'failed', tokensPerSecond: null })
+  })
+
+  it('Stop now resets the output to pending with null speeds', async () => {
+    const r = rig((_n, _input, rg) => {
+      let finish: (v: BenchReplyResult) => void = () => undefined
+      const done = new Promise<BenchReplyResult>((res) => (finish = res))
+      rg.stopping.value = 'now'
+      return { done, abort: () => finish({ text: 'cut', error: null, stopped: true, finish: null, stats: { tokensPerSecond: 5, predictedTokens: 3 } }) }
+    })
+    await runWbenchLoop(r.deps)
+    expect(r.run().outputs[0]).toMatchObject({ status: 'pending', text: '', tokensPerSecond: null, promptTokensPerSecond: null, tokens: null })
+  })
+})
