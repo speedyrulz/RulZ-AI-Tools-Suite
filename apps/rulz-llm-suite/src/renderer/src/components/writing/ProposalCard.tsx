@@ -2,6 +2,7 @@ import { Check, LoaderCircle, Pencil, RefreshCw, Square, TriangleAlert, X } from
 import { useEffect, useState, type ReactNode } from 'react'
 import { wordCount } from '@shared/novelText'
 import { resolveSceneRefs } from '../../lib/novelRun'
+import { dropPlanItem, isPlanList, planEmptied } from '../../lib/proposalPlan'
 import { useNovel, type Proposal } from '../../stores/novel'
 import { Button, Input, Textarea } from '../ui'
 
@@ -65,6 +66,8 @@ export function ProposalCard() {
 
   const d = draft ?? proposal
   const set = (patch: Partial<Proposal>): void => setDraft({ ...d, ...patch })
+  const emptied = planEmptied(d)
+  const drop = (i: number): void => setDraft(dropPlanItem(d, i))
 
   return (
     <Card title={proposal.title} note={queue > 0 ? `${queue} more to summarize after this one.` : undefined}>
@@ -89,12 +92,15 @@ export function ProposalCard() {
                   <Textarea rows={3} aria-label="Chapter summary" value={c.summary} onChange={(e) => set({ chapters: { chapters: d.chapters!.chapters.map((x, j) => (j === i ? { ...x, summary: e.target.value } : x)) } })} />
                 </div>
               ) : (
-                <>
-                  <div className="font-medium">
-                    {i + 1}. {c.title} {c.act && <span className="text-[11px] font-normal text-faint">{c.act}</span>}
+                <div className="flex items-start gap-1.5">
+                  <div className="min-w-0 flex-1">
+                    <div className="font-medium">
+                      {i + 1}. {c.title} {c.act && <span className="text-[11px] font-normal text-faint">{c.act}</span>}
+                    </div>
+                    <div className="mt-0.5 text-xs text-muted">{c.summary}</div>
                   </div>
-                  <div className="mt-0.5 text-xs text-muted">{c.summary}</div>
-                </>
+                  <DropItem label={`Leave out chapter ${i + 1}`} onClick={() => drop(i)} />
+                </div>
               )}
             </li>
           ))}
@@ -122,36 +128,54 @@ export function ProposalCard() {
                     <Textarea rows={4} aria-label="Beats" value={sc.beats} onChange={(e) => set({ scenes: { scenes: d.scenes!.scenes.map((x, j) => (j === i ? { ...x, beats: e.target.value } : x)) } })} />
                   </div>
                 ) : (
-                  <>
-                    <div className="font-medium">
-                      {i + 1}. {sc.title}
-                    </div>
-                    <div className="mt-0.5 text-xs whitespace-pre-wrap text-muted">{sc.beats}</div>
-                    {(shown.pov || shown.present.length > 0) && (
-                      <div className="mt-1 text-[11px] text-faint">
-                        {shown.pov && <>POV: {name(shown.pov)}. </>}
-                        {shown.present.length > 0 && <>Present: {shown.present.map(name).join(', ')}.</>}
+                  <div className="flex items-start gap-1.5">
+                    <div className="min-w-0 flex-1">
+                      <div className="font-medium">
+                        {i + 1}. {sc.title}
                       </div>
-                    )}
-                  </>
+                      <div className="mt-0.5 text-xs whitespace-pre-wrap text-muted">{sc.beats}</div>
+                      {(shown.pov || shown.present.length > 0) && (
+                        <div className="mt-1 text-[11px] text-faint">
+                          {shown.pov && <>POV: {name(shown.pov)}. </>}
+                          {shown.present.length > 0 && <>Present: {shown.present.map(name).join(', ')}.</>}
+                        </div>
+                      )}
+                    </div>
+                    <DropItem label={`Leave out scene ${i + 1}`} onClick={() => drop(i)} />
+                  </div>
                 )}
               </li>
             )
           })}
         </ol>
       )}
+      {emptied && <p className="text-[11px] text-muted">Every item is left out. Reject the proposal, or press Retry for a new one.</p>}
       <div className="flex justify-end gap-2">
-        <Button size="sm" variant="ghost" onClick={() => rejectProposal()}>
-          <X size={14} /> Reject
+        <Button size="sm" variant="ghost" onClick={() => rejectProposal()} title={isPlanList(d) ? 'Throws away the whole list. Use the X on an item to leave out just that one.' : undefined}>
+          <X size={14} /> {isPlanList(d) ? 'Reject all' : 'Reject'}
         </Button>
+        {emptied && (
+          <Button size="sm" onClick={() => void retryProposal()}>
+            <RefreshCw size={14} /> Retry
+          </Button>
+        )}
         <Button size="sm" onClick={() => setEditing((e) => !e)}>
           <Pencil size={14} /> {editing ? 'Done editing' : 'Edit'}
         </Button>
-        <Button size="sm" variant="primary" onClick={() => void acceptProposal(d)}>
+        <Button size="sm" variant="primary" disabled={emptied} onClick={() => void acceptProposal(d)}>
           <Check size={14} /> Accept
         </Button>
       </div>
     </Card>
+  )
+}
+
+/** Leaves one planned chapter or scene out of the proposal; the rest can still be accepted. */
+function DropItem({ label, onClick }: { label: string; onClick: () => void }) {
+  return (
+    <Button size="sm" variant="ghost" aria-label={label} title={label} onClick={onClick}>
+      <X size={14} />
+    </Button>
   )
 }
 
