@@ -32,6 +32,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -40,7 +41,9 @@ import tarfile
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from pathlib import PurePosixPath, PureWindowsPath
 
 HERE = Path(__file__).resolve().parent
 APP = HERE.parents[1]
@@ -61,13 +64,13 @@ def pulls_root() -> Path:
 REMOTE_DIR = "/workspace/RulzTrainer"
 PYTHON = '"$(test -x /venv/main/bin/python && echo /venv/main/bin/python || echo python3)"'
 AGENT_COMMANDS = {"status", "jobs", "job", "log", "probes", "config", "start", "stop", "queue", "snapshot",
-                  "record", "update", "webui"}  # rulz_agent.py's
+                  "record", "update", "webui", "test-status", "test-stop"}  # rulz_agent.py's
 CONFIG_SLOT = b'SENT_CONFIG = ""'  # the line of rulz_agent.py that takes a local config
 SSH_FAILED = 255  # ssh's own exit status: it could not connect, or the connection dropped
 TIMED_OUT = 124  # the exit status Remote.run reports for a call that got no answer in its timeout (as timeout(1))
 SHORT_CALL_TIMEOUT = 120  # seconds for a snapshot, status or stop: ssh alive but hung must not wait for ever
 SHORT_COMMANDS = {"status", "jobs", "job", "log", "probes", "config", "stop", "queue", "snapshot", "record", "webui",
-                  "files", "poll"}  # agent commands that only read or touch a file: they answer within seconds
+                  "files", "poll", "test-status", "test-stop"}  # agent commands that only read or touch a file
 SYNC_PATHS = ("rulztrainer", "webui.py", "scripts", "requirements.txt")  # what a run needs of the code
 VASTAI_TIMEOUT = 120  # seconds for one vastai CLI call: a hung API request must not hold up every look after it
 UPLOAD_MARK = ".rulz_upload"  # in a dataset sent by rulz_fleet.py: dataset_digest() of what was sent
@@ -388,6 +391,34 @@ def cmd_pull(args) -> int:
         raise SystemExit(f"The downloads folder {root} was not found (is the drive connected?). Change it on the "
                          "WebUI's Fleet page, or pass --dest.")
     dest = Path(args.dest) if args.dest else root / str(args.remote.conn["id"])
+    tests = getattr(args, "tests", None)
+    if tests:
+        if args.name or args.what or args.step is not None:
+            raise SystemExit("--tests cannot be combined with a job, --what or --step")
+        if not re.fullmatch(r"[a-z0-9-]+", tests):
+            raise SystemExit("Bad test_id")
+        download_root = dest.resolve()
+        test_root = dest / "_tests"
+        dest = test_root / tests
+        if test_root.is_symlink() or dest.is_symlink() or not dest.resolve().is_relative_to(download_root):
+            raise SystemExit("Test destination is outside the downloads root or is a symlink")
+        dest = dest.resolve()
+        listing = args.remote.agent_json("files", "--tests", tests)
+        for entry in listing["files"]:
+            name = entry["path"]
+            if (not isinstance(name, str) or "\n" in name or "\r" in name or
+                    PurePosixPath(name).is_absolute() or PureWindowsPath(name).is_absolute() or
+                    ".." in PurePosixPath(name).parts or ".." in PureWindowsPath(name).parts or
+                    not (dest / name).resolve().is_relative_to(dest)):
+                raise SystemExit("Unsafe test file path")
+        todo = pull_plan(listing["files"], dest)
+        if todo:
+            fetch(args.remote, listing["base"], [f["path"] for f in todo], dest)
+        print(json.dumps({"folder": str(dest), "fetched": len(todo),
+                          "mb": round(sum(f["size"] for f in todo) / 1e6, 1),
+                          "already_here": len(listing["files"]) - len(todo),
+                          "files": [f["path"] for f in todo][:args.show]}, indent=1))
+        return 0
     extra = [a for what in args.what or [] for a in ("--what", what)]
     if args.step is not None:
         extra += ["--step", str(args.step)]
@@ -502,6 +533,15 @@ def send(remote: Remote, items: list[tuple[Path, str]], target: str, hidden: boo
             pass
     if proc.wait() != 0:
         raise SystemExit(f"tar on the instance ended with {proc.returncode}: the copy may be incomplete")
+
+
+def cmd_test_start(args) -> int:
+    """Start a LoRA test from a local JSON spec."""
+    spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
+    if not spec.get("test_id"):
+        spec["test_id"] = "t" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
+    print(f"Test ID: {spec['test_id']}", flush=True)
+    return forward(args.remote.agent("test-start", config=json.dumps(spec).encode("utf-8"), retry=False))
 
 
 def cmd_push(args) -> int:
@@ -621,11 +661,14 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--attach-key", action="store_true", help="add your ssh key to the instance (rented before it)")
     p = command("pull", cmd_pull)
     p.add_argument("name", nargs="?", help="job name; default: the running or last job")
+    p.add_argument("--tests", metavar="TEST_ID", help="fetch all files for this test")
     p.add_argument("--what", action="append", choices=("logs", "probes", "samples", "maps", "loras", "best", "all"),
                    help="repeatable; default logs; maps: the training_maps folder")
     p.add_argument("--step", type=int, help="only this step's images and LoRA")
     p.add_argument("--dest", help="default: ~/.rulz_vast/runs/<instance>")
     p.add_argument("--show", type=int, default=20, help="how many fetched file names to list")
+    p = command("test-start", cmd_test_start)
+    p.add_argument("--spec", required=True, help="local JSON spec")
     p = command("push", cmd_push)
     p.add_argument("source")
     p.add_argument("target", help="folder on the instance, relative to the install: datasets, say")
@@ -653,7 +696,7 @@ def main(argv=None) -> int:
             words, config = agent_args(rest)
             # never run twice by a reconnect: an update, a start, and a stop (a Stop that was delivered but whose
             # answer was lost would otherwise hit the next job of the queue; a Kill that worked would be refused)
-            once = words[0] in ("start", "stop") or (words[0] == "update" and "--check" not in words)
+            once = words[0] in ("start", "stop", "test-stop") or (words[0] == "update" and "--check" not in words)
             return forward(Remote(opts.instance, opts.key, opts.dir).agent(*words, config=config, retry=not once))
         args = parser().parse_args(argv)
         if args.func is not cmd_connect:

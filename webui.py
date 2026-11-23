@@ -34,8 +34,8 @@ from rulztrainer.config import (AUTOMAGIC, KEEL, alpha_differs, alpha_lr_note, a
                                 MODEL_PRESETS, ARCH_SAMPLE_LORA, VIDEO_ARCHS, VIDEO_EXTS, VIDEO_DATA_PRESETS,
                                 ARCH_FULL_SAMPLE, ARCH_TURBO_DEFAULT_OFF, STILL_FFN_TARGETS, detect_video_data_preset, video_data_preset,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
-from rulztrainer import (__version__, blockaudit, bodysim, capabilities, facesim, history, lookfilter, machine, oom_recovery,
-                         promptcheck, storage)
+from rulztrainer import (__version__, blockaudit, bodysim, capabilities, facesim, history, lookfilter, loratest, machine,
+                         oom_recovery, promptcheck, storage)
 from rulztrainer.train_queue import TrainQueue
 from rulztrainer import renderhelper_ctl as rulz_renderctl
 from rulztrainer.dataset import skipped as dataset_skipped
@@ -607,6 +607,9 @@ def _start_training(cfg: TrainConfig, recovery_note: str | None = None) -> str:
     reattach_job()
     if _running():
         return "A training job is already running."
+    live_test = lt_live_test()
+    if live_test:  # a LoRA test owns its GPUs until it ends (Test LoRAs tab)
+        return f"Not started: LoRA test {live_test} is running and uses the GPUs. Wait for it or stop it first."
     missing = [sp.path or "(none picked)" for sp in cfg.dataset_specs() if not sp.path or not Path(sp.path).is_dir()]
     if missing:
         return f"Dataset folder not found: {', '.join(missing)}"
@@ -826,6 +829,10 @@ def recover_after_oom(job_dir: Path, returncode: int | None = None, killed: bool
         except (TypeError, ValueError) as e:
             d = {**d, "do": "stop", "why": f"the lighter settings are not valid ({e})"}
         else:
+            live_test = lt_live_test()
+            if live_test:  # no restart beside a running LoRA test: the run is left stopped, its logs as they are
+                return (f"{job_dir.name}: out of {what} at step {step}; not restarted because LoRA test {live_test} "
+                        "is running (the run is left stopped; start it again when the test has ended)")
             tries = oom_recovery.add_try(job_dir, kind, step, action)
             kept = oom_recovery.keep_logs(job_dir, len(tries))
             note = (f"[oom recovery] try {len(tries)} of {cfg.oom_retries}: the last try ran out of {what} at step "
@@ -863,7 +870,8 @@ def queue_tick() -> None:
             except Exception as e:  # noqa: BLE001  (recovery must never stop the queue)
                 note = f"recovery failed: {type(e).__name__}: {e}"
             running = _running()
-        done = QUEUE.advance(running, _start_queued)
+        # a LoRA test owns its GPUs until it ends: the next queued run waits for it (Test LoRAs tab)
+        done = QUEUE.advance(running or lt_live_test() is not None, _start_queued)
     if note:
         print(f"[oom recovery] {note}", flush=True)
     if done is not None:
@@ -2935,6 +2943,17 @@ h1, h2, h3, .rz-pane-title { font-family: "Segoe UI Variable Display", "Segoe UI
 .rz-kv .v { color: var(--rz-heading); font-weight: 600; font-variant-numeric: tabular-nums; }
 .rz-kv.warn { border-color: rgba(245, 158, 11, .5); }
 .rz-kv.warn .v { color: var(--rz-warn-text); }
+/* Test LoRAs: the results grid (rows prompt x seed, columns LoRA x strength) */
+.rz-lt-scroll { overflow-x: auto; width: 100%; padding-bottom: 6px; }
+.rz-lt-grid { display: grid; gap: 8px; align-items: start; }
+.rz-lt-head { display: flex; flex-direction: column; gap: 2px; align-items: flex-start; min-width: 0; background: var(--rz-surface-2);
+  border: 1px solid var(--rz-border); border-radius: 8px; padding: 6px 8px; font-size: 13px; color: var(--rz-text); }
+.rz-lt-head.rz-lt-win, .rz-lt-cell.rz-lt-win { border: 2px solid var(--rz-red); }
+.rz-lt-rowlabel { font-size: 12px; color: var(--rz-muted); line-height: 1.4; overflow-wrap: anywhere; padding-top: 6px; }
+.rz-lt-cell { background: var(--rz-surface-2); border: 1px solid var(--rz-border); border-radius: 8px; overflow: hidden; min-width: 0; }
+.rz-lt-score { font-size: 12px; text-align: center; color: var(--rz-text-2); padding: 3px 0; font-variant-numeric: tabular-nums; }
+.rz-lt-missing { display: flex; align-items: center; justify-content: center; aspect-ratio: 1 / 1; font-size: 12px;
+  color: var(--rz-muted); background: var(--rz-thumb-bg); }
 /* Previous Runs: a probe image's "tick to compare" box over its corner, and the ticked ones outlined */
 .rz-shot { position: relative; }
 .rz-shot-pick { position: absolute; top: 4px; right: 4px; background: rgba(0, 0, 0, .55); color: #fff; }
@@ -9649,6 +9668,1605 @@ def start_history_import(importer=None) -> bool:
     return True
 
 
+# ---------------------------------------------------------------- Test LoRAs tab: helpers and routes
+# The tab builds, follows and shows LoRA tests (rulztrainer/loratest.py runs them; docs/lora-test-contract.md is the
+# file contract). Everything that does not need the page is a plain function here, so tests call it without NiceGUI.
+
+LT_TAB = "Test LoRAs"
+LT_PLACEHOLDER_ID = "t00000000-000000-0000"  # a valid id for checking a spec before its real id is made
+LT_EXPORTS = {"grid": ("grid.jpg", "image/jpeg"),
+              "xlsx": ("scores.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+              "pdf": ("report.pdf", "application/pdf")}
+LT_SECONDS_PER_PICTURE = (20, 60)  # the estimate's range on one GPU; the running test reports its real speed
+LT_STATE_WORDS = {"queued": "Queued", "loading": "Loading the model", "rendering": "Rendering", "scoring": "Scoring",
+                  "done": "Done", "stopped": "Stopped", "refused": "Refused", "failed": "Failed",
+                  "unknown": "Unknown"}
+LT_ACTIVE_STATES = ("queued", "loading", "rendering", "scoring")
+
+
+def lt_root() -> Path:
+    """output/_tests/ of this install: where every test folder lives."""
+    return loratest.tests_root(ROOT)
+
+
+def lt_read_json(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def lt_confined_file(test_id, rel, exts, root: Path | None = None, prefix: str | None = None) -> Path | None:
+    """A file of one test folder for a download or an <img>: `rel` inside root/<test_id>/ (root: output/_tests/), with
+    an extension in `exts`, under `prefix` ("images/") when given. None for anything else: a bad id, an absolute path,
+    `..`, a link that leads out, a folder that is not directly under root, a missing file."""
+    root = Path(root) if root is not None else lt_root()
+    if not isinstance(test_id, str) or not loratest.TEST_ID_RE.match(test_id):
+        return None
+    if not isinstance(rel, str) or not rel or "\x00" in rel or "\\" in rel:
+        return None
+    p = Path(rel)
+    if p.is_absolute() or p.drive or ".." in p.parts:
+        return None
+    if prefix is not None and (not p.parts or p.parts[0] != prefix.strip("/")):
+        return None
+    try:
+        folder = (root / test_id).resolve()
+        target = (folder / p).resolve()
+        if folder.parent != root.resolve():
+            return None
+        target.relative_to(folder)
+    except (OSError, ValueError):
+        return None
+    if target.suffix.lower() not in exts or not target.is_file():
+        return None
+    return target
+
+
+LT_EXPORT_NAME = re.compile(r"^grid(_\d{2})?\.jpg$|^scores\.xlsx$|^report\.pdf$")
+LT_EXPORT_MIME = {".jpg": "image/jpeg", ".xlsx": LT_EXPORTS["xlsx"][1], ".pdf": "application/pdf"}
+LT_INSTANCE = re.compile(r"^\d{1,12}$")  # a vast.ai instance id: the folder name under the Fleet downloads folder
+
+
+def lt_pulls_root() -> Path | None:
+    """The Fleet's downloads folder (scripts/vast/rulz_remote.pulls_root()), else None when that module cannot load."""
+    try:
+        vast = str(ROOT / "scripts" / "vast")
+        if vast not in sys.path:
+            sys.path.insert(0, vast)
+        import rulz_remote
+
+        return Path(rulz_remote.pulls_root())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def lt_tests_root(instance=None, pulls: Path | None = None) -> Path | None:
+    """The folder that holds test folders: output/_tests/ here, or for a test downloaded from an instance
+    <Fleet downloads folder>/<instance id>/_tests/ (the id must be digits and the folder must really lie under the
+    downloads folder). None for anything else."""
+    if not instance:
+        return lt_root()
+    if not LT_INSTANCE.match(str(instance)):
+        return None
+    pulls = pulls if pulls is not None else lt_pulls_root()
+    if pulls is None:
+        return None
+    root = Path(pulls) / str(instance) / "_tests"
+    try:
+        if root.parent.is_symlink() or root.is_symlink() or root.resolve().parent.parent != Path(pulls).resolve():
+            return None
+    except (OSError, ValueError):
+        return None
+    return root
+
+
+@app.get("/rz-test-image")
+def _serve_test_image(test: str, path: str, inst: str = ""):
+    """A picture of a LoRA test: images/... inside its folder under output/_tests/ (or, with inst, under the Fleet
+    downloads folder's <inst>/_tests/) only."""
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+
+    root = lt_tests_root(inst or None)
+    p = lt_confined_file(test, path, IMAGE_EXTS, root=root, prefix="images") if root is not None else None
+    if p is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return FileResponse(p, headers={"Cache-Control": "max-age=3600"})
+
+
+@app.get("/rz-test-file")
+def _serve_test_file(test: str, name: str, inst: str = ""):
+    """A file a LoRA test exported (export/grid.jpg or grid_NN.jpg, scores.xlsx, report.pdf), as a download."""
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+
+    if not LT_EXPORT_NAME.match(name):
+        raise HTTPException(status_code=404, detail="Not Found")
+    ext = Path(name).suffix.lower()
+    root = lt_tests_root(inst or None)
+    p = lt_confined_file(test, f"export/{name}", {ext}, root=root, prefix="export") if root is not None else None
+    if p is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return FileResponse(p, filename=name, media_type=LT_EXPORT_MIME[ext])
+
+
+def lt_live_test(root: Path | None = None, now: float | None = None) -> str | None:
+    """The id of a test that is running (a state that is not final and a pid that lives), else None. The training
+    queue waits while there is one, and a second test is not started beside it."""
+    root = Path(root) if root is not None else lt_root()
+    now = time.time() if now is None else now
+    try:
+        dirs = sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name, reverse=True)[:40]
+    except OSError:
+        return None
+    for d in dirs:
+        st = lt_read_json(d / "status.json")
+        if st is None:
+            continue
+        try:
+            age = now - (d / "status.json").stat().st_mtime
+        except OSError:
+            continue
+        state = loratest.effective_state(st, age)  # a dead (or reused) pid reads failed; queued stays 120 s
+        if state in loratest.FINAL_STATES:
+            continue
+        return d.name
+    return None
+
+
+def _lt_dev(d) -> str:
+    d = str(d or "").strip().lower()
+    return "cuda:0" if d == "cuda" else d
+
+
+LT_CUDA = re.compile(r"cuda(?::(\d+))?", re.IGNORECASE)
+
+
+def lt_job_gpus(cfg: dict) -> dict[str, str]:
+    """The GPUs a training job's config holds, each with the reason: its training GPU(s), a probe / sample / maps /
+    sweep worker's second GPU, and every cuda:N its split plan, text encoder or body scoring names."""
+    train = _lt_dev(cfg.get("device") or "cuda:0")
+    multi = str(cfg.get("multi_gpu") or "off")
+    held: dict[str, str] = {}
+    if multi != "off":
+        for d in str(cfg.get("devices") or "").split(","):
+            if _lt_dev(d).startswith("cuda"):
+                held[_lt_dev(d)] = "the training job uses it"
+    elif train.startswith("cuda"):
+        held[train] = "the training job uses it"
+    if multi == "off" and any(cfg.get(k) for k in ("probe_async", "sample_async", "maps_async", "sweep_async")):
+        probe = _lt_dev(cfg.get("probe_device"))
+        for d in [probe] if probe else [_lt_dev(x) for x in str(cfg.get("devices") or "").split(",")]:
+            if d.startswith("cuda") and d != train:
+                held.setdefault(d, "the training job's probe worker uses it")
+                break
+    for key, what in (("split_plan", "the training job's split plan names it"),
+                      ("text_encoder_device", "the training job's text encoder uses it"),
+                      ("body_device", "the training job's body scoring uses it")):
+        for m in LT_CUDA.finditer(str(cfg.get(key) or "")):
+            held.setdefault(f"cuda:{m.group(1) or 0}", what)
+    return held
+
+
+def lt_held_gpus(job_running: bool, job_cfg, gpus: list[str]) -> dict[str, str]:
+    """{gpu: reason} for the GPUs a test must not use now. No job running: none. A running job whose config cannot be
+    read: every GPU (it cannot be told which the job holds)."""
+    if not job_running:
+        return {}
+    if not isinstance(job_cfg, dict):
+        return {g: "a training job runs and the GPUs it uses could not be read" for g in gpus}
+    held = lt_job_gpus(job_cfg)
+    return {g: held[g] for g in gpus if g in held}
+
+
+def lt_current_job_gpus(gpus: list[str]) -> dict[str, str]:
+    """lt_held_gpus for this WebUI's own training job."""
+    running = _running()
+    cfg = None
+    if running and _job_dir is not None:
+        try:
+            cfg = loratest.read_config(Path(_job_dir) / "config.yaml")
+        except loratest.SpecError:
+            cfg = None
+    return lt_held_gpus(running, cfg, gpus)
+
+
+def lt_lora_files(job_dir) -> list[dict]:
+    """The .safetensors files of a job folder, oldest first: [{"path", "name", "label"}] with the label "final" (the
+    job's own file), "best" (_best) or what follows the job name (a step save)."""
+    d = Path(job_dir)
+    out = []
+    try:
+        files = [p for p in d.iterdir() if p.suffix.lower() == ".safetensors" and p.is_file()]
+        files.sort(key=lambda p: (p.stat().st_mtime, p.name))
+    except OSError:
+        return []
+    for p in files:
+        out.append({"path": p, "name": p.name, "label": lt_file_label(p.stem, d.name)})
+    return out
+
+
+def lt_job_dir_of(rec: dict, runs: list[dict], pulls: Path | None = None) -> Path | None:
+    """The folder that holds a Previous Runs record's LoRA files: history_job_dir's, else for a vast.ai run its
+    downloaded folder (the record's job_dir, or <Fleet downloads folder>/<instance>/<job>), the first that has
+    .safetensors files, else the first that exists."""
+    d = history_job_dir(rec, runs)
+    if d is not None:
+        return d
+    src = rec.get("source") or {}
+    if src.get("kind") != "vast":
+        return None
+    cands = []
+    if rec.get("job_dir"):
+        cands.append(Path(rec["job_dir"]))
+    if pulls is not None and src.get("instance") not in (None, "") and rec.get("job"):
+        cands.append(Path(pulls) / str(src["instance"]) / str(rec["job"]))
+    existing = [c for c in cands if c.is_dir()]
+    return next((c for c in existing if lt_lora_files(c)), existing[0] if existing else None)
+
+
+def lt_run_options(runs: list[dict], output_root: Path, job_dir_of) -> list[dict]:
+    """The runs a test can take LoRAs from: the Previous Runs records (job_dir_of(record): the job folder that still
+    holds that run's files, or None), then job folders of output/ that have no record. Each: {"key", "label",
+    "run_id", "job_dir", "config", "files", "problem"}; a run whose files are gone has a problem text and no files."""
+    out = []
+    used = set()
+    for r in runs:
+        d = job_dir_of(r)
+        opt = {"key": f"run:{r['id']}", "label": history_label(r), "run_id": r["id"], "job_dir": d, "config": None,
+               "files": [], "problem": None}
+        if d is None:
+            opt["problem"] = "No LoRA files left"
+        else:
+            try:
+                used.add(Path(d).resolve())
+            except OSError:
+                pass
+            files = lt_lora_files(d)
+            if not files:
+                opt["problem"] = "No LoRA files left"
+            elif not (Path(d) / "config.yaml").is_file():
+                opt["problem"] = "No config.yaml left"
+            else:
+                opt["files"], opt["config"] = files, Path(d) / "config.yaml"
+        out.append(opt)
+    try:
+        folders = sorted((p for p in Path(output_root).iterdir() if p.is_dir() and not p.name.startswith("_")),
+                         key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        folders = []
+    for d in folders:
+        try:
+            if d.resolve() in used:
+                continue
+        except OSError:
+            continue
+        files = lt_lora_files(d)
+        if files and (d / "config.yaml").is_file():
+            out.append({"key": f"dir:{d.name}", "label": d.name, "run_id": None, "job_dir": d,
+                        "config": d / "config.yaml", "files": files, "problem": None})
+    return out
+
+
+def lt_path_text(p, base: Path | None = None) -> str:
+    """A path as the spec writes it: relative to the install folder (forward slashes) when inside it, else absolute."""
+    base = Path(base) if base is not None else ROOT
+    try:
+        return Path(p).resolve().relative_to(base.resolve()).as_posix()
+    except (ValueError, OSError):
+        return str(Path(p))
+
+
+def lt_parse_numbers(text, what: str, whole: bool) -> list:
+    """"1, 2 3" as [1, 2, 3] (whole numbers) or floats; ValueError (a sentence naming `what`) for anything else."""
+    out = []
+    for part in (x for x in re.split(r"[,\s;]+", str(text or "").strip()) if x):
+        try:
+            out.append(int(part) if whole else float(part))
+        except ValueError:
+            raise ValueError(f"{what}: {part!r} is not {'a whole number' if whole else 'a number'}") from None
+    return out
+
+
+def lt_count(n_files: int, n_soups: int, strengths, prompts, seeds) -> int:
+    return (n_files + n_soups) * len(strengths) * len(prompts) * len(seeds)
+
+
+def lt_estimate_text(pictures: int, n_gpus: int) -> str:
+    """"84 pictures, about 14 to 42 min on 1 GPU": the range is a rule of thumb; the test shows its real speed."""
+    lo, hi = (pictures * s / max(1, n_gpus) for s in LT_SECONDS_PER_PICTURE)
+
+    def show(sec: float) -> str:
+        return f"{max(1, round(sec / 60))} min" if sec >= 90 else f"{max(1, round(sec))} s"
+
+    return (f"{pictures} picture{'s' if pictures != 1 else ''}, about {show(lo)} to {show(hi)} on "
+            f"{n_gpus} GPU{'s' if n_gpus != 1 else ''}")
+
+
+def lt_eta_text(seconds) -> str:
+    if not isinstance(seconds, (int, float)) or seconds < 0:
+        return ""
+    s = int(seconds)
+    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d} left" if s >= 3600 else f"{s // 60}:{s % 60:02d} left"
+
+
+def lt_build_spec(name: str, picks: list[dict], prompts: list[dict], seeds: list[int], strengths: list[float],
+                  soups: list[list[int]], devices: list[str], base: Path | None = None) -> dict:
+    """A test spec (docs/lora-test-contract.md section 2) from the form: picks [{"path", "config", "label",
+    "run_id"}] in order (c1, c2, ...), prompts [{"text", "kind"}], soups as lists of indexes into picks (s1, s2, ...).
+    No test_id: loratest.cmd_new makes one."""
+    contestants = [{"id": f"c{i + 1}", "label": p["label"], "lora": p.get("spec_lora") or lt_path_text(p["path"], base),
+                    "config": p.get("spec_config") or lt_path_text(p["config"], base), "run_id": p.get("run_id")}
+                   for i, p in enumerate(picks)]
+    soup_specs = [{"id": f"s{i + 1}", "label": "soup " + "+".join(f"c{j + 1}" for j in of),
+                   "of": [f"c{j + 1}" for j in of], "weights": None} for i, of in enumerate(soups)]
+    return {"version": loratest.SPEC_VERSION, "name": " ".join(str(name or "").split()) or "LoRA test",
+            "contestants": contestants, "soups": soup_specs,
+            "prompts": [" ".join(str(p["text"]).split()) for p in prompts], "prompt_kinds": [p["kind"] for p in prompts],
+            "seeds": list(seeds), "strengths": [float(s) for s in strengths],
+            "render": {"width": None, "height": None, "steps": None, "cfg": None, "negative": None},
+            "scoring": {"face_refs": None, "body_refs": None, "from_contestant": "c1"}, "devices": list(devices)}
+
+
+def lt_validate(spec: dict, base: Path | None = None, config_reader=None) -> str | None:
+    """loratest.validate on a spec without an id yet: None when it is accepted, else its refusal text."""
+    cache: dict = {}
+    reader = config_reader or loratest.read_config
+
+    def read(path):
+        key = str(path)
+        if key not in cache:
+            cache[key] = reader(path)
+        return cache[key]
+
+    try:
+        loratest.validate({**spec, "test_id": spec.get("test_id") or LT_PLACEHOLDER_ID}, base or ROOT,
+                          config_reader=read)
+    except loratest.SpecError as e:
+        return str(e)
+    except Exception as e:  # noqa: BLE001  (an odd config must show as a refusal, not break the page)
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
+def lt_preset_prompt(key: str, trigger: str = "", subject: str = "", mine: list[dict] | None = None):
+    """(prompt text, kind) of a probe preset key (the built-ins' keys, or "my:<kind>:<name>" for the user's own) with
+    the trigger word and subject filled in; None when the key is unknown."""
+    if str(key).startswith(MY_PRESET):
+        for p in mine if mine is not None else load_probe_presets():
+            if f"{MY_PRESET}{p['kind']}:{p['name']}" == key:
+                return promptcheck.fill(p["template"], trigger, subject), p["kind"]
+        return None
+    try:
+        return promptcheck.build(key, trigger, subject), promptcheck.preset(key).kind
+    except ValueError:
+        return None
+
+
+def lt_preset_options() -> dict:
+    """Every probe preset for a select: {key: label}, the face presets first, then the body ones, each with the
+    user's own last."""
+    out = {}
+    for kind in ("face", "body"):
+        out.update({k: f"{kind}: {v}" for k, v in probe_preset_options(kind).items()})
+    return out
+
+
+def lt_spec_key(spec: dict) -> str:
+    """A short hash of a built spec (without its name): the form's validation result is kept for it."""
+    import hashlib
+
+    return hashlib.sha1(json.dumps({k: v for k, v in spec.items() if k != "name"}, sort_keys=True)
+                        .encode("utf-8")).hexdigest()
+
+
+def lt_start(spec: dict, held: dict[str, str], base: Path | None = None, launch=None,
+             held_fn=None) -> tuple[str | None, str]:
+    """Write the spec (loratest.cmd_new) and start the run detached. (test id, message); the id is None when nothing
+    was started. All under the start lock the queue and Start training use, with the live-test and GPU checks made
+    again inside it (held_fn() gives the GPUs a training job holds right now; else `held` is used): a test and a
+    training run cannot both start in the same moment. A second test is not started beside a live one."""
+    base = Path(base) if base is not None else ROOT
+    with _start_lock:
+        live = lt_live_test(loratest.tests_root(base))
+        if live:
+            return None, f"Not started: test {live} is still running. Stop it or wait for it to finish."
+        busy = held_fn() if held_fn is not None else held
+        clash = [d for d in spec.get("devices") or [] if d in busy]
+        if clash:
+            return None, f"Not started: {clash[0]} is busy ({busy[clash[0]]}). Pick another GPU."
+        try:
+            tid = loratest.cmd_new(json.dumps(spec), base)
+        except loratest.SpecError as e:
+            return None, f"Not started: {e}"
+        test_dir = loratest.tests_root(base) / tid
+        try:
+            (launch or lt_launch)(test_dir, base)
+        except OSError as e:
+            loratest.write_json(test_dir / "status.json", {"state": "failed", "test_id": tid, "pid": None,
+                                                             "error": f"could not start: {e}"})
+            return tid, f"The test was saved but did not start: {e}"
+        return tid, f"Started test {tid}."
+
+
+def lt_launch(test_dir: Path, base: Path | None = None) -> int:
+    """`python -m rulztrainer.loratest run <test_dir>` detached from the WebUI (own process group / session, no
+    console), logging to <test_dir>/run.log: a page reload or a WebUI restart leaves it running. Returns its pid."""
+    env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+    if sys.platform == "win32":
+        detach = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+    else:
+        detach = {"start_new_session": True}
+    with open(Path(test_dir) / "run.log", "w", encoding="utf-8") as log:  # the run keeps its own handle
+        proc = subprocess.Popen([sys.executable, "-m", "rulztrainer.loratest", "run", str(test_dir)],
+                                cwd=str(base or ROOT), env=env, stdout=log, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, **detach)
+    return proc.pid
+
+
+def lt_stop(test_dir: Path) -> None:
+    """Ask a running test to stop: it finishes the picture in hand, scores what it has and ends "stopped"."""
+    (Path(test_dir) / "STOP").write_text("stop\n", encoding="utf-8")
+
+
+def lt_valid_run_id(run_id, root: Path | None = None) -> bool:
+    """A Previous Runs record name that may be labelled: text without a slash, backslash or "..", and a record file of
+    that name that exists (history_dir()/<id>.json)."""
+    if not isinstance(run_id, str) or not run_id or "/" in run_id or "\\" in run_id or ".." in run_id \
+            or "\x00" in run_id:
+        return False
+    try:
+        return (Path(root) if root is not None else history.history_dir()).joinpath(f"{run_id}.json").is_file()
+    except OSError:
+        return False
+
+
+def lt_pick_label(spec: dict, cid: str, strength: float, set_label=None, run_ids: dict | None = None,
+                  root: Path | None = None) -> tuple[bool, str]:
+    """Pick: put a label on the contestant's run in Previous Runs (history.set_label). The run id is the one this PC
+    kept (run_ids: {contestant id: run id}, for a test downloaded from an instance, whose own spec.json is not
+    trusted), else the spec's; and only a name that is an existing record (lt_valid_run_id)."""
+    c = next((x for x in spec.get("contestants") or [] if x.get("id") == cid), None)
+    rid = None if c is None else (run_ids.get(cid) if run_ids is not None else c.get("run_id"))
+    if c is None or not rid:
+        return False, "Only a LoRA from a saved run can be picked (a soup or a loose folder has no run to label)."
+    if not lt_valid_run_id(rid, root):
+        return False, "That run is not in Previous Runs (any more), so it cannot be labelled."
+    label = f"{c.get('label') or cid} @ {strength:.2f}"
+    if (set_label or history.set_label)(rid, label):
+        return True, f"Labelled the run in Previous Runs: {label}"
+    return False, "The run's record in Previous Runs could not be changed."
+
+
+def lt_score_text(cell) -> str:
+    """"face 61.2 · body 55.0 · gold 58.4" for a cell's tooltip ("-" where a score is missing)."""
+    def one(v):
+        return "-" if not isinstance(v, (int, float)) else f"{v:.1f}"
+
+    cell = cell or {}
+    return f"face {one(cell.get('face'))} · body {one(cell.get('body'))} · gold {one(cell.get('gold'))}"
+
+
+def lt_grid_model(spec: dict, results: dict) -> dict:
+    """The grid as data: "columns" (contestant x strength, with the column's means, "winner" and "best" flags) and
+    "rows" (prompt x seed, each with one cell or None per column)."""
+    contestants = results.get("contestants") or []
+    labels = {c["id"]: c.get("label") or c["id"] for c in contestants}
+    key = lambda s: f"{float(s):.2f}"  # noqa: E731
+    stats = {(c["contestant"], key(c["strength"])): c for c in results.get("columns") or []}
+    cells = {(c["contestant"], key(c["strength"]), c["prompt"], c["seed"]): c for c in results.get("cells") or []}
+    win = results.get("winner") or {}
+    best = results.get("best_strength") or {}
+    columns = []
+    for c in contestants:
+        for s in spec.get("strengths") or []:
+            columns.append({"contestant": c["id"], "label": labels[c["id"]], "strength": float(s),
+                            "kind": c.get("kind", "file"), "stats": stats.get((c["id"], key(s))) or {},
+                            "winner": win.get("contestant") == c["id"] and win.get("strength") is not None
+                            and key(win["strength"]) == key(s),
+                            "best": best.get(c["id"]) is not None and key(best[c["id"]]) == key(s)})
+    prompts = spec.get("prompts") or []
+    kinds = spec.get("prompt_kinds") or ["both"] * len(prompts)
+    rows = [{"prompt_index": pi, "prompt": prompt, "kind": kinds[pi], "seed": seed,
+             "cells": [cells.get((col["contestant"], key(col["strength"]), pi, seed)) for col in columns]}
+            for pi, prompt in enumerate(prompts) for seed in spec.get("seeds") or []]
+    return {"columns": columns, "rows": rows}
+
+
+LT_REMOTE_MARK = "remote.json"  # in a test folder of an instance: {"instance", "test_id", "pulled"}
+
+
+def lt_file_label(stem: str, job: str) -> str:
+    """A LoRA file's short name inside its run: "final" (the job's own file), "best" (_best) or what follows the job
+    name (a step save)."""
+    if stem == job:
+        return "final"
+    if stem.endswith("_best"):
+        return "best"
+    return stem[len(job) + 1:] if stem.startswith(job + "_") else stem
+
+
+def lt_status_age(d) -> float | None:
+    """Seconds since a test folder's status.json was written (None: it cannot be read)."""
+    try:
+        return max(0.0, time.time() - (Path(d) / "status.json").stat().st_mtime)
+    except OSError:
+        return None
+
+
+def lt_state(d, status: dict | None, age: float | None = None) -> str:
+    """The state readers show for a test folder: loratest.effective_state (a dead pid means failed), except for a test
+    of an instance (remote.json), whose pid is not a process here: its own state stands (test-status already turns a
+    dead process into failed)."""
+    if status is None:
+        return "unknown"
+    if (Path(d) / LT_REMOTE_MARK).is_file():
+        return status.get("state") or "queued"
+    return loratest.effective_state(status, age)
+
+
+def lt_remote_mark(dest: Path, instance, test_id: str, pulled: bool = False, run_ids: dict | None = None) -> None:
+    """remote.json beside a downloaded test: which instance, whether it was pulled, and the run ids this PC chose for
+    the contestants (kept when rewritten): Pick trusts these, never the pulled spec.json."""
+    old = lt_read_json(Path(dest) / LT_REMOTE_MARK) or {}
+    keep = run_ids if run_ids is not None else old.get("run_ids")
+    loratest.write_json(Path(dest) / LT_REMOTE_MARK, {"instance": str(instance), "test_id": test_id, "pulled": pulled,
+                                                      "run_ids": keep if isinstance(keep, dict) else {}})
+
+
+def lt_remote_instances(fl) -> list[tuple[str, str]]:
+    """[(instance id, label)] of the Fleet's instances a test can go to (not the ones that are gone)."""
+    try:
+        instances = fl.read()["instances"]
+    except Exception:  # noqa: BLE001  (no fleet module / state: the tab is for this PC only)
+        return []
+    out = []
+    for iid, inst in sorted(instances.items(), key=lambda kv: str(kv[0])):
+        if inst.get("gone"):
+            continue
+        out.append((str(iid), f"Instance {iid}" + (f" · {inst['label']}" if inst.get("label") else "") +
+                    (f" · {inst['gpu']}" if inst.get("gpu") else "")))
+    return out
+
+
+def lt_remote_jobs(jobs: list[dict]) -> list[dict]:
+    """The job folders of an instance (rulz_agent.py jobs), newest first: [{"job", "label", "running"}]."""
+    rows = [j for j in jobs if isinstance(j, dict) and j.get("job")]
+    rows.sort(key=lambda j: j.get("modified") or 0, reverse=True)
+    return [{"job": j["job"], "label": j["job"] + (" (running now)" if j.get("running") else ""),
+             "running": bool(j.get("running"))} for j in rows]
+
+
+def lt_remote_job_files(listing: dict, job: str) -> dict:
+    """One job's LoRA files from the instance's own file listing (rulz_agent.py files <job> --what loras --what logs):
+    {"files": [{"name", "label", "spec", "mtime"}], "config": spec path or None, "problem"}. Paths are relative to the
+    instance's install (output/<job>/<file>), never to a downloaded copy."""
+    files, config = [], None
+    for f in listing.get("files") or []:
+        parts = str(f.get("path") or "").split("/")
+        if len(parts) != 2 or parts[0] != job:
+            continue
+        if parts[1] == "config.yaml":
+            config = f"output/{job}/config.yaml"
+        elif parts[1].lower().endswith(".safetensors"):
+            files.append({"name": parts[1], "label": lt_file_label(parts[1][:-len(".safetensors")], job),
+                          "spec": f"output/{job}/{parts[1]}", "mtime": f.get("mtime") or 0})
+    files.sort(key=lambda x: (x["mtime"], x["name"]))
+    problem = "No LoRA files left" if not files else None if config else "No config.yaml left"
+    return {"files": files, "config": config, "problem": problem}
+
+
+def lt_remote_precheck(spec: dict) -> str | None:
+    """What can be checked without the instance's files (loratest.validate needs them here): the refusal text, or None.
+    The instance checks the rest (files, base models) when it starts the test, and its refusal is shown as it is."""
+    if not spec.get("contestants"):
+        return "Pick at least one LoRA file."
+    if not spec.get("prompts"):
+        return "Add at least one prompt."
+    if not spec.get("devices"):
+        return "Pick a GPU."
+    if not spec.get("seeds") or len(set(spec["seeds"])) != len(spec["seeds"]):
+        return "seeds: a non-empty list without repeats is needed"
+    if not spec.get("strengths"):
+        return "strengths: a non-empty list of strengths is needed"
+    lo, hi = loratest.STRENGTH_RANGE
+    for s in spec["strengths"]:
+        if not lo <= s <= hi:
+            return f"strengths: {s} is outside {lo:g} to {hi:g}"
+    if any(len(s.get("of") or []) < 2 for s in spec.get("soups") or []):
+        return "Each soup needs two or more LoRAs."
+    total = lt_count(len(spec["contestants"]), len(spec.get("soups") or []), spec["strengths"], spec["prompts"],
+                     spec["seeds"])
+    if total > loratest.MAX_CELLS:
+        return f"{total} pictures is more than the {loratest.MAX_CELLS} a test may render"
+    return None
+
+
+def lt_agent(remote, *args: str, config: bytes | None = None, retry: bool = True) -> tuple[bool, str]:
+    """rulz_remote's Remote.agent as (ok, text): the output on success, else the instance's own error text, verbatim."""
+    done = remote.agent(*args, config=config, retry=retry)
+    out = (done.stdout or b"").decode("utf-8", "replace").strip()
+    err = (done.stderr or b"").decode("utf-8", "replace").strip()
+    return done.returncode == 0, out if done.returncode == 0 else (err or out or f"{args[0]} failed")
+
+
+def lt_remote_start(remote, instance, spec: dict, pulls: Path | None = None) -> tuple[str | None, str]:
+    """test-start on the instance (the spec piped to it). (test id, message); None when it was not started, with the
+    instance's refusal as it came. A folder for the test is made under the Fleet downloads folder at once (after the
+    same link and location checks as a download), so the tab can follow it and a restarted WebUI finds it."""
+    why = lt_remote_precheck(spec)
+    if why:
+        return None, why
+    root = lt_tests_root(instance, pulls)
+    if root is None:
+        return None, f"Not started: this PC's download folder for instance {instance} cannot be used."
+    try:
+        lt_check_dest(root / "t", pulls)
+    except OSError as e:
+        return None, f"Not started: {e}"
+    ok, text = lt_agent(remote, "test-start", config=json.dumps(spec).encode("utf-8"), retry=False)
+    if not ok:
+        return None, f"Not started: {text}"
+    try:
+        tid = json.loads(text)["test_id"]
+    except (ValueError, KeyError, TypeError):
+        return None, f"Not started: the instance answered {text!r}"
+    dest = root / str(tid)
+    try:
+        if not loratest.TEST_ID_RE.match(str(tid)):
+            raise OSError("bad test id")
+        lt_check_dest(dest, pulls)
+    except OSError as e:
+        return None, f"The test started on the instance as {tid}, but its folder here could not be used ({e})."
+    dest.mkdir(parents=True, exist_ok=True)
+    loratest.write_json(dest / "spec.json", {**spec, "test_id": tid})
+    loratest.write_json(dest / "status.json", {"state": "queued", "test_id": tid, "pid": None})
+    lt_remote_mark(dest, instance, tid, run_ids={c["id"]: c.get("run_id") for c in spec.get("contestants") or []})
+    return tid, f"Started test {tid} on instance {instance}."
+
+
+def lt_remote_poll(remote, dest: Path, tid: str) -> tuple[dict | None, str]:
+    """test-status of one test: (its status, "") with the status also written to <dest>/status.json, or (None, the
+    reason it could not be read)."""
+    ok, text = lt_agent(remote, "test-status", tid)
+    if not ok:
+        return None, text
+    try:
+        status = json.loads(text)
+    except ValueError:
+        return None, f"The instance answered {text!r}"
+    if not isinstance(status, dict):
+        return None, f"The instance answered {text!r}"
+    loratest.write_json(Path(dest) / "status.json", status)
+    return status, ""
+
+
+def lt_remote_stop(remote, tid: str) -> tuple[bool, str]:
+    return lt_agent(remote, "test-stop", tid)
+
+
+def lt_check_dest(dest: Path, pulls: Path | None = None) -> Path:
+    """The folder a test of an instance is kept in, checked (OSError, with the reason): no link among dest, its _tests
+    parent and the instance folder, and inside the Fleet downloads folder. Returns dest resolved."""
+    dest = Path(dest)
+    pulls = pulls if pulls is not None else lt_pulls_root()
+    if pulls is None:
+        raise OSError("The Fleet's downloads folder could not be found.")
+    try:
+        if any(p.is_symlink() for p in (dest, dest.parent, dest.parent.parent)):
+            raise OSError("The test's download folder is a link; it is not used.")
+        base = dest.resolve()
+        if not base.is_relative_to(Path(pulls).resolve()):
+            raise OSError("The test's download folder is outside the Fleet's downloads folder.")
+    except (OSError, ValueError) as e:
+        raise OSError(str(e) or "The test's download folder cannot be used.") from e
+    return base
+
+
+def lt_check_pull(dest: Path, files, pulls: Path | None = None) -> None:
+    """Refuse a download of a test before anything is written (OSError, with the reason): the folder must be
+    <downloads>/<instance>/_tests/<id> (lt_check_dest), and no entry of the instance's listing may leave it (a path
+    that is not text, has a line break, is absolute or has .. as a POSIX or a Windows path, resolves outside dest, or
+    names remote.json, which holds this PC's own notes on the test). One bad entry refuses the whole pull: the
+    listing comes from the instance, which may be broken or hostile."""
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    base = lt_check_dest(dest, pulls)
+    if not isinstance(files, list):
+        raise OSError("Unsafe test file list: the instance's listing is not a list.")
+    for entry in files:
+        name = entry.get("path") if isinstance(entry, dict) else None
+        if (not isinstance(name, str) or not name or "\n" in name or "\r" in name or "\x00" in name or
+                PurePosixPath(name).is_absolute() or PureWindowsPath(name).is_absolute() or
+                ".." in PurePosixPath(name).parts or ".." in PureWindowsPath(name).parts):
+            raise OSError("Unsafe test file path in the instance's listing; nothing was downloaded.")
+        try:
+            target = (base / name).resolve()
+            inside = target.is_relative_to(base) and target != (base / LT_REMOTE_MARK).resolve()
+        except (OSError, ValueError):
+            inside = False
+        if not inside:
+            raise OSError("Unsafe test file path in the instance's listing; nothing was downloaded.")
+
+
+def lt_remote_pull(remote, dest: Path, tid: str, rr=None, pulls: Path | None = None) -> int:
+    """pull --tests: copy the test's folder from the instance into `dest` (<Fleet downloads>/<instance>/_tests/<id>),
+    skipping what is already there; returns how many files came. The listing is checked first (lt_check_pull).
+    rr: the rulz_remote module (tests pass a fake)."""
+    if rr is None:
+        lt_pulls_root()  # puts scripts/vast on the path
+        import rulz_remote as rr
+    if rr.fleet_move_in_progress():
+        raise OSError("The Fleet's downloads folder is being moved; try again when that is done.")
+    if not loratest.TEST_ID_RE.match(str(tid)):
+        raise OSError("Bad test id")
+    listing = remote.agent_json("files", "--tests", tid)
+    files = listing.get("files") if isinstance(listing, dict) else None
+    lt_check_pull(dest, files, pulls)
+    if not isinstance(listing.get("base"), str):
+        raise OSError("Unsafe test listing: no base folder.")
+    todo = rr.pull_plan(files, Path(dest).resolve())
+    if todo:
+        rr.fetch(remote, listing["base"], [f["path"] for f in todo], Path(dest).resolve())
+    return len(todo)
+
+
+_LT_PULLS: set = set()
+_LT_PULLS_LOCK = threading.Lock()
+
+
+def lt_pull_once(remote, dest: Path, instance, tid: str, rr=None, pulls: Path | None = None) -> int | None:
+    """lt_remote_pull, once: None (nothing done) when this test is already pulled or another pull of it is going on
+    in this process (a second browser); else how many files came, with the folder then marked pulled."""
+    key = (str(instance), str(tid))
+    with _LT_PULLS_LOCK:
+        if key in _LT_PULLS:
+            return None
+        _LT_PULLS.add(key)
+    try:
+        if (lt_read_json(Path(dest) / LT_REMOTE_MARK) or {}).get("pulled"):
+            return None
+        n = lt_remote_pull(remote, dest, tid, rr=rr, pulls=pulls)
+        lt_remote_mark(dest, instance, tid, True)
+        return n
+    finally:
+        with _LT_PULLS_LOCK:
+            _LT_PULLS.discard(key)
+
+
+def lt_list_tests(pulls: Path | None = None, limit: int = 300) -> list[dict]:
+    """Saved tests, newest first: this PC's (loratest.list_tests) and the ones downloaded from instances
+    (<Fleet downloads>/<instance>/_tests/<id>), each with "instance" (None for this PC) and the state readers show."""
+    out = [{**t, "instance": None} for t in loratest.list_tests(ROOT)]
+    pulls = pulls if pulls is not None else lt_pulls_root()
+    try:
+        insts = [p for p in Path(pulls).iterdir() if p.is_dir() and LT_INSTANCE.match(p.name)] if pulls else []
+    except OSError:
+        insts = []
+    for ip in insts:
+        try:
+            dirs = [d for d in (ip / "_tests").iterdir() if d.is_dir() and loratest.TEST_ID_RE.match(d.name)]
+        except OSError:
+            continue
+        for d in dirs:
+            if len(out) >= limit + 50:
+                break
+            spec = lt_read_json(d / "spec.json") or {}
+            out.append({"id": d.name, "test_id": d.name, "name": spec.get("name"),
+                        "state": lt_state(d, lt_read_json(d / "status.json"), lt_status_age(d)), "created": spec.get("created"),
+                        "instance": ip.name})
+    out.sort(key=lambda t: (t["id"], t["instance"] or ""), reverse=True)
+    return out[:limit]
+
+
+def lt_test_url(test_id: str, rel: str, instance=None) -> str:
+    from urllib.parse import quote
+
+    return f"/rz-test-image?test={quote(test_id)}&path={quote(rel)}" + (f"&inst={quote(str(instance))}" if instance else "")
+
+
+# ---------------------------------------------------------------- Test LoRAs tab: the page
+
+
+def render_test_results(test_dir, *, image_url=None, on_pick=None, open_image=None, export: bool = True,
+                        instance=None) -> None:
+    """The results of one test folder (spec.json + results.json) into the current NiceGUI context: the grid, the column
+    table, the best strength per LoRA, the winner and the scale note. The seam for other sources of a test folder
+    (a test downloaded from a vast.ai instance): pass image_url(rel) -> the URL of a picture under images/ and leave
+    export off or point it at the same folder.
+
+    image_url: default lt_test_url(folder name, rel, instance), served confined to output/_tests/ (or, with
+    instance, to <Fleet downloads>/<instance>/_tests/) by /rz-test-image.
+    instance: the vast.ai instance id of a downloaded test, None for a test of this PC.
+    on_pick(contestant id, strength): the Pick button of a column (None: no Pick buttons).
+    open_image(url, title): a click on a picture (None: no zoom)."""
+    from urllib.parse import quote
+
+    test_dir = Path(test_dir)
+    spec, results = lt_read_json(test_dir / "spec.json"), lt_read_json(test_dir / "results.json")
+    if spec is None or results is None:
+        hint("This test has no results yet.")
+        return
+    tid = test_dir.name
+    image_url = image_url or (lambda rel: lt_test_url(tid, rel, instance))
+    inst_q = f"&inst={quote(str(instance))}" if instance else ""
+    model = lt_grid_model(spec, results)
+    cols, rows = model["columns"], model["rows"]
+    winner = results.get("winner")
+    labels = {c["id"]: c.get("label") or c["id"] for c in results.get("contestants") or []}
+    if winner:
+        ui.label(f"Winner: {labels.get(winner['contestant'], winner['contestant'])} at strength "
+                 f"{float(winner['strength']):.2f}, combined {winner.get('combined') if winner.get('combined') is not None else '-'}") \
+            .classes("rz-step-title")
+    else:
+        hint("No winner: nothing was scored.")
+    if results.get("complete") is False:
+        hint("This test was stopped early. The grid shows the pictures that were rendered.", warn=True)
+    if results.get("scale") == "references":
+        hint(results.get("scale_note") or "These scores are on the references' own scale, not each run's own, so they "
+             "do not compare with the Monitor's or Previous Runs' numbers.", warn=True)
+    elif results.get("scale_note"):
+        hint(str(results["scale_note"]))
+    best = results.get("best_strength") or {}
+    if best:
+        ui.label("Best strength: " + " · ".join(f"{labels.get(cid, cid)} {float(s):.2f}" for cid, s in best.items())) \
+            .classes("rz-hint")
+
+    # the column table: one row per contestant x strength
+    def num(v):
+        return "-" if not isinstance(v, (int, float)) else f"{v:.1f}"
+
+    table_rows = [{"key": f"{c['contestant']}-{c['strength']:.2f}", "lora": c["label"], "strength": f"{c['strength']:.2f}",
+                   "face": num(c["stats"].get("face")), "body": num(c["stats"].get("body")),
+                   "gold": num(c["stats"].get("gold")), "combined": num(c["stats"].get("combined")),
+                   "n": c["stats"].get("n", 0),
+                   "result": "winner" if c["winner"] else ("best strength" if c["best"] else "")} for c in cols]
+    columns = [{"name": k, "label": lbl, "field": k, "align": "left" if k in ("lora", "result") else "right",
+                "sortable": True} for k, lbl in (("lora", "LoRA"), ("strength", "Strength"), ("face", "Face"),
+                                                 ("body", "Body"), ("gold", "Gold"), ("combined", "Combined"),
+                                                 ("n", "n"), ("result", ""))]
+    ui.table(columns=columns, rows=table_rows, row_key="key", pagination={"rowsPerPage": 0}) \
+        .props("flat dense hide-pagination").classes("w-full")
+
+    if export:
+        with ui.row().classes("items-center gap-2"):
+            def offer(names: list[str]) -> None:
+                """One file: it downloads. Several grid pages: a dialog with a button for each."""
+                if len(names) == 1:
+                    ui.download(f"/rz-test-file?test={quote(tid)}&name={quote(names[0])}{inst_q}", names[0])
+                    return
+                with ui.dialog() as dlg, ui.card().classes("rz-card gap-2"):
+                    ui.label(f"The grid is {len(names)} pages").classes("rz-step-title")
+                    for n in names:
+                        ui.button(n, icon="download", color=None,
+                                  on_click=lambda _, n=n: ui.download(
+                                      f"/rz-test-file?test={quote(tid)}&name={quote(n)}{inst_q}", n)) \
+                            .props("outline dense no-caps")
+                    ui.button("Close", on_click=dlg.close, color=None).props("flat")
+                dlg.open()
+
+            async def do_export(kind: str) -> None:
+                from rulztrainer import loratest_export as LX
+
+                try:
+                    if kind == "grid":
+                        names = [p.name for p in await run.io_bound(LX.export_grid_pages, str(test_dir))]
+                    else:
+                        await run.io_bound({"xlsx": LX.export_xlsx, "pdf": LX.export_pdf}[kind], str(test_dir))
+                        names = [LT_EXPORTS[kind][0]]
+                except Exception as e:  # noqa: BLE001  (a missing library or file: say so, keep the page)
+                    ui.notify(f"The export did not work: {e}", type="negative")
+                    return
+                offer(names)
+
+            for kind, text, icon in (("grid", "Export grid image", "grid_on"), ("xlsx", "Export scores", "table_view"),
+                                     ("pdf", "Export report", "picture_as_pdf")):
+                ui.button(text, icon=icon, on_click=lambda _, k=kind: do_export(k), color=None) \
+                    .props("outline dense no-caps")
+
+    # the grid: rows = prompt x seed, columns = contestant x strength
+    with ui.element("div").classes("rz-lt-scroll"):
+        with ui.element("div").classes("rz-lt-grid").style(
+                f"grid-template-columns: 9rem repeat({max(1, len(cols))}, minmax(8rem, 12rem))"):
+            ui.element("div")
+            for c in cols:
+                with ui.element("div").classes("rz-lt-head" + (" rz-lt-win" if c["winner"] else "")):
+                    ui.label(c["label"]).classes("rz-shot-title").style("padding: 0")
+                    ui.label(f"strength {c['strength']:.2f}" + ("  ·  winner" if c["winner"] else
+                                                                  "  ·  best" if c["best"] else "")).classes("rz-hint")
+                    comb = c["stats"].get("combined")
+                    ui.label(f"combined {num(comb)}").classes("rz-hint")
+                    if on_pick is not None:
+                        ui.button("Pick", on_click=lambda _, cid=c["contestant"], s=c["strength"]: on_pick(cid, s),
+                                  color=None).props("outline dense no-caps")
+            for row in rows:
+                with ui.element("div").classes("rz-lt-rowlabel"):
+                    ui.label(f"Prompt {row['prompt_index'] + 1} · {row['kind']} · seed {row['seed']}")
+                    ui.tooltip(row["prompt"])
+                for col, cell in zip(cols, row["cells"]):
+                    shown = cell is not None and cell.get("image") and (test_dir / cell["image"]).is_file()
+                    with ui.element("div").classes("rz-lt-cell" + (" rz-lt-win" if col["winner"] else "")):
+                        if not shown:
+                            ui.label("missing").classes("rz-lt-missing")
+                            continue
+                        url = image_url(cell["image"])
+                        img = ui.image(url).props("fit=contain loading=lazy").classes("w-full rz-imgbg")
+                        if open_image is not None:
+                            img.classes("cursor-pointer")
+                            img.on("click", lambda _, u=url, t=f"{col['label']} at {col['strength']:.2f}, prompt "
+                                   f"{row['prompt_index'] + 1}, seed {row['seed']}": open_image(u, t))
+                        comb = cell.get("combined")
+                        ui.label(num(comb)).classes("rz-lt-score")
+                        ui.tooltip(lt_score_text(cell))
+
+
+def build_loratest_tab(is_visible=lambda: True) -> None:
+    """Test LoRAs: build a test from finished runs, start it, follow it, read its grid, export it, reopen saved ones.
+    is_visible(): whether the tab is the open one (the 2 s timer rests when it is not)."""
+    st = {"options": None, "picks": {}, "prompts": [], "soups": [], "view": None, "view_inst": None, "view_sig": None,
+          "list_sig": None, "gpus": [], "held": {}, "target": "pc", "targets": {"pc": "This PC"}, "remote_jobs": None,
+          "remote_files": {}, "remote_gpus": [], "runs_err": "", "remote_err": "", "refused": "", "fleet": None,
+          "val": {}, "val_pending": None, "remote_run_ids": {}}
+    gpu_boxes: dict = {}
+    gpu_notes: dict = {}
+
+    # ---- the pictures' zoom dialog (one for the tab)
+    with ui.dialog() as zoom, ui.card().classes("rz-card gap-2").style("max-width: 94vw"):
+        zoom_title = ui.label("").classes("rz-shot-title")
+        zoom_img = ui.image("").props("fit=contain").style("max-height: 80vh; min-width: 40vw")
+        ui.button("Close", on_click=zoom.close, color=None).props("flat")
+
+    def open_image(url: str, title: str) -> None:
+        zoom_img.set_source(url)
+        zoom_title.text = title
+        zoom.open()
+
+    # ================================================================ build form
+    with card():
+        ui.label("Test LoRAs").classes("rz-step-title")
+        hint("Renders LoRAs from your runs on the same prompts and seeds, at several strengths, and scores every picture "
+             "the way the run's probes are scored. Pick LoRA files below, set the prompts, and press Start test.")
+
+    with card():
+        subhead("1. LoRAs")
+        hint("Tick the files to compare. Final, best and step saves are the .safetensors files found in each run's job "
+             "folder. Every LoRA in one test must come from the same base model.")
+        with ui.row().classes("items-center gap-2 w-full"):
+            target_sel = ui.select(st["targets"], value="pc", label="Run on").props("dense").classes("w-80")
+            with target_sel:
+                ui.tooltip("This PC renders on its own GPUs. An instance renders with its own GPUs, from its own job "
+                           "folders; the results are downloaded here when the test ends.")
+        with ui.row().classes("items-center gap-2 w-full"):
+            run_filter = ui.input("Filter runs").props("dense clearable").classes("w-64")
+            ui.button("Reload runs", icon="refresh", on_click=lambda: reload_runs(), color=None) \
+                .props("flat dense no-caps")
+            picked_label = ui.label("").classes("rz-hint")
+        runs_box = ui.column().classes("w-full gap-1").style("max-height: 24rem; overflow-y: auto")
+
+    with card():
+        subhead("2. Prompts, seeds and strengths")
+        hint("Each prompt gets a kind: face is scored on the face, body on the body, both on both.")
+        with ui.row().classes("items-end gap-2 w-full"):
+            preset_sel = ui.select(lt_preset_options(), label="Probe preset", with_input=True).classes("w-96") \
+                .props("dense clearable")
+            ui.button("Add preset", icon="add", on_click=lambda: add_preset(), color=None).props("outline dense no-caps")
+        with ui.row().classes("items-end gap-2 w-full"):
+            typed = ui.input("Typed prompt").props("dense clearable").classes("grow").style("min-width: 20rem")
+            typed_kind = ui.select(["face", "body", "both"], value="both", label="Kind").classes("w-28").props("dense")
+            ui.button("Add prompt", icon="add", on_click=lambda: add_typed(), color=None).props("outline dense no-caps")
+        prompts_box = ui.column().classes("w-full gap-1")
+        with ui.row().classes("items-end gap-4 w-full"):
+            seeds_in = ui.input("Seeds", value="1, 2").props("dense").classes("w-48")
+            strengths_in = ui.input("Strengths", value="0.8, 1.0, 1.2").props("dense").classes("w-56")
+            with strengths_in:
+                ui.tooltip("1.0 is the LoRA exactly as the probes render it. Allowed: 0 to 2.")
+
+    with card():
+        subhead("3. Seed soups (optional)")
+        hint("A soup averages two or more of your picked LoRAs into one new file and tests it as one more LoRA.")
+        soups_box = ui.column().classes("w-full gap-1")
+        add_soup_btn = ui.button("Add soup", icon="add", on_click=lambda: add_soup(), color=None) \
+            .props("outline dense no-caps")
+
+    with card():
+        subhead("4. GPUs")
+        gpus_box = ui.column().classes("w-full gap-0")
+
+    with card():
+        subhead("Start")
+        name_in = ui.input("Test name", value="LoRA test").props("dense").classes("w-80")
+        summary = ui.label("").classes("rz-hint")
+        refusal = ui.label("").classes("rz-hint rz-warn")
+        start_btn = ui.button("Start test", icon="play_arrow", on_click=lambda: start()).props("unelevated")
+        start_btn.set_enabled(False)
+
+    # ================================================================ this test
+    with card() as test_card:
+        subhead("This test")
+        test_title = ui.label("Nothing opened. Start a test or open a saved one below.").classes("rz-step-title")
+        with ui.row().classes("items-center gap-3 w-full no-wrap"):
+            state_label = ui.label("").classes("rz-run-state")
+            bar = ui.linear_progress(value=0, show_value=False, size="8px").props("rounded").classes("grow")
+            eta_label = ui.label("").classes("rz-hint")
+            stop_btn = ui.button("Stop", icon="stop", on_click=lambda: stop(), color=None).props("outline dense no-caps")
+        current_label = ui.label("").classes("rz-hint")
+        error_label = ui.label("").classes("rz-mono").style("white-space: pre-wrap")
+        results_box = ui.column().classes("w-full gap-3")
+    test_card.visible = False
+
+    # ================================================================ saved tests
+    with card():
+        subhead("Saved tests")
+        saved_hint = hint("")
+        saved_table = ui.table(columns=[{"name": "name", "label": "Name", "field": "name", "align": "left"},
+                                        {"name": "where", "label": "Where", "field": "where", "align": "left"},
+                                        {"name": "state", "label": "State", "field": "state", "align": "left"},
+                                        {"name": "created", "label": "Created", "field": "created", "align": "left"},
+                                        {"name": "id", "label": "Id", "field": "id", "align": "left"}],
+                               rows=[], row_key="key", pagination={"rowsPerPage": 8}).props("flat dense") \
+            .classes("w-full cursor-pointer")
+        saved_table.on("rowClick", lambda e: open_test(e.args[1]["id"], e.args[1].get("inst") or None))
+
+    # ---------------------------------------------------------------- the form's logic
+    def trigger_subject() -> tuple[str, str]:
+        for p in st["picks"].values():
+            if p.get("spec_lora"):  # a file on an instance: its config is not readable here
+                continue
+            try:
+                cfg = loratest.read_config(p["config"])
+            except loratest.SpecError:
+                continue
+            return (str(cfg.get("trigger_word") or ""), str(cfg.get("probe_subject") or ""))
+        return "", ""
+
+    def get_fleet():
+        if st["fleet"] is None:
+            st["fleet"] = fleet()
+        return st["fleet"]
+
+    def remote_of(iid):
+        """The ssh route to an instance (blocking: call it from run.io_bound)."""
+        fl = get_fleet()
+        return fl.remote_for(fl.instance(iid))
+
+    def is_remote() -> bool:
+        return st["target"] != "pc"
+
+    def pick_row(o: dict) -> None:
+        with ui.expansion(o["label"], caption=f"{len(o['files'])} file{'s' if len(o['files']) != 1 else ''}") \
+                .classes("w-full rz-section"):
+            with ui.row().classes("gap-4"):
+                for f_ in o["files"]:
+                    key = str(f_["path"])
+                    ui.checkbox(f_["label"], value=key in st["picks"],
+                                on_change=lambda e, o=o, f_=f_: toggle_pick(o, f_, e.value))
+
+    def fill_remote_job(job: str, box, info: dict) -> None:
+        box.clear()
+        with box:
+            if info["problem"]:
+                ui.label(info["problem"]).classes("rz-hint rz-warn")
+                return
+            for f_ in info["files"]:
+                ui.checkbox(f_["label"], value=f_["spec"] in st["picks"],
+                            on_change=lambda e, job=job, f_=f_, info=info: toggle_remote_pick(job, info, f_, e.value))
+
+    async def open_remote_job(job: str, box) -> None:
+        iid = st["target"]
+        if job not in st["remote_files"]:
+            box.clear()
+            with box:
+                ui.label("Asking the instance for this run's files").classes("rz-hint")
+            try:
+                listing = await run.io_bound(lambda: remote_of(iid).agent_json("files", job, "--what", "loras",
+                                                                               "--what", "logs"))
+                st["remote_files"][job] = lt_remote_job_files(listing, job)
+            except (Exception, SystemExit) as e:  # noqa: BLE001  (ssh down, instance gone: say so)
+                box.clear()
+                with box:
+                    ui.label(f"Instance {iid} did not answer: {e}").classes("rz-hint rz-warn")
+                return
+        if st["target"] == iid:
+            fill_remote_job(job, box, st["remote_files"][job])
+
+    def draw_runs() -> None:
+        runs_box.clear()
+        needle = (run_filter.value or "").strip().lower()
+        with runs_box:
+            if is_remote():
+                jobs = st["remote_jobs"]
+                if jobs is None:
+                    hint("Asking the instance for its runs")
+                    return
+                if st["runs_err"]:
+                    hint(st["runs_err"], warn=True)
+                elif not jobs:
+                    hint("This instance has no job folders.")
+                for j in (j for j in jobs if needle in j["label"].lower()):
+                    with ui.expansion(j["label"], caption="open to list its LoRA files").classes("w-full rz-section") as exp:
+                        box = ui.row().classes("gap-4")
+                    exp.on_value_change(lambda e, j=j, box=box: open_remote_job(j["job"], box) if e.value else None)
+                    if j["job"] in st["remote_files"]:
+                        fill_remote_job(j["job"], box, st["remote_files"][j["job"]])
+                return
+            opts = st["options"] or []
+            if not opts:
+                hint("No runs found. Previous Runs and the job folders in output/ have none yet.")
+            shown = [o for o in opts if needle in o["label"].lower()]
+            for o in (o for o in shown if not o["problem"]):
+                pick_row(o)
+            bad = [o for o in shown if o["problem"]]
+            if bad:
+                with ui.expansion(f"Show {len(bad)} run{'s' if len(bad) != 1 else ''} without files") \
+                        .classes("w-full rz-section"):
+                    for o in bad:
+                        with ui.row().classes("items-center gap-2 no-wrap"):
+                            ui.icon("block").classes("rz-hint")
+                            ui.label(o["label"]).classes("rz-hint")
+                            ui.label(o["problem"]).classes("rz-hint rz-warn")
+
+    def toggle_pick(o: dict, f_: dict, on: bool) -> None:
+        key = str(f_["path"])
+        if on:
+            st["picks"][key] = {"path": f_["path"], "config": o["config"], "run_id": o["run_id"],
+                                "label": f"{o['label']} · {f_['label']}"}
+        else:
+            st["picks"].pop(key, None)
+        draw_soups()
+        changed()
+
+    def toggle_remote_pick(job: str, info: dict, f_: dict, on: bool) -> None:
+        key = f_["spec"]
+        if on:
+            st["picks"][key] = {"path": key, "config": info["config"], "spec_lora": key, "spec_config": info["config"],
+                                "run_id": st["remote_run_ids"].get(job), "label": f"{job} · {f_['label']}"}
+        else:
+            st["picks"].pop(key, None)
+        draw_soups()
+        changed()
+
+    async def load_remote() -> None:
+        iid = st["target"]
+
+        def work():
+            r = remote_of(iid)
+            ids = {}
+            try:  # Previous Runs records of this instance's runs (history.import_fleet_runs: source kind vast)
+                for rec in sorted(history.list_runs(), key=lambda x: x.get("started") or 0):
+                    src = rec.get("source") or {}
+                    if src.get("kind") == "vast" and str(src.get("instance")) == str(iid) and rec.get("job"):
+                        ids[rec["job"]] = rec["id"]
+            except OSError:
+                pass
+            return r.agent_json("jobs"), r.agent_json("status").get("gpus") or [], ids
+
+        try:
+            jobs, gpus, run_ids = await run.io_bound(work)
+        except (Exception, SystemExit) as e:  # noqa: BLE001
+            if st["target"] != iid:
+                return
+            st["remote_jobs"], st["remote_gpus"], st["runs_err"] = [], [], f"Instance {iid} did not answer: {e}"
+        else:
+            if st["target"] != iid:
+                return
+            st["runs_err"] = ""
+            st["remote_run_ids"] = run_ids
+            st["remote_jobs"] = lt_remote_jobs(jobs if isinstance(jobs, list) else [])
+            st["remote_gpus"] = [(f"cuda:{i}", f"GPU {i}: {g.get('name')}, "
+                                  f"{round((g.get('memory_total_mb') or 0) / 1024)} GB") for i, g in enumerate(gpus)]
+        draw_runs()
+        st["gpus"] = None
+        refresh_gpus()
+        changed()
+
+    async def switch_target(e) -> None:
+        st["target"] = e.value or "pc"
+        st["picks"].clear()
+        st["soups"].clear()
+        st.update(options=None, remote_jobs=None, remote_files={}, remote_gpus=[], gpus=None, runs_err="")
+        draw_runs()
+        draw_soups()
+        if is_remote():
+            await load_remote()
+        else:
+            load_runs(True)
+            refresh_gpus()
+        changed()
+
+    target_sel.on_value_change(switch_target)
+
+    async def reload_runs() -> None:
+        if is_remote():
+            st.update(remote_jobs=None, remote_files={}, runs_err="")
+            draw_runs()
+            await load_remote()
+        else:
+            load_runs(True)
+
+    def load_targets() -> None:
+        opts = {"pc": "This PC"}
+        if VAST_INSTANCE is None:  # an instance has no fleet of its own to send a test to
+            try:
+                opts.update(dict(lt_remote_instances(get_fleet())))
+            except Exception:  # noqa: BLE001
+                pass
+        if opts != st["targets"]:
+            st["targets"] = opts
+            target_sel.set_options(opts, value=st["target"] if st["target"] in opts else "pc")
+
+    def load_runs(force: bool = False) -> None:
+        if is_remote():
+            return
+        if st["options"] is not None and not force:
+            return
+        st["val"] = {}
+        try:
+            runs = history.list_runs()
+        except OSError:
+            runs = []
+        pulls = lt_pulls_root()
+        st["options"] = lt_run_options(runs, ROOT / "output", lambda r: lt_job_dir_of(r, runs, pulls))
+        keep = {str(f_["path"]) for o in st["options"] for f_ in o["files"]}
+        for k in [k for k in st["picks"] if k not in keep]:
+            st["picks"].pop(k)
+        draw_runs()
+        draw_soups()
+        changed()
+
+    run_filter.on_value_change(lambda _: draw_runs())
+
+    def draw_prompts() -> None:
+        prompts_box.clear()
+        with prompts_box:
+            if not st["prompts"]:
+                hint("No prompts yet. Add a probe preset or type one.")
+            for i, p in enumerate(st["prompts"]):
+                with ui.row().classes("items-center gap-2 w-full no-wrap"):
+                    ui.label(f"{i + 1}").classes("rz-hint")
+                    ui.label(p["text"]).classes("grow").style("min-width: 0; overflow-wrap: anywhere")
+                    kind = ui.select(["face", "body", "both"], value=p["kind"]).classes("w-24").props("dense")
+                    kind.on_value_change(lambda e, p=p: (p.update(kind=e.value), changed()))
+                    ui.button(icon="close", on_click=lambda _, i=i: remove_prompt(i), color=None) \
+                        .props("flat round dense").classes("rz-icon-only")
+
+    def remove_prompt(i: int) -> None:
+        if 0 <= i < len(st["prompts"]):
+            st["prompts"].pop(i)
+        draw_prompts()
+        changed()
+
+    def add_preset() -> None:
+        if not preset_sel.value:
+            ui.notify("Pick a probe preset first", type="warning")
+            return
+        trigger, subject = trigger_subject()
+        got = lt_preset_prompt(preset_sel.value, trigger, subject)
+        if got is None:
+            ui.notify("That preset is no longer saved", type="warning")
+            return
+        st["prompts"].append({"text": got[0], "kind": got[1]})
+        draw_prompts()
+        changed()
+
+    def add_typed() -> None:
+        text = " ".join(str(typed.value or "").split())
+        if not text:
+            ui.notify("Write a prompt first", type="warning")
+            return
+        st["prompts"].append({"text": text, "kind": typed_kind.value or "both"})
+        typed.value = ""
+        draw_prompts()
+        changed()
+
+    def pick_options() -> dict:
+        return {k: p["label"] for k, p in st["picks"].items()}
+
+    def draw_soups() -> None:
+        opts = pick_options()
+        for s in st["soups"]:  # what is chosen now survives the redraw
+            if s.get("sel") is not None:
+                s["keep"] = list(s["sel"].value or [])
+        soups_box.clear()
+        with soups_box:
+            if not st["soups"]:
+                hint("No soups. Pick two or more LoRAs above, then Add soup.")
+            for i, s in enumerate(st["soups"]):
+                s["keep"] = [k for k in s["keep"] if k in opts]
+                with ui.row().classes("items-center gap-2 w-full no-wrap"):
+                    sel = ui.select(opts, value=s["keep"], multiple=True, label=f"Soup {i + 1}: made of")                         .props("dense use-chips").classes("grow")
+                    sel.on_value_change(lambda _: changed())
+                    s["sel"] = sel
+                    ui.button(icon="close", on_click=lambda _, i=i: remove_soup(i), color=None)                         .props("flat round dense").classes("rz-icon-only")
+        add_soup_btn.set_enabled(len(opts) >= 2)
+
+    def add_soup() -> None:
+        st["soups"].append({"keep": list(st["picks"])[:2], "sel": None})
+        draw_soups()
+        changed()
+
+    def remove_soup(i: int) -> None:
+        if 0 <= i < len(st["soups"]):
+            st["soups"].pop(i)
+        draw_soups()
+        changed()
+
+    # ---- GPUs
+    def gpu_list() -> list[tuple[str, str]]:
+        if is_remote():
+            return st["remote_gpus"]
+        stats = gpu_stats_cached()
+        if stats:
+            return [(f"cuda:{s['index']}", f"GPU {s['index']}: {s['name']}, {s['total'] / 1024:.0f} GB") for s in stats]
+        return [("cuda:0", "GPU 0")]
+
+    def refresh_gpus() -> None:
+        gpus = gpu_list()
+        names = [g for g, _ in gpus]
+        if names != st["gpus"]:
+            st["gpus"] = names
+            gpus_box.clear()
+            gpu_boxes.clear()
+            gpu_notes.clear()
+            with gpus_box:
+                for g, label in gpus:
+                    with ui.row().classes("items-center gap-3"):
+                        cb = ui.checkbox(label, value=(g == names[0]), on_change=lambda _: changed())
+                        note = ui.label("").classes("rz-hint rz-warn")
+                    gpu_boxes[g], gpu_notes[g] = cb, note
+        held = {} if is_remote() else lt_current_job_gpus(names)  # an instance refuses a busy GPU itself
+        if held != st["held"]:
+            st["held"] = held
+            for g, cb in gpu_boxes.items():
+                if g in held:
+                    cb.value = False
+                    cb.disable()
+                    gpu_notes[g].text = f"Busy: {held[g]}"
+                else:
+                    cb.enable()
+                    gpu_notes[g].text = ""
+            if held and not any(cb.value for cb in gpu_boxes.values()):
+                free = next((g for g in gpu_boxes if g not in held), None)
+                if free:
+                    gpu_boxes[free].value = True
+            changed()
+
+    def current() -> tuple[dict | None, str, int]:
+        """(spec or None, the text to show: the refusal or the summary, pictures)"""
+        picks = list(st["picks"].values())
+        try:
+            seeds = lt_parse_numbers(seeds_in.value, "Seeds", True)
+            strengths = lt_parse_numbers(strengths_in.value, "Strengths", False)
+        except ValueError as e:
+            return None, str(e), 0
+        paths = list(st["picks"])
+        soups = []
+        for s in st["soups"]:
+            sel = s["sel"].value if s.get("sel") is not None else s.get("keep")
+            idx = [paths.index(k) for k in sel or [] if k in paths]
+            soups.append(idx)
+        n = lt_count(len(picks), len(soups), strengths, st["prompts"], seeds)
+        devices = [g for g, cb in gpu_boxes.items() if cb.value and cb.enabled and g not in st["held"]]
+        if not picks:
+            return None, "Pick at least one LoRA file.", n
+        if not st["prompts"]:
+            return None, "Add at least one prompt.", n
+        if any(len(i) < 2 for i in soups):
+            return None, "Each soup needs two or more LoRAs.", n
+        if not devices:
+            return None, "Pick a GPU that no training job is using.", n
+        spec = lt_build_spec(name_in.value, picks, st["prompts"], seeds, strengths, soups, devices)
+        if is_remote():
+            why = lt_remote_precheck(spec)
+        else:
+            key = lt_spec_key(spec)
+            if key not in st["val"]:  # checked off the event loop, once per form state (the 2 s timer asks again)
+                if st["val_pending"] != key:
+                    st["val_pending"] = key
+                    background_tasks.create(validate_async(key, spec))
+                return None, "Checking the settings", n
+            why = st["val"][key]
+        return (spec if why is None else None), why or "", n
+
+    async def validate_async(key: str, spec: dict) -> None:
+        why = await run.io_bound(lt_validate, spec)
+        st["val"] = {key: why}
+        st["val_pending"] = None
+        changed(from_timer=True)
+
+    def changed(*_, from_timer: bool = False) -> None:
+        if not from_timer:
+            st["refused"] = ""
+        spec, text, n = current()
+        picked_label.text = f"{len(st['picks'])} file{'s' if len(st['picks']) != 1 else ''} ticked"
+        devices = [g for g, cb in gpu_boxes.items() if cb.value and cb.enabled]
+        summary.text = lt_estimate_text(n, max(1, len(devices))) if n else ""
+        refusal.text = "" if spec is not None else text
+        refusal.visible = spec is None and bool(text)
+        live = None if is_remote() else lt_live_test()
+        if spec is not None and live:
+            refusal.text, refusal.visible = f"Test {live} is still running; wait for it or stop it first.", True
+        if st["refused"]:
+            refusal.text, refusal.visible = st["refused"], True
+        start_btn.set_enabled(spec is not None and not live)
+
+    for w in (seeds_in, strengths_in, name_in):
+        w.on_value_change(changed)
+
+    async def start() -> None:
+        spec, text, _ = current()
+        if spec is None:
+            ui.notify(text or "The test is not ready", type="warning")
+            return
+        if is_remote():
+            iid = st["target"]
+            start_btn.set_enabled(False)
+            try:
+                tid, msg = await run.io_bound(lambda: lt_remote_start(remote_of(iid), iid, spec))
+            except (Exception, SystemExit) as e:  # noqa: BLE001
+                tid, msg = None, f"Not started: instance {iid} did not answer: {e}"
+            ui.notify(msg, type="positive" if tid else "warning", multi_line=True)
+            changed()
+            if tid:
+                st["list_sig"] = None
+                open_test(tid, iid)
+            else:
+                st["refused"] = msg
+                changed(from_timer=True)
+            return
+        names = [g for g, _ in gpu_list()]
+        start_btn.set_enabled(False)
+        tid, msg = await run.io_bound(lambda: lt_start(spec, {}, held_fn=lambda: lt_current_job_gpus(names)))
+        ui.notify(msg, type="positive" if tid and msg.startswith("Started") else "warning")
+        if tid:
+            st["list_sig"] = None
+            open_test(tid)
+        changed()
+
+    # ---------------------------------------------------------------- following a test
+    def view_dir() -> Path | None:
+        root = lt_tests_root(st["view_inst"])
+        return None if root is None or not st["view"] else root / st["view"]
+
+    def open_test(tid: str, inst=None) -> None:
+        root = lt_tests_root(inst)
+        if root is None or not loratest.TEST_ID_RE.match(str(tid)) or not (root / tid).is_dir():
+            ui.notify("That test is no longer on disk", type="warning")
+            return
+        st.update(view=tid, view_inst=inst, view_sig=None, remote_err="", remote_at=0.0)
+        test_card.visible = True
+        refresh_view()
+
+    async def stop() -> None:
+        if not st["view"]:
+            return
+        if st["view_inst"]:
+            iid, tid = st["view_inst"], st["view"]
+            try:
+                ok, text = await run.io_bound(lambda: lt_remote_stop(remote_of(iid), tid))
+            except (Exception, SystemExit) as e:  # noqa: BLE001
+                ok, text = False, f"Instance {iid} did not answer: {e}"
+            ui.notify("Stopping: the picture in hand finishes, then what is rendered is scored" if ok else text,
+                      type="info" if ok else "warning", multi_line=True)
+            return
+        lt_stop(lt_root() / st["view"])
+        ui.notify("Stopping: the picture in hand finishes, then what is rendered is scored", type="info")
+
+    def on_pick(cid: str, strength: float) -> None:
+        d = view_dir()
+        spec = (lt_read_json(d / "spec.json") if d else None) or {}
+        run_ids = None
+        if d is not None and st["view_inst"]:  # a downloaded spec.json came from the instance: use the ids kept here
+            run_ids = (lt_read_json(d / LT_REMOTE_MARK) or {}).get("run_ids") or {}
+        ok, msg = lt_pick_label(spec, cid, strength, run_ids=run_ids)
+        ui.notify(msg, type="positive" if ok else "warning")
+
+    def refresh_view() -> None:
+        d = view_dir()
+        if d is None:
+            return
+        tid, inst = st["view"], st["view_inst"]
+        spec = lt_read_json(d / "spec.json") or {}
+        status = lt_read_json(d / "status.json")
+        state = lt_state(d, status, lt_status_age(d)) if status else "unknown"
+        mark = lt_read_json(d / LT_REMOTE_MARK) if inst else None
+        done, total = (status or {}).get("done") or 0, (status or {}).get("total") or 0
+        test_title.text = f"{spec.get('name') or tid}  ·  {tid}" + (f"  ·  instance {inst}" if inst else "")
+        state_label.text = LT_STATE_WORDS.get(state, state)
+        bar.value = (done / total) if total else (1.0 if state == "done" else 0.0)
+        bar.visible = state in LT_ACTIVE_STATES or state in ("done", "stopped")
+        active = state in LT_ACTIVE_STATES
+        eta_label.text = (f"{done} of {total} pictures · " + lt_eta_text((status or {}).get("eta_s"))) if active and total else \
+            (f"{done} of {total} pictures" if total else "")
+        waiting = bool(inst) and state in ("done", "stopped") and not (mark or {}).get("pulled")
+        current_label.text = ("Downloading the results from the instance" if waiting else
+                              f"Now: {status['current']}" if active and (status or {}).get("current") else "")
+        why = ((status or {}).get("reason") or (status or {}).get("error") or "") if state in ("refused", "failed") else ""
+        if state == "failed" and status and not status.get("error") and not status.get("reason"):
+            why = "The test's process is no longer running."
+        why = "\n".join(x for x in (str(why), st["remote_err"]) if x)
+        error_label.text = why
+        error_label.visible = bool(why)
+        stop_btn.visible = active
+        try:
+            mtime = (d / "results.json").stat().st_mtime_ns
+        except OSError:
+            mtime = None
+        sig = (tid, inst, state, mtime)
+        if sig != st["view_sig"]:
+            st["view_sig"] = sig
+            results_box.clear()
+            with results_box:
+                if mtime is not None:
+                    render_test_results(d, on_pick=on_pick, open_image=open_image, instance=inst)
+                elif state in ("done", "stopped") and not waiting:
+                    hint("This test has no results file.")
+
+    async def remote_tick() -> None:
+        """A test on an instance: ask it for the status (every 10 s, not 2), and when the test has ended, download its
+        folder into <Fleet downloads>/<instance>/_tests/<id> so the results open from there."""
+        d, inst, tid = view_dir(), st["view_inst"], st["view"]
+        if d is None or not inst:  # the page is connected (while_connected), whichever tab is open
+            return
+        mark = lt_read_json(d / LT_REMOTE_MARK)
+        if mark is None:
+            return
+        status = lt_read_json(d / "status.json")
+        state = lt_state(d, status)
+        err = ""
+        try:
+            remote = None
+            if state not in loratest.FINAL_STATES:
+                remote = await run.io_bound(remote_of, inst)
+                status, err = await run.io_bound(lt_remote_poll, remote, d, tid)
+                state = lt_state(d, status) if status else state
+            if state in ("done", "stopped") and not mark.get("pulled") and st["view"] == tid:
+                remote = remote or await run.io_bound(remote_of, inst)
+                if await run.io_bound(lt_pull_once, remote, d, inst, tid) is not None:
+                    st["view_sig"] = None
+        except (Exception, SystemExit) as e:  # noqa: BLE001  (unreachable, a folder move, a broken download)
+            err = f"Instance {inst} did not answer: {e}" if not err else err
+        st["remote_err"] = err
+        refresh_view()
+
+    def refresh_saved() -> None:
+        tests = lt_list_tests()
+        sig = json.dumps([[t["id"], t["state"], t["instance"]] for t in tests])
+        if sig == st["list_sig"]:
+            return
+        st["list_sig"] = sig
+        saved_table.rows = [{"key": f"{t['instance'] or 'pc'}/{t['id']}", "id": t["id"], "inst": t["instance"] or "",
+                             "where": f"Instance {t['instance']}" if t["instance"] else "This PC",
+                             "name": t.get("name") or "(no name)",
+                             "state": LT_STATE_WORDS.get(t["state"], t["state"]),
+                             "created": (t.get("created") or "").replace("T", " ").replace("Z", "")} for t in tests]
+        saved_table.update()
+        saved_hint.text = "Click a test to open it." if tests else "No saved tests yet."
+
+    def tick() -> None:
+        if not is_visible():
+            return
+        load_targets()
+        load_runs()
+        refresh_gpus()
+        refresh_saved()
+        if st["view"]:
+            refresh_view()
+        changed(from_timer=True)
+
+    # a test still running when the page opens (a reload, a new browser): show it
+    live_now = lt_live_test()
+    if live_now:
+        st["view"] = live_now
+        test_card.visible = True
+    draw_prompts()
+    draw_soups()
+    ui.timer(2.0, while_connected(tick))
+    ui.timer(10.0, while_connected(remote_tick))
+    ui.timer(0.2, lambda: (refresh_gpus(), refresh_saved(), refresh_view()), once=True)
+
+
 def build_history_tab(charts: list, f: Form | None = None):
     """Previous Runs: the saved likeness history of every run (output/_history), any number of them ticked to overlay
     their charts."""
@@ -12569,6 +14187,7 @@ def build_page(local: bool = True):
                 tab_samples = ui.tab("Samples", icon="collections")
                 tab_maps = ui.tab("Training maps", icon="layers")
                 tab_history = ui.tab("Previous Runs", icon="history")
+                tab_loratest = ui.tab(LT_TAB, icon="compare")
                 # several vast.ai instances from this computer; an instance itself has no fleet to show
                 tab_fleet = ui.tab("Fleet", icon="dns") if VAST_INSTANCE is None else None
                 ui.element("span").classes("rz-tab-sep")
@@ -16061,15 +17680,18 @@ def build_page(local: bool = True):
 
             def queue_draw(force: bool = False):
                 q = QUEUE.snapshot()
+                test_hold = bool(q["waiting"]) and not q["paused"] and lt_live_test() is not None
                 sig = json.dumps([[e["id"] for e in q["waiting"]], q["paused"], [r.get("started") or r.get("error")
-                                                                                  for r in q["recent"][:5]]])
+                                                                                  for r in q["recent"][:5]], test_hold])
                 if sig == queue_shown["sig"] and not force:
                     return
                 queue_shown["sig"] = sig
                 n = len(q["waiting"])
+                hold_text = "Waiting for the LoRA test to finish"
                 queue_state.text = (f"{n} run{'s' if n != 1 else ''} waiting" if n else "Nothing queued") + \
-                    (" · paused" if q["paused"] else "")
-                queue_note.text = (f"Queue: {n} waiting" + (", paused" if q["paused"] else "")) if n else ""
+                    (" · paused" if q["paused"] else "") + (f" · {hold_text}" if test_hold else "")
+                queue_note.text = (f"Queue: {n} waiting" + (", paused" if q["paused"] else "") +
+                                   (f". {hold_text}" if test_hold else "")) if n else ""
                 queue_pause.text = "Resume queue" if q["paused"] else "Pause queue"
                 queue_exp.props["caption"] = (f"{n} waiting" + (", paused" if q["paused"] else "")) if n else \
                     "Nothing queued. Runs added with Add to queue start one after another"
@@ -16545,6 +18167,11 @@ def build_page(local: bool = True):
             with ui.column().classes("rz-page gap-4 rz-history"):
                 build_history_tab(charts, f)
 
+        # ------------------------------------------------------------ Test LoRAs
+        with ui.tab_panel(tab_loratest):
+            with ui.column().classes("rz-page gap-4"):
+                build_loratest_tab(lambda: tabs.value == LT_TAB)
+
         # ------------------------------------------------------------ Fleet
         if tab_fleet is not None:
             with ui.tab_panel(tab_fleet):
@@ -16687,7 +18314,7 @@ def build_page(local: bool = True):
     pill_tick()
     machine_tick()
 
-    tab_names = ("Wizard", "Train", "Dataset", "Monitor", "Samples", "Training maps", "Previous Runs", "Fleet",
+    tab_names = ("Wizard", "Train", "Dataset", "Monitor", "Samples", "Training maps", "Previous Runs", LT_TAB, "Fleet",
                  "Help")
 
     def remember_tab(e):
@@ -16835,7 +18462,7 @@ def build_page(local: bool = True):
 HELP = """
 ## Finding your way around
 The tabs follow the work, in three groups: **Wizard, Train, Dataset** set a run up, **Monitor, Samples, Training maps,
-Previous Runs** watch it and look back, and **Help** is this page. The **run strip** under the tabs is on every tab: what
+Previous Runs, Test LoRAs** watch it and look back, and **Help** is this page. The **run strip** under the tabs is on every tab: what
 the trainer is doing, the job, the step, a progress bar, the time left and the number of queued runs. Click it for the
 Monitor. The browser tab's title carries the progress too, so a tab in the background still tells you how far the run
 is. The chip at the top right shows free disk space (amber under 15 GB, red under 5 GB). On a vast.ai rental it also
