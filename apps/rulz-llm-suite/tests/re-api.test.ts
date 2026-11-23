@@ -1,5 +1,5 @@
 import http from 'node:http'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -115,7 +115,8 @@ describe('recording RE sessions from the API server', () => {
           if (taskId !== 'xor-1') throw new Error('No such task.')
           return { target: 'C:\\w\\xor.exe', prompt: 'Find the key in C:\\w\\xor.exe', family: 'xor', tier: 't1' }
         },
-        gradePractice: async (_taskId: string, _target: string, text: string) => ({ answer: text.includes('ANSWER: 7') ? '7' : null, passed: text.includes('ANSWER: 7'), expected: '7' })
+        gradePractice: async (_taskId: string, _target: string, text: string) => ({ answer: text.includes('ANSWER: 7') ? '7' : null, passed: text.includes('ANSWER: 7'), expected: '7' }),
+        setKit: async (kitDir: string) => ({ kitDir, tasks: [] })
       }
     })
     await server.start()
@@ -248,4 +249,96 @@ describe('RE overview', () => {
     expect(parseReSessionPatch({ kind: 'other' })).toMatch(/kind/)
     expect(parseReSessionPatch({ practice: { taskId: 1 } })).toMatch(/practice/)
   })
+})
+
+describe('POST /v1/re/kit', () => {
+  let dir: string
+  let port: number
+  let server: ApiServer
+  const seen: string[] = []
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'rulz-re-kit-'))
+    seen.length = 0
+    port = await freePort()
+    server = new ApiServer({
+      instances: { list: () => [], readyFor: () => undefined } as unknown as InstanceManager,
+      getModels: () => [],
+      getSettings: () => ({ autoStart: false, port, bind: 'localhost', apiKey: '', cors: false, idleUnloadMinutes: 0, defaultModelId: '', unknownModelFallback: true }),
+      getLoadDefaults: () => ({ config: DEFAULT_LOAD_CONFIG, custom: false }),
+      setLoadDefaults: async () => undefined,
+      estimate: () => null,
+      gpus: () => [],
+      onStatus: () => undefined,
+      onRequest: () => undefined,
+      re: {
+        enabled: () => false,
+        record: () => undefined,
+        session: async () => null,
+        update: async () => {
+          throw new Error('unused')
+        },
+        overview: async () => buildOverview({ chats: [], traces: [], practice: { kitDir: 'k', tasks: [] }, recording: false }),
+        preparePractice: async () => {
+          throw new Error('unused')
+        },
+        gradePractice: async () => {
+          throw new Error('unused')
+        },
+        setKit: async (kitDir: string) => {
+          seen.push(kitDir)
+          return { kitDir, tasks: [], error: `No build/tasks.jsonl in ${kitDir}.` }
+        }
+      }
+    })
+    await server.start()
+  })
+  afterEach(async () => {
+    await server.stop()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  const post = (body: unknown): Promise<Response> =>
+    fetch(`http://127.0.0.1:${port}/v1/re/kit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+
+  it('gives the trimmed path to the dependency and returns its practice info', async () => {
+    const res = await post({ kitDir: `  ${dir}  ` })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ kitDir: dir, tasks: [], error: `No build/tasks.jsonl in ${dir}.` })
+    expect(seen).toEqual([dir])
+  }, 20_000)
+
+  it('rejects a missing, relative, non-existent or non-folder path without calling the dependency', async () => {
+    const file = join(dir, 'not-a-folder.txt')
+    await writeFile(file, 'x')
+    for (const body of [{}, { kitDir: '' }, { kitDir: '   ' }, { kitDir: 1 }, { kitDir: 'kits/re' }, { kitDir: join(dir, 'missing') }, { kitDir: file }, { kitDir: `${dir}${'a'.repeat(1000)}` }]) {
+      expect((await post(body)).status).toBe(400)
+    }
+    expect(seen).toEqual([])
+    expect((await fetch(`http://127.0.0.1:${port}/v1/re/kit`)).status).toBe(404)
+  }, 20_000)
+})
+
+describe('POST /v1/re/kit without the RE dependency', () => {
+  it('is a 404, like the other RE routes', async () => {
+    const port = await freePort()
+    const server = new ApiServer({
+      instances: { list: () => [], readyFor: () => undefined } as unknown as InstanceManager,
+      getModels: () => [],
+      getSettings: () => ({ autoStart: false, port, bind: 'localhost', apiKey: '', cors: false, idleUnloadMinutes: 0, defaultModelId: '', unknownModelFallback: true }),
+      getLoadDefaults: () => ({ config: DEFAULT_LOAD_CONFIG, custom: false }),
+      setLoadDefaults: async () => undefined,
+      estimate: () => null,
+      gpus: () => [],
+      onStatus: () => undefined,
+      onRequest: () => undefined
+    })
+    await server.start()
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/v1/re/kit`, { method: 'POST', body: JSON.stringify({ kitDir: 'C:\\kit' }) })
+      expect(res.status).toBe(404)
+    } finally {
+      await server.stop()
+    }
+  }, 20_000)
 })

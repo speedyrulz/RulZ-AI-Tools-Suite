@@ -8,6 +8,7 @@ import { ToolServers } from './mcp/toolServers'
 import { FIX_RUN_SHOWN, fixRunTask, SHARE_SHOWN, SHARE_TASK, systemPrompt } from './agent/prompt'
 import { childPids } from './agent/childPids'
 import { ProjectSession } from './agent/session'
+import { BatchRunner, BatchStore } from './agent/batch'
 import { practiceTask, reTask } from './agent/reTasks'
 import { broadcast, handle, invokeHandler, onBroadcast } from './ipc'
 import { checkPageInWindow } from './project/pageWindow'
@@ -198,6 +199,15 @@ async function main(): Promise<void> {
   let runner: AppRunner | null = null
   let current: ProjectInfo | null = null
 
+  // ---- Practice batch runs (the loop lives here, so it outlasts the window and the phone) ----
+  const batch = new BatchRunner({
+    client,
+    store: new BatchStore(join(userData, 'batch-runs.json')),
+    session: () => session,
+    modelName: () => settings.get().model || connection.models.find((m) => m.loaded)?.id || '',
+    broadcast: (state) => broadcast('batch:changed', state)
+  })
+
   const snapshotter = async (kind: 'git' | 'copy' | 'auto'): Promise<Snapshotter> => {
     if (!session) throw new Error('No project is open.')
     const useGit = kind === 'git' || (kind === 'auto' && hasGit)
@@ -220,12 +230,15 @@ async function main(): Promise<void> {
   }
 
   const closeProject = async (): Promise<void> => {
+    batch.assertIdle()
     if (session?.isRunning) throw new Error('A task is still running. Press Stop first.')
-    await runner?.stop()
-    await session?.close()
+    // Let go of the project before the awaits below, so nothing (a batch run, a task) can start in it meanwhile.
+    const closing = { session, runner }
     session = null
     runner = null
     current = null
+    await closing.runner?.stop()
+    await closing.session?.close()
   }
 
   const openProject = async (path: string): Promise<ProjectState> => {
@@ -241,7 +254,10 @@ async function main(): Promise<void> {
       client,
       settings: () => settings.get(),
       store,
-      emit: (e) => broadcast('agent:event', e),
+      emit: (e) => {
+        broadcast('agent:event', e)
+        batch.onAgentEvent(e)
+      },
       activity: setActivity,
       models: () => connection.models,
       refreshModels: () => void refreshModels(),
@@ -313,6 +329,7 @@ async function main(): Promise<void> {
   handle('models:previewLoadSettings', (model, config) => client.previewLoadSettings(model, config))
   handle('models:setLoadSettings', async (model, config) => {
     // Restarting the model would cut off the answer it is writing.
+    batch.assertIdle()
     if (session?.isRunning) throw new Error('A task is running. Wait for it to finish or press Stop, then change the load settings.')
     const info = await client.setLoadSettings(model, config)
     void refreshModels()
@@ -339,16 +356,32 @@ async function main(): Promise<void> {
     projectChanged()
   })
 
-  handle('task:start', (path, text) => requireSession(path).start(text))
+  handle('task:start', (path, text) => {
+    batch.assertIdle()
+    return requireSession(path).start(text)
+  })
   handle('task:stop', (path) => requireSession(path).stop())
   handle('re:overview', () => client.reOverview())
+  handle('re:setKit', (kitDir) => {
+    // A run's tasks were planned from the kit it started with.
+    batch.assertIdle()
+    return client.setReKit(kitDir)
+  })
+  handle('batch:state', () => batch.state())
+  handle('batch:start', (path, label, options, record) => batch.start(path, label, options, record))
+  handle('batch:stop', (mode) => batch.stop(mode))
+  handle('batch:delete', (id) => batch.delete(id))
   handle('re:start', async (path, req) => {
+    batch.assertIdle()
     const s = requireSession(path)
     if (s.isRunning) throw new Error('A task is already running. Wait for it to finish or press Stop.')
     const t =
       req.kind === 'practice'
         ? practiceTask(await client.preparePractice(req.taskId), req.taskId, req.record !== false)
         : reTask(req, s.root)
+    // Preparing the copy takes a moment: a batch run or another task may have started meanwhile.
+    batch.assertIdle()
+    if (s !== session) throw new Error('The project was closed.')
     s.start(t.text, { shown: t.shown, re: t.info })
   })
   handle('task:answer', (path, id, answer) => requireSession(path).answer(id, answer))
@@ -356,6 +389,7 @@ async function main(): Promise<void> {
   handle('task:cancelNote', (path, id) => requireSession(path).cancelNote(id))
   handle('task:interrupt', (path) => requireSession(path).interrupt())
   handle('task:undo', async (path, taskId) => {
+    batch.assertIdle()
     const s = requireSession(path)
     await runner?.stop()
     await s.undo(taskId)
@@ -363,12 +397,14 @@ async function main(): Promise<void> {
     return s.state(current!.name, current!.lastOpened)
   })
   handle('task:deleteItem', async (path, itemId) => {
+    batch.assertIdle()
     const s = requireSession(path)
     await s.deleteItem(itemId)
     projectChanged()
     return s.state(current!.name, current!.lastOpened)
   })
   handle('task:redo', async (path, taskId, text) => {
+    batch.assertIdle()
     const s = requireSession(path)
     if (s.data.tasks.at(-1)?.files.length && !s.data.tasks.at(-1)?.undone) await runner?.stop()
     await s.redo(taskId, text)
@@ -396,8 +432,12 @@ async function main(): Promise<void> {
     projectChanged()
     return requireRunner(path).get()
   })
-  handle('run:askAgent', (path) => requireSession(path).start('How do I run this app?', { howToRun: true }))
+  handle('run:askAgent', (path) => {
+    batch.assertIdle()
+    return requireSession(path).start('How do I run this app?', { howToRun: true })
+  })
   handle('run:fix', async (path) => {
+    batch.assertIdle()
     const s = requireSession(path)
     if (s.isRunning) throw new Error('A task is already running. Wait for it to finish or press Stop.')
     const r = requireRunner(path)
@@ -407,6 +447,7 @@ async function main(): Promise<void> {
     s.start(fixRunTask(before), { shown: FIX_RUN_SHOWN })
   })
   handle('run:share', async (path) => {
+    batch.assertIdle()
     const s = requireSession(path)
     if (s.isRunning) throw new Error('A task is already running. Wait for it to finish or press Stop.')
     // A running app holds its files open, and packaging rebuilds them.
@@ -437,6 +478,8 @@ async function main(): Promise<void> {
   const shutDown = async (): Promise<void> => {
     const deadline = Date.now() + QUIT_WAIT_MS
     const s = session
+    // A run going now is left as stopped, its task in progress as not tried (see BatchRunner.stop).
+    batch.stop('now')
     const closeSession = async (): Promise<void> => {
       if (!s) return
       s.stop()
@@ -445,7 +488,7 @@ async function main(): Promise<void> {
       while (s.isRunning && Date.now() < deadline - 500) await new Promise((r) => setTimeout(r, 50))
       await s.close()
     }
-    const work = Promise.allSettled([runner?.stop(), closeSession(), toolServers.dispose(), phone.dispose()])
+    const work = Promise.allSettled([runner?.stop(), closeSession(), toolServers.dispose(), phone.dispose(), batch.idle().then(() => batch.flush())])
     let timer: NodeJS.Timeout | undefined
     await Promise.race([work, new Promise((r) => (timer = setTimeout(r, Math.max(0, deadline - Date.now()))))])
     clearTimeout(timer)

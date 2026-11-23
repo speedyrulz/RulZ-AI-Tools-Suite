@@ -530,3 +530,82 @@ export interface ReTaskInfo {
   language?: string
   practice?: { taskId: string; family: string; tier: string; answer?: string | null; expected?: string; passed?: boolean }
 }
+
+// ---------- Practice batch runs ----------
+// Practice tasks run one after another in the open project with nobody watching, each graded, with
+// a saved score per run (the scoreboard), so models can be compared on the same tasks. The run
+// lives in the computer's app, so it carries on when the phone disconnects.
+
+export type BatchItemStatus =
+  | 'pending'
+  | 'running'
+  /** The final ANSWER line passed the task's check. */
+  | 'solved'
+  /** An ANSWER line that did not pass. */
+  | 'wrong'
+  /** A final reply without an ANSWER line. */
+  | 'no-answer'
+  /** Still working at the time limit. */
+  | 'timeout'
+  /** It could not run or be graded (task missing, model error, RulZ LLM Suite unreachable). */
+  | 'error'
+  /** The owner pressed Stop on this task (or "Stop now"); it does not count toward the score. */
+  | 'stopped'
+
+export interface BatchItem {
+  taskId: string
+  family: string
+  tier: string
+  /** 1 for the first try of this task in the run. */
+  attempt: number
+  status: BatchItemStatus
+  /** The project task it ran as. */
+  taskRecordId?: string
+  startedAt?: number
+  ms?: number
+  /** Model replies that called tools. */
+  toolRounds?: number
+  answer?: string
+  expected?: string
+  error?: string
+}
+
+export interface BatchOptions {
+  /** Only this task family; '' = every family. */
+  family: string
+  /** Leave out tasks an earlier session already solved. */
+  onlyUnsolved: boolean
+  /** At most this many tasks, spread over the families; 0 = all. */
+  maxTasks: number
+  /** Tries per task (1-10). */
+  attempts: number
+  /** A task still running after this long is stopped; 0 = no limit. */
+  minutesPerTask: number
+}
+
+export interface BatchRun {
+  id: string
+  /** The owner's note for telling runs apart ("base", "lora-v2"). */
+  label: string
+  createdAt: number
+  finishedAt?: number
+  /** 'running' in a saved run that is not running means the app closed during it. */
+  status: 'running' | 'done' | 'stopped'
+  projectPath: string
+  /** The model the run started with. */
+  modelName: string
+  kitDir: string
+  /** Each task is recorded in RulZ LLM Suite for training. */
+  record: boolean
+  options: BatchOptions
+  items: BatchItem[]
+}
+
+export interface BatchState {
+  /** Saved runs, newest first. */
+  runs: BatchRun[]
+  /** The run going now, if any. */
+  activeId: string | null
+  /** A stop was asked for: 'after' finishes the task in progress first, 'now' stops it too. */
+  stopping: 'after' | 'now' | null
+}

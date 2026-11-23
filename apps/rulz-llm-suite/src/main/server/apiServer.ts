@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto'
+import { stat } from 'node:fs/promises'
 import http, { type IncomingMessage, type ServerResponse } from 'node:http'
-import type { AdapterEntry, ApiReSession, ReOverview, ApiRequestLog, ApiServerSettings, ApiServerStatus, GpuStat, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@shared/types'
+import { isAbsolute } from 'node:path'
+import type { AdapterEntry, ApiReSession, ReOverview, RePracticeInfo, ApiRequestLog, ApiServerSettings, ApiServerStatus, GpuStat, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@shared/types'
 import { fileName } from '@shared/draft'
 import { API_RE_ID, RE_OUTCOMES, RE_SESSION_HEADER } from '@shared/re'
 import type { RecordedRound } from '../chat/service'
@@ -63,6 +65,8 @@ const RE_SESSIONS_PREFIX = '/v1/re/sessions/'
 const RE_OVERVIEW = '/v1/re/overview'
 /** POST /v1/re/practice/{task}/prepare copies a task's binary into a work folder; .../grade checks an answer. */
 const RE_PRACTICE_PREFIX = '/v1/re/practice/'
+/** POST /v1/re/kit saves the shared RE training kit folder. */
+const RE_KIT = '/v1/re/kit'
 const PRACTICE_ID = /^[\w-]{1,80}$/
 
 export interface ApiServerDeps {
@@ -87,6 +91,8 @@ export interface ApiServerDeps {
     overview: () => Promise<ReOverview>
     preparePractice: (taskId: string) => Promise<{ target: string; prompt: string; family: string; tier: string }>
     gradePractice: (taskId: string, target: string, text: string) => Promise<{ answer: string | null; passed: boolean; expected: string }>
+    /** Saves the kit folder and returns that kit's practice list (error set when the kit has no tasks). */
+    setKit: (kitDir: string) => Promise<RePracticeInfo>
   }
 }
 
@@ -300,6 +306,17 @@ export class ApiServer {
       if (path === RE_OVERVIEW && method === 'GET') {
         if (!this.deps.re) return fail(404, `Unknown endpoint: ${method} ${path}`, 'not_found_error')
         res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(await this.deps.re.overview()))
+        return finish(200)
+      }
+      if (path === RE_KIT && method === 'POST') {
+        const re = this.deps.re
+        if (!re) return fail(404, `Unknown endpoint: ${method} ${path}`, 'not_found_error')
+        const json = await jsonBody()
+        if (!json) return
+        const kitDir = await parseKitDir(json)
+        if (typeof kitDir !== 'string') return fail(400, kitDir.error, 'invalid_request_error')
+        const out = await re.setKit(kitDir)
+        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(out))
         return finish(200)
       }
       if (path.startsWith(RE_PRACTICE_PREFIX) && method === 'POST') {
@@ -715,6 +732,25 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
     req.on('end', () => resolve(Buffer.concat(chunks)))
     req.on('error', reject)
   })
+}
+
+/**
+ * kitDir from POST /v1/re/kit. Trimmed, the way the kit field saves it. A problem is `{ error }`.
+ * An empty or unreadable kit is still a valid folder; the practice list reports that itself.
+ */
+async function parseKitDir(json: Record<string, unknown>): Promise<string | { error: string }> {
+  const kitDir = json.kitDir
+  if (typeof kitDir !== 'string' || kitDir.trim().length === 0 || kitDir.length > 1000) {
+    return { error: 'kitDir must be a non-empty string of at most 1000 characters.' }
+  }
+  const dir = kitDir.trim()
+  if (!isAbsolute(dir)) return { error: 'kitDir must be an absolute path to an existing folder.' }
+  try {
+    if (!(await stat(dir)).isDirectory()) return { error: 'kitDir must be an absolute path to an existing folder.' }
+  } catch {
+    return { error: 'kitDir must be an absolute path to an existing folder.' }
+  }
+  return dir
 }
 
 /** Checks the body of POST /v1/re/sessions/{id}; returns the problem as text. */

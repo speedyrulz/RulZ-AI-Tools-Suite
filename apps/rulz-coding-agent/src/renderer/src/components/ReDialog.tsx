@@ -5,6 +5,7 @@ import type { ReKind, ReOutcome, ReOverview, ReStartRequest } from '@shared/type
 import { errorMessage, invoke } from '../lib/api'
 import { cn, relativeTime } from '../lib/format'
 import { useWorkspace } from '../stores/workspace'
+import { PracticePanel } from './PracticeBatch'
 import { Badge, Button, Dialog, Field, Input, Select, Switch, Textarea } from './ui'
 
 export const OUTCOME_TONE: Record<ReOutcome, 'neutral' | 'ok' | 'warn' | 'danger'> = { unrated: 'neutral', solved: 'ok', partial: 'warn', failed: 'danger' }
@@ -93,7 +94,7 @@ export function ReDialog({ open, onOpenChange, initialTab = 'start' }: { open: b
         ) : tab === 'start' ? (
           <StartForm data={data} busy={running} onStart={start} />
         ) : tab === 'practice' ? (
-          <PracticeList data={data} busy={running} onStart={(taskId) => void start({ kind: 'practice', taskId })} />
+          <PracticeTab data={data} busy={running} record={record} open={open} onReload={reload} onStart={(taskId) => void start({ kind: 'practice', taskId })} />
         ) : (
           <SessionList data={data} />
         )}
@@ -221,12 +222,48 @@ function StartForm({ data, busy, onStart }: { data: ReOverview; busy: boolean; o
   )
 }
 
-function PracticeList({ data, busy, onStart }: { data: ReOverview; busy: boolean; onStart: (taskId: string) => void }) {
+function PracticeTab({
+  data,
+  busy,
+  record,
+  open,
+  onReload,
+  onStart
+}: {
+  data: ReOverview
+  busy: boolean
+  record: boolean
+  open: boolean
+  onReload: () => void
+  onStart: (taskId: string) => void
+}) {
   const [family, setFamily] = useState('')
+  return (
+    <div className="space-y-5">
+      <PracticePanel data={data} busy={busy} record={record} open={open} family={family} onFamily={setFamily} onReload={onReload} onStartTask={onStart} />
+      {data.practice.tasks.length > 0 && <div className="text-[13px] font-medium">All tasks</div>}
+      <PracticeList data={data} busy={busy} family={family} onFamily={setFamily} onStart={onStart} />
+    </div>
+  )
+}
+
+function PracticeList({
+  data,
+  busy,
+  family,
+  onFamily: setFamily,
+  onStart
+}: {
+  data: ReOverview
+  busy: boolean
+  family: string
+  onFamily: (family: string) => void
+  onStart: (taskId: string) => void
+}) {
   const [unsolved, setUnsolved] = useState(false)
   const families = useMemo(() => [...new Set(data.practice.tasks.map((t) => t.family))].sort(), [data])
   const tasks = data.practice.tasks.filter((t) => (!family || t.family === family) && (!unsolved || t.solved === 0))
-  if (data.practice.error) return <div className="rounded-lg border border-warn/40 bg-warn/10 p-3 text-sm">{data.practice.error}</div>
+  if (data.practice.error) return null
   if (!data.practice.tasks.length) return <div className="text-sm text-muted">No practice tasks in {data.practice.kitDir}.</div>
   return (
     <div className="space-y-3">
