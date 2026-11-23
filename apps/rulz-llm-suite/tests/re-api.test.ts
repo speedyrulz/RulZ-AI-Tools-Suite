@@ -317,6 +317,17 @@ describe('POST /v1/re/kit', () => {
     expect(seen).toEqual([])
     expect((await fetch(`http://127.0.0.1:${port}/v1/re/kit`)).status).toBe(404)
   }, 20_000)
+
+  it('refuses web pages, non-JSON bodies and network paths', async () => {
+    const url = `http://127.0.0.1:${port}/v1/re/kit`
+    const body = JSON.stringify({ kitDir: dir })
+    expect((await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: 'https://example.com' }, body })).status).toBe(403)
+    expect((await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body })).status).toBe(415)
+    expect((await fetch(url, { method: 'POST', body })).status).toBe(415)
+    expect((await post({ kitDir: '\\\\host\\share\\kit' })).status).toBe(400)
+    expect((await post({ kitDir: '//host/share/kit' })).status).toBe(400)
+    expect(seen).toEqual([])
+  }, 20_000)
 })
 
 describe('POST /v1/re/kit without the RE dependency', () => {

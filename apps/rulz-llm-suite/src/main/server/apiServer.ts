@@ -311,6 +311,12 @@ export class ApiServer {
       if (path === RE_KIT && method === 'POST') {
         const re = this.deps.re
         if (!re) return fail(404, `Unknown endpoint: ${method} ${path}`, 'not_found_error')
+        // The kit folder holds the programs practice tasks run, so only another app may change it, never a web
+        // page: browsers send Origin with a cross-site POST, and a JSON content type can't be sent from a plain form.
+        if (req.headers.origin) return fail(403, 'The kit folder cannot be changed from a web page.', 'permission_error')
+        if (!/^application\/json\b/i.test(String(req.headers['content-type'] ?? ''))) {
+          return fail(415, 'Send the kit folder as application/json.', 'invalid_request_error')
+        }
         const json = await jsonBody()
         if (!json) return
         const kitDir = await parseKitDir(json)
@@ -745,6 +751,8 @@ async function parseKitDir(json: Record<string, unknown>): Promise<string | { er
   }
   const dir = kitDir.trim()
   if (!isAbsolute(dir)) return { error: 'kitDir must be an absolute path to an existing folder.' }
+  // A network share would let someone else supply the programs practice tasks run.
+  if (/^[\\/]{2}/.test(dir)) return { error: 'kitDir must be a folder on this computer, not a network path.' }
   try {
     if (!(await stat(dir)).isDirectory()) return { error: 'kitDir must be an absolute path to an existing folder.' }
   } catch {
