@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_AUTO_STOP, DEFAULT_OFFER_FILTER, type RemoteModelDef, type RemoteOffer, type RentRequest } from '@shared/remote'
+import { DEFAULT_AUTO_STOP, DEFAULT_OFFER_FILTER, type OfferFilter, type RemoteModelDef, type RemoteOffer, type RentRequest } from '@shared/remote'
 import type { ProbeResult, RentalOps, Secrets } from '../src/main/remote/contract'
 import { remoteHandlers } from '../src/main/remote/ipc'
 import { RentalManager, type RentalManagerDeps } from '../src/main/remote/rentals'
@@ -26,6 +26,7 @@ function offer(over: Partial<RemoteOffer> = {}): RemoteOffer {
     cpuCores: 16,
     cpuRamMiB: 64000,
     dollarsPerHour: 0.5,
+    dlperf: 100,
     reliability: 0.99,
     inetDownMbps: 900,
     inetUpMbps: 500,
@@ -64,6 +65,7 @@ class Harness {
   rentBodies: { offerId: number; label: string; onstart: string }[] = []
   instances = new Map<number, VastInstanceDetail>()
   offers: RemoteOffer[] = [offer()]
+  findFilters: OfferFilter[] = []
   accountKeys = [PUB]
   rentImpl: (r: { offerId: number; label: string }) => Promise<{ contractId: number }> = async () => ({ contractId: 777 })
   listFails = false
@@ -83,6 +85,11 @@ class Harness {
     searchOffers: async () => {
       this.calls.push('search')
       return this.offers
+    },
+    findOffer: async (id, filter) => {
+      this.calls.push('find')
+      this.findFilters.push(filter)
+      return this.offers.find((o) => o.id === id) ?? null
     },
     rent: async (r) => {
       this.calls.push('rent')
@@ -251,10 +258,14 @@ describe('rent', () => {
     h.offers = [offer({ dollarsPerHour: 0.501 })]
     await expect(h.m.rent(h.req())).rejects.toThrow(/rose/)
     expect(h.calls).not.toContain('rent')
-    h.offers = [offer({ dollarsPerHour: 0.49 })]
+    h.offers = [offer({ id: 41 }), offer({ dollarsPerHour: 0.49 })]
     h.instances.set(777, inst(777, { label: 'rulz-llm-00000001' }))
     await h.m.rent(h.req())
     expect(h.calls).toContain('rent')
+    // Looked up by its id: a repeated search returns a different selection and mostly misses the offer.
+    expect(h.calls).not.toContain('search')
+    expect(h.findFilters).toHaveLength(3)
+    expect(h.findFilters[2]).toEqual(h.req().filter)
   })
 
   it('refuses without a key, without an ssh key on the account, and when the offer is gone', async () => {

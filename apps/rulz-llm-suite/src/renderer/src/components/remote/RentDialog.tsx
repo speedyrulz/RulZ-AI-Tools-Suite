@@ -1,24 +1,37 @@
 import { ArrowDown, ArrowLeft, ArrowUp, CircleAlert, LoaderCircle, Search } from 'lucide-react'
-import { useMemo, useRef, useState } from 'react'
-import { DEFAULT_AUTO_STOP, DEFAULT_OFFER_FILTER, type AutoStop, type OfferFilter, type RemoteOffer, type RemoteState } from '@shared/remote'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { DEFAULT_AUTO_STOP, type AutoStop, type OfferFilter, type OfferSort, type RemoteOffer, type RemoteState } from '@shared/remote'
 import { errorMessage, invoke } from '../../lib/api'
 import { cn, formatBytes } from '../../lib/format'
 import {
   cleanAutoStop,
+  dlperfPerDollar,
   minVramForModel,
   money,
   offerVramGb,
+  readRentPrefs,
   remoteModelSize,
   rentBlockedReason,
   rentButtonLabel,
   rentSummary,
   sortOffers,
-  type OfferSort
+  type RentPrefs,
+  type SortDir
 } from '../../lib/remote'
 import { isChannelBusy, useRemote } from '../../stores/remote'
 import { useModels } from '../../stores/models'
 import { toast } from 'sonner'
 import { Button, Dialog, Field, Input, NumberInput, Select, Switch } from '../ui'
+
+const PREFS_KEY = 'rulz.vast.rent'
+
+function loadPrefs(): RentPrefs {
+  try {
+    return readRentPrefs(localStorage.getItem(PREFS_KEY))
+  } catch {
+    return readRentPrefs(null)
+  }
+}
 
 /**
  * Renting, in two steps: find an offer, then a dialog that states the price and what stays billed. Nothing is sent
@@ -28,14 +41,16 @@ export function RentDialog({ state, onClose }: { state: RemoteState; onClose: ()
   const run = useRemote((s) => s.run)
   const renting = useRemote((s) => isChannelBusy(s, 'remote:rent'))
   const library = useModels((s) => s.models)
-  const [filter, setFilter] = useState<OfferFilter>(DEFAULT_OFFER_FILTER)
-  const [forModel, setForModel] = useState('')
-  const [offers, setOffers] = useState<RemoteOffer[] | null>(null)
+  const [prefs] = useState(loadPrefs)
+  const [filter, setFilter] = useState<OfferFilter>(prefs.filter)
+  const [forModel, setForModel] = useState(state.models.some((m) => m.id === prefs.forModel) ? prefs.forModel : '')
+  // With the filter and model they were searched for: the rent check, disk size and model must be the ones the list is for.
+  const [found, setFound] = useState<{ offers: RemoteOffer[]; filter: OfferFilter; forModel: string } | null>(null)
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState('')
-  const [sort, setSort] = useState<{ key: OfferSort; dir: 'asc' | 'desc' }>({ key: 'price', dir: 'asc' })
-  const [picked, setPicked] = useState<RemoteOffer | null>(null)
-  const [auto, setAuto] = useState<AutoStop>({ ...DEFAULT_AUTO_STOP })
+  const [dir, setDir] = useState<SortDir>(prefs.dir)
+  const [picked, setPicked] = useState<{ offer: RemoteOffer; filter: OfferFilter } | null>(null)
+  const [auto, setAuto] = useState<AutoStop>({ ...DEFAULT_AUTO_STOP, idleMinutes: prefs.idleMinutes, capHours: prefs.capHours })
   const [setupModel, setSetupModel] = useState('')
   const seq = useRef(0)
 
@@ -45,19 +60,31 @@ export function RentDialog({ state, onClose }: { state: RemoteState; onClose: ()
   // The model raises the minimum, never lowers what was typed.
   const effective: OfferFilter = { ...filter, minVramGb: Math.max(filter.minVramGb, needVram ?? 0) }
   const set = <K extends keyof OfferFilter>(k: K, v: OfferFilter[K]): void => setFilter((f) => ({ ...f, [k]: v }))
-  const rows = useMemo(() => (offers ? sortOffers(offers, sort.key, sort.dir) : null), [offers, sort])
+  const sort = { key: filter.sort, dir }
+  const rows = useMemo(() => (found ? sortOffers(found.offers, filter.sort, dir) : null), [found, filter.sort, dir])
   const blocked = rentBlockedReason(state)
   // Enter in a number field commits its draft and submits in the same event; the search reads the committed filter.
   const latest = useRef(effective)
   latest.current = effective
+  const lastCap = useRef(prefs.capHours)
+  lastCap.current = auto.capHours ?? lastCap.current
 
-  const search = async (): Promise<void> => {
+  useEffect(() => {
+    try {
+      const keep: RentPrefs = { filter, dir, forModel, idleMinutes: auto.idleMinutes, capHours: lastCap.current }
+      localStorage.setItem(PREFS_KEY, JSON.stringify(keep))
+    } catch {
+      // Storage may be blocked; the window works without it.
+    }
+  }, [filter, dir, forModel, auto.idleMinutes, auto.capHours])
+
+  const search = async (by: OfferFilter = latest.current): Promise<void> => {
     const mine = ++seq.current
     setSearching(true)
     setSearchError('')
     try {
-      const found = await invoke('remote:searchOffers', latest.current)
-      if (mine === seq.current) setOffers(found)
+      const offers = await invoke('remote:searchOffers', by)
+      if (mine === seq.current) setFound({ offers, filter: by, forModel })
     } catch (e) {
       if (mine === seq.current) setSearchError(errorMessage(e))
     } finally {
@@ -65,10 +92,16 @@ export function RentDialog({ state, onClose }: { state: RemoteState; onClose: ()
     }
   }
 
-  const sortBy = (key: OfferSort): void => setSort((s) => (s.key === key ? { key, dir: s.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: key === 'price' ? 'asc' : 'desc' }))
+  const sortBy = (key: OfferSort): void => {
+    if (filter.sort === key) return setDir((d) => (d === 'asc' ? 'desc' : 'asc'))
+    set('sort', key)
+    setDir(key === 'price' ? 'asc' : 'desc')
+    // vast.ai returns only part of the matches, so the best ones by the new column have to be asked for.
+    if (found) void search({ ...latest.current, sort: key })
+  }
 
   if (picked) {
-    const summary = rentSummary(picked, { diskGb: effective.diskGb, autoStop: cleanAutoStop(auto), credit: state.credit, modelBytes: setupModel ? (remoteModelSizeOf(state, setupModel, library) ?? null) : null })
+    const summary = rentSummary(picked.offer, { diskGb: picked.filter.diskGb, autoStop: cleanAutoStop(auto), credit: state.credit, modelBytes: setupModel ? (remoteModelSizeOf(state, setupModel, library) ?? null) : null })
     const sshWarn = state.ssh.onAccount === false || !state.ssh.publicKeyPath
     return (
       <Dialog
@@ -91,9 +124,9 @@ export function RentDialog({ state, onClose }: { state: RemoteState; onClose: ()
               disabled={renting || !!blocked}
               onClick={async () => {
                 const ok = await run('remote:rent', {
-                  offerId: picked.id,
-                  shownDollarsPerHour: picked.dollarsPerHour,
-                  filter: effective,
+                  offerId: picked.offer.id,
+                  shownDollarsPerHour: picked.offer.dollarsPerHour,
+                  filter: picked.filter,
                   autoStop: cleanAutoStop(auto),
                   modelId: setupModel
                 })
@@ -103,7 +136,7 @@ export function RentDialog({ state, onClose }: { state: RemoteState; onClose: ()
                 }
               }}
             >
-              {renting && <LoaderCircle size={14} className="animate-spin" />} {rentButtonLabel(picked.dollarsPerHour)}
+              {renting && <LoaderCircle size={14} className="animate-spin" />} {rentButtonLabel(picked.offer.dollarsPerHour)}
             </Button>
           </>
         }
@@ -153,7 +186,7 @@ export function RentDialog({ state, onClose }: { state: RemoteState; onClose: ()
       onOpenChange={(o) => !o && onClose()}
       title="Rent an instance"
       description="Search the on-demand offers, then pick one. You see the price and settings before anything is rented."
-      className="w-[min(1000px,calc(100vw-32px))]"
+      className="w-[min(1100px,calc(100vw-32px))]"
       footer={
         <Button autoFocus variant="ghost" onClick={onClose}>
           Close
@@ -205,7 +238,7 @@ export function RentDialog({ state, onClose }: { state: RemoteState; onClose: ()
             {searching ? <LoaderCircle size={14} className="animate-spin" /> : <Search size={14} />} Search offers
           </Button>
           <span className="text-[11px] text-faint">
-            Enter searches; it never rents.{def && modelBytes ? ` ${def.name} is ${formatBytes(modelBytes)}.` : ''}
+            Enter searches; it never rents. vast.ai shows up to 64 offers, a different selection each time.{def && modelBytes ? ` ${def.name} is ${formatBytes(modelBytes)}.` : ''}
           </span>
         </div>
       </form>
@@ -226,6 +259,9 @@ export function RentDialog({ state, onClose }: { state: RemoteState; onClose: ()
                 </SortTh>
                 <SortTh k="price" sort={sort} onSort={sortBy} className="w-20">
                   $/hour
+                </SortTh>
+                <SortTh k="value" sort={sort} onSort={sortBy} className="w-28">
+                  DLPerf/$/hr
                 </SortTh>
                 <SortTh k="reliability" sort={sort} onSort={sortBy} className="w-20">
                   Reliable
@@ -248,6 +284,9 @@ export function RentDialog({ state, onClose }: { state: RemoteState; onClose: ()
                   </td>
                   <td className="tabular-nums">{offerVramGb(o)} GB</td>
                   <td className="font-medium tabular-nums">{money(o.dollarsPerHour)}</td>
+                  <td className="tabular-nums" title={o.dlperf === null ? undefined : `DLPerf ${o.dlperf.toFixed(1)}`}>
+                    {dlperfPerDollar(o)?.toFixed(0) ?? '—'}
+                  </td>
                   <td className="tabular-nums">{Math.round(o.reliability * 1000) / 10}%</td>
                   <td className="tabular-nums">{Math.round(o.inetDownMbps)}</td>
                   <td className="tabular-nums" title="Received / sent">
@@ -261,8 +300,9 @@ export function RentDialog({ state, onClose }: { state: RemoteState; onClose: ()
                     <Button
                       size="sm"
                       onClick={() => {
-                        setSetupModel(forModel)
-                        setPicked(o)
+                        if (!found) return
+                        setSetupModel(found.forModel)
+                        setPicked({ offer: o, filter: found.filter })
                       }}
                     >
                       Choose
@@ -292,7 +332,7 @@ function SortTh({
   children
 }: {
   k: OfferSort
-  sort: { key: OfferSort; dir: 'asc' | 'desc' }
+  sort: { key: OfferSort; dir: SortDir }
   onSort: (k: OfferSort) => void
   className?: string
   children: string

@@ -1,13 +1,18 @@
 // Pure helpers for the vast.ai window: money and time words, button states, target checks, next-step sentences.
 // Nothing here talks to the main process or reads a store, so all of it is tested (tests/renderer-remote.test.ts).
 import {
+  DEFAULT_AUTO_STOP,
   DEFAULT_BATCH_TARGET,
+  DEFAULT_OFFER_FILTER,
   MAX_LANES,
   MAX_SESSIONS_PER_HOST,
+  OFFER_SORTS,
   isRemoteModelId,
   type AutoStop,
   type BatchHost,
   type BatchTarget,
+  type OfferFilter,
+  type OfferSort,
   type RemoteModelDef,
   type RemoteModelSource,
   type RemoteOffer,
@@ -257,13 +262,66 @@ export function remoteModelSize(def: RemoteModelDef, models: ModelEntry[]): numb
   return e && e.sizeBytes > 0 ? e.sizeBytes : null
 }
 
-export type OfferSort = 'price' | 'vram' | 'reliability' | 'down'
+/** vast.ai's DLPerf/$/hr; null when the speed score or a price is missing. */
+export function dlperfPerDollar(o: Pick<RemoteOffer, 'dlperf' | 'dollarsPerHour'>): number | null {
+  return o.dlperf === null || !(o.dollarsPerHour > 0) ? null : o.dlperf / o.dollarsPerHour
+}
 
-export function sortOffers(offers: RemoteOffer[], key: OfferSort, dir: 'asc' | 'desc'): RemoteOffer[] {
-  const val = (o: RemoteOffer): number =>
-    key === 'price' ? o.dollarsPerHour : key === 'vram' ? o.gpuRamMiB * o.numGpus : key === 'reliability' ? o.reliability : o.inetDownMbps
+/** Offers without the value come last in both directions. */
+export function sortOffers(offers: RemoteOffer[], key: OfferSort, dir: SortDir): RemoteOffer[] {
+  const val = (o: RemoteOffer): number | null =>
+    key === 'price' ? o.dollarsPerHour : key === 'value' ? dlperfPerDollar(o) : key === 'vram' ? o.gpuRamMiB * o.numGpus : key === 'reliability' ? o.reliability : o.inetDownMbps
   const sign = dir === 'asc' ? 1 : -1
-  return [...offers].sort((a, b) => sign * (val(a) - val(b)) || a.dollarsPerHour - b.dollarsPerHour || a.id - b.id)
+  return [...offers].sort((a, b) => {
+    const x = val(a)
+    const y = val(b)
+    const main = x === null || y === null ? Number(x === null) - Number(y === null) : sign * (x - y)
+    return main || a.dollarsPerHour - b.dollarsPerHour || a.id - b.id
+  })
+}
+
+export type SortDir = 'asc' | 'desc'
+
+// ---------- What the rent window remembers ----------
+
+/** Auto-stop itself is not part of it: it is on again for every new rental. */
+export interface RentPrefs {
+  filter: OfferFilter
+  dir: SortDir
+  /** Remote model the search is for; '' = none. */
+  forModel: string
+  idleMinutes: number
+  capHours: number
+}
+
+/** The last used settings from their saved text; anything missing or out of range becomes the default. */
+export function readRentPrefs(text: string | null): RentPrefs {
+  let raw: Record<string, unknown> = {}
+  try {
+    const p: unknown = JSON.parse(text ?? '')
+    if (p && typeof p === 'object') raw = p as Record<string, unknown>
+  } catch {
+    // Nothing saved yet, or not readable: the defaults.
+  }
+  const f = (raw.filter && typeof raw.filter === 'object' ? raw.filter : {}) as Record<string, unknown>
+  const d = DEFAULT_OFFER_FILTER
+  const n = (v: unknown, def: number, lo: number, hi: number): number => (typeof v === 'number' && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : def)
+  return {
+    filter: {
+      minVramGb: n(f.minVramGb, d.minVramGb, 1, 2000),
+      gpuName: typeof f.gpuName === 'string' ? f.gpuName.slice(0, 60) : d.gpuName,
+      maxGpus: Math.round(n(f.maxGpus, d.maxGpus, 1, 8)),
+      maxDollarsPerHour: f.maxDollarsPerHour === null ? null : n(f.maxDollarsPerHour, d.maxDollarsPerHour ?? 1, 0, 100),
+      diskGb: Math.round(n(f.diskGb, d.diskGb, 10, 4000)),
+      minReliability: n(f.minReliability, d.minReliability, 0, 1),
+      minInetDownMbps: n(f.minInetDownMbps, d.minInetDownMbps, 0, 100_000),
+      sort: OFFER_SORTS.find((s) => s === f.sort) ?? d.sort
+    },
+    dir: raw.dir === 'desc' ? 'desc' : 'asc',
+    forModel: typeof raw.forModel === 'string' ? raw.forModel : '',
+    idleMinutes: Math.round(n(raw.idleMinutes, DEFAULT_AUTO_STOP.idleMinutes, 1, 1440)),
+    capHours: n(raw.capHours, DEFAULT_AUTO_STOP.capHours ?? 12, 1, 720)
+  }
 }
 
 export function offerVramGb(o: Pick<RemoteOffer, 'gpuRamMiB' | 'numGpus'>): number {
