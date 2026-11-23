@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import { toast } from 'sonner'
 import type { AppInfo } from '@shared/ipc'
 import type { AppSettings, EngineInfo } from '@shared/types'
-import { errorMessage, invoke } from '../lib/api'
+import { errorMessage, invoke, on } from '../lib/api'
 import { once } from '../lib/once'
 
 export type Page = 'chat' | 'writing' | 're' | 'models' | 'mcp' | 'settings' | 'discover' | 'developer'
@@ -50,6 +50,16 @@ export const useApp = create<AppState>((set, get) => ({
     set({ settings, info })
     applyTheme(settings.theme)
     void get().refreshEngine()
+    // Another app (RulZ Coding Agent) can change the practice kit folder through the API server.
+    // Take the saved RE settings over, so a later save from this window doesn't write the old folder back.
+    on('re:changed', () => {
+      void invoke('settings:get')
+        .then((saved) => {
+          const now = get().settings
+          if (now && saved.re.kitDir !== now.re.kitDir) set({ settings: { ...now, re: { ...now.re, kitDir: saved.re.kitDir } } })
+        })
+        .catch(() => undefined)
+    })
   }),
 
   updateSettings: async (patch) => {

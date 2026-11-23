@@ -98,6 +98,9 @@ export interface SessionDeps {
   checkSyntax?: typeof checkSyntax
 }
 
+/** What ask_user gets back in a batch task. */
+const UNATTENDED_ANSWER = 'Nobody is watching: this task runs unattended as part of a batch run. Decide this yourself and carry on.'
+
 /** Ends the task without counting as an error (owner chose Stop in a prompt, or pressed Stop). */
 class StopTask extends Error {}
 
@@ -148,6 +151,8 @@ export class ProjectSession {
   private lastBackgroundNote = ''
   /** The running task, whose checklist is repeated to the model when the call that held it is tidied away. */
   private current: TaskRecord | null = null
+  /** True while a batch run's task runs: nobody is watching, so nothing may wait for a person (see ask). */
+  private unattended = false
 
   constructor(
     public data: ProjectData,
@@ -254,7 +259,7 @@ export class ProjectSession {
   }
 
   /** `shown` is what the conversation shows when the model gets a longer text (e.g. "Fix this"). */
-  start(text: string, opts: { howToRun?: boolean; share?: boolean; shown?: string; re?: ReTaskInfo } = {}): void {
+  start(text: string, opts: { howToRun?: boolean; share?: boolean; shown?: string; re?: ReTaskInfo; batch?: boolean } = {}): void {
     const trimmed = text.trim()
     if (!trimmed) return
     if (this.running) throw new Error('A task is already running. Wait for it to finish or press Stop.')
@@ -268,6 +273,7 @@ export class ProjectSession {
     this.data.tasks.push(task)
     this.data.timeline.push(item)
     this.running = true
+    this.unattended = opts.batch === true
     this.abort = new AbortController()
     this.emit({ type: 'task-start', task, item })
     void this.run(task, trimmed, opts.howToRun ?? false, opts.share ?? false)
@@ -495,6 +501,7 @@ export class ProjectSession {
         this.emit({ type: 'notes', notes: [] })
       }
       this.running = false
+      this.unattended = false
       this.abort = null
       this.current = null
       this.setStatus({ phase: 'idle' })
@@ -705,6 +712,8 @@ export class ProjectSession {
 
   private async handleStuck(task: TaskRecord, message: string, reason: GuardTrip | 'limit', signal: AbortSignal): Promise<void> {
     this.notice(message, 'warn', task.id)
+    // Nobody is watching a batch task: stuck ends it as an error instead of waiting for a decision.
+    if (this.unattended) throw new FriendlyError('Stopped: the agent got stuck.')
     const answer = await this.ask({ kind: 'stuck', message, reason }, signal)
     if (!answer || answer.kind !== 'stuck' || answer.decision === 'stop') throw new StopTask()
     if (answer.decision === 'change') {
@@ -723,6 +732,13 @@ export class ProjectSession {
     // Stop pressed while this step was getting ready (e.g. starting a tool server): its 'abort'
     // event has already fired, so a question now could never be ended by Stop.
     if (signal.aborted) return Promise.resolve(null)
+    // A batch task has nobody to ask: approvals are given ("allow for this task", no prompt shown),
+    // questions get a note to decide alone. (Refusals by the safety rules never reach here.)
+    if (this.unattended) {
+      if (req.kind === 'approval') return Promise.resolve({ kind: 'approval', decision: 'allow-task' })
+      if (req.kind === 'question') return Promise.resolve({ kind: 'question', text: UNATTENDED_ANSWER })
+      return Promise.resolve({ kind: 'stuck', decision: 'stop' })
+    }
     const request = { ...req, id: randomUUID() } as PendingPrompt
     const previous = this.statusNow
     return new Promise<PromptAnswer | null>((resolve) => {

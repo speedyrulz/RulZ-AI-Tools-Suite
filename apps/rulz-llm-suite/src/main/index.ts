@@ -283,6 +283,14 @@ async function main(): Promise<void> {
         const answer = extractAnswer(text)
         const { passed, expected } = await gradePractice(settings.get().re.kitDir, practiceRoot, taskId, target, answer)
         return { answer, passed, expected }
+      },
+      // The kit field saves `{ re: { ...re, kitDir } }` through settings:update. That handler does not
+      // broadcast; the window applies its own reply. re:changed is the event the page already follows
+      // when another app changes RE data.
+      setKit: async (kitDir) => {
+        const saved = await settings.update({ re: { ...settings.get().re, kitDir } })
+        broadcast('re:changed', undefined)
+        return listPractice(saved.re.kitDir)
       }
     }
   })
