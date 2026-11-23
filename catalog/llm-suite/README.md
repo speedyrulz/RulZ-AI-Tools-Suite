@@ -175,6 +175,26 @@ Discover/downloads, RAG and a CLI are planned.
     waits for the other to finish. Also playable from [RulZ Writer for Android](../rulz-writer-android) (no deletes
     on the phone). Design: [docs/adventure-mode-design.md](docs/adventure-mode-design.md).
   - Not yet tried with a real model.
+- **vast.ai** (`Ctrl+9`, 0.29.0) — run a model on a rented GPU and control everything from here. Only the model server
+  (`llama-server`) runs on the rental; chats, REA, the targets, recordings, grading and the scoreboard stay on this PC.
+  - **Rent, start, stop, destroy** from the app: search on-demand offers (GPU memory, price, reliability, download
+    speed), see the price, disk and traffic costs and your balance, and confirm. Nothing is rented or started without
+    that click; loading a model, a batch run, an API request or a phone never does it. A rent request whose answer is
+    lost is never repeated: the app looks for the instance by its label first. **Attach** uses an instance rented
+    elsewhere; the app never destroys it and leaves it alone while something else uses its GPU.
+  - **Auto-stop**: an app rental stops after 30 idle minutes and at the latest after 12 hours (both can be changed, and
+    **Extend cap** adds hours), after a 60-second countdown with **Keep running**. A small watchdog on the instance
+    enforces the same limits when the app or the PC is off. Stopping keeps the disk, which is still billed. The top bar
+    shows what the rentals cost; quitting asks what to do with running ones.
+  - **Models**: pick a model from this PC (its files are uploaded, with resume and checksums) or from Hugging Face
+    (downloaded on the instance; gated repositories need a token). **Set up** installs the llama.cpp Linux CUDA build
+    with the same build number as this PC's, checked against GitHub's checksums, and the model's files.
+  - A loaded remote model works everywhere a local one does: chat, Reverse Engineering, Writing, Adventure and the API
+    server. The API server and the phone only use one that is already loaded. The connection is an ssh tunnel that
+    reconnects by itself; the server is reachable from this PC only.
+  - Needs a vast.ai API key (typed in the app and kept encrypted, or taken from `VAST_API_KEY` or the `vastai` CLI) and
+    an ssh key in `~/.ssh` that is on the vast.ai account (the app can add it).
+  - Design: [docs/vast-design.md](docs/vast-design.md). Not yet tried on a real rental.
 - **Reverse Engineering mode** (`Ctrl+6`) — runs a local model as a reverse engineer with the REA MCP tools, and
   collects fine-tuning data while it works. Tuned first for Ornith 1.5 35B-A3B (Heretic MTP APEX I-Mini).
   - **Sessions**: pick a program, library, package or folder and a goal (overview, license check, network, config,
@@ -192,7 +212,7 @@ Discover/downloads, RAG and a CLI are planned.
   - **Practice tasks**: reads `build/tasks.jsonl` from the RE training kit (`C:\coding\Trainers\re-training-kit`),
     copies a task's binary to a fresh work folder, and checks the final `ANSWER:` line automatically (a port of the
     kit's `verify.py`).
-  - **Batch runs**: **Start batch run** under the practice tasks runs them one after another without you and keeps a
+  - **Batch runs**: **Start batch run** under the practice tasks runs them without you and keeps a
     score, so two models (or one model before and after fine-tuning) can be compared on the same tasks. Options: at
     most N tasks (taken family by family in turn, so a short run still covers every family), tries per task, a time
     limit per task (counted from the task's first reply, so loading the model is not counted), only tasks no earlier
@@ -205,7 +225,13 @@ Discover/downloads, RAG and a CLI are planned.
     solved tries out of the tries that ran to an end (errors and tasks you stopped are not counted), median tool rounds
     and time of the solved ones, a score per task family, and each task's result, rounds, time and largest prompt, with
     a button to open its chat. Runs are kept in `%APPDATA%\RulZ LLM Suite\re-batches.json`; removing a run keeps its
-    chats. The chat is busy while a run is going, so other chats wait until it ends or is stopped.
+    chats. A chat that belongs to a run can be watched but
+    not changed while its task runs; other chats can be used meanwhile.
+    **Several tasks at once** (0.29.0): choose how many run side by side on each host and which hosts (this PC, or one
+    or more vast.ai rentals with the model set up). Each task has its own REA process on this PC (about 1.3 GB of RAM
+    each) and stays on one model server. Rows show the hosts and, for rentals, the cost and the cost per solved task.
+    **Stop the rentals when the run ends** is an option. A task cut off by a lost connection goes back to the queue
+    instead of counting as failed.
   - **Export**: writes `train.jsonl` in the kit's format (OpenAI / Hugging Face chat: `messages`, `tools`, `meta`;
     thinking in `reasoning_content`) plus `manifest.json`, from solved sessions by default, at most N per practice task
     (fewest tool rounds first), leaving out sessions whose context was trimmed. Email addresses are replaced.

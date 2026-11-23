@@ -10,6 +10,7 @@ import { invoke } from '../../lib/api'
 import { uid } from '../../lib/format'
 import { useApp } from '../../stores/app'
 import { useChat } from '../../stores/chat'
+import { isRemoteModelId } from '@shared/remote'
 import { useModels } from '../../stores/models'
 import { useWbench } from '../../stores/wbench'
 import { VarietyFields } from '../chat/InferencePanel'
@@ -351,7 +352,7 @@ function CandidateCard({
         <Field label="Model">
           <Select value={draft.modelId} onChange={(e) => apply({ modelId: e.target.value, adapters: [], own: { ...draft.own, load: {} } })}>
             <option value="">Choose a model…</option>
-            {models.map((m) => (
+            {models.filter((m) => !m.remote).map((m) => (
               <option key={m.id} value={m.id}>
                 {m.name}
               </option>
@@ -426,7 +427,7 @@ export function SetupForm({ onCancel }: { onCancel: () => void }) {
 
   const [label, setLabel] = useState('')
   const [picked, setPicked] = useState<Set<string>>(() => new Set(BUILTIN_PROMPTS.slice(0, 4).map((p) => p.id)))
-  const [drafts, setDrafts] = useState<CandidateDraft[]>(() => [newDraft(activeModelId ?? ''), newDraft()])
+  const [drafts, setDrafts] = useState<CandidateDraft[]>(() => [newDraft(isRemoteModelId(activeModelId) ? '' : (activeModelId ?? '')), newDraft()])
   const [seedCount, setSeedCount] = useState(2)
   const [maxTokens, setMaxTokens] = useState(DEFAULT_TOKENS)
   const [editing, setEditing] = useState<BenchPrompt | 'new' | null>(null)

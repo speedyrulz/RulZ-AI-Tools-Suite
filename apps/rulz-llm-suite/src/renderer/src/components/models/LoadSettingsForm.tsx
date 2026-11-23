@@ -28,13 +28,16 @@ export function LoadSettingsForm({
   model,
   config,
   onChange,
-  estimate
+  estimate,
+  remote
 }: {
   model: ModelEntry | null
   config: LoadConfig
   onChange: (c: LoadConfig) => void
   /** Shown next to each GPU's split slider. */
   estimate?: MemoryEstimate | null
+  /** A model that runs on a vast.ai rental: the settings that name this PC's GPUs, threads, memory lock and template file are left out. */
+  remote?: boolean
 }) {
   const engine = useApp((s) => s.engine)
   const hardware = useModels((s) => s.hardware)
@@ -161,31 +164,33 @@ export function LoadSettingsForm({
         </Field>
       )}
 
-      <Field label="GPUs">
-        <Select
-          value={gpuMode}
-          onChange={(e) => {
-            const v = e.target.value
-            if (v.startsWith('single:')) onChange({ ...config, splitMode: 'single', mainGpu: Number(v.slice(7)) })
-            else if (v === 'custom') {
-              // Start the sliders from an even split unless a valid one is already saved.
-              const even = toPercents(gpus.map(() => 1 / gpus.length)).join(',')
-              onChange({ ...config, splitMode: 'custom', tensorSplit: parseTensorSplit(config.tensorSplit, gpus.length) ? config.tensorSplit : even })
-            } else onChange({ ...config, splitMode: 'auto' })
-          }}
-        >
-          <option value="auto">{gpus.length > 1 ? 'Split across all GPUs (by free memory)' : 'Automatic'}</option>
-          {gpus.map((g) => (
-            <option key={g.index} value={`single:${g.index}`}>
-              Only GPU{g.index}: {g.name}
-            </option>
-          ))}
-          {gpus.length > 1 && <option value="custom">Custom split…</option>}
-        </Select>
-        {config.splitMode === 'custom' && gpus.length > 1 && (
-          <GpuSplit gpus={gpus} split={config.tensorSplit} estimate={estimate} onChange={(s) => set('tensorSplit', s)} />
-        )}
-      </Field>
+      {!remote && (
+        <Field label="GPUs">
+          <Select
+            value={gpuMode}
+            onChange={(e) => {
+              const v = e.target.value
+              if (v.startsWith('single:')) onChange({ ...config, splitMode: 'single', mainGpu: Number(v.slice(7)) })
+              else if (v === 'custom') {
+                // Start the sliders from an even split unless a valid one is already saved.
+                const even = toPercents(gpus.map(() => 1 / gpus.length)).join(',')
+                onChange({ ...config, splitMode: 'custom', tensorSplit: parseTensorSplit(config.tensorSplit, gpus.length) ? config.tensorSplit : even })
+              } else onChange({ ...config, splitMode: 'auto' })
+            }}
+          >
+            <option value="auto">{gpus.length > 1 ? 'Split across all GPUs (by free memory)' : 'Automatic'}</option>
+            {gpus.map((g) => (
+              <option key={g.index} value={`single:${g.index}`}>
+                Only GPU{g.index}: {g.name}
+              </option>
+            ))}
+            {gpus.length > 1 && <option value="custom">Custom split…</option>}
+          </Select>
+          {config.splitMode === 'custom' && gpus.length > 1 && (
+            <GpuSplit gpus={gpus} split={config.tensorSplit} estimate={estimate} onChange={(s) => set('tensorSplit', s)} />
+          )}
+        </Field>
+      )}
 
       <div className="grid grid-cols-3 gap-3">
         <Field label="Flash attention">
@@ -311,7 +316,7 @@ export function LoadSettingsForm({
         </div>
       )}
 
-      {model && <AdapterPicker model={model} adapters={config.adapters ?? []} onChange={(a) => set('adapters', a)} />}
+      {model && !remote && <AdapterPicker model={model} adapters={config.adapters ?? []} onChange={(a) => set('adapters', a)} />}
 
       <Collapsible.Root open={samplingOpen} onOpenChange={setSamplingOpen}>
         <Collapsible.Trigger className="flex items-center gap-1 text-xs font-medium text-muted hover:text-text">
@@ -363,9 +368,11 @@ export function LoadSettingsForm({
           Advanced
         </Collapsible.Trigger>
         <Collapsible.Content className="mt-3 space-y-1">
-          <Field inline label="CPU threads" hint="Empty = automatic">
-            <NumberInput value={config.threads} placeholder="Auto" min={1} onChange={(v) => set('threads', v)} />
-          </Field>
+          {!remote && (
+            <Field inline label="CPU threads" hint="Empty = automatic">
+              <NumberInput value={config.threads} placeholder="Auto" min={1} onChange={(v) => set('threads', v)} />
+            </Field>
+          )}
           <Field inline label="Batch size" hint="Logical batch for prompt processing">
             <NumberInput value={config.batchSize} placeholder="2048" min={1} onChange={(v) => set('batchSize', v)} />
           </Field>
@@ -381,27 +388,31 @@ export function LoadSettingsForm({
           <Field inline label="Memory-map the model file (mmap)">
             <Switch checked={config.useMmap} onCheckedChange={(v) => set('useMmap', v)} />
           </Field>
-          <Field inline label="Keep model in RAM (mlock)">
-            <Switch checked={config.useMlock} onCheckedChange={(v) => set('useMlock', v)} />
-          </Field>
-          <div className="space-y-3 pt-2">
-            <Field label="Chat template override" hint="Jinja file; empty = model's own template">
-              <div className="flex gap-1.5">
-                <Input value={config.chatTemplateFile} placeholder="None" onChange={(e) => set('chatTemplateFile', e.target.value)} />
-                <IconButton
-                  label="Browse"
-                  onClick={async () => {
-                    const p = await invoke('dialog:pickFile', {
-                      title: 'Choose a Jinja chat template',
-                      filters: [{ name: 'Jinja templates', extensions: ['jinja', 'j2', 'txt'] }]
-                    })
-                    if (p) set('chatTemplateFile', p)
-                  }}
-                >
-                  <FolderSearch size={15} />
-                </IconButton>
-              </div>
+          {!remote && (
+            <Field inline label="Keep model in RAM (mlock)">
+              <Switch checked={config.useMlock} onCheckedChange={(v) => set('useMlock', v)} />
             </Field>
+          )}
+          <div className="space-y-3 pt-2">
+            {!remote && (
+              <Field label="Chat template override" hint="Jinja file; empty = model's own template">
+                <div className="flex gap-1.5">
+                  <Input value={config.chatTemplateFile} placeholder="None" onChange={(e) => set('chatTemplateFile', e.target.value)} />
+                  <IconButton
+                    label="Browse"
+                    onClick={async () => {
+                      const p = await invoke('dialog:pickFile', {
+                        title: 'Choose a Jinja chat template',
+                        filters: [{ name: 'Jinja templates', extensions: ['jinja', 'j2', 'txt'] }]
+                      })
+                      if (p) set('chatTemplateFile', p)
+                    }}
+                  >
+                    <FolderSearch size={15} />
+                  </IconButton>
+                </div>
+              </Field>
+            )}
             <Field label="Tensor overrides" hint="--override-tensor; one pattern=buffer rule per line, e.g. blk\.(3[0-9])\.ffn_.*_exps=CPU">
               <Textarea
                 className="font-mono text-xs"

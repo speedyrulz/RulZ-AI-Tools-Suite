@@ -1,18 +1,16 @@
-// Practice batch runs: the list of runs (the scoreboard) and the one in progress. The loop itself
-// is lib/batchRunner.ts; this store gives it the chat, the models and the saved runs.
+// Practice batch runs: the list of runs (the scoreboard) and the one in progress. The run itself is the practice
+// pool in the main process (src/main/re/pool.ts); this store starts and stops it and follows its events.
 import { create } from 'zustand'
 import { toast } from 'sonner'
-import { cleanBatchOptions, planBatch, summarize, type BatchOptions, type BatchRun } from '@shared/batch'
+import { cleanBatchOptions, summarize, type BatchOptions, type BatchRun, type BatchStop } from '@shared/batch'
+import { DEFAULT_BATCH_TARGET, type BatchTarget } from '@shared/remote'
 import type { RePracticeTask } from '@shared/types'
-import { batchAdapterLabel, batchAdapters, sameBatchAdapters } from '../lib/adapters'
-import { errorMessage, invoke } from '../lib/api'
-import { runBatchLoop, type BatchStop } from '../lib/batchRunner'
-import { uid } from '../lib/format'
+import { errorMessage, invoke, on } from '../lib/api'
 import { once } from '../lib/once'
 import { useApp } from './app'
-import { isChatBusy, isGrading, onTurnEnd, useChat } from './chat'
+import { useChat } from './chat'
 import { WBENCH_BUSY, wbenchRunning } from '../lib/wbenchFlag'
-import { readyInstance, useModels } from './models'
+import { useModels } from './models'
 import { practiceRecords, solvedTasks, useReTraces } from './reTraces'
 
 interface BatchState {
@@ -21,93 +19,34 @@ interface BatchState {
   runs: BatchRun[]
   /** The run in progress. */
   activeId: string | null
-  /** The model for a new or resumed run is loading. */
+  /** A run is being started: its model is loading on the hosts. */
   starting: boolean
-  /** 'after': finish the task in progress, then stop. 'now': stop that task too. */
+  /** 'after': finish the tasks in progress, then stop. 'now': stop them too. */
   stopping: BatchStop | null
   init: () => Promise<void>
-  start: (tasks: RePracticeTask[], options: BatchOptions, label: string, kitDir: string) => Promise<void>
-  /** Runs the tasks a stopped run has not tried yet. */
-  resume: (id: string) => Promise<void>
+  /** Starts a run where `target` says (this PC, one or more rentals; several tasks at once). Refusals arrive as a toast. */
+  start: (tasks: RePracticeTask[], options: BatchOptions, label: string, kitDir: string, target?: BatchTarget) => Promise<void>
+  /** Runs the tasks a stopped run has not tried yet, where `target` says (default: where it ran last). */
+  resume: (id: string, target?: BatchTarget) => Promise<void>
   stop: (mode: BatchStop) => void
+  /** Stops one session of the run (its chat id); its task counts as stopped and the lane takes the next. */
+  skip: (conversationId: string) => void
   /** Removes a run from the list. Its chats and recorded data stay. */
   remove: (id: string) => Promise<void>
 }
 
+/** A run in the list, newest first. */
+function upsert(runs: BatchRun[], run: BatchRun): BatchRun[] {
+  const next = runs.some((r) => r.id === run.id) ? runs.map((r) => (r.id === run.id ? run : r)) : [run, ...runs]
+  return next.sort((a, b) => b.createdAt - a.createdAt)
+}
+
 export const useBatch = create<BatchState>((set, get) => {
-  let saveFailed = false
-
-  const save = (run: BatchRun): void => {
-    void invoke('re:saveBatch', run).then(
-      () => {
-        saveFailed = false
-      },
-      (e) => {
-        // Once per failure streak: a run saves after every task.
-        if (!saveFailed) toast.error(`Could not save the batch run: ${errorMessage(e)}`)
-        saveFailed = true
-      }
-    )
-  }
-
-  /** Changes a run in the list and saves it; undefined if it was removed meanwhile. */
-  const patchRun = (id: string, fn: (run: BatchRun) => BatchRun): BatchRun | undefined => {
-    const cur = get().runs.find((r) => r.id === id)
-    if (!cur) return undefined
-    const next = fn(cur)
-    set((s) => ({ runs: s.runs.map((r) => (r.id === id ? next : r)) }))
-    save(next)
-    return next
-  }
-
-  /** Loads the run's model if needed; null (after a toast) if it cannot be used. */
-  const readyModel = async (modelId: string | null): Promise<{ modelName: string; contextLength: number | null; adapters: BatchRun['adapters'] } | null> => {
-    if (!modelId) {
-      toast.error('Load a model first, or choose one under New session.')
-      return null
-    }
-    if (!useModels.getState().models.some((m) => m.id === modelId) && !readyInstance(modelId)) {
-      toast.error(`${modelId} is no longer in your models folder.`)
-      return null
-    }
-    // Messages go to the active model, so the run's model becomes it.
-    useModels.getState().setActive(modelId)
-    const inst = readyInstance(modelId) ?? (await useModels.getState().ensure(modelId))
-    // The model is ready here, so its adapters are known; sessions use their default strengths.
-    return inst ? { modelName: inst.modelName, contextLength: inst.contextLength, adapters: batchAdapters(inst.adapters) } : null
-  }
-
-  const runBatch = async (runId: string): Promise<void> => {
-    const { run, error } = await runBatchLoop({
-      now: () => Date.now(),
-      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
-      stopping: () => get().stopping,
-      chatBusy: () => isChatBusy(useChat.getState()),
-      chatIdle: () => {
-        const c = useChat.getState()
-        return !isChatBusy(c) && !c.handoff
-      },
-      replyingIn: () => useChat.getState().generation?.conversationId ?? null,
-      settling: isGrading,
-      currentChat: () => useChat.getState().current?.id ?? null,
-      stopReply: () => useChat.getState().stop(),
-      prepare: (kitDir, taskId) => invoke('re:practicePrepare', kitDir, taskId),
-      startSession: (o) =>
-        useChat.getState().startRe({ ...o, collect: useApp.getState().settings?.re.collect ?? true, background: true }),
-      attended: () => useChat.getState().setUnattended(null),
-      failPractice: (id, notes) => useChat.getState().failRePractice(id, notes),
-      snapshot: (id) => useChat.getState().snapshot(id),
-      onTurnEnd,
-      getRun: () => get().runs.find((r) => r.id === runId),
-      patchRun: (fn) => patchRun(runId, fn)
-    })
-    set({ activeId: null, stopping: null })
-    if (error) toast.error(`The batch run stopped: ${error}`)
-    if (run) {
-      const s = summarize(run)
-      const head = run.status === 'done' ? 'Batch run finished' : 'Batch run stopped'
-      toast(`${head}: ${s.solved} of ${s.scored} solved${s.finished < s.total ? `, ${s.total - s.finished} not run` : ''}.`, { duration: 15000 })
-    }
+  /** Said once when the run in progress ends. */
+  const announce = (run: BatchRun): void => {
+    const s = summarize(run)
+    const head = run.status === 'done' ? 'Batch run finished' : 'Batch run stopped'
+    toast(`${head}: ${s.solved} of ${s.scored} solved${s.finished < s.total ? `, ${s.total - s.finished} not run` : ''}.`, { duration: 15000 })
   }
 
   return {
@@ -118,80 +57,72 @@ export const useBatch = create<BatchState>((set, get) => {
     stopping: null,
 
     init: once(async () => {
+      on('re:batchChanged', ({ run, active, stopping }) => {
+        const wasActive = get().activeId === run.id
+        set((s) => ({
+          runs: upsert(s.runs, run),
+          activeId: active ? run.id : s.activeId === run.id ? null : s.activeId,
+          stopping: active ? stopping : s.activeId === run.id ? null : s.stopping
+        }))
+        if (wasActive && !active) announce(run)
+      })
       try {
-        set({ runs: await invoke('re:batches'), loaded: true })
+        const runs = await invoke('re:batches')
+        // A run the pool is still running (this window was reloaded) comes back as running.
+        set({ runs, loaded: true, activeId: runs.find((r) => r.status === 'running')?.id ?? null })
       } catch (e) {
         set({ loaded: true })
         toast.error(`Could not read the batch runs: ${errorMessage(e)}`)
       }
     }),
 
-    start: async (tasks, options, label, kitDir) => {
+    start: async (tasks, options, label, kitDir, target = DEFAULT_BATCH_TARGET) => {
       if (get().activeId || get().starting) return
       if (wbenchRunning()) return void toast(WBENCH_BUSY)
       const settings = useApp.getState().settings
       if (!settings) return
-      const opts = cleanBatchOptions(options)
-      const items = planBatch(tasks, opts, solvedTasks(practiceRecords(useChat.getState().summaries, useReTraces.getState().traces)))
-      if (!items.length) return void toast('No practice tasks match this selection.')
       const models = useModels.getState()
       const wanted = settings.re.modelId
       const modelId = wanted && models.models.some((m) => m.id === wanted) ? wanted : models.activeModelId
+      if (!modelId) return void toast.error('Load a model first, or choose one under New session.')
+      const solved = [...solvedTasks(practiceRecords(useChat.getState().summaries, useReTraces.getState().traces))]
       set({ starting: true, stopping: null })
-      let model: Awaited<ReturnType<typeof readyModel>>
       try {
-        model = await readyModel(modelId)
+        const run = await invoke('re:batchStart', { tasks, options: cleanBatchOptions(options), label, kitDir, modelId, solved, target })
+        set((s) => ({ runs: upsert(s.runs, run), activeId: run.id }))
+      } catch (e) {
+        toast.error(errorMessage(e))
       } finally {
         set({ starting: false })
       }
-      if (!model || get().activeId) return
-      const run: BatchRun = {
-        id: uid(),
-        label: label.trim().slice(0, 80),
-        createdAt: Date.now(),
-        status: 'running',
-        modelId,
-        modelName: model.modelName,
-        contextLength: model.contextLength,
-        maxToolRounds: settings.re.maxToolRounds,
-        kitDir,
-        options: opts,
-        items,
-        ...(model.adapters ? { adapters: model.adapters } : {})
-      }
-      set((s) => ({ runs: [run, ...s.runs], activeId: run.id }))
-      save(run)
-      void runBatch(run.id)
     },
 
-    resume: async (id) => {
+    resume: async (id, target) => {
       if (get().activeId || get().starting) return
       if (wbenchRunning()) return void toast(WBENCH_BUSY)
       const run = get().runs.find((r) => r.id === id)
       if (!run || !run.items.some((i) => i.status === 'pending')) return
       set({ starting: true, stopping: null })
-      let model: Awaited<ReturnType<typeof readyModel>>
       try {
-        model = await readyModel(run.modelId)
+        const resumed = await invoke('re:batchResume', id, target ?? run.target ?? DEFAULT_BATCH_TARGET)
+        set((s) => ({ runs: upsert(s.runs, resumed), activeId: resumed.id }))
+      } catch (e) {
+        toast.error(errorMessage(e))
       } finally {
         set({ starting: false })
       }
-      if (!model || get().activeId) return
-      // Results already recorded were made with the run's adapters; resuming with others would mix them.
-      if (!sameBatchAdapters(run.adapters, model.adapters)) {
-        const used = batchAdapterLabel(run.adapters) || 'no adapters'
-        toast.error(`This run used other adapters (${used}). Load the model with the same adapters, or start a new run.`)
-        return
-      }
-      if (!patchRun(id, (r) => ({ ...r, status: 'running', finishedAt: undefined }))) return
-      set({ activeId: id })
-      void runBatch(id)
     },
 
     stop: (mode) => {
       if (!get().activeId) return
       // 'now' outranks 'after'; asking for 'after' later does not take 'now' back.
       set((s) => ({ stopping: s.stopping === 'now' ? 'now' : mode }))
+      void invoke('re:batchStop', mode).catch((e) => toast.error(errorMessage(e)))
+    },
+
+    skip: (conversationId) => {
+      if (!get().activeId) return
+      void invoke('re:batchSkip', conversationId).catch((e) => toast.error(errorMessage(e)))
     },
 
     remove: async (id) => {

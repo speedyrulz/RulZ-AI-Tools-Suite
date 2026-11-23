@@ -1,9 +1,10 @@
 // Single source of truth for IPC channels between the renderer and the main process.
 import type { AdventureDesktopInvoke, AdventureIpcEvents, AdventureIpcInvoke } from './adventure'
-import type { BatchRun } from './batch'
+import type { BatchOptions, BatchRun } from './batch'
 import type { BenchmarkRequest, BenchmarkRun } from './benchmark'
 import type { NovelIpcEvents, NovelIpcInvoke } from './novel'
 import type { PhoneIpcEvents, PhoneIpcInvoke, WritingIpcEvents, WritingIpcInvoke } from './phone'
+import type { BatchTarget, RemoteIpcEvents, RemoteIpcInvoke } from './remote'
 import type { WritingBenchIpcInvoke } from './writingBench'
 import type {
   AdapterConvertRequest,
@@ -31,6 +32,7 @@ import type {
   FileToolScope,
   ReExportResult,
   RePracticeInfo,
+  RePracticeTask,
   ReTraceInfo,
   StreamEvent,
   ToolRequest,
@@ -43,6 +45,17 @@ export interface FileFilter {
   extensions: string[]
 }
 
+export interface BatchStartRequest {
+  tasks: RePracticeTask[]
+  options: BatchOptions
+  label: string
+  kitDir: string
+  modelId: string
+  /** Tasks an earlier session solved (for `onlyUnsolved`). */
+  solved: string[]
+  target: BatchTarget
+}
+
 export interface AppInfo {
   version: string
   userData: string
@@ -50,7 +63,7 @@ export interface AppInfo {
 }
 
 /** Request/response channels (ipcRenderer.invoke ↔ ipcMain.handle). */
-export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke, PhoneIpcInvoke, WritingIpcInvoke, AdventureIpcInvoke, AdventureDesktopInvoke {
+export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke, PhoneIpcInvoke, WritingIpcInvoke, AdventureIpcInvoke, AdventureDesktopInvoke, RemoteIpcInvoke {
   'app:info': () => AppInfo
   'settings:get': () => AppSettings
   'settings:update': (patch: Partial<AppSettings>) => AppSettings
@@ -148,8 +161,18 @@ export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke, PhoneI
   ) => { answer: string | null; passed: boolean; expected: string }
   /** Saved practice batch runs, newest first. */
   're:batches': () => BatchRun[]
-  /** Adds a batch run, or replaces the saved one with its id. */
-  're:saveBatch': (run: BatchRun) => void
+  /** Starts a batch run (one at a time); refused with a sentence. Progress arrives as re:batchChanged. */
+  're:batchStart': (req: BatchStartRequest) => BatchRun
+  /** Runs the tasks a stopped run has not tried yet, where `target` says. */
+  're:batchResume': (runId: string, target: BatchTarget) => BatchRun
+  /** 'after': let the tasks in progress finish. 'now': stop them too (they go back to pending). */
+  're:batchStop': (mode: 'after' | 'now') => void
+  /** Stops one session of the run; its task is marked stopped and the lane takes the next. */
+  're:batchSkip': (conversationId: string) => void
+  /** Streams a chat the pool runs to this window as re:chatLive; null = none. Replies with the chat as it is now. */
+  're:watch': (conversationId: string | null) => Conversation | null
+  /** Chats the pool owns now (read-only in the window). */
+  're:poolChats': () => string[]
   're:deleteBatch': (id: string) => void
 
   'presets:list': () => Preset[]
@@ -158,7 +181,7 @@ export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke, PhoneI
 }
 
 /** Push channels (webContents.send → ipcRenderer.on). */
-export interface IpcEvents extends NovelIpcEvents, PhoneIpcEvents, WritingIpcEvents, AdventureIpcEvents {
+export interface IpcEvents extends NovelIpcEvents, PhoneIpcEvents, WritingIpcEvents, AdventureIpcEvents, RemoteIpcEvents {
   'models:changed': ModelEntry[]
   'adapters:changed': AdapterEntry[]
   /** One output line of the running adapter conversion. */
@@ -175,6 +198,14 @@ export interface IpcEvents extends NovelIpcEvents, PhoneIpcEvents, WritingIpcEve
   'server:request': ApiRequestLog
   /** An app recorded or described an RE session through the API server. */
   're:changed': undefined
+  /** A batch run changed; `active` = it is running. */
+  're:batchChanged': { run: BatchRun; active: boolean; stopping: 'after' | 'now' | null }
+  /** The chats the pool owns changed. */
+  're:poolChats': string[]
+  /** The chat being watched (re:watch), as it is now. */
+  're:chatLive': Conversation
+  /** The pool saved a chat: its list entry. */
+  'conversations:saved': ConversationSummary
 }
 
 export type InvokeChannel = keyof IpcInvoke

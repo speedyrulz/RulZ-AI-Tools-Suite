@@ -1,7 +1,4 @@
-import { execFile, spawnSync } from 'node:child_process'
-import { existsSync, promises as fs } from 'node:fs'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { promises as fs } from 'node:fs'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { getDefaultEnvironment, StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
@@ -9,6 +6,7 @@ import type { McpConfigState, McpServerConfig, McpServerStatus, McpToolInfo, Too
 import { FILE_TOOL_DEFS, FILE_TOOLS_SERVER, runFileTool } from '../files/fileTools'
 import type { FileToolScope } from '@shared/types'
 import { contentToText, EMPTY_CONFIG, parseMcpConfig, qualifyToolName, qualifyToolNames, readMcpConfigFile } from './config'
+import { killTree, killTreesSync, launcherDirs, McpScope, SCOPED_SERVERS, SCOPES_OPEN_MESSAGE, type ScopedProcess } from './scopes'
 
 const MAX_LOG = 200
 const MAX_RESULT_CHARS = 24000
@@ -24,35 +22,6 @@ interface Connection {
   pid?: () => number | null
 }
 
-const taskkillArgs = (pids: number[]): string[] => ['/F', '/T', ...pids.flatMap((p) => ['/PID', String(p)])]
-
-/**
- * On Windows, npx/uvx-style launchers run the real server as a child process, and closing the
- * launcher (all the SDK does) leaves that child running. taskkill /T ends the whole tree.
- */
-function killTreesSync(pids: number[]): void {
-  if (process.platform !== 'win32' || !pids.length) return
-  spawnSync('taskkill', taskkillArgs(pids), { windowsHide: true, stdio: 'ignore', timeout: 5000 })
-}
-
-function killTree(pid: number): Promise<void> {
-  return new Promise((resolve) => execFile('taskkill', taskkillArgs([pid]), { windowsHide: true, timeout: 5000 }, () => resolve()))
-}
-
-/**
- * Folders where npx/uvx-style launchers usually live but that are often missing from the PATH
- * an app started from Explorer receives.
- */
-function launcherDirs(): string[] {
-  const home = homedir()
-  return [
-    'C:\\Program Files\\nodejs',
-    join(process.env.APPDATA ?? join(home, 'AppData', 'Roaming'), 'npm'),
-    join(home, '.local', 'bin'),
-    join(home, '.cargo', 'bin')
-  ].filter((d) => existsSync(d))
-}
-
 /** Connects to the MCP servers in mcp.json and exposes their tools to chats. */
 export class McpManager {
   private connections = new Map<string, Connection>()
@@ -62,6 +31,8 @@ export class McpManager {
   /** Every server name in mcp.json, so tool names can be kept unique across servers. */
   private serverNames: string[] = []
   private disposed = false
+  /** Private server processes held by practice lanes; config changes wait until they are closed. */
+  private scopes = new Set<McpScope>()
   /** Built-in read-only file tools, always present and handled in-process. */
   private readonly builtin: Connection = {
     status: {
@@ -109,6 +80,7 @@ export class McpManager {
 
   /** Validates and saves mcp.json, then reconnects every server. */
   async saveConfig(text: string): Promise<McpServerStatus[]> {
+    this.assertNoScopes()
     const servers = this.withAppServers(parseMcpConfig(text))
     await fs.writeFile(this.configPath, text, 'utf8')
     this.configText = text
@@ -121,7 +93,12 @@ export class McpManager {
 
   /** Re-reads mcp.json from disk, then reconnects one server (by name) or all of them (null). */
   async restart(name: string | null): Promise<void> {
+    this.assertNoScopes()
     await this.reload(name)
+  }
+
+  private assertNoScopes(): void {
+    if (this.scopes.size) throw new Error(SCOPES_OPEN_MESSAGE)
   }
 
   /**
@@ -194,13 +171,10 @@ export class McpManager {
         })
         await client.connect(transport)
       } else {
-        const base = getDefaultEnvironment()
-        const pathKey = Object.keys(base).find((k) => k.toLowerCase() === 'path') ?? 'PATH'
-        const env = { ...base, [pathKey]: [...launcherDirs(), base[pathKey] ?? ''].join(';'), ...cfg.env }
         const transport = new StdioClientTransport({
           command: cfg.command!,
           args: cfg.args ?? [],
-          env,
+          env: this.stdioEnv(cfg),
           cwd: cfg.cwd,
           stderr: 'pipe'
         })
@@ -261,6 +235,100 @@ export class McpManager {
       await this.closeConnection(conn)
     }
     this.emit()
+  }
+
+  /** The environment a stdio server starts with: the SDK's default plus the usual launcher folders on PATH, then the config's own. */
+  private stdioEnv(cfg: McpServerConfig): Record<string, string> {
+    const base = getDefaultEnvironment()
+    const pathKey = Object.keys(base).find((k) => k.toLowerCase() === 'path') ?? 'PATH'
+    return { ...base, [pathKey]: [...launcherDirs(), base[pathKey] ?? ''].join(';'), ...cfg.env }
+  }
+
+  /**
+   * Starts a private copy of a stdio server for a scope: same command, environment and process-tree handling as
+   * connect(). It is not a connection of the app (nothing is listed or shown for it).
+   */
+  private async startScoped(cfg: McpServerConfig): Promise<ScopedProcess> {
+    const client = new Client({ name: 'RulZ LLM Suite', version: '0.2.0' })
+    const transport = new StdioClientTransport({ command: cfg.command!, args: cfg.args ?? [], env: this.stdioEnv(cfg), cwd: cfg.cwd, stderr: 'pipe' })
+    const tail: string[] = []
+    transport.stderr?.on('data', (d: Buffer) => {
+      for (const line of d.toString().split(/\r?\n/)) if (line.trim()) tail.push(line)
+      if (tail.length > 20) tail.splice(0, tail.length - 20)
+    })
+    let alive = true
+    client.onclose = () => {
+      alive = false
+    }
+    try {
+      await client.connect(transport)
+    } catch (err) {
+      alive = false
+      const p = transport.pid
+      if (process.platform === 'win32' && p) await killTree(p)
+      await client.close().catch(() => undefined)
+      throw new Error(`${(err as Error).message}${tail.length ? ` (${tail.slice(-2).join(' | ')})` : ''}`)
+    }
+    const pid = transport.pid
+    return {
+      callTool: async (toolName, args, opts) =>
+        (await client.callTool({ name: toolName, arguments: args }, undefined, opts)) as { content?: unknown; structuredContent?: unknown; isError?: boolean },
+      pid: () => (alive ? pid : null),
+      alive: () => alive,
+      stderrTail: () => tail.slice(),
+      close: async () => {
+        alive = false
+        const closing = client.close().catch(() => undefined)
+        if (process.platform === 'win32' && pid) {
+          const exited = await Promise.race([closing.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), EXIT_GRACE_MS).unref())])
+          if (!exited) await killTree(pid)
+        }
+        await closing
+      }
+    }
+  }
+
+  /**
+   * A private set of the servers that keep state per process (REA), for one practice lane. Its tools are the shared
+   * ones; calls to them run in processes started for this scope (at the first call), everything else uses the
+   * shared connections. While a scope is open, saving or restarting the config is refused. Throws a sentence when
+   * REA is not a connected local program.
+   */
+  openScope(opts: { alone?: boolean } = {}): McpScope {
+    if (this.disposed) throw new Error('RulZ LLM Suite is closing.')
+    const alone = !!opts.alone
+    let configs: Record<string, McpServerConfig> = {}
+    try {
+      configs = this.withAppServers(parseMcpConfig(this.configText))
+    } catch (err) {
+      if (!alone) throw new Error(`mcp.json cannot be read: ${(err as Error).message}`)
+    }
+    const own = new Map<string, McpServerConfig>()
+    for (const n of SCOPED_SERVERS) {
+      const cfg = configs[n]
+      if (!cfg || cfg.disabled) continue
+      // A lane that has the program to itself may use the shared connection, whatever kind it is.
+      if (cfg.url && alone) continue
+      if (cfg.url) throw new Error(`Practice sessions side by side need "${n}" to be a local program (a "command") in mcp.json; it is an HTTP server there.`)
+      own.set(n, cfg)
+    }
+    if (!alone && (!own.has('rea') || this.connections.get('rea')?.status.state !== 'connected')) {
+      throw new Error('REA is not connected. Open the MCP page, fix it, and start the run again.')
+    }
+    // Alone and REA not connected: the shared connection is used (its tools are simply not there).
+    if (alone && this.connections.get('rea')?.status.state !== 'connected') own.clear()
+    const scope: McpScope = new McpScope({
+      scoped: new Set(own.keys()),
+      locate: (qualified) => {
+        const found = this.findTool(qualified)
+        return found ? { server: found.conn.status.name, tool: found.tool.name } : undefined
+      },
+      shared: (call, signal, files) => this.callTool(call, signal, files),
+      start: (server) => this.startScoped(own.get(server)!),
+      onClose: () => void this.scopes.delete(scope)
+    })
+    this.scopes.add(scope)
+    return scope
   }
 
   private async disconnect(name: string): Promise<void> {
@@ -369,6 +437,8 @@ export class McpManager {
     // The app quits without waiting for this, so a polite close would never finish: end the
     // stdio servers' process trees now, synchronously, so none outlive the app.
     const pids: number[] = []
+    for (const scope of this.scopes) scope.closeSync()
+    this.scopes.clear()
     for (const conn of this.connections.values()) {
       const pid = conn.pid?.()
       if (pid) pids.push(pid)

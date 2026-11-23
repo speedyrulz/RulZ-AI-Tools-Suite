@@ -1,4 +1,5 @@
 // Types shared by the main process, the preload bridge and the renderer.
+import type { RemoteHost } from './remote'
 
 export type Theme = 'dark' | 'light' | 'system'
 
@@ -606,6 +607,8 @@ export interface ModelEntry {
   info: GgufInfo | null
   error?: string
   modifiedAt: number
+  /** Runs on a vast.ai rental (docs/vast-design.md); path, files and sidecars then describe the source, not files to load here. */
+  remote?: boolean
 }
 
 export interface MemoryEstimate {
@@ -675,6 +678,10 @@ export interface LoadedInstance {
   estimate: MemoryEstimate | null
   /** Adapters this instance loaded, in llama-server id order (index = id). Empty when none. */
   adapters: InstanceAdapter[]
+  /** The vast.ai rental it runs on; absent = this PC. */
+  host?: RemoteHost
+  /** The connection to the rental is being re-made; the model is still loaded. */
+  reconnecting?: boolean
 }
 
 export interface InstanceErrorEvent {
@@ -764,6 +771,8 @@ export interface Conversation {
    * adapter the model loaded but this list leaves out keeps its default; ids the model didn't load are ignored.
    */
   adapters?: LoadAdapter[] | null
+  /** Goes up with every save by the practice pool; a window copy with an older number is stale and is not saved. */
+  poolRev?: number
 }
 
 export interface ConversationSummary {
@@ -811,6 +820,14 @@ export interface WireMessage {
 export interface ChatRequest {
   requestId: string
   modelId: string
+  /** Use this instance of the model (it may be loaded on several hosts); an error if it is gone. */
+  instanceId?: string
+  /**
+   * Any string the caller keeps the same for one chat (a conversation id, a run id). The requests of one session
+   * stay on the instance the first one used while that is ready, so a tool round finds its prompt cache. Ignored
+   * when `instanceId` is set.
+   */
+  sessionKey?: string
   messages: WireMessage[]
   sampling: SamplingParams
   overflow: ContextOverflow
@@ -830,4 +847,5 @@ export type StreamEvent =
   | { type: 'progress'; requestId: string; processed: number; total: number }
   | { type: 'delta'; requestId: string; content?: string; reasoning?: string }
   | { type: 'done'; requestId: string; stats: GenerationStats; reasoningMs?: number; toolCalls?: WireToolCall[] }
-  | { type: 'error'; requestId: string; error: string; stats?: GenerationStats }
+  /** `transport`: the server could not be reached or the connection broke; says nothing about the model. */
+  | { type: 'error'; requestId: string; error: string; stats?: GenerationStats; transport?: boolean }

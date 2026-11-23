@@ -1,14 +1,16 @@
 import * as DialogPrimitive from '@radix-ui/react-dialog'
-import { Eye, RotateCcw, Search, X } from 'lucide-react'
+import { Cloud, Eye, RotateCcw, Search, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
 import type { LoadConfig, ModelEntry } from '@shared/types'
 import { toast } from 'sonner'
 import { errorMessage, invoke } from '../../lib/api'
 import { cn, formatBytes } from '../../lib/format'
+import { loadPlan, rentalLabel } from '../../lib/remote'
 import { WBENCH_BUSY, wbenchRunning } from '../../lib/wbenchFlag'
 import { useApp } from '../../stores/app'
 import { useModels } from '../../stores/models'
+import { loadRemoteModel, useRemote } from '../../stores/remote'
 import { Badge, Button, Switch, Tooltip } from '../ui'
 import { EstimateView, useEstimate } from './EstimateView'
 import { LoadSettingsForm } from './LoadSettingsForm'
@@ -105,6 +107,7 @@ function PickerBody({ preselect, onDone }: { preselect: string | null; onDone: (
           )}
           {filtered.map((m) => {
             const inst = instances.find((i) => i.modelId === m.id)
+            const hosts = instances.filter((i) => i.modelId === m.id && i.host)
             return (
               <button
                 id={`model-row-${m.id}`}
@@ -118,8 +121,22 @@ function PickerBody({ preselect, onDone }: { preselect: string | null; onDone: (
               >
                 <div className="flex items-center gap-2">
                   <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{m.name}</span>
+                  {m.remote && (
+                    <Tooltip content="Runs on a rented vast.ai instance">
+                      <span>
+                        <Badge>
+                          <Cloud size={11} /> vast.ai
+                        </Badge>
+                      </span>
+                    </Tooltip>
+                  )}
                   {inst && <Badge tone={inst.status === 'ready' ? 'ok' : 'accent'}>{inst.status === 'ready' ? 'Loaded' : 'Loading'}</Badge>}
                 </div>
+                {hosts.length > 0 && (
+                  <div className="truncate text-[11px] text-muted">
+                    {hosts.map((i) => `${i.host!.label}${i.reconnecting ? ' (reconnecting)' : ''}`).join(' · ')}
+                  </div>
+                )}
                 <div className="flex items-center gap-1.5 text-[11px] text-muted">
                   {m.info?.sizeLabel && <span>{m.info.sizeLabel}</span>}
                   {m.info?.architecture && <span className="text-faint">· {m.info.architecture}</span>}
@@ -141,7 +158,7 @@ function PickerBody({ preselect, onDone }: { preselect: string | null; onDone: (
         <div className="flex items-start justify-between gap-3 border-b border-border px-5 py-3">
           <div className="min-w-0">
             <div className="truncate text-[15px] font-semibold">{selected?.name ?? 'No model selected'}</div>
-            <div className="truncate text-xs text-faint">{selected?.folder || ' '}</div>
+            <div className="truncate text-xs text-faint">{selected?.remote ? 'Runs on a rented vast.ai instance' : selected?.folder || ' '}</div>
           </div>
           <DialogPrimitive.Close className="rounded-md p-1 text-muted hover:bg-hover hover:text-text" aria-label="Close">
             <X size={16} />
@@ -158,11 +175,14 @@ function LoadPanel({ model, onDone }: { model: ModelEntry; onDone: () => void })
   const load = useModels((s) => s.load)
   const unload = useModels((s) => s.unload)
   const settings = useApp((s) => s.settings)
+  const rentals = useRemote((s) => s.state?.rentals)
   const [config, setConfig] = useState<LoadConfig | null>(null)
   const [remember, setRemember] = useState(false)
   const [hasCustom, setHasCustom] = useState(false)
-  const estimate = useEstimate(model.id, config ?? DEFAULT_LOAD_CONFIG)
   const inst = instances.find((i) => i.modelId === model.id && i.status !== 'stopping')
+  // A remote model loads on the one running rental that has it set up, or is not loaded from here at all.
+  const plan = model.remote ? (inst?.host ? ({ kind: 'load', rentalId: inst.host.rentalId } as const) : loadPlan(model.id, rentals ?? [])) : null
+  const estimate = useEstimate(model.id, config ?? DEFAULT_LOAD_CONFIG, plan?.kind === 'load' ? plan.rentalId : null)
 
   useEffect(() => {
     invoke('models:getDefaults', model.id)
@@ -187,15 +207,33 @@ function LoadPanel({ model, onDone }: { model: ModelEntry; onDone: () => void })
       await invoke('models:setDefaults', model.id, config).catch((e) => toast.error(`Could not save the settings: ${errorMessage(e)}`))
     }
     onDone()
+    if (plan?.kind === 'go') {
+      // Never rents or starts anything: the vast.ai page does that, with a price on screen.
+      useApp.getState().setPage('vast')
+      toast(plan.sentence, { duration: 12000 })
+      return
+    }
     useApp.getState().setPage('chat')
-    await load(model.id, config)
+    if (plan?.kind === 'load') await loadRemoteModel(plan.rentalId, model.id, config)
+    else await load(model.id, config)
   }
 
   return (
     <>
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
         {model.error && <div className="rounded-md border border-danger/40 bg-danger/10 p-2 text-xs text-danger">Could not read this file: {model.error}</div>}
-        <LoadSettingsForm model={model} config={config} onChange={setConfig} estimate={estimate} />
+        {plan?.kind === 'go' && (
+          <div className="flex items-start gap-2 rounded-md border border-border bg-panel-2 px-3 py-2 text-xs text-muted">
+            <Cloud size={14} className="mt-px shrink-0" />
+            <div>{plan.sentence}</div>
+          </div>
+        )}
+        {plan?.kind === 'load' && !inst && (
+          <div className="text-xs text-muted">
+            Loads on {rentalLabel(rentals?.find((r) => r.id === plan.rentalId) ?? { id: plan.rentalId, gpuName: 'instance', numGpus: 1 })}.
+          </div>
+        )}
+        <LoadSettingsForm model={model} config={config} onChange={setConfig} estimate={estimate} remote={model.remote} />
         <EstimateView estimate={estimate} />
       </div>
       <div className="flex items-center gap-3 border-t border-border px-5 py-3">
@@ -230,7 +268,7 @@ function LoadPanel({ model, onDone }: { model: ModelEntry; onDone: () => void })
           </Button>
         )}
         <Button id="picker-load-button" variant="primary" onClick={() => void doLoad()}>
-          {inst ? 'Reload with these settings' : 'Load model'}
+          {plan?.kind === 'go' ? 'Go to vast.ai' : inst ? 'Reload with these settings' : 'Load model'}
         </Button>
       </div>
     </>

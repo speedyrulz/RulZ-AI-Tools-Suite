@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { isRemoteModelId } from '@shared/remote'
 import type { GpuEstimate, LoadConfig, MemoryEstimate } from '@shared/types'
 import { invoke } from '../../lib/api'
 import { cn, formatBytes } from '../../lib/format'
@@ -11,22 +12,25 @@ const VERDICT = {
   unknown: { tone: 'neutral', text: 'VRAM unknown' }
 } as const
 
-export function useEstimate(modelId: string | null, config: LoadConfig): MemoryEstimate | null {
+/**
+ * The memory estimate for a model and settings. A remote model is estimated for a rental's GPUs: pass its id as
+ * `rentalId`; without one a remote model has no estimate (this PC's GPUs say nothing about it).
+ */
+export function useEstimate(modelId: string | null, config: LoadConfig, rentalId?: number | null): MemoryEstimate | null {
   const [estimate, setEstimate] = useState<MemoryEstimate | null>(null)
   const key = JSON.stringify(config)
   useEffect(() => {
-    if (!modelId) return setEstimate(null)
+    if (!modelId || (isRemoteModelId(modelId) && !rentalId)) return setEstimate(null)
     let cancelled = false
     const t = setTimeout(() => {
-      invoke('models:estimate', modelId, config)
-        .then((e) => !cancelled && setEstimate(e))
-        .catch(() => !cancelled && setEstimate(null))
+      const ask = isRemoteModelId(modelId) && rentalId ? invoke('remote:estimate', rentalId, modelId, config) : invoke('models:estimate', modelId, config)
+      ask.then((e) => !cancelled && setEstimate(e)).catch(() => !cancelled && setEstimate(null))
     }, 200)
     return () => {
       cancelled = true
       clearTimeout(t)
     }
-  }, [modelId, key])
+  }, [modelId, key, rentalId])
   return estimate
 }
 

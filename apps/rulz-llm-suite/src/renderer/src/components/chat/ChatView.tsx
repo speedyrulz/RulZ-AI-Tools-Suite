@@ -10,7 +10,7 @@ import { IconButton, Tooltip } from '../ui'
 import { Composer, type ComposerHandle } from './Composer'
 import { HandoffDialogs, useHandoffTrigger } from './Handoff'
 import { MessageItem } from './MessageItem'
-import { ReBanner } from './ReBanner'
+import { PoolBanner, ReBanner } from './ReBanner'
 
 export function ChatView() {
   const current = useChat((s) => s.current)
@@ -102,6 +102,7 @@ export function ChatView() {
       </div>
 
       <ReBanner conv={current} />
+      <PoolBanner id={current.id} />
 
       <div
         ref={scroller}
