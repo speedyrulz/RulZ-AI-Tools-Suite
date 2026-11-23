@@ -37,7 +37,8 @@ the instance can stop itself; the remote model works everywhere a model is used.
    retries: it lists instances and looks for the label, and shows "may have been rented" until that is settled. An
    intent left by a crash is settled the same way at start. The search pages through every instance (25 per page). "Not
    found" is not "not rented": the intent stays open for 10 minutes of checks, and no other rent is allowed meanwhile.
-3. The price shown is the price rented: if a fresh search of that offer id shows a higher `dph_total`, the rent is
+3. The price shown is the price rented: if a fresh lookup of that offer id (`findOffer`, by `ask_contract_id`: a repeated
+   search returns a different selection of the matches, so it mostly misses the offer) shows a higher `dph_total`, the rent is
    refused and the new price shown. `cancel_unavail: true` so an offer that cannot start costs nothing. On-demand only.
    The search passes the chosen disk size (`allocated_storage`), the dialog shows the traffic prices, and the contract's
    real `dph_total` is read back after renting; more than 2% above the shown price is reported loudly.

@@ -1,6 +1,6 @@
 // vast.ai REST client (docs/vast-design.md, sections 2 and 3). Only the rent call is dangerous: it has no idempotency key,
 // so it is sent at most once and its failures are split into "definitely refused" and "may have been accepted".
-import type { OfferFilter, RemoteOffer, VastInstance } from '@shared/remote'
+import { OFFER_SORTS, type OfferFilter, type OfferSort, type RemoteOffer, type VastInstance } from '@shared/remote'
 import type { SshRoute } from './contract'
 
 const BASE = 'https://console.vast.ai/api/v0'
@@ -50,6 +50,8 @@ export interface VastInstanceDetail extends VastInstance {
 /** What the rental manager needs of the client; tests pass a fake. */
 export interface VastApiClient {
   searchOffers(filter: OfferFilter): Promise<RemoteOffer[]>
+  /** One offer as it is now; null = gone, or no longer inside the filter. */
+  findOffer(id: number, filter: OfferFilter): Promise<RemoteOffer | null>
   rent(req: { offerId: number; image: string; diskGb: number; label: string; onstart: string }): Promise<{ contractId: number }>
   showInstance(id: number): Promise<VastInstanceDetail | null>
   listInstances(): Promise<VastInstanceDetail[]>
@@ -92,8 +94,17 @@ export function cleanOfferFilter(raw: unknown): OfferFilter {
     maxDollarsPerHour: maxDph === null ? null : clamp(maxDph, 0.01, 100),
     diskGb: Math.round(n(r.diskGb, 60, 10, 4000)),
     minReliability: n(r.minReliability, 0.98, 0, 1),
-    minInetDownMbps: n(r.minInetDownMbps, 200, 0, 100_000)
+    minInetDownMbps: n(r.minInetDownMbps, 200, 0, 100_000),
+    sort: OFFER_SORTS.find((s) => s === r.sort) ?? 'price'
   }
+}
+
+const SEARCH_ORDER: Record<OfferSort, [string, 'asc' | 'desc']> = {
+  price: ['dph_total', 'asc'],
+  value: ['dlperf_per_dphtotal', 'desc'],
+  vram: ['gpu_total_ram', 'desc'],
+  reliability: ['reliability', 'desc'],
+  down: ['inet_down', 'desc']
 }
 
 export function offerSearchBody(filter: OfferFilter): Record<string, unknown> {
@@ -101,7 +112,7 @@ export function offerSearchBody(filter: OfferFilter): Record<string, unknown> {
   const body: Record<string, unknown> = {
     limit: 64,
     type: 'ondemand',
-    order: [['dph_total', 'asc']],
+    order: [SEARCH_ORDER[f.sort]],
     allocated_storage: f.diskGb,
     rentable: { eq: true },
     rented: { eq: false },
@@ -128,7 +139,7 @@ export function parseOffer(raw: unknown): RemoteOffer | null {
   const gpuRam = num(raw.gpu_ram)
   if (id === null || dph === null || dph < 0 || numGpus === null || gpuRam === null || gpuRam <= 0) return null
   const dur = num(raw.duration)
-  const perGb = (v: unknown): number | null => {
+  const notNegative = (v: unknown): number | null => {
     const n = num(v)
     return n !== null && n >= 0 ? n : null
   }
@@ -142,11 +153,12 @@ export function parseOffer(raw: unknown): RemoteOffer | null {
     cpuCores: Math.max(0, num(raw.cpu_cores_effective ?? raw.cpu_cores) ?? 0),
     cpuRamMiB: Math.max(0, num(raw.cpu_ram) ?? 0),
     dollarsPerHour: dph,
+    dlperf: notNegative(raw.dlperf),
     reliability: rel === null ? 0 : clamp(rel, 0, 1),
     inetDownMbps: Math.max(0, num(raw.inet_down) ?? 0),
     inetUpMbps: Math.max(0, num(raw.inet_up) ?? 0),
-    inetDownPerGb: perGb(raw.inet_down_cost),
-    inetUpPerGb: perGb(raw.inet_up_cost),
+    inetDownPerGb: notNegative(raw.inet_down_cost),
+    inetUpPerGb: notNegative(raw.inet_up_cost),
     cudaMaxGood: Math.max(0, num(raw.cuda_max_good) ?? 0),
     geolocation: str(raw.geolocation, 80),
     maxDays: dur !== null && dur > 0 ? dur / 86400 : null
@@ -294,8 +306,22 @@ export class VastApi implements VastApiClient {
   }
 
   async searchOffers(filter: OfferFilter): Promise<RemoteOffer[]> {
+    return this.bundles(filter)
+  }
+
+  async findOffer(id: number, filter: OfferFilter): Promise<RemoteOffer | null> {
+    // A repeated search is not enough: vast.ai leaves most matching offers out of it. Asked for by id it is returned; the
+    // second try is for a selection that left it out anyway.
+    for (let i = 0; i < 2; i++) {
+      const found = (await this.bundles(filter, { ask_contract_id: { eq: id } })).find((o) => o.id === id)
+      if (found) return found
+    }
+    return null
+  }
+
+  private async bundles(filter: OfferFilter, extra: Record<string, unknown> = {}): Promise<RemoteOffer[]> {
     const f = cleanOfferFilter(filter)
-    const json = this.readJson(await this.call('POST', `${BASE}/bundles/`, offerSearchBody(f), { retry429: true }))
+    const json = this.readJson(await this.call('POST', `${BASE}/bundles/`, { ...offerSearchBody(f), ...extra }, { retry429: true }))
     const raw = isObject(json) ? json.offers : json
     const list = Array.isArray(raw) ? raw : isObject(raw) ? [raw] : []
     const need = f.minVramGb * 1000 * VRAM_TOLERANCE

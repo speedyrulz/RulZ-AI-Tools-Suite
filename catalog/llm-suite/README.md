@@ -178,7 +178,7 @@ Discover/downloads, RAG and a CLI are planned.
 - **vast.ai** (`Ctrl+9`, 0.29.0) — run a model on a rented GPU and control everything from here. Only the model server
   (`llama-server`) runs on the rental; chats, REA, the targets, recordings, grading and the scoreboard stay on this PC.
   - **Rent, start, stop, destroy** from the app: search on-demand offers (GPU memory, price, reliability, download
-    speed), see the price, disk and traffic costs and your balance, and confirm. Nothing is rented or started without
+    speed), sort them by price, DLPerf/$/hr and more (0.30.0; the last used settings are kept), see the price, disk and traffic costs and your balance, and confirm. Nothing is rented or started without
     that click; loading a model, a batch run, an API request or a phone never does it. A rent request whose answer is
     lost is never repeated: the app looks for the instance by its label first. **Attach** uses an instance rented
     elsewhere; the app never destroys it and leaves it alone while something else uses its GPU.

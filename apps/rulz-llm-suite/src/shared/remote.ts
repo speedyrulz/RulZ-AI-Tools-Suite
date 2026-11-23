@@ -37,6 +37,10 @@ export interface RemoteModelDef {
 
 // ---------- Offers ----------
 
+export const OFFER_SORTS = ['price', 'value', 'vram', 'reliability', 'down'] as const
+/** `value` is DLPerf per $/hour. */
+export type OfferSort = (typeof OFFER_SORTS)[number]
+
 export interface OfferFilter {
   /** GB of VRAM over all GPUs of the offer. */
   minVramGb: number
@@ -48,6 +52,8 @@ export interface OfferFilter {
   /** 0..1 */
   minReliability: number
   minInetDownMbps: number
+  /** Which offers vast.ai puts first: it returns at most 64 of the matches, a different selection on every search. */
+  sort: OfferSort
 }
 
 export const DEFAULT_OFFER_FILTER: OfferFilter = {
@@ -57,7 +63,8 @@ export const DEFAULT_OFFER_FILTER: OfferFilter = {
   maxDollarsPerHour: 1,
   diskGb: 60,
   minReliability: 0.98,
-  minInetDownMbps: 200
+  minInetDownMbps: 200,
+  sort: 'price'
 }
 
 export interface RemoteOffer {
@@ -71,6 +78,8 @@ export interface RemoteOffer {
   cpuRamMiB: number
   /** Including the disk size asked for. */
   dollarsPerHour: number
+  /** vast.ai's deep learning speed score of the whole offer; null = not reported. */
+  dlperf: number | null
   reliability: number
   inetDownMbps: number
   inetUpMbps: number

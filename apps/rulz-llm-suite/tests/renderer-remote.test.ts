@@ -31,6 +31,8 @@ import {
   rentalLabel,
   rentSummary,
   resumeTarget,
+  dlperfPerDollar,
+  readRentPrefs,
   sortOffers,
   statusWords,
   stopConfirmText,
@@ -87,6 +89,7 @@ function offer(over: Partial<RemoteOffer> = {}): RemoteOffer {
     cpuCores: 16,
     cpuRamMiB: 65536,
     dollarsPerHour: 0.42,
+    dlperf: 100,
     reliability: 0.99,
     inetDownMbps: 900,
     inetUpMbps: 500,
@@ -244,6 +247,25 @@ describe('renting', () => {
     expect(sortOffers(o, 'price', 'asc').map((x) => x.id)).toEqual([2, 3, 1])
     expect(sortOffers(o, 'price', 'desc').map((x) => x.id)).toEqual([1, 3, 2])
     expect(sortOffers([offer({ id: 1, inetDownMbps: 100 }), offer({ id: 2, inetDownMbps: 900 })], 'down', 'desc')[0].id).toBe(2)
+  })
+
+  it('sorts by DLPerf per dollar, with offers that have no score last in both directions', () => {
+    const o = [offer({ id: 1, dollarsPerHour: 0.5, dlperf: 100 }), offer({ id: 2, dlperf: null }), offer({ id: 3, dollarsPerHour: 1, dlperf: 400 }), offer({ id: 4, dollarsPerHour: 0, dlperf: 9 })]
+    expect(dlperfPerDollar(o[0])).toBe(200)
+    expect(dlperfPerDollar(o[3])).toBeNull()
+    expect(sortOffers(o, 'value', 'desc').map((x) => x.id)).toEqual([3, 1, 4, 2])
+    expect(sortOffers(o, 'value', 'asc').map((x) => x.id)).toEqual([1, 3, 4, 2])
+  })
+
+  it('reads the rent settings back, and falls back to the defaults for what is missing or wrong', () => {
+    const none = readRentPrefs(null)
+    expect(none).toEqual({ filter: DEFAULT_OFFER_FILTER, dir: 'asc', forModel: '', idleMinutes: 30, capHours: 12 })
+    for (const bad of ['', '{', '3', 'null', '[]', '{"filter":5}']) expect(readRentPrefs(bad), bad).toEqual(none)
+    const used = { filter: { ...DEFAULT_OFFER_FILTER, minVramGb: 48, gpuName: 'RTX 5090', maxDollarsPerHour: null, sort: 'value' as const }, dir: 'desc' as const, forModel: 'vast/q', idleMinutes: 10, capHours: 4 }
+    expect(readRentPrefs(JSON.stringify(used))).toEqual(used)
+    const odd = readRentPrefs(JSON.stringify({ filter: { maxGpus: 99, diskGb: 1, sort: 'x', minReliability: 'a' }, idleMinutes: -1, capHours: null }))
+    expect(odd.filter).toEqual({ ...DEFAULT_OFFER_FILTER, maxGpus: 8, diskGb: 10 })
+    expect(odd).toMatchObject({ idleMinutes: 1, capHours: 12 })
   })
 
   it('names the price on the rent button', () => {

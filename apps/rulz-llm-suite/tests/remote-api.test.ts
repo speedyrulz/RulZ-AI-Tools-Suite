@@ -72,6 +72,28 @@ describe('offer search', () => {
     expect(body.allocated_storage).toBe(80)
     expect(body.cpu_arch).toEqual({ eq: 'amd64' })
     expect(body.order).toEqual([['dph_total', 'asc']])
+    expect(found[0].dlperf).toBeNull()
+  })
+
+  it('asks vast.ai for the best offers by the chosen column', async () => {
+    const order = (sort: unknown): unknown => offerSearchBody(cleanOfferFilter({ ...DEFAULT_OFFER_FILTER, sort })).order
+    expect(order('value')).toEqual([['dlperf_per_dphtotal', 'desc']])
+    expect(order('vram')).toEqual([['gpu_total_ram', 'desc']])
+    expect(order('reliability')).toEqual([['reliability', 'desc']])
+    expect(order('down')).toEqual([['inet_down', 'desc']])
+    expect(order('constructor')).toEqual([['dph_total', 'asc']])
+  })
+
+  it('finds one offer by its id, with the same filter, and tries twice', async () => {
+    const one = { id: 7, gpu_name: 'RTX 4090', num_gpus: 1, gpu_ram: 24564, dph_total: 0.5, dlperf: 100 }
+    const t = api((_c, n) => ({ status: 200, body: { offers: n < 2 ? [] : [{ ...one, id: 8 }, one] } }))
+    const filter = { ...DEFAULT_OFFER_FILTER, diskGb: 90, sort: 'value' as const }
+    expect(await t.api.findOffer(7, filter)).toMatchObject({ id: 7, dollarsPerHour: 0.5, dlperf: 100 })
+    expect(t.calls).toHaveLength(2)
+    expect(t.calls[1].body).toEqual({ ...offerSearchBody(filter), ask_contract_id: { eq: 7 } })
+    const gone = api(() => ({ status: 200, body: { offers: [{ ...one, id: 8 }] } }))
+    expect(await gone.api.findOffer(7, filter)).toBeNull()
+    expect(gone.calls).toHaveLength(2)
   })
 
   it('accepts a single offer object and clamps filter values', async () => {

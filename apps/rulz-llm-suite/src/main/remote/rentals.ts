@@ -929,13 +929,12 @@ export class RentalManager implements RentalDirectory {
     if (!keys.some((k) => sameKey(k, ssh.publicKey as string))) {
       throw new Error('Your ssh key is not on your vast.ai account yet, so the instance could not be reached. Use Add ssh key first. Nothing was rented.')
     }
-    let offers: RemoteOffer[]
+    let offer: RemoteOffer | null
     try {
-      offers = await api.searchOffers(a.filter)
+      offer = await api.findOffer(a.offerId, a.filter)
     } catch (e) {
       throw new Error(`Could not look the offer up again, so nothing was rented. ${this.msg(e)}`)
     }
-    const offer = offers.find((o) => o.id === a.offerId)
     if (!offer) throw new Error('That offer is not available any more, or no longer fits the filter. Nothing was rented. Search again.')
     if (offer.dollarsPerHour > a.shown * PRICE_RISE_REFUSE) {
       throw new Error(`The price rose from $${a.shown.toFixed(3)} to $${offer.dollarsPerHour.toFixed(3)} per hour, so nothing was rented. Search again to see the current price.`)
