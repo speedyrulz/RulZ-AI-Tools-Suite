@@ -243,6 +243,11 @@ export class ApiServer {
     if (!authorized(settings.apiKey, req.headers as Record<string, string>)) {
       return fail(401, 'Invalid API key.', 'authentication_error')
     }
+    // Reverse-engineering calls copy, run and grade programs and change the kit folder: only other apps may make
+    // them, never a web page (browsers send Origin with every cross-site POST, form posts included).
+    if (method === 'POST' && path.startsWith('/v1/re/') && req.headers.origin) {
+      return fail(403, 'Reverse-engineering calls cannot come from a web page.', 'permission_error')
+    }
 
     // Watched from the start, so a client that leaves while its model loads is noticed too.
     let clientGone = false
@@ -311,9 +316,7 @@ export class ApiServer {
       if (path === RE_KIT && method === 'POST') {
         const re = this.deps.re
         if (!re) return fail(404, `Unknown endpoint: ${method} ${path}`, 'not_found_error')
-        // The kit folder holds the programs practice tasks run, so only another app may change it, never a web
-        // page: browsers send Origin with a cross-site POST, and a JSON content type can't be sent from a plain form.
-        if (req.headers.origin) return fail(403, 'The kit folder cannot be changed from a web page.', 'permission_error')
+        // Web pages are refused above; a JSON content type also can't be sent from a plain form.
         if (!/^application\/json\b/i.test(String(req.headers['content-type'] ?? ''))) {
           return fail(415, 'Send the kit folder as application/json.', 'invalid_request_error')
         }

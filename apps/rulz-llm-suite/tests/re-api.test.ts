@@ -327,6 +327,10 @@ describe('POST /v1/re/kit', () => {
     expect((await post({ kitDir: '\\\\host\\share\\kit' })).status).toBe(400)
     expect((await post({ kitDir: '//host/share/kit' })).status).toBe(400)
     expect(seen).toEqual([])
+    // Every other reverse-engineering POST is refused from a web page too.
+    for (const p of ['/v1/re/practice/xor-1/prepare', '/v1/re/practice/xor-1/grade', '/v1/re/sessions/task-1']) {
+      expect((await fetch(`http://127.0.0.1:${port}${p}`, { method: 'POST', headers: { Origin: 'https://example.com' }, body: '{}' })).status).toBe(403)
+    }
   }, 20_000)
 })
 
