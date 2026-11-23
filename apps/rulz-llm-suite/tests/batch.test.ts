@@ -3,25 +3,26 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
+  batchAdapters,
   cleanBatchRun,
   DEFAULT_BATCH_OPTIONS,
   isScored,
+  isStaleChatError,
   itemResult,
   median,
   planBatch,
+  sameBatchAdapters,
   sessionStats,
   settleRun,
   summarize,
   UNATTENDED_DENIAL,
   type BatchItem,
   type BatchOptions,
-  type BatchRun,
-  type TurnEndReason
+  type BatchRun
 } from '@shared/batch'
-import { runsWithoutAsking, starterToolsThatAsk } from '@shared/re'
+import { argsStayInside, remoteRoots, runsWithoutAsking, starterToolsThatAsk } from '@shared/re'
 import type { ChatMessage, Conversation, RePracticeTask, ReSession } from '@shared/types'
 import { BatchStore, MAX_BATCH_RUNS } from '../src/main/re/batches'
-import { runBatchLoop, type BatchDeps, type BatchSessionOptions, type BatchStop } from '../src/renderer/src/lib/batchRunner'
 
 const task = (id: string, family: string, tier = 'easy'): RePracticeTask => ({ id, family, tier, binary: `${id}.exe`, prompt: `Solve {exe}` })
 const opts = (o: Partial<BatchOptions> = {}): BatchOptions => ({ ...DEFAULT_BATCH_OPTIONS, ...o })
@@ -158,6 +159,29 @@ describe('reading a finished session', () => {
   })
 })
 
+describe('adapters of a run and the host of a task', () => {
+  it('records what the model loaded, and tells the same adapters from other ones', () => {
+    expect(batchAdapters(undefined)).toBeUndefined()
+    expect(batchAdapters([])).toBeUndefined()
+    expect(batchAdapters([{ name: 'a', scale: 0.8 }])).toEqual([{ name: 'a', scale: 0.8 }])
+    expect(sameBatchAdapters(undefined, [])).toBe(true)
+    expect(sameBatchAdapters([{ name: 'a', scale: 1 }], [{ name: 'a', scale: 1 }])).toBe(true)
+    expect(sameBatchAdapters([{ name: 'a', scale: 1 }], [{ name: 'a', scale: 0.5 }])).toBe(false)
+    expect(sameBatchAdapters([{ name: 'a', scale: 1 }], undefined)).toBe(false)
+  })
+
+  it('keeps the host a task ran on', () => {
+    const r = cleanBatchRun({ id: 'ok', items: [{ taskId: 'a', host: 'RTX 4090 (12)', lost: 1 }, { taskId: 'b', host: 7 }] })!
+    expect(r.items[0]).toMatchObject({ host: 'RTX 4090 (12)', lost: 1 })
+    expect(r.items[1]).not.toHaveProperty('host')
+  })
+
+  it('recognises the refusal of a stale chat copy, however the error was wrapped on its way over IPC', () => {
+    expect(isStaleChatError("Error invoking remote method 'conversations:save': Error: The batch run is using this chat, so this copy was not saved.")).toBe(true)
+    expect(isStaleChatError('ENOSPC: no space left on device')).toBe(false)
+  })
+})
+
 describe('scoring a run', () => {
   it('leaves errors and stops out of the score', () => {
     expect(['solved', 'wrong', 'no-answer', 'rounds', 'timeout'].every((s) => isScored(s as BatchItem['status']))).toBe(true)
@@ -249,6 +273,23 @@ describe('saved batch runs', () => {
     expect(JSON.parse(await readFile(path, 'utf8')).map((r: BatchRun) => r.id)).toEqual(['old'])
   }, 20_000)
 
+  it('does not settle the run the pool is running when a reloaded window asks for the list', async () => {
+    const path = join(dir, 're-batches.json')
+    const store = new BatchStore(path)
+    await store.save(makeRun([item('a-1', 'running'), item('a-2', 'pending')], { id: 'live', createdAt: 5 }))
+    await store.save(makeRun([item('a-1', 'running')], { id: 'cut', createdAt: 4 }))
+    let active: string | null = 'live'
+    store.setActive(() => active)
+    const first = await store.list()
+    expect(first.map((r) => `${r.id}:${r.status}`)).toEqual(['live:running', 'cut:stopped'])
+    expect(first[0].items.map((i) => i.status)).toEqual(['running', 'pending'])
+    // Once the pool is done with it, a list settles whatever is still marked running.
+    active = null
+    expect((await store.list()).map((r) => `${r.id}:${r.status}`)).toEqual(['live:stopped', 'cut:stopped'])
+    expect((await store.get('live'))?.id).toBe('live')
+    expect(await store.get('none')).toBeUndefined()
+  }, 20_000)
+
   it('keeps only the newest runs and survives a file that is not a list', async () => {
     const path = join(dir, 're-batches.json')
     await writeFile(path, '{"not":"a list"}', 'utf8')
@@ -261,269 +302,73 @@ describe('saved batch runs', () => {
   }, 20_000)
 })
 
-/** What a fake session does: ends by itself after `after` ms with `end`, or never (undefined). */
-interface Script {
-  after?: number
-  end?: TurnEndReason
-  re?: Partial<ReSession>
-  /** The model loads for this long first: busy, but no reply to stop yet. */
-  loading?: number
-  /** After the final reply, checking the answer takes this long: not busy, the end not yet reported. */
-  grading?: number
-  /** The model the session ended up running on, if not the run's. */
-  ranOn?: string
-  prepareError?: string
-}
+describe('tool calls of a model on a rented instance', () => {
+  const roots = ['C:\\work\\t\\1']
+  const tool = (server: string, name: string) => ({ qualifiedName: `${server}__${name}`, server, name })
+  const open = { confirmToolCalls: false, allowedTools: ['rea__start_gdb_session', 'shell__run'], re: { autoApproveStatic: true } }
+  const call = (args: unknown) => ({ args: typeof args === 'string' ? args : JSON.stringify(args), roots, rea: 'private' as const })
 
-function harness(run: BatchRun, scripts: Record<string, Script>, o: { stopAt?: [number, BatchStop]; busyUntil?: number; watching?: boolean } = {}) {
-  let now = 0
-  let current: string | null = 'user-chat'
-  let state: BatchRun | undefined = run
-  const listeners = new Set<(id: string, reason: TurnEndReason) => void>()
-  const sessions: { id: string; script: Script; startedAt: number; ended: boolean; end?: TurnEndReason }[] = []
-  const log = { started: [] as BatchSessionOptions[], stops: 0, failed: [] as string[], attendedCalls: 0, patches: 0 }
-  const finish = (s: (typeof sessions)[number], reason: TurnEndReason): void => {
-    if (s.ended) return
-    s.ended = true
-    s.end = reason
-    for (const fn of listeners) fn(s.id, reason)
-  }
-  /** When the session's last reply is in (grading may still follow); Infinity if it never answers. */
-  const repliedAt = (s: (typeof sessions)[number]): number => (s.script.after === undefined ? Infinity : s.startedAt + (s.script.loading ?? 0) + s.script.after)
-  const tick = (): void => {
-    for (const s of sessions) if (!s.ended && now >= repliedAt(s) + (s.script.grading ?? 0)) finish(s, s.script.end ?? 'done')
-  }
-  const active = (): (typeof sessions)[number] | undefined => sessions.find((s) => !s.ended && now < repliedAt(s))
-  const externalBusy = (): boolean => o.busyUntil !== undefined && now < o.busyUntil
-  const deps: BatchDeps = {
-    now: () => now,
-    sleep: async (ms) => {
-      now += ms
-      tick()
-      await Promise.resolve()
-    },
-    stopping: () => (o.stopAt && now >= o.stopAt[0] ? o.stopAt[1] : null),
-    chatBusy: () => !!active() || externalBusy(),
-    chatIdle: () => !active() && !externalBusy(),
-    replyingIn: () => {
-      const s = active()
-      return s && now >= s.startedAt + (s.script.loading ?? 0) ? s.id : null
-    },
-    settling: (id) => sessions.some((s) => s.id === id && !s.ended && now >= repliedAt(s)),
-    currentChat: () => current,
-    stopReply: () => {
-      log.stops++
-      const s = active()
-      if (s) finish(s, 'stopped')
-    },
-    prepare: async (_kit, taskId) => {
-      const err = scripts[taskId]?.prepareError
-      if (err) throw new Error(err)
-      return { target: `C:\\work\\${taskId}.exe`, prompt: `Solve ${taskId}`, family: 'f', tier: 't' }
-    },
-    startSession: async (opts) => {
-      if (externalBusy()) return null
-      const id = `c${sessions.length + 1}`
-      log.started.push(opts)
-      sessions.push({ id, script: scripts[opts.practice.taskId] ?? { after: 1000 }, startedAt: now, ended: false })
-      if (opts.follow && o.watching !== false) current = id
-      return id
-    },
-    attended: () => void log.attendedCalls++,
-    failPractice: async (id) => void log.failed.push(id),
-    snapshot: async (id) => {
-      const s = sessions.find((x) => x.id === id)
-      if (!s) return null
-      const c = conv({ practice: { taskId: 'x', family: 'f', tier: 't' }, ...s.script.re }, [{ toolCalls: [{ id: '1', name: 't', arguments: '{}', status: 'done' }] }, {}])
-      return { ...c, modelId: s.script.ranOn ?? 'm/model.gguf' }
-    },
-    onTurnEnd: (fn) => {
-      listeners.add(fn)
-      return () => void listeners.delete(fn)
-    },
-    getRun: () => state,
-    patchRun: (fn) => {
-      if (!state) return undefined
-      log.patches++
-      state = fn(state)
-      return state
+  it('does not count "do not ask" or the always-allowed tools, inside or outside RE', () => {
+    expect(runsWithoutAsking(open, tool('rea', 'start_gdb_session'), true, call({}))).toBe(false)
+    expect(runsWithoutAsking(open, tool('shell', 'run'), true, call({}))).toBe(false)
+    expect(runsWithoutAsking(open, tool('shell', 'run'), false, call({}))).toBe(false)
+    expect(runsWithoutAsking(open, tool('rea', 'xrefs'), false, call({}))).toBe(false)
+    const ask = { confirmToolCalls: true, allowedTools: [] as string[], re: { autoApproveStatic: false } }
+    expect(runsWithoutAsking(ask, tool('rea', 'xrefs'), true, call({}))).toBe(false)
+    expect(runsWithoutAsking(ask, tool('rea', 'open_binary'), true, call({ path: 'C:\\work\\t\\1\\a.exe' }))).toBe(false)
+    expect(runsWithoutAsking({ ...ask, allowedTools: ['rea__open_binary'] }, tool('rea', 'open_binary'), true, call({ path: 'C:\\work\\t\\1\\a.exe' }))).toBe(true)
+    expect(runsWithoutAsking(open, tool('rea', 'xrefs'), true, call({ address: '0x1000' }))).toBe(true)
+    expect(runsWithoutAsking(open, tool('calc', 'calc'), true, call({ expression: '~5 / 2' }))).toBe(true)
+    // A local model keeps its settings.
+    expect(runsWithoutAsking(open, tool('shell', 'run'), false)).toBe(true)
+  })
+
+  it('lets static analysis open the task folder only', () => {
+    const opens = (path: string): boolean => runsWithoutAsking(open, tool('rea', 'open_binary'), true, call({ path }))
+    for (const p of ['C:\\work\\t\\1\\a.exe', 'c:/WORK/t/1/a.exe', 'C:\\work\\t\\1', 'C:\\work\\\\t\\1\\sub\\b.dll']) expect(opens(p), p).toBe(true)
+    for (const p of [
+      'C:\\work\\t\\1\\..\\2\\a.exe', 'C:\\work\\t\\1\\.. \\x', 'C:\\work\\t\\10\\a.exe', 'C:\\work\\t', 'C:\\Users\\u\\.ssh\\id_ed25519', 'D:\\work\\t\\1\\a.exe',
+      '\\\\host\\share\\a', '//host/share/a', '\\\\?\\C:\\work\\t\\1\\a.exe', '\\work\\t\\1\\a.exe', 'C:a.exe', 'C:\\work\\t\\1\\a.exe:stream', '%USERPROFILE%\\a', '~/a', 'a.exe', '', '/mnt/c/work/t/1/a.exe', 'file:///C:/work/t/1/a.exe', 'http://127.0.0.1:9222'
+    ]) expect(opens(p), p).toBe(false)
+    expect(runsWithoutAsking(open, tool('rulz', 'list_directory'), true, call({ path: 'C:\\Users' }))).toBe(false)
+    expect(runsWithoutAsking(open, tool('rulz', 'find_files'), true, call({ root: 'C:\\work\\t\\1', pattern: '*.exe' }))).toBe(true)
+    expect(runsWithoutAsking(open, tool('rulz', 'find_files'), true, call({ root: 'C:\\', pattern: '*.key' }))).toBe(false)
+  })
+
+  it('does not read a program another chat opened, or files next to the target in a clone', () => {
+    const other = { ...call({}), rea: 'other' as const }
+    expect(runsWithoutAsking(open, tool('rea', 'list_strings'), true, other)).toBe(false)
+    expect(runsWithoutAsking(open, tool('rea', 'list_strings'), true, call({}))).toBe(true)
+    expect(runsWithoutAsking(open, tool('rea', 'open_binary'), true, { ...call({ path: 'C:\\work\\t\\1\\a.exe' }), rea: 'other' })).toBe(true)
+    for (const n of ['get_evidence_bundle', 'compare_functions']) {
+      expect(runsWithoutAsking(open, tool('rea', n), true, { ...call({}), rea: 'opened' }), n).toBe(false)
+      expect(runsWithoutAsking(open, tool('rea', n), true, call({})), n).toBe(true)
     }
-  }
-  return { deps, log, listeners, get run() { return state }, remove: () => void (state = undefined), get now() { return now } }
-}
-
-const SOLVED: Script = { after: 5000, re: { outcome: 'solved', autoGraded: true, practice: { taskId: 'x', family: 'f', tier: 't', answer: '42' } } }
-const WRONG: Script = { after: 3000, re: { outcome: 'failed', autoGraded: true, practice: { taskId: 'x', family: 'f', tier: 't', answer: '7' } } }
-
-describe('the batch run loop', () => {
-  it('runs every task in order and records each result', async () => {
-    const h = harness(makeRun([item('a-1', 'pending'), item('a-2', 'pending'), item('a-3', 'pending')]), {
-      'a-1': SOLVED,
-      'a-2': WRONG,
-      'a-3': { after: 2000, end: 'error' }
-    })
-    const { run, error } = await runBatchLoop(h.deps)
-    expect(error).toBeUndefined()
-    expect(run).toMatchObject({ status: 'done' })
-    expect(run!.finishedAt).toBeGreaterThan(0)
-    expect(run!.items.map((i) => i.status)).toEqual(['solved', 'wrong', 'error'])
-    expect(run!.items.map((i) => i.conversationId)).toEqual(['c1', 'c2', 'c3'])
-    expect(run!.items[0]).toMatchObject({ answer: '42', toolRounds: 1, ms: 5000, startedAt: 0 })
-    expect(h.log.started.map((s) => s.title)).toEqual(['Practice: a-1', 'Practice: a-2', 'Practice: a-3'])
-    expect(h.log.started[0]).toMatchObject({ target: 'C:\\work\\a-1.exe', goal: 'Solve a-1', modelId: 'm/model.gguf', practice: { taskId: 'a-1', kitDir: 'C:\\kit' } })
-    expect(h.log.failed).toEqual([])
-    expect(h.listeners.size).toBe(0)
+    const reads = (path: string): boolean => runsWithoutAsking(open, tool('rulz', 'read_file'), true, call({ path }))
+    for (const p of ['src/main.c', 'NOTES.md', 'C:\\work\\t\\1\\src\\a.c']) expect(reads(p), p).toBe(true)
+    for (const p of ['C:\\work\\t\\secrets.txt', '..\\x', 'a/../../x', 'C:x', '\\x', '"C:\\x"', "'\\x'", '%TEMP%\\x', '\\\\host\\share\\x', '']) expect(reads(p), p).toBe(false)
+    expect(runsWithoutAsking(open, tool('rulz', 'write_file'), true, call({ path: 'src/main.c', content: 'C:\\Windows' }))).toBe(true)
   })
 
-  it('grades a session that hit the round limit as failed', async () => {
-    const h = harness(makeRun([item('a-1', 'pending')]), { 'a-1': { after: 4000, end: 'rounds' } })
-    const { run } = await runBatchLoop(h.deps)
-    expect(run!.items[0].status).toBe('rounds')
-    expect(h.log.failed).toEqual(['c1'])
-    expect(h.log.stops).toBe(0)
+  it('checks nested and list arguments and paths under any key, but not search text', () => {
+    expect(argsStayInside('{"pattern":"C:\\\\Windows"}', roots)).toBe(true)
+    expect(argsStayInside('{"query":"http://example"}', roots)).toBe(true)
+    expect(argsStayInside('{"anything":"C:\\\\Windows\\\\x"}', roots)).toBe(false)
+    expect(argsStayInside('{"cdp_endpoint":"http://127.0.0.1:9222","target_id":"1"}', roots)).toBe(false)
+    expect(argsStayInside('{"additional_paths":["C:\\\\work\\\\t\\\\1\\\\a.js","C:\\\\x.js"]}', roots)).toBe(false)
+    expect(argsStayInside('{"a":{"b":[{"local_path":"C:\\\\x"}]}}', roots)).toBe(false)
+    expect(argsStayInside('', roots)).toBe(true)
+    expect(argsStayInside('not json', roots)).toBe(false)
+    expect(argsStayInside('{"overwrite":true}', roots)).toBe(false)
+    expect(argsStayInside('{"overwrite":false}', roots)).toBe(true)
+    expect(argsStayInside('[]', roots)).toBe(false)
+    expect(argsStayInside('{"path":"C:\\\\work\\\\t\\\\1\\\\a"}', [])).toBe(false)
   })
 
-  it('stops a task at the time limit and goes on to the next', async () => {
-    const h = harness(makeRun([item('a-1', 'pending'), item('a-2', 'pending')], { options: opts({ minutesPerTask: 1 }) }), { 'a-1': {}, 'a-2': SOLVED })
-    const { run } = await runBatchLoop(h.deps)
-    expect(run!.items.map((i) => i.status)).toEqual(['timeout', 'solved'])
-    expect(run!.items[0].ms).toBeGreaterThanOrEqual(60_000)
-    expect(run!.items[0].ms).toBeLessThan(62_000)
-    expect(h.log.stops).toBe(1)
-    expect(h.log.failed).toEqual(['c1'])
-    expect(run!.status).toBe('done')
-  })
-
-  it('has no time limit at 0 minutes', async () => {
-    const h = harness(makeRun([item('a-1', 'pending')], { options: opts({ minutesPerTask: 0 }) }), { 'a-1': { ...SOLVED, after: 5 * 3_600_000 } })
-    const { run } = await runBatchLoop(h.deps)
-    expect(run!.items[0].status).toBe('solved')
-    expect(h.log.stops).toBe(0)
-  })
-
-  it('counts the time limit from the first reply, not from the model loading', async () => {
-    // Loading takes longer than the limit; the task still gets its full minute, and solves in it.
-    const slow = harness(makeRun([item('a-1', 'pending')], { options: opts({ minutesPerTask: 1 }) }), { 'a-1': { ...SOLVED, loading: 75_000, after: 50_000 } })
-    const a = await runBatchLoop(slow.deps)
-    expect(a.run!.items[0].status).toBe('solved')
-    expect(slow.log.stops).toBe(0)
-    // The time recorded is the model's working time.
-    expect(a.run!.items[0].ms).toBeGreaterThanOrEqual(49_000)
-    expect(a.run!.items[0].ms).toBeLessThanOrEqual(51_000)
-
-    const never = harness(makeRun([item('a-1', 'pending')], { options: opts({ minutesPerTask: 1 }) }), { 'a-1': { loading: 75_000 } })
-    const b = await runBatchLoop(never.deps)
-    expect(b.run!.items[0].status).toBe('timeout')
-    expect(never.log.stops).toBe(1)
-    expect(never.now).toBeGreaterThanOrEqual(135_000)
-    expect(never.now).toBeLessThan(140_000)
-  })
-
-  it('lets a final reply that beat the time limit be graded', async () => {
-    // The reply is in at 59 s; checking it runs past the 60 s limit.
-    const h = harness(makeRun([item('a-1', 'pending')], { options: opts({ minutesPerTask: 1 }) }), { 'a-1': { ...SOLVED, after: 59_000, grading: 8000 } })
-    const { run } = await runBatchLoop(h.deps)
-    expect(run!.items[0].status).toBe('solved')
-    expect(h.log.stops).toBe(0)
-    expect(h.log.failed).toEqual([])
-  })
-
-  it('"Stop now" stops the task in progress and leaves it and the rest to resume', async () => {
-    const h = harness(makeRun([item('a-1', 'pending'), item('a-2', 'pending'), item('a-3', 'pending')]), { 'a-1': SOLVED, 'a-2': {} }, { stopAt: [20_000, 'now'] })
-    const { run } = await runBatchLoop(h.deps)
-    // The cut-off task has not had its try: it runs again when the run is resumed.
-    expect(run!.items.map((i) => i.status)).toEqual(['solved', 'pending', 'pending'])
-    expect(run!.items[1].conversationId).toBeUndefined()
-    expect(run!.items[1].startedAt).toBeUndefined()
-    expect(run!.status).toBe('stopped')
-    expect(h.log.stops).toBe(1)
-    // Stopped by the user: no verdict on the model.
-    expect(h.log.failed).toEqual([])
-  })
-
-  it('does not start a task when a stop is asked for while it is being prepared', async () => {
-    const h = harness(makeRun([item('a-1', 'pending')]), {})
-    let stop: BatchStop | null = null
-    h.deps.stopping = () => stop
-    const prepare = h.deps.prepare
-    h.deps.prepare = async (k, t) => {
-      stop = 'after'
-      return prepare(k, t)
-    }
-    const { run } = await runBatchLoop(h.deps)
-    expect(h.log.started).toHaveLength(0)
-    expect(run).toMatchObject({ status: 'stopped', items: [{ status: 'pending' }] })
-  })
-
-  it('does not count a session that ran on another model', async () => {
-    const h = harness(makeRun([item('a-1', 'pending')]), { 'a-1': { ...SOLVED, ranOn: 'other/model.gguf' } })
-    const { run } = await runBatchLoop(h.deps)
-    expect(run!.items[0].status).toBe('error')
-    expect(run!.items[0].error).toMatch(/other\/model\.gguf/)
-  })
-
-  it('"Stop after this task" lets the task finish', async () => {
-    const h = harness(makeRun([item('a-1', 'pending'), item('a-2', 'pending')]), { 'a-1': SOLVED }, { stopAt: [1000, 'after'] })
-    const { run } = await runBatchLoop(h.deps)
-    expect(run!.items.map((i) => i.status)).toEqual(['solved', 'pending'])
-    expect(run!.status).toBe('stopped')
-    expect(h.log.stops).toBe(0)
-  })
-
-  it('resumes: tasks already run are left alone', async () => {
-    const h = harness(makeRun([item('a-1', 'wrong', { conversationId: 'old' }), item('a-2', 'pending')], { status: 'stopped' }), { 'a-2': SOLVED })
-    const { run } = await runBatchLoop(h.deps)
-    expect(run!.items).toMatchObject([{ status: 'wrong', conversationId: 'old' }, { status: 'solved', conversationId: 'c1' }])
-    expect(h.log.started).toHaveLength(1)
-  })
-
-  it('waits while another reply is running, then starts', async () => {
-    const h = harness(makeRun([item('a-1', 'pending')]), { 'a-1': SOLVED }, { busyUntil: 30_000 })
-    const { run } = await runBatchLoop(h.deps)
-    expect(run!.items[0]).toMatchObject({ status: 'solved' })
-    expect(run!.items[0].startedAt).toBeGreaterThanOrEqual(30_000)
-  })
-
-  it('tries a task again when another reply got in first', async () => {
-    const h = harness(makeRun([item('a-1', 'pending')]), { 'a-1': SOLVED })
-    let refused = 0
-    const start = h.deps.startSession
-    h.deps.startSession = async (o) => (refused++ < 2 ? null : start(o))
-    const { run } = await runBatchLoop(h.deps)
-    expect(refused).toBe(3)
-    expect(run!.items[0].status).toBe('solved')
-  })
-
-  it('records a task that cannot be prepared and carries on', async () => {
-    const h = harness(makeRun([item('a-1', 'pending'), item('a-2', 'pending')]), { 'a-1': { prepareError: 'Practice task a-1 is not in C:\\kit.' }, 'a-2': SOLVED })
-    const { run } = await runBatchLoop(h.deps)
-    expect(run!.items[0]).toMatchObject({ status: 'error', error: 'Practice task a-1 is not in C:\\kit.' })
-    expect(run!.items[0].conversationId).toBeUndefined()
-    expect(run!.items[1].status).toBe('solved')
-  })
-
-  it('shows each new session only while the user is watching the one before', async () => {
-    const watching = harness(makeRun([item('a-1', 'pending'), item('a-2', 'pending')]), {})
-    await runBatchLoop(watching.deps)
-    expect(watching.log.started.map((s) => s.follow)).toEqual([true, true])
-    const away = harness(makeRun([item('a-1', 'pending'), item('a-2', 'pending')]), {}, { watching: false })
-    await runBatchLoop(away.deps)
-    expect(away.log.started.map((s) => s.follow)).toEqual([true, false])
-  })
-
-  it('ends quietly when the run is removed, and reports a failure instead of throwing', async () => {
-    const gone = harness(makeRun([item('a-1', 'pending')]), {})
-    gone.remove()
-    expect(await runBatchLoop(gone.deps)).toEqual({ run: undefined, error: undefined })
-
-    const broken = harness(makeRun([item('a-1', 'pending'), item('a-2', 'pending')]), {})
-    broken.deps.chatIdle = () => {
-      throw new Error('store is gone')
-    }
-    const r = await runBatchLoop(broken.deps)
-    expect(r.error).toBe('store is gone')
-    expect(r.run).toMatchObject({ status: 'stopped' })
-    expect(r.run!.items.map((i) => i.status)).toEqual(['pending', 'pending'])
-    expect(broken.listeners.size).toBe(0)
+  it('roots: the target, the work folder of a practice task, the output folder of a clone', () => {
+    const practice = { taskId: 'a', family: 'f', tier: 'easy', kitDir: 'C:\\kit' }
+    expect(remoteRoots({ target: 'C:\\dl\\a.exe' })).toEqual(['C:\\dl\\a.exe'])
+    expect(remoteRoots({ target: '"C:\\work\\t\\1\\a.exe"', practice })).toEqual(['C:\\work\\t\\1\\a.exe', 'C:\\work\\t\\1'])
+    expect(remoteRoots(undefined)).toEqual([])
   })
 })

@@ -89,7 +89,7 @@ export function ToolApprovalDialog() {
           <Button variant="ghost" onClick={() => decide('deny')}>
             Deny
           </Button>
-          <Button onClick={() => decide('always')}>Always allow this tool</Button>
+          <Button onClick={() => decide('always')}>{approval.remote ? 'Allow this tool in this chat' : 'Always allow this tool'}</Button>
           <Button variant="primary" onClick={() => decide('once')} autoFocus>
             Allow once
           </Button>
@@ -97,6 +97,12 @@ export function ToolApprovalDialog() {
       }
     >
       <div className="px-5 py-4">
+        {approval.remote && (
+          <div className="mb-3 text-xs text-warn">
+            The model runs on a rented instance, so the result of this call is sent to a machine someone else owns. Your
+            approval settings cover only static analysis of the session&apos;s own files here.
+          </div>
+        )}
         <div className="mb-1 text-[11px] text-faint">Arguments</div>
         <pre className="max-h-[40vh] overflow-auto rounded-lg border border-border bg-code p-3 font-mono text-xs whitespace-pre-wrap">
           {prettyJson(approval.call.arguments) || '{}'}

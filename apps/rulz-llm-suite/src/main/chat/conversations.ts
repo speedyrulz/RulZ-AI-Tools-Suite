@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs'
 import { join } from 'node:path'
 import { shell } from 'electron'
+import { STALE_COPY_TEXT } from '@shared/batch'
 import type { Conversation, ConversationSummary } from '@shared/types'
 import { parseChatAdapters, parseSampling } from '../settings/schema'
 import { readJson, writeJsonAtomic } from '../util/jsonFile'
@@ -40,6 +41,14 @@ export class DeletedConversationError extends Error {
   }
 }
 
+/** The window's save of a chat was refused: the practice pool owns the chat, or the window's copy is older than the pool's last save. */
+export class StaleConversationError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'StaleConversationError'
+  }
+}
+
 /**
  * One JSON file per conversation, plus a list of folder names. Summaries are kept in an index
  * checked against each file's size and mtime, so listing chats doesn't read every chat (images
@@ -51,6 +60,10 @@ export class ConversationStore {
   private indexTimer: ReturnType<typeof setTimeout> | null = null
   /** Chats deleted this session; a reply that finishes afterwards must not write them back. */
   private deleted = new Set<string>()
+  /** Chats a practice session is writing now; the window may not save or delete them. */
+  private owned = new Set<string>()
+  /** The newest poolRev the pool saved per chat (this app run); a window copy with a lower one is stale. */
+  private newest = new Map<string, number>()
   private foldersUnreadable = false
   private readonly foldersPath: string
   private readonly indexPath: string
@@ -120,7 +133,43 @@ export class ConversationStore {
     return c ? { ...c, sampling: parseSampling(c.sampling), ...(c.adapters === undefined ? {} : { adapters: parseChatAdapters(c.adapters) }) } : null
   }
 
+  /** The pool starts writing this chat: saves and deletes from the window are refused until release(). */
+  own(id: string): void {
+    this.owned.add(id)
+  }
+
+  /** The pool is done with the chat. Saves from the window work again, with a copy at the pool's last revision or newer. */
+  release(id: string): void {
+    this.owned.delete(id)
+  }
+
+  isOwned(id: string): boolean {
+    return this.owned.has(id)
+  }
+
+  /** Ids of the chats the pool owns now. */
+  ownedIds(): string[] {
+    return [...this.owned]
+  }
+
+  /** A save from the window. Refused while the pool owns the chat or when the copy is older than the pool's last save. */
   async save(c: Conversation): Promise<ConversationSummary> {
+    if (this.owned.has(c.id)) throw new StaleConversationError(`The batch run is using this chat, so ${STALE_COPY_TEXT}`)
+    const known = this.newest.get(c.id)
+    if (known !== undefined && (c.poolRev ?? 0) < known) {
+      throw new StaleConversationError(`A batch run changed this chat after this copy was made, so ${STALE_COPY_TEXT}`)
+    }
+    return this.write(c)
+  }
+
+  /** A save by the practice pool: records the chat's revision first, so a window copy older than it is refused from now on. */
+  async savePool(c: Conversation): Promise<ConversationSummary> {
+    const rev = c.poolRev ?? 0
+    this.newest.set(c.id, Math.max(this.newest.get(c.id) ?? 0, rev))
+    return this.write(c)
+  }
+
+  private async write(c: Conversation): Promise<ConversationSummary> {
     const path = this.file(c.id)
     if (this.deleted.has(c.id)) throw new DeletedConversationError()
     await writeJsonAtomic(path, c)
@@ -140,6 +189,7 @@ export class ConversationStore {
   }
 
   async delete(id: string): Promise<void> {
+    if (this.owned.has(id)) throw new StaleConversationError('The batch run is using this chat, so it cannot be deleted now.')
     const path = this.file(id)
     this.deleted.add(id)
     try {

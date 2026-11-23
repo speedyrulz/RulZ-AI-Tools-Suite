@@ -270,7 +270,9 @@ export class ApiServer {
       }
       if (path.startsWith('/v1/models/') && path.endsWith(LOAD_CONFIG_SUFFIX) && (method === 'GET' || method === 'POST')) {
         const model = resolveModel(this.deps.getModels(), decodeURIComponent(path.slice('/v1/models/'.length, -LOAD_CONFIG_SUFFIX.length)))
-        if (!model) return fail(404, 'Model not found.', 'not_found_error')
+        if (!model || (model.remote && !this.deps.instances.readyFor(model.id))) return fail(404, 'Model not found.', 'not_found_error')
+        // Changing the settings would reload the model, and the API never loads a rental's model.
+        if (model.remote && method === 'POST') return fail(409, remoteRefusal(model, 'change its load settings'), 'invalid_request_error')
         let preview: LoadConfig | undefined
         if (method === 'POST') {
           const json = await jsonBody()
@@ -304,6 +306,7 @@ export class ApiServer {
       if (method === 'POST' && path.startsWith('/v1/models/') && path.endsWith(UNLOAD_SUFFIX)) {
         const model = resolveModel(this.deps.getModels(), decodeURIComponent(path.slice('/v1/models/'.length, -UNLOAD_SUFFIX.length)))
         if (!model) return fail(404, 'Model not found.', 'not_found_error')
+        if (model.remote) return fail(409, remoteRefusal(model, 'unload it'), 'invalid_request_error')
         const unloaded = await this.unloadModel(model.id)
         res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ ...(this.modelEntry(model) as object), unloaded }))
         return finish(200)
@@ -371,7 +374,7 @@ export class ApiServer {
       }
       if (method === 'GET' && path.startsWith('/v1/models/')) {
         const model = resolveModel(this.deps.getModels(), decodeURIComponent(path.slice('/v1/models/'.length)))
-        if (!model) return fail(404, 'Model not found.', 'not_found_error')
+        if (!model || (model.remote && !this.deps.instances.readyFor(model.id))) return fail(404, 'Model not found.', 'not_found_error')
         res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(this.modelEntry(model)))
         return finish(200)
       }
@@ -407,9 +410,13 @@ export class ApiServer {
         return fail(404, `Unknown endpoint: ${method} ${path}`, 'not_found_error')
       }
 
-      const ready = this.deps.instances.list().filter((i) => i.status === 'ready').map((i) => i.modelId)
-      const picked = pickModel(this.deps.getModels(), requestedModel, ready, settings)
+      // One entry per model: a rental's model may be ready on several rentals.
+      const ready = [...new Set(this.deps.instances.list().filter((i) => i.status === 'ready').map((i) => i.modelId))]
+      // A rental's model counts as a model only while it is loaded there, so it can't take over a fuzzy name match.
+      const picked = pickModel(this.visibleModels(), requestedModel, ready, settings)
       if (!picked) {
+        const asked = requestedModel ? resolveModel(this.deps.getModels(), requestedModel) : undefined
+        if (asked?.remote) return fail(409, remoteRefusal(asked, 'load it'), 'invalid_request_error')
         const hint = requestedModel
           ? settings.unknownModelFallback
             ? `Model "${requestedModel}" was not found, and there is no single loaded model or default model to use instead.`
@@ -423,6 +430,7 @@ export class ApiServer {
       entry.stream = stream
 
       let inst = this.deps.instances.readyFor(model.id)
+      if (!inst && model.remote) return fail(409, remoteRefusal(model, 'load it'), 'invalid_request_error')
       if (!inst) {
         entry.phase = 'loading'
         this.record(entry)
@@ -465,7 +473,7 @@ export class ApiServer {
       }
 
       // Held for the whole request, however long the stream runs, so idle-unload can't stop the model under it.
-      const release = this.deps.instances.acquire(inst.instanceId)
+      const release = this.deps.instances.acquire(inst.instanceId, 'api', 'api request')
       if (this.jit.has(inst.instanceId)) this.jit.set(inst.instanceId, Date.now())
       this.emit()
       try {
@@ -549,9 +557,13 @@ export class ApiServer {
         }
       )
       upstream.on('error', (err) => {
-        if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'application/json' }).end(errorBody(`Model server error: ${err.message}`, 'server_error'))
+        // A rental's tunnel can drop while the model stays loaded there; say so, so the client knows to try again.
+        const message = inst.host
+          ? `The connection to the rental ${inst.host.label} was lost (${err.message}). The model is still loaded there; try again in a moment.`
+          : `Model server error: ${err.message}`
+        if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'application/json' }).end(errorBody(message, 'server_error'))
         else res.destroy()
-        finish(502, err.message)
+        finish(502, inst.host ? message : err.message)
         resolve()
       })
       // A client that disconnects mid-stream stops generation on the model server too.
@@ -592,7 +604,8 @@ export class ApiServer {
   /** Restarts a loaded model so new load defaults take effect; does nothing if it isn't loaded. */
   private reload(modelId: string): void {
     const prev = this.deps.instances.list().find((i) => i.modelId === modelId && i.status !== 'stopping')
-    if (!prev) return
+    // A rental's model is never reloaded from here.
+    if (!prev || prev.host) return
     // Keep auto-unloading a model only if the server loaded it in the first place.
     const wasJit = this.jit.delete(prev.instanceId)
     const p = this.deps.instances
@@ -616,7 +629,8 @@ export class ApiServer {
 
   /** Unloads every instance of a model, loading or ready; resolves how many there were. */
   private async unloadModel(modelId: string): Promise<number> {
-    const targets = this.deps.instances.list().filter((i) => i.modelId === modelId && i.status !== 'stopping')
+    // Never a rental's instance: only the window unloads those.
+    const targets = this.deps.instances.list().filter((i) => i.modelId === modelId && i.status !== 'stopping' && !i.host)
     for (const i of targets) this.jit.delete(i.instanceId)
     await Promise.all(targets.map((i) => this.deps.instances.unload(i.instanceId)))
     if (targets.length) this.emit()
@@ -627,11 +641,19 @@ export class ApiServer {
     const minutes = this.deps.getSettings().idleUnloadMinutes
     if (!minutes) return
     const cutoff = Date.now() - minutes * 60_000
-    const live = new Set(this.deps.instances.list().map((i) => i.instanceId))
+    const all = this.deps.instances.list()
+    const live = new Set(all.map((i) => i.instanceId))
+    const remote = new Set(all.filter((i) => i.host).map((i) => i.instanceId))
     let changed = false
     for (const instanceId of [...this.jit.keys()]) {
       if (!live.has(instanceId)) {
         changed = this.jit.delete(instanceId) || changed
+        continue
+      }
+      // Never unloaded here, whatever the idle time: a rental's model is the window's to unload.
+      if (remote.has(instanceId)) {
+        this.jit.delete(instanceId)
+        changed = true
         continue
       }
       // Idle time counts from the last use by anyone (API requests and in-app chats alike); an
@@ -645,9 +667,13 @@ export class ApiServer {
     if (changed) this.emit()
   }
 
+  /** The models a client can use: the library's, and a rental's only while it is loaded on one. */
+  private visibleModels(): ModelEntry[] {
+    return this.deps.getModels().filter((m) => !m.remote || !!this.deps.instances.readyFor(m.id))
+  }
+
   private listModels(): unknown {
-    const models = this.deps.getModels()
-    return { object: 'list', data: models.map((m) => this.modelEntry(m)) }
+    return { object: 'list', data: this.visibleModels().map((m) => this.modelEntry(m)) }
   }
 
   private modelEntry(m: ModelEntry): unknown {
@@ -683,8 +709,9 @@ export class ApiServer {
       draft_choices: draftChoices(m, this.deps.getModels()),
       adapters: config.adapters ?? [],
       adapter_choices: adapterChoiceList(m, this.deps.getAdapters?.() ?? []),
-      gpus: this.deps.gpus().map(({ index, name, memUsedMiB, memTotalMiB }) => ({ index, name, memUsedMiB, memTotalMiB })),
-      estimate: this.deps.estimate(m, config),
+      gpus: m.remote ? [] : this.deps.gpus().map(({ index, name, memUsedMiB, memTotalMiB }) => ({ index, name, memUsedMiB, memTotalMiB })),
+      // The estimate is about this PC's memory, which says nothing about a rental.
+      estimate: m.remote ? null : this.deps.estimate(m, config),
       max_context_length: m.info?.contextLength,
       // Layers whose experts cpuMoe can keep on the CPU; null for dense models.
       moe_layers: m.info?.expertCount ? (m.info.expertBytesByLayer?.length ?? m.info.blockCount ?? null) : null,
@@ -707,6 +734,11 @@ export class ApiServer {
   private emit(): void {
     this.deps.onStatus(this.getStatus())
   }
+}
+
+/** Why the API server won't load, unload or change a model that runs on a rented vast.ai instance. */
+function remoteRefusal(model: ModelEntry, what: string): string {
+  return `${model.name} runs on a rented vast.ai instance. The API server only uses it while it is loaded there and cannot ${what}; load it on the vast.ai page of the app.`
 }
 
 class BodyTooLarge extends Error {

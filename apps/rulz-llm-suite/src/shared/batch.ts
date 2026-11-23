@@ -1,5 +1,6 @@
 // Practice batch runs: practice tasks run one after another with nobody watching, and a score per
 // run, so two models (or a model before and after fine-tuning) can be compared on the same tasks.
+import { cleanBatchTarget, type BatchTarget } from './remote'
 import type { Conversation, RePracticeTask } from './types'
 
 export type BatchItemStatus =
@@ -51,6 +52,10 @@ export interface BatchItem {
   outputTokens?: number
   /** Tool calls refused because they needed approval and nobody was there to give it. */
   denied?: number
+  /** Times it went back to pending because its instance was lost. */
+  lost?: number
+  /** Where it ran last: the host's label ("This PC", "RTX 4090 (12345)"). */
+  host?: string
   answer?: string
   error?: string
 }
@@ -85,16 +90,48 @@ export interface BatchRun {
   kitDir: string
   options: BatchOptions
   items: BatchItem[]
+  /** Where it ran last. Absent in runs from before 0.29. */
+  target?: BatchTarget
+  /** "This PC", "RTX 4090 (12345)"; one entry per host used. */
+  hosts?: { label: string; dollarsPerHour: number }[]
+  /** Estimated rental cost of the run in dollars (all its running periods); absent = none. */
+  cost?: number
   /** Adapters the model had loaded when the run started, with the strengths its sessions used. Absent = none or an older run. */
   adapters?: { name: string; scale: number }[]
 }
 
-/** How a turn in the chat ended (see onTurnEnd in the chat store). */
+/** How a turn in the chat ended: 'done' a final reply (graded by then), 'stopped' by the user or the run, 'error' the request failed, 'rounds' the tool round limit, 'failed' it never started. */
 export type TurnEndReason = 'done' | 'stopped' | 'error' | 'rounds' | 'failed'
+
+/**
+ * The end of the sentence main refuses a window's save of a pool chat with. The error crosses IPC as plain text
+ * (its class is lost), so the window recognises it by this.
+ */
+export const STALE_COPY_TEXT = 'this copy was not saved.'
+export const isStaleChatError = (message: string): boolean => message.includes(STALE_COPY_TEXT)
+
+/** 'after': finish the tasks in progress, then stop. 'now': stop them too (they go back to pending). */
+export type BatchStop = 'after' | 'now'
+
+/** The adapters a run records of a running instance's adapters; undefined when it has none. */
+export function batchAdapters(loaded: { name: string; scale: number }[] | undefined): { name: string; scale: number }[] | undefined {
+  return loaded?.length ? loaded.map((a) => ({ name: a.name, scale: a.scale })) : undefined
+}
+
+/** Whether a run's recorded adapters are the ones the model has loaded now: same names and strengths, same order; both absent = equal. */
+export function sameBatchAdapters(a: { name: string; scale: number }[] | undefined, b: { name: string; scale: number }[] | undefined): boolean {
+  const x = a ?? []
+  const y = b ?? []
+  return x.length === y.length && x.every((e, i) => e.name === y[i].name && e.scale === y[i].scale)
+}
 
 /** Result text of a tool call refused in an unattended session; the model reads it and carries on. */
 export const UNATTENDED_DENIAL =
   'Not run: this tool needs the user’s approval and this session runs unattended. Continue with the tools that read the target.'
+
+/** The same for a call by a model on a rented instance. */
+export const REMOTE_DENIAL =
+  'Not run: without asking, a model on a rented instance may only use static analysis, on absolute paths in this task’s folder. Continue with the given target.'
 
 const clampInt = (v: unknown, min: number, max: number, fallback: number): number => {
   const n = typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : fallback
@@ -159,7 +196,7 @@ export function sessionStats(conv: Pick<Conversation, 'messages'>): Pick<BatchIt
     if (m.toolCalls?.length) toolRounds++
     promptTokens = Math.max(promptTokens, m.stats?.promptTokens ?? 0)
     outputTokens += m.stats?.predictedTokens ?? 0
-    for (const c of m.toolCalls ?? []) if (c.status === 'denied' && c.result === UNATTENDED_DENIAL) denied++
+    for (const c of m.toolCalls ?? []) if (c.status === 'denied' && (c.result === UNATTENDED_DENIAL || c.result === REMOTE_DENIAL)) denied++
   }
   return { toolRounds, promptTokens, outputTokens, denied }
 }
@@ -301,6 +338,8 @@ export function cleanBatchRun(raw: unknown): BatchRun | null {
       ...(optNum(i.promptTokens) !== undefined ? { promptTokens: optNum(i.promptTokens) } : {}),
       ...(optNum(i.outputTokens) !== undefined ? { outputTokens: optNum(i.outputTokens) } : {}),
       ...(optNum(i.denied) !== undefined ? { denied: optNum(i.denied) } : {}),
+      ...(optNum(i.lost) !== undefined ? { lost: optNum(i.lost) } : {}),
+      ...(str(i.host, 200) ? { host: str(i.host, 200) } : {}),
       ...(answer ? { answer } : {}),
       ...(error ? { error } : {})
     })
@@ -318,6 +357,15 @@ export function cleanBatchRun(raw: unknown): BatchRun | null {
     maxToolRounds: clampInt(r.maxToolRounds, 1, 2000, 80),
     kitDir: str(r.kitDir, 1000),
     options: cleanBatchOptions(r.options as Partial<BatchOptions> | undefined),
-    items
+    items,
+    ...(r.target ? { target: cleanBatchTarget(r.target) } : {}),
+    ...(Array.isArray(r.hosts)
+      ? {
+          hosts: r.hosts.slice(0, 32).flatMap((h: { label?: unknown; dollarsPerHour?: unknown } | null) =>
+            typeof h?.label === 'string' ? [{ label: h.label.slice(0, 200), dollarsPerHour: optNum(h.dollarsPerHour) ?? 0 }] : []
+          )
+        }
+      : {}),
+    ...(optNum(r.cost) !== undefined ? { cost: optNum(r.cost) } : {})
   }
 }

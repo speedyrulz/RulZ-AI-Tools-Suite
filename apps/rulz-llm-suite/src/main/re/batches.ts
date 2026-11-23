@@ -55,15 +55,28 @@ export class BatchStore {
     return this.runs
   }
 
+  /** Which run the practice pool is running now (if any); the list leaves it as it is. */
+  private activeId: () => string | null = () => null
+
+  setActive(fn: () => string | null): void {
+    this.activeId = fn
+  }
+
   /**
-   * Newest first. Only a window that is starting asks for the list, and the run loop lives in the
-   * window: so a run still marked running here was cut off (the window was reloaded or crashed).
+   * Newest first. A run still marked running here was cut off (the app closed or crashed), except the one
+   * the pool is running now: a window that reloads asks for the list too and must not stop that run.
    */
   list(): Promise<BatchRun[]> {
     return this.enqueue(async () => {
-      this.runs = (await this.load()).map(settleRun)
+      const active = this.activeId()
+      this.runs = (await this.load()).map((r) => (r.id === active ? r : settleRun(r)))
       return [...this.runs].sort((a, b) => b.createdAt - a.createdAt)
     })
+  }
+
+  /** One run as saved; undefined if there is none. */
+  async get(id: string): Promise<BatchRun | undefined> {
+    return this.enqueue(async () => (await this.load()).find((r) => r.id === id))
   }
 
   save(raw: unknown): Promise<void> {

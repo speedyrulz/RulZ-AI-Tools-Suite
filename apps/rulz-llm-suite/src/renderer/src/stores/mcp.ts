@@ -1,7 +1,13 @@
 import { create } from 'zustand'
-import { toolTokens } from '@shared/tools'
-import { CLONE_FILE_TOOLS } from '@shared/re'
-import type { FileToolScope, McpConfigState, McpServerStatus, McpToolInfo, ToolRequest } from '@shared/types'
+import {
+  availableToolsOf,
+  effectiveToolModeOf,
+  tokensOfNames,
+  toolBudgetOf,
+  toolRequestOf,
+  type ToolOptions
+} from '@shared/toolSession'
+import type { McpConfigState, McpServerStatus, McpToolInfo, ToolRequest } from '@shared/types'
 import { invoke, on } from '../lib/api'
 import { once } from '../lib/once'
 import { useApp } from './app'
@@ -32,56 +38,28 @@ export function findTool(qualifiedName: string): McpToolInfo | undefined {
   return undefined
 }
 
-/** Connected tools the user has not switched off. */
 /** Connected, switched-on tools. The write/read file tools are included only for clone sessions. */
 export function availableTools(opts: { clone?: boolean } = {}): McpToolInfo[] {
-  const disabled = new Set(useApp.getState().settings?.disabledTools ?? [])
-  if (!opts.clone) for (const n of CLONE_FILE_TOOLS) disabled.add(n)
-  return useMcp
-    .getState()
-    .servers.filter((s) => s.state === 'connected')
-    .flatMap((s) => s.tools)
-    .filter((t) => !disabled.has(t.qualifiedName))
+  return availableToolsOf(useMcp.getState().servers, useApp.getState().settings, opts)
 }
 
 export function tokensOf(names: string[]): number {
-  return names.reduce((sum, n) => {
-    const t = findTool(n)
-    return sum + (t ? toolTokens(t) : 0)
-  }, 0)
+  return tokensOfNames(useMcp.getState().servers, names)
 }
 
-/** Tool options of an RE session: tools are on even when chats have them off, with the RE budget. */
-export interface ToolOptions {
-  re?: boolean
-  /** Clone sessions: where the write/read file tools may work. */
-  files?: FileToolScope
-}
+export type { ToolOptions }
 
 /** Token budget for loaded tool descriptions. */
 export function toolBudget(opts: ToolOptions = {}): number {
-  const s = useApp.getState().settings
-  return (opts.re ? s?.re.toolBudgetTokens : s?.toolBudgetTokens) ?? 6000
+  return toolBudgetOf(useApp.getState().settings, opts)
 }
 
 /** 'all' or 'dynamic' after resolving 'auto' against the budget; null when tools are off or none exist. */
 export function effectiveToolMode(opts: ToolOptions = {}): 'all' | 'dynamic' | null {
-  const s = useApp.getState().settings
-  if (!s || (!s.toolsEnabled && !opts.re)) return null
-  const tools = availableTools({ clone: !!opts.files })
-  if (!tools.length) return null
-  if (s.toolMode !== 'auto') return s.toolMode
-  return tools.reduce((sum, t) => sum + toolTokens(t), 0) > toolBudget(opts) ? 'dynamic' : 'all'
+  return effectiveToolModeOf(useMcp.getState().servers, useApp.getState().settings, opts)
 }
 
 /** The tool selection to send with a chat request. */
 export function toolRequestFor(activeTools: string[] | undefined, opts: ToolOptions = {}): ToolRequest | undefined {
-  const mode = effectiveToolMode(opts)
-  if (!mode) return undefined
-  const available = new Set(availableTools({ clone: !!opts.files }).map((t) => t.qualifiedName))
-  return {
-    mode,
-    active: mode === 'dynamic' ? (activeTools ?? []).filter((n) => available.has(n)) : [],
-    ...(opts.files ? { files: opts.files } : {})
-  }
+  return toolRequestOf(useMcp.getState().servers, useApp.getState().settings, activeTools, opts)
 }

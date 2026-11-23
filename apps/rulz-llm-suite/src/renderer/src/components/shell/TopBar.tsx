@@ -3,6 +3,8 @@ import type { LoadedInstance } from '@shared/types'
 import { cn, formatBytes } from '../../lib/format'
 import { isDarkTheme, useApp } from '../../stores/app'
 import { useModels } from '../../stores/models'
+import { CostChip } from '../remote/CostChip'
+import { HostBadge } from '../remote/HostBadge'
 import { IconButton, Kbd, ProgressBar, Tooltip } from '../ui'
 
 export function TopBar() {
@@ -26,6 +28,7 @@ export function TopBar() {
           <span className={cn('min-w-0 flex-1 truncate text-[13px]', !active && 'text-muted')}>
             {active ? active.modelName : 'Select a model to load'}
           </span>
+          {active?.host && <HostBadge host={active.host} reconnecting={active.reconnecting} compact />}
           <Kbd>Ctrl+L</Kbd>
           <ChevronDown size={14} className="shrink-0 text-faint" />
         </button>
@@ -35,6 +38,7 @@ export function TopBar() {
           ))}
         </div>
       </div>
+      <CostChip />
       <HardwareMeters />
       <ThemeToggle />
     </header>
@@ -66,7 +70,10 @@ function InstanceChip({ inst, active }: { inst: LoadedInstance; active: boolean 
       )}
     >
       <button className="flex max-w-56 min-w-0 flex-col items-start" onClick={() => setActive(inst.modelId)}>
-        <span className="max-w-56 truncate font-medium">{inst.modelName}</span>
+        <span className="flex max-w-56 items-center gap-1.5">
+          <span className="truncate font-medium">{inst.modelName}</span>
+          {inst.host && <HostBadge host={inst.host} reconnecting={inst.reconnecting} compact />}
+        </span>
         {loading ? (
           <span className="flex w-40 items-center gap-1.5 text-[10px] text-muted">
             <ProgressBar value={inst.progress} className="flex-1" />

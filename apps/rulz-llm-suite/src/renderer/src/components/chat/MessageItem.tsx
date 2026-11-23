@@ -3,7 +3,7 @@ import { memo, useEffect, useRef, useState } from 'react'
 import type { ChatMessage, GenerationStats } from '@shared/types'
 import { cn, formatBytes, formatDuration, formatNumber } from '../../lib/format'
 import { useApp } from '../../stores/app'
-import { isChatBusy, useChat } from '../../stores/chat'
+import { isChatBusy, isPoolChat, useChat } from '../../stores/chat'
 import { Button, IconButton, ProgressBar, Textarea, Tooltip } from '../ui'
 import { Markdown } from './Markdown'
 import { splitThink, ThinkingBlock } from './ThinkingBlock'
@@ -55,6 +55,8 @@ export const MessageItem = memo(function MessageItem({
   const keepThinkingOpen = useApp((s) => s.settings?.keepThinkingOpen ?? false)
   // Also while a model auto-loads for a send: a second reply would start alongside it.
   const busy = useChat(isChatBusy)
+  // A batch run writes this chat in the main process: nothing here may change it.
+  const poolOwned = useChat((s) => isPoolChat(s, s.current?.id))
   const { regenerate, continueMessage, deleteMessage, branchFrom } = useChat.getState()
   const isUser = message.role === 'user'
 
@@ -81,21 +83,21 @@ export const MessageItem = memo(function MessageItem({
       <IconButton size="sm" label={copied ? 'Copied' : 'Copy'} onClick={copy}>
         {copied ? <Check size={13} /> : <Copy size={13} />}
       </IconButton>
-      <IconButton size="sm" label="Edit" onClick={() => setEditing(true)} disabled={streaming}>
+      <IconButton size="sm" label="Edit" onClick={() => setEditing(true)} disabled={streaming || poolOwned}>
         <Pencil size={13} />
       </IconButton>
-      <IconButton size="sm" label={isUser ? 'Resend' : 'Regenerate'} onClick={() => void regenerate(message.id)} disabled={busy}>
+      <IconButton size="sm" label={isUser ? 'Resend' : 'Regenerate'} onClick={() => void regenerate(message.id)} disabled={busy || poolOwned}>
         <RotateCcw size={13} />
       </IconButton>
       {!isUser && isLast && (
-        <IconButton size="sm" label="Continue" onClick={() => void continueMessage(message.id)} disabled={busy}>
+        <IconButton size="sm" label="Continue" onClick={() => void continueMessage(message.id)} disabled={busy || poolOwned}>
           <FastForward size={13} />
         </IconButton>
       )}
       <IconButton size="sm" label="Branch into a new chat" onClick={() => void branchFrom(message.id)} disabled={streaming}>
         <GitBranch size={13} />
       </IconButton>
-      <IconButton size="sm" label={isUser ? 'Delete with its reply' : 'Delete'} onClick={() => deleteMessage(message.id)} disabled={busy}>
+      <IconButton size="sm" label={isUser ? 'Delete with its reply' : 'Delete'} onClick={() => deleteMessage(message.id)} disabled={busy || poolOwned}>
         <Trash2 size={13} />
       </IconButton>
     </div>

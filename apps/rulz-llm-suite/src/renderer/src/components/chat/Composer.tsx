@@ -5,7 +5,7 @@ import type { Attachment } from '@shared/types'
 import { filesToAttachments } from '../../lib/attachments'
 import { formatBytes } from '../../lib/format'
 import { useApp } from '../../stores/app'
-import { useChat } from '../../stores/chat'
+import { isPoolChat, useChat } from '../../stores/chat'
 import { modelById, useModels } from '../../stores/models'
 import { IconButton, Kbd } from '../ui'
 
@@ -24,6 +24,8 @@ export const Composer = forwardRef<ComposerHandle>(function Composer(_props, ref
   const replyingHere = useChat((s) => !!s.generation && s.generation.conversationId === s.current?.id)
   const allQueued = useChat((s) => s.queued)
   const currentId = useChat((s) => s.current?.id)
+  /** A batch run is writing this chat in the main process: it cannot be added to from here. */
+  const poolOwned = useChat((s) => isPoolChat(s, s.current?.id))
   const queued = allQueued.filter((q) => q.conversationId === currentId)
   const autoLoading = useChat((s) => s.autoLoadingModelId)
   const conversationModelId = useChat((s) => s.current?.modelId ?? null)
@@ -53,7 +55,7 @@ export const Composer = forwardRef<ComposerHandle>(function Composer(_props, ref
   }, [text])
 
   const hasInput = text.trim().length > 0 || attachments.length > 0
-  const canSend = hasInput && !autoLoading && (!generating || replyingHere)
+  const canSend = hasInput && !autoLoading && !poolOwned && (!generating || replyingHere)
 
   /** While a reply streams here: "now" stops it and sends the note, "later" queues the note for when it ends. */
   const submit = (when: 'now' | 'later' = 'now'): void => {
@@ -70,7 +72,7 @@ export const Composer = forwardRef<ComposerHandle>(function Composer(_props, ref
   const model = modelById(targetId)
   let status: React.ReactNode
   if (autoLoading) status = <>Loading {modelById(autoLoading)?.name ?? 'model'}…</>
-  else if (inst?.status === 'ready') status = <>Chatting with <span className="text-muted">{inst.modelName}</span></>
+  else if (inst?.status === 'ready') status = <>Chatting with <span className="text-muted">{inst.modelName}</span>{inst.host ? <> on vast.ai ({inst.host.label}){inst.reconnecting ? ', reconnecting' : ''}</> : null}</>
   else if (inst?.status === 'loading') status = <>Loading {inst.modelName}… {Math.round(inst.progress * 100)}%</>
   else if (model) status = <>Sending will load <span className="text-muted">{model.name}</span> with its saved settings</>
   else
@@ -129,7 +131,8 @@ export const Composer = forwardRef<ComposerHandle>(function Composer(_props, ref
           data-composer
           rows={1}
           value={text}
-          placeholder={replyingHere ? 'Add a note while it replies…' : 'Send a message…'}
+          disabled={poolOwned}
+          placeholder={poolOwned ? 'A batch run is using this chat' : replyingHere ? 'Add a note while it replies…' : 'Send a message…'}
           className="block max-h-[40vh] w-full resize-none bg-transparent px-4 pt-3.5 pb-2 text-[14px] leading-relaxed placeholder:text-faint focus:outline-none focus-visible:outline-none"
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
@@ -149,7 +152,7 @@ export const Composer = forwardRef<ComposerHandle>(function Composer(_props, ref
           }}
         />
         <div className="flex items-center gap-1 px-2 pb-2">
-          <IconButton label="Attach images or text files" onClick={() => fileRef.current?.click()}>
+          <IconButton label="Attach images or text files" onClick={() => fileRef.current?.click()} disabled={poolOwned}>
             <Paperclip size={16} />
           </IconButton>
           <input

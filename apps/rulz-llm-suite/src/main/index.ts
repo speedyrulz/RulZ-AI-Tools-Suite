@@ -1,9 +1,13 @@
 import { promises as fs } from 'node:fs'
 import { join } from 'node:path'
-import { app, BrowserWindow, dialog, Menu, nativeTheme, shell, Tray } from 'electron'
+import { homedir } from 'node:os'
+import { randomUUID } from 'node:crypto'
+import { app, BrowserWindow, dialog, Menu, nativeTheme, safeStorage, shell, Tray } from 'electron'
+import { batchAdapters } from '@shared/batch'
 import { resolveDraft } from '@shared/draft'
+import type { RemoteIpcInvoke } from '@shared/remote'
 import { META_TOOL_DEFS, toolCatalogNote } from '@shared/tools'
-import type { LoadConfig, McpServerConfig, ModelEntry, Theme } from '@shared/types'
+import type { LoadConfig, LoadedInstance, McpServerConfig, ModelEntry, Theme } from '@shared/types'
 import { ChatService } from './chat/service'
 import { ConversationStore } from './chat/conversations'
 import { EngineService } from './engine/engine'
@@ -13,6 +17,7 @@ import { InstanceManager, resolveAdapters } from './engine/instances'
 import { broadcast, handle } from './ipc'
 import { estimateMemory, type FreeMemory } from './models/estimate'
 import { AdapterConverter } from './models/convert'
+import { createModelCatalog } from './models/catalog'
 import { ModelLibrary } from './models/library'
 import { ApiServer } from './server/apiServer'
 import { parseLoadConfig } from './settings/schema'
@@ -20,6 +25,9 @@ import { SettingsStore } from './settings/store'
 import { FILE_TOOLS_SERVER } from './files/fileTools'
 import { API_RE_PREFIX, CLONE_FILE_TOOLS, extractAnswer } from '@shared/re'
 import { BatchStore } from './re/batches'
+import { PracticePool, type PoolHost } from './re/pool'
+import { poolHandlers } from './re/poolIpc'
+import { createRemoteService } from './remote/service'
 import { BenchmarkRunner } from './bench/runner'
 import { BenchStore } from './bench/store'
 import { WritingBenchStore } from './wbench/store'
@@ -156,14 +164,15 @@ async function main(): Promise<void> {
   const library = new ModelLibrary(
     join(userData, 'gguf-cache.json'),
     () => settings.get().modelsDir,
-    (models) => broadcast('models:changed', models),
+    () => broadcast('models:changed', catalog.list()),
     (adapters) => broadcast('adapters:changed', adapters)
   )
 
   const freeMemory = (cfg: LoadConfig): FreeMemory => {
     const snap = hardware.snapshot()
     // Models that will be unloaded first give their memory back.
-    const unloading = settings.get().unloadPreviousOnLoad ? instances.list() : []
+    // Models on rentals use no memory here and are not unloaded by a load here.
+    const unloading = settings.get().unloadPreviousOnLoad ? instances.list().filter((i) => !i.host) : []
     const freed = (index: number): number =>
       unloading.reduce((sum, i) => sum + (i.estimate?.perGpu?.find((g) => g.index === index)?.bytes ?? 0), 0)
     const all = [...snap.gpus]
@@ -187,11 +196,42 @@ async function main(): Promise<void> {
   const estimate = (model: ModelEntry, cfg: LoadConfig) =>
     estimateMemory({ ...model, draft: draftFor(model, cfg) }, cfg, freeMemory(cfg), adapterBytes(cfg))
 
+  const getDefaults = (id: string): LoadConfig => settings.getModelDefaults(id).config
+  // Models on rented vast.ai instances (docs/vast-design.md).
+  const remote = createRemoteService({
+    userData,
+    homedir: homedir(),
+    env: process.env,
+    safeStorage,
+    getLocalModel: (id) => library.get(id),
+    getAdapter: (id) => library.getAdapter(id),
+    getDefaults,
+    draftFor,
+    adapterBytes,
+    localEngineBuild: async () => {
+      const build = /\bbuild:?\s+(\d+)/i.exec((await engine.getInfo()).version ?? '')?.[1]
+      return build ? Number(build) : null
+    },
+    loadOn: (host, modelId, config) => instances.load(modelId, config, host),
+    isLoaded: (modelId) => instances.list().some((i) => i.modelId === modelId),
+    forgetDefaults: (modelId) => settings.setModelDefaults(modelId, null),
+    // A batch run's tasks there go back to pending once its instance is gone.
+    onStopping: async (rentalId) => {
+      const there = instances.list().filter((i) => i.host?.rentalId === rentalId)
+      await Promise.allSettled(there.map((i) => instances.unload(i.instanceId)))
+    },
+    onChange: (state) => broadcast('remote:changed', state),
+    onModels: () => broadcast('models:changed', catalog.list())
+  })
+  const catalog = createModelCatalog(library, remote.models)
+
   const instances = new InstanceManager({
     engine,
-    getModel: (id) => library.get(id),
+    launcher: remote.launcher,
+    onUse: (instance, by, what) => (instance.host ? remote.rentals.use(instance.host.rentalId, what, by) : () => undefined),
+    getModel: (id) => catalog.get(id),
     draftFor,
-    getDefaults: (id) => settings.getModelDefaults(id).config,
+    getDefaults,
     unloadPreviousOnLoad: () => settings.get().unloadPreviousOnLoad,
     estimate,
     getAdapter: (id) => library.getAdapter(id),
@@ -219,7 +259,8 @@ async function main(): Promise<void> {
     (s) => broadcast('mcp:changed', s),
     (c) => broadcast('mcp:config', c),
     (): Record<string, McpServerConfig> =>
-      python ? { calc: { command: python.command, args: [...python.args, '-I', calcScript] } } : {}
+      python ? { calc: { command: python.command, args: [...python.args, '-I', calcScript] } } : {},
+    () => broadcast('mcp:reaTaken', undefined)
   )
   void findPython()
     .then((p) => {
@@ -234,7 +275,7 @@ async function main(): Promise<void> {
   const writingBenchStore = new WritingBenchStore(userData)
   const bench = new BenchmarkRunner({
     instances,
-    getModel: (id) => library.get(id),
+    getModel: (id) => catalog.get(id),
     estimate,
     draftFor,
     sampleGpus: async () => (await hardware.refresh()).gpus,
@@ -245,7 +286,7 @@ async function main(): Promise<void> {
 
   const apiServer = new ApiServer({
     instances,
-    getModels: () => library.list(),
+    getModels: () => catalog.list(),
     getAdapters: () => library.listAdapters(),
     getSettings: () => settings.get().apiServer,
     getLoadDefaults: (id) => settings.getModelDefaults(id),
@@ -301,10 +342,14 @@ async function main(): Promise<void> {
     }
   })
 
+  // One model job at a time for the jobs main runs itself: the phone's Writing runs and adventure jobs.
+  const modelGate = new ModelGate()
   // Phone writing runs wait for their own requests' events through this tap.
   const chatTap = new ChatEventTap()
+  // Requests of the practice pool: the window has no part in them (it would release their tool rounds).
+  const poolRequests = new Set<string>()
   const chat = new ChatService(instances, (e) => {
-    broadcast('chat:event', e)
+    if (!poolRequests.has(e.requestId)) broadcast('chat:event', e)
     chatTap.push(e)
   }, (req) => {
     const disabled = new Set(settings.get().disabledTools)
@@ -363,11 +408,15 @@ async function main(): Promise<void> {
 
   handle('engine:info', (refresh) => engine.getInfo(refresh))
 
-  handle('models:list', () => library.list())
-  handle('models:rescan', () => library.scan())
+  handle('models:list', () => catalog.list())
+  handle('models:rescan', async () => {
+    await library.scan()
+    return catalog.list()
+  })
   handle('models:trash', async (modelId) => {
-    const model = library.get(modelId)
+    const model = catalog.get(modelId)
     if (!model) throw new Error('Model not found')
+    if (model.remote) throw new Error('This model is defined on the vast.ai page; delete it there.')
     if (instances.list().some((i) => i.modelId === modelId)) throw new Error('Eject the model before deleting it.')
     for (const f of model.files) await shell.trashItem(f)
     await settings.setModelDefaults(modelId, null)
@@ -378,7 +427,7 @@ async function main(): Promise<void> {
     const adapter = library.getAdapter(adapterId)
     if (!adapter) throw new Error('Adapter not found')
     // A loaded adapter is held open by llama-server; its model has to be ejected first.
-    if (instances.list().some((i) => i.adapters.some((a) => a.id === adapterId))) throw new Error('Eject the model using this adapter before deleting it.')
+    if (instances.list().some((i) => !i.host && i.adapters.some((a) => a.id === adapterId))) throw new Error('Eject the model using this adapter before deleting it.')
     await shell.trashItem(adapter.path)
     await library.scan()
   })
@@ -388,7 +437,7 @@ async function main(): Promise<void> {
   handle('models:getDefaults', (modelId) => settings.getModelDefaults(modelId))
   handle('models:setDefaults', (modelId, config) => settings.setModelDefaults(modelId, config))
   handle('models:estimate', (modelId, config) => {
-    const model = library.get(modelId)
+    const model = catalog.get(modelId)
     if (!model) throw new Error('Model not found')
     return estimate(model, config)
   })
@@ -421,7 +470,7 @@ async function main(): Promise<void> {
   handle('hardware:snapshot', () => hardware.refresh())
 
   handle('chat:start', (req) => {
-    void chat.start(req)
+    void chat.start(req, 'window')
   })
   handle('chat:abort', (id) => chat.abort(id))
   handle('chat:releaseTurn', (id) => chat.releaseTurn(id))
@@ -499,18 +548,109 @@ async function main(): Promise<void> {
     return exportDataset(traces, sessions, opts)
   })
   handle('re:practiceList', (kitDir) => listPractice(kitDir))
-  handle('re:practicePrepare', async (kitDir, taskId) => {
+  const practicePrepare = async (kitDir: string, taskId: string): Promise<{ target: string; prompt: string; family: string; tier: string }> => {
     const { target, prompt, task } = await preparePractice(kitDir, practiceRoot, taskId)
     return { target, prompt, family: task.family, tier: task.tier }
-  })
-  handle('re:practiceGrade', async (kitDir, taskId, target, finalText) => {
+  }
+  const practiceGrade = async (kitDir: string, taskId: string, target: string, finalText: string): Promise<{ answer: string | null; passed: boolean; expected: string }> => {
     const answer = extractAnswer(finalText)
     const { passed, expected } = await gradePractice(kitDir, practiceRoot, taskId, target, answer)
     return { answer, passed, expected }
+  }
+  handle('re:practicePrepare', practicePrepare)
+  handle('re:practiceGrade', practiceGrade)
+
+  // ---- Practice batch runs: several sessions at once, here or on rentals (docs/vast-design.md, section 8) ----
+  const poolHost = (i: LoadedInstance, dollarsPerHour: number): PoolHost => ({
+    instanceId: i.instanceId,
+    hostLabel: i.host?.label ?? 'This PC',
+    dollarsPerHour,
+    ...(i.host ? { rentalId: i.host.rentalId } : {}),
+    modelName: i.modelName,
+    contextLength: i.contextLength,
+    adapters: batchAdapters(i.adapters)
   })
+  const pool = new PracticePool({
+    now: () => Date.now(),
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    uid: () => randomUUID(),
+    store: batches,
+    conversations,
+    events: {
+      batchChanged: (run, active, stopping) => broadcast('re:batchChanged', { run, active, stopping }),
+      poolChats: (ids) => broadcast('re:poolChats', ids),
+      chatLive: (c) => broadcast('re:chatLive', c),
+      conversationSaved: (s) => broadcast('conversations:saved', s)
+    },
+    busy: (hosts) => {
+      if (bench.isRunning()) return 'A load benchmark is running. Wait for it or stop it first.'
+      if (!hosts.some((h) => h.kind === 'local')) return null
+      const held = modelGate.busyReason()
+      if (held) return held
+      // A model here that is in use: a reply, a tool round or an API request.
+      return instances.list().some((i) => !i.host && i.status === 'ready' && instances.idleSince(i.instanceId) === null) ? 'A reply is still being written on this PC. Wait for it or stop it first.' : null
+    },
+    prepareHosts: (target, modelId, load) =>
+      Promise.all(
+        target.hosts.map(async (h): Promise<PoolHost> => {
+          const model = catalog.get(modelId)
+          if (!model) throw new Error(`${modelId} is no longer in your models.`)
+          if (h.kind === 'local') {
+            if (model.remote) throw new Error(`${model.name} runs on a vast.ai rental, not on this PC.`)
+            const inst = load
+              ? await instances.load(modelId, { ...getDefaults(modelId), ...load })
+              : (instances.readyFor(modelId) ?? (await instances.ensure(modelId)).instance)
+            return poolHost(inst, 0)
+          }
+          if (!model.remote) throw new Error(`${model.name} runs on this PC. Choose a vast.ai model to run on a rental.`)
+          const host = remote.host(h.rentalId)
+          const release = remote.rentals.use(h.rentalId, 'loading a model', 'window')
+          try {
+            const there = instances.list().find((i) => i.modelId === modelId && i.host?.rentalId === h.rentalId && i.status === 'ready')
+            const inst = load ? await instances.load(modelId, { ...getDefaults(modelId), ...load }, host) : (there ?? (await instances.load(modelId, null, host)))
+            return poolHost(inst, remote.rentals.info(h.rentalId)?.dollarsPerHour ?? 0)
+          } finally {
+            release()
+          }
+        })
+      ),
+    useHost: (instanceId) => instances.acquire(instanceId, 'window', 'batch run'),
+    servers: () => mcp.status(),
+    openScope: (opts) => mcp.openScope(opts),
+    settings: () => settings.get(),
+    chat: {
+      start: async (req, onEvent) => {
+        poolRequests.add(req.requestId)
+        const off = chatTap.subscribe(req.requestId, onEvent)
+        try {
+          await chat.start(req, 'window')
+        } finally {
+          off()
+          poolRequests.delete(req.requestId)
+        }
+      },
+      abort: (id) => chat.abort(id),
+      releaseTurn: (id) => chat.releaseTurn(id)
+    },
+    instance: (id) => instances.get(id),
+    instanceState: (id) => {
+      const i = instances.get(id)
+      if (!i || i.status !== 'ready') return 'gone'
+      return i.reconnecting ? 'reconnecting' : 'ready'
+    },
+    prepare: practicePrepare,
+    grade: practiceGrade,
+    onEnded: (_run, rentalIds) => {
+      if (rentalIds.length) remote.rentals.stopAfterRun(rentalIds)
+    },
+    warn: (message) => console.warn(message)
+  })
+  const poolTable = poolHandlers(pool, (id) => batches.delete(id))
+  for (const channel of Object.keys(poolTable) as (keyof typeof poolTable)[]) handle(channel, poolTable[channel] as never)
   handle('re:batches', () => batches.list())
-  handle('re:saveBatch', (run) => batches.save(run))
-  handle('re:deleteBatch', (id) => batches.delete(id))
+
+  // ---- vast.ai (window only: never registered for the phone or the API server) ----
+  for (const channel of Object.keys(remote.handlers) as (keyof RemoteIpcInvoke)[]) handle(channel, remote.handlers[channel] as never)
 
   handle('bench:list', () => benchStore.list())
   handle('wbench:list', () => writingBenchStore.list())
@@ -518,7 +658,10 @@ async function main(): Promise<void> {
   handle('wbench:delete', (id) => writingBenchStore.delete(id))
   handle('wbench:prompts', () => writingBenchStore.prompts())
   handle('wbench:savePrompts', (prompts) => writingBenchStore.savePrompts(prompts))
-  handle('bench:start', (req) => bench.start(req))
+  handle('bench:start', (req) => {
+    if (pool.busy) throw new Error('A batch run is in progress. Wait for it or stop it first.')
+    return bench.start(req)
+  })
   handle('bench:stop', () => bench.stop())
   handle('bench:delete', (id) => benchStore.delete(id))
 
@@ -573,13 +716,15 @@ async function main(): Promise<void> {
   handle('phone:disconnect', (clientId) => phone.access.disconnect(clientId))
   // Writing runs: AI actions started from the phone, run here (docs/phone-access-design.md, "Writing runs").
   const writingEvents = new WritingEvents()
-  // One model job at a time for the jobs main runs itself: the phone's Writing runs and adventure jobs.
-  const modelGate = new ModelGate()
+  const chatReason = chatBusyReason(chat, () => bench.isRunning(), modelGate)
+  // A batch run on rentals alone leaves this PC's model free.
+  const busyReason = (): string | null =>
+    pool.busy && pool.activeInstances.some((id) => !instances.get(id)?.host) ? 'A practice batch run is using the model on the computer.' : chatReason()
   const writingRuns = new WritingRuns({
     store: storeAdapter(novel),
-    chat: chatAdapter(chat, chatTap),
-    models: modelsAdapter(library, instances),
-    busyReason: chatBusyReason(chat, () => bench.isRunning(), modelGate),
+    chat: chatAdapter(chat, chatTap, 'phone'),
+    models: modelsAdapter(catalog, instances),
+    busyReason,
     gate: modelGate,
     // A phone may use a project's jobs while it holds the project open (a reconnected phone has a new id).
     holds: (owner, folder) => novel.ownersOf(folder).includes(owner),
@@ -604,9 +749,9 @@ async function main(): Promise<void> {
   const adventureRuns = new AdventureRuns({
     store: adventureStore,
     chat: chatAdapter(chat, chatTap),
-    models: modelsAdapter(library, instances),
+    models: modelsAdapter(catalog, instances),
     gate: modelGate,
-    busyReason: chatBusyReason(chat, () => bench.isRunning(), modelGate),
+    busyReason,
     emit: (job) => {
       broadcast('adventure:job', job)
       phone.emit('adventure:job', job)
@@ -642,6 +787,47 @@ async function main(): Promise<void> {
   handle('presets:delete', (id) => settings.deletePreset(id))
 
   // ---- Lifecycle ----
+  /** Answered once per quit: rentals keep costing money after the app is gone. False = do not quit. */
+  let rentalsSettled = false
+  let asking: Promise<boolean> | null = null
+  const settleRentals = (): Promise<boolean> => {
+    if (rentalsSettled) return Promise.resolve(true)
+    asking ??= (async () => {
+      const { running } = remote.rentals.quitSummary()
+      if (!running.length) return true
+      const lines = running.map((r) => `${r.label}: ${r.dollarsPerHour > 0 ? `$${r.dollarsPerHour.toFixed(2)} per hour` : 'price not reported'}. ${r.stopsItself ?? 'It will not stop by itself.'}`)
+      const opts = {
+        type: 'warning' as const,
+        title: 'RulZ LLM Suite',
+        message: running.length === 1 ? 'A vast.ai rental is still running.' : `${running.length} vast.ai rentals are still running.`,
+        detail: `${lines.join('\n')}\n\nStopping ends a batch run or setup on it. A stopped rental still bills its disk.`,
+        buttons: ['Stop and quit', 'Leave running and quit', 'Cancel'],
+        defaultId: 2,
+        cancelId: 2,
+        noLink: true
+      }
+      const { response } = mainWindow && !mainWindow.isDestroyed() ? await dialog.showMessageBox(mainWindow, opts) : await dialog.showMessageBox(opts)
+      if (response === 2) return false
+      if (response === 1) return true
+      const errors = await remote.rentals.stopAllForQuit()
+      if (!errors.length) return true
+      const again = await dialog.showMessageBox({ type: 'error', title: 'RulZ LLM Suite', message: 'Not every rental was stopped.', detail: errors.join('\n'), buttons: ['Quit anyway', 'Cancel'], defaultId: 1, cancelId: 1, noLink: true })
+      return again.response === 0
+    })()
+      .then((ok) => {
+        rentalsSettled = ok
+        // Cancelled: the app goes on, and closing to the tray has to work again.
+        if (!ok) quitting = false
+        return ok
+      })
+      .finally(() => {
+        asking = null
+      })
+    return asking
+  }
+  const rentalsRunning = (): boolean => !rentalsSettled && !sessionEnding && remote.rentals.quitSummary().running.length > 0
+  let sessionEnding = false
+  let poolDisposed = false
   mainWindow = createWindow(settings.get().theme)
   mainWindow.on('minimize', () => {
     if (!settings.get().minimizeToTray) return
@@ -653,6 +839,13 @@ async function main(): Promise<void> {
       e.preventDefault()
       ensureTray()
       mainWindow?.hide()
+      return
+    }
+    if (rentalsRunning()) {
+      e.preventDefault()
+      void settleRentals().then((ok) => {
+        if (ok) mainWindow?.close()
+      })
       return
     }
     // Really closing: let the Writing page save or journal its open text first, then close for real.
@@ -669,12 +862,14 @@ async function main(): Promise<void> {
   // most that much typing can be missing after a forced shutdown, and it is offered back on the next open.
   mainWindow.on('session-end', () => {
     quitting = true
+    sessionEnding = true
     flushTimeoutMs = 1000
     void flushNovel()
   })
   mainWindow.on('show', destroyTray)
   mainWindow.on('focus', () => hardware.poke())
   hardware.start()
+  void remote.load().catch((err) => console.error('Could not read the vast.ai state:', remote.scrub(err)))
   void library.scan()
   void engine.getInfo()
   if (settings.get().apiServer.autoStart) apiServer.start().catch(() => undefined)
@@ -683,6 +878,24 @@ async function main(): Promise<void> {
   app.on('window-all-closed', () => app.quit())
   app.on('before-quit', (e) => {
     quitting = true
+    if (rentalsRunning()) {
+      e.preventDefault()
+      void settleRentals().then((ok) => {
+        if (ok) app.quit()
+      })
+      return
+    }
+    // The batch run notes which tasks it did not finish.
+    if (pool.busy && !poolDisposed) {
+      e.preventDefault()
+      // Bounded: a chat or run that cannot be saved must not keep the app from closing.
+      const saved = Promise.race([pool.dispose().then(() => pool.whenIdle()), new Promise((r) => setTimeout(r, 8000))])
+      void saved.catch(() => undefined).finally(() => {
+        poolDisposed = true
+        app.quit()
+      })
+      return
+    }
     // app.quit() fires this before the window's close event. Hold the quit until the Writing page has
     // saved or journalled its text, then quit again; the second pass tears everything down.
     if (!novelFlushed && novel.hasOpenProject()) {
@@ -701,6 +914,7 @@ async function main(): Promise<void> {
     // The benchmark first: it sets its stop flag and starts unloading before the servers are killed.
     void bench.stop()
     instances.killAllSync()
+    remote.rentals.dispose()
     void mcp.dispose()
     void apiServer.stop()
   })

@@ -61,6 +61,23 @@ const TOKENIZE_CONCURRENCY = 4
 /** Longest a model stays held between tool rounds without hearing from the renderer. */
 const TURN_HOLD_MAX_MS = 30 * 60_000
 
+/** Chats whose instance is remembered (see ChatRequest.sessionKey). */
+const SESSION_MEMORY = 500
+
+/** The connection to the server broke; says nothing about the model. */
+class TransportError extends Error {}
+
+const TRANSPORT_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'EPIPE', 'ETIMEDOUT', 'UND_ERR_SOCKET', 'UND_ERR_CLOSED', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT'])
+
+/** A failed fetch or a stream cut off in the middle (node reports both as a TypeError, with the socket error as its cause). */
+export function isTransportError(err: unknown): boolean {
+  if (err instanceof TransportError) return true
+  if (!(err instanceof Error)) return false
+  const code = (err as { code?: string }).code ?? (err.cause as { code?: string } | undefined)?.code
+  if (code && TRANSPORT_CODES.has(code)) return true
+  return err instanceof TypeError && /fetch failed|terminated|network|socket|closed|reset/i.test(err.message)
+}
+
 type Limiter = <T>(task: () => Promise<T>) => Promise<T>
 
 /** Runs at most `n` tasks at once; the rest wait their turn. */
@@ -347,21 +364,43 @@ export class ChatService {
     }
   }
 
-  async countTokens(modelId: string, messages: WireMessage[], tools: ToolRequest | null = null): Promise<number | null> {
-    const inst = this.instances.readyFor(modelId)
+  /**
+   * The instance a request runs on: the pinned one (it must be ready), else the one this session used last while it
+   * is ready, else the best ready one (docs/vast-design.md, section 7). A model may be loaded on several rentals.
+   */
+  private instanceFor(modelId: string, instanceId?: string, sessionKey?: string): LoadedInstance | undefined {
+    if (instanceId) {
+      const pinned = this.instances.get(instanceId)
+      return pinned && pinned.status === 'ready' && pinned.modelId === modelId ? pinned : undefined
+    }
+    const inst = this.instances.readyFor(modelId, sessionKey ? this.sessions.get(sessionKey) : undefined)
+    if (inst && sessionKey) {
+      this.sessions.delete(sessionKey)
+      this.sessions.set(sessionKey, inst.instanceId)
+      if (this.sessions.size > SESSION_MEMORY) this.sessions.delete(this.sessions.keys().next().value!)
+    }
+    return inst
+  }
+
+  /** Session key → the instance its last request used (least recently used goes first). */
+  private sessions = new Map<string, string>()
+
+  async countTokens(modelId: string, messages: WireMessage[], tools: ToolRequest | null = null, instanceId?: string): Promise<number | null> {
+    const inst = instanceId ? this.instanceFor(modelId, instanceId) : this.instances.readyFor(modelId)
     if (!inst) return null
     const set = this.toolSet(tools)
     return this.contextApi(inst, set.defs).countConversation(withSystemNote(messages, set.note))
   }
 
   /** Token count of plain text on the loaded model (cached per instance); null if it can't count. */
-  async countText(modelId: string, text: string): Promise<number | null> {
-    const inst = this.instances.readyFor(modelId)
+  async countText(modelId: string, text: string, instanceId?: string): Promise<number | null> {
+    const inst = instanceId ? this.instanceFor(modelId, instanceId) : this.instances.readyFor(modelId)
     if (!inst) return null
     return this.contextApi(inst, []).countText(text)
   }
 
-  async start(req: ChatRequest): Promise<void> {
+  /** `by` says who asked, so a rental can tell its owner what keeps it running. */
+  async start(req: ChatRequest, by: 'window' | 'api' | 'phone' = 'window'): Promise<void> {
     const { requestId } = req
     const ctrl = new AbortController()
     this.active.set(requestId, ctrl)
@@ -379,12 +418,18 @@ export class ChatService {
       this.send({ type: 'delta', requestId, content: content || undefined, reasoning: reasoning || undefined })
     )
     let release: (() => void) | undefined
+    let inst: LoadedInstance | undefined
+    // The instance this chat was pinned to is gone: the connection to it is what failed, not the model.
+    let pinnedGone = false
 
     try {
-      const inst = this.instances.readyFor(req.modelId)
-      if (!inst) throw new Error('The model for this chat is not loaded.')
+      inst = this.instanceFor(req.modelId, req.instanceId, req.sessionKey)
+      if (!inst) {
+        pinnedGone = !!req.instanceId
+        throw new Error(req.instanceId ? 'The instance this chat was using is not available any more.' : 'The model for this chat is not loaded.')
+      }
       // Marks the model in use, so the API server's idle-unload leaves it alone while this reply runs.
-      release = this.instances.acquire(inst.instanceId)
+      release = this.instances.acquire(inst.instanceId, by, req.prefitted ? 'writing' : 'chat')
       stats.modelName = inst.modelName
 
       const set = this.toolSet(req.tools)
@@ -443,11 +488,15 @@ export class ChatService {
       const toolCalls = new ToolCallAccumulator()
       const decoder = new TextDecoder()
       const reader = res.body.getReader()
+      let sawDone = false
       for (;;) {
         const { done, value } = await reader.read()
         if (done) break
         for (const data of parser.push(decoder.decode(value, { stream: true }))) {
-          if (data === '[DONE]') continue
+          if (data === '[DONE]') {
+            sawDone = true
+            continue
+          }
           let json: unknown
           try {
             json = JSON.parse(data)
@@ -477,6 +526,11 @@ export class ChatService {
           if (c.finishReason) finishReason = c.finishReason
           if (c.timings) stats = statsFromTimings(c.timings, stats)
         }
+      }
+      // A stream that just stops, with no finish reason and no [DONE], is a tunnel that broke mid-answer. On this PC
+      // that has always ended as a done event, and stays so.
+      if (inst.host && !finishReason && !sawDone && !ctrl.signal.aborted) {
+        throw new TransportError(`The connection to ${inst.host.label} broke while the model was answering.`)
       }
       const calls = toolCalls.result()
       if (req.record && this.recorder) {
@@ -512,7 +566,14 @@ export class ChatService {
       deltas.flush()
       const final = this.finalStats(stats, t0, firstTokenAt, predicted, ctrl.signal.aborted ? 'stopped' : 'error')
       if (ctrl.signal.aborted) this.send({ type: 'done', requestId, stats: final, reasoningMs: reasoningMs() })
-      else this.send({ type: 'error', requestId, error: (err as Error).message, stats: final })
+      else {
+        // Only for rentals (and a pinned instance that vanished): this PC's server dying is reported as it always was.
+        const now = inst ? this.instances.get(inst.instanceId) : undefined
+        const transport = pinnedGone || (!!inst?.host && (isTransportError(err) || !now || !!now.reconnecting))
+        const message = (err as Error).message
+        const error = transport && inst?.host && !(err instanceof TransportError) && !pinnedGone ? `The connection to ${inst.host.label} was lost (${message}). The model is still loaded there.` : message
+        this.send({ type: 'error', requestId, error, stats: final, ...(transport ? { transport: true } : {}) })
+      }
     } finally {
       release?.()
       this.active.delete(requestId)

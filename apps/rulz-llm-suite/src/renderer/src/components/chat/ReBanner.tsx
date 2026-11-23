@@ -1,9 +1,11 @@
-import { Binary, CircleDot } from 'lucide-react'
+import { Binary, CircleDot, ListChecks, SkipForward } from 'lucide-react'
 import type { Conversation, ReOutcome } from '@shared/types'
 import { cn } from '../../lib/format'
 import { invoke } from '../../lib/api'
-import { useChat } from '../../stores/chat'
-import { Badge, Tooltip } from '../ui'
+import { POOL_CHAT_TEXT } from '../../lib/remote'
+import { useBatch } from '../../stores/batch'
+import { isPoolChat, useChat } from '../../stores/chat'
+import { Badge, Button, Tooltip } from '../ui'
 
 export const OUTCOMES: { value: Exclude<ReOutcome, 'unrated'>; label: string; tone: string }[] = [
   { value: 'solved', label: 'Solved', tone: 'border-ok/40 bg-ok/15 text-ok' },
@@ -41,6 +43,32 @@ export function OutcomeButtons({
           {o.label}
         </button>
       ))}
+    </div>
+  )
+}
+
+/**
+ * Shown while a batch run writes this chat (in the main process, maybe on a rented GPU): the chat is read-only here,
+ * and the task can be skipped. The run goes on with the next task.
+ */
+export function PoolBanner({ id }: { id: string }) {
+  const owned = useChat((s) => isPoolChat(s, id))
+  const item = useBatch((s) => s.runs.find((r) => r.id === s.activeId)?.items.find((i) => i.conversationId === id && i.status === 'running'))
+  const skip = useBatch((s) => s.skip)
+  if (!owned) return null
+  return (
+    <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-accent/40 bg-accent-soft/50 px-5 py-2 text-[12px]" role="status">
+      <ListChecks size={14} className="shrink-0 text-accent" />
+      <span className="font-medium">{POOL_CHAT_TEXT}</span>
+      <span className="min-w-0 flex-1 truncate text-muted">
+        You can read it as it grows. It cannot be edited or added to until the task ends.
+        {item?.host ? ` Running on ${item.host}.` : ''}
+      </span>
+      <Tooltip content="Stops this session. Its task counts as stopped, and the run takes the next task.">
+        <Button size="sm" onClick={() => skip(id)}>
+          <SkipForward size={13} /> Skip this task
+        </Button>
+      </Tooltip>
     </div>
   )
 }

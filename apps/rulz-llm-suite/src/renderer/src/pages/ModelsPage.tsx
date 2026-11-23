@@ -1,4 +1,4 @@
-import { Ellipsis, Eye, FolderOpen, FolderSearch, Gauge, Play, RefreshCw, Repeat, Search, Trash2 } from 'lucide-react'
+import { Cloud, Ellipsis, Eye, FolderOpen, FolderSearch, Gauge, Play, RefreshCw, Repeat, Search, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { adapterChoices } from '@shared/adapters'
@@ -41,7 +41,9 @@ export function ModelsPage() {
     )
   }, [models, query, sort])
   const selected = models.find((m) => m.id === selectedId) ?? null
-  const totalSize = models.reduce((sum, m) => sum + m.sizeBytes + (m.mmproj?.sizeBytes ?? 0), 0)
+  // Remote models are definitions, not files on this PC: they are listed but not counted in the folder's size.
+  const localModels = models.filter((m) => !m.remote)
+  const totalSize = localModels.reduce((sum, m) => sum + m.sizeBytes + (m.mmproj?.sizeBytes ?? 0), 0)
 
   const doRescan = async (): Promise<void> => {
     setScanning(true)
@@ -59,7 +61,7 @@ export function ModelsPage() {
           <div className="min-w-0 flex-1">
             <h1 className="font-[family-name:var(--font-display)] text-base font-semibold">My Models</h1>
             <div className="truncate text-xs text-muted">
-              {models.length} models · {formatBytes(totalSize)} · <span className="font-mono">{settings?.modelsDir}</span>
+              {localModels.length} models · {formatBytes(totalSize)}{models.length > localModels.length ? ` · ${models.length - localModels.length} on vast.ai` : ''} · <span className="font-mono">{settings?.modelsDir}</span>
             </div>
           </div>
           <Button size="sm" onClick={() => settings && void invoke('shell:openPath', settings.modelsDir)}>
@@ -124,7 +126,7 @@ export function ModelsPage() {
               <tbody>
                 {list.map((m) => {
                   const inst = instances.find((i) => i.modelId === m.id)
-                  const fits = adapterChoices(m, adapters)
+                  const fits = m.remote ? [] : adapterChoices(m, adapters)
                   return (
                     <tr
                       key={m.id}
@@ -135,10 +137,15 @@ export function ModelsPage() {
                         <div className="flex items-center gap-1.5">
                           <span className="truncate font-medium">{m.name}</span>
                           {m.mmproj && <Eye size={12} className="shrink-0 text-accent" aria-label="Vision" />}
+                          {m.remote && (
+                            <Badge>
+                              <Cloud size={11} /> vast.ai
+                            </Badge>
+                          )}
                           {inst && <Badge tone={inst.status === 'ready' ? 'ok' : 'accent'}>{inst.status === 'ready' ? 'Loaded' : 'Loading'}</Badge>}
                           {m.error && <Badge tone="danger">Unreadable</Badge>}
                         </div>
-                        <div className="truncate text-[11px] text-faint">{m.folder || '/'}</div>
+                        <div className="truncate text-[11px] text-faint">{m.remote ? 'Runs on a rented instance. Edit it on the vast.ai page.' : m.folder || '/'}</div>
                         {fits.length > 0 && (
                           <div className="truncate text-[11px] text-faint" title={fits.map((a) => a.name).join(', ')}>
                             Adapters: {fits.map((a) => a.name).join(', ')}
@@ -157,6 +164,7 @@ export function ModelsPage() {
                           <Button size="sm" variant="ghost" onClick={() => openPicker(m.id)}>
                             <Play size={12} /> Load
                           </Button>
+                          {!m.remote && (
                           <DropdownMenu
                             trigger={
                               <button className="rounded p-1.5 text-faint hover:bg-hover hover:text-text" aria-label="Model options">
@@ -170,6 +178,7 @@ export function ModelsPage() {
                               { label: 'Move to Recycle Bin…', icon: <Trash2 size={13} />, onSelect: () => setTrashTarget(m), danger: true }
                             ]}
                           />
+                          )}
                         </div>
                       </td>
                     </tr>
@@ -346,9 +355,13 @@ function ModelDetails({ model, onClose, onBenchmark }: { model: ModelEntry; onCl
       <div className="flex items-start justify-between gap-2 border-b border-border px-5 py-4">
         <div className="min-w-0">
           <div className="text-sm font-semibold break-words">{model.name}</div>
-          <button className="mt-0.5 truncate text-left text-[11px] text-faint hover:text-text" onClick={() => void invoke('shell:showItem', model.path)}>
-            {model.path}
-          </button>
+          {model.remote ? (
+            <div className="mt-0.5 truncate text-[11px] text-faint">Runs on a rented vast.ai instance</div>
+          ) : (
+            <button className="mt-0.5 truncate text-left text-[11px] text-faint hover:text-text" onClick={() => void invoke('shell:showItem', model.path)}>
+              {model.path}
+            </button>
+          )}
         </div>
         <IconButton size="sm" label="Close" onClick={onClose}>
           ✕
@@ -371,14 +384,16 @@ function ModelDetails({ model, onClose, onBenchmark }: { model: ModelEntry; onCl
             <h3 className="text-[11px] font-semibold tracking-wide text-faint uppercase">Default load settings</h3>
             {custom ? <Badge tone="accent">Custom</Badge> : <Badge>App defaults</Badge>}
           </div>
-          {config && <LoadSettingsForm model={model} config={config} onChange={setConfig} estimate={estimate} />}
+          {config && <LoadSettingsForm model={model} config={config} onChange={setConfig} estimate={estimate} remote={model.remote} />}
         </div>
         <EstimateView estimate={estimate} />
       </div>
       <div className="flex justify-end gap-2 border-t border-border px-5 py-3">
-        <Button variant="ghost" disabled={!!model.error} onClick={onBenchmark}>
-          <Gauge size={14} /> Benchmark
-        </Button>
+        {!model.remote && (
+          <Button variant="ghost" disabled={!!model.error} onClick={onBenchmark}>
+            <Gauge size={14} /> Benchmark
+          </Button>
+        )}
         {custom && (
           <Button
             variant="ghost"

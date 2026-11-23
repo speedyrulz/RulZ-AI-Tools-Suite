@@ -1,9 +1,8 @@
 // Binds WritingRuns' dependencies to main's real services. Kept apart from runs.ts so the service itself has no
 // import of the chat service, the store, the library or the instance manager (tests use fakes).
-import type { LoadedInstance, StreamEvent, WireMessage } from '@shared/types'
+import type { LoadedInstance, ModelEntry, StreamEvent, WireMessage } from '@shared/types'
 import type { ChatService } from '../chat/service'
 import type { InstanceManager } from '../engine/instances'
-import type { ModelLibrary } from '../models/library'
 import type { NovelStore } from '../novel/store'
 import type { WritingChat, WritingModel, WritingModels, WritingStore } from './runs'
 
@@ -27,11 +26,15 @@ export class ChatEventTap {
   }
 }
 
-export function chatAdapter(chat: ChatService, tap: ChatEventTap): WritingChat {
+/**
+ * `by` says whose requests these are, so a rental can tell what keeps it running: 'window' for runs the user started
+ * here, 'phone' for runs a phone started (and adventure jobs on a phone's behalf).
+ */
+export function chatAdapter(chat: ChatService, tap: ChatEventTap, by: 'window' | 'phone' = 'window'): WritingChat {
   return {
     countText: (modelId, text) => chat.countText(modelId, text),
     countTokens: (modelId, messages: WireMessage[]) => chat.countTokens(modelId, messages, null),
-    start: (req) => chat.start(req),
+    start: (req) => chat.start(req, by),
     abort: (id) => chat.abort(id),
     subscribe: (id, handler) => tap.subscribe(id, handler)
   }
@@ -65,8 +68,11 @@ export function storeAdapter(store: NovelStore): WritingStore {
 
 const modelOf = (i: LoadedInstance): WritingModel => ({ modelId: i.modelId, instanceId: i.instanceId, contextLength: i.contextLength })
 
-/** The model library and instance manager as the Writing page's `useModels.ensure` and `readyInstance` use them. */
-export function modelsAdapter(library: ModelLibrary, instances: InstanceManager): WritingModels {
+/**
+ * The model catalog (the library, plus the models on rentals) and instance manager as the Writing page's
+ * `useModels.ensure` and `readyInstance` use them.
+ */
+export function modelsAdapter(library: { list(): ModelEntry[] }, instances: InstanceManager): WritingModels {
   return {
     list: () => library.list().map((m) => ({ id: m.id, name: m.name })),
     ready: (modelId) => {
@@ -79,6 +85,15 @@ export function modelsAdapter(library: ModelLibrary, instances: InstanceManager)
       ready.sort((a, b) => b.startedAt - a.startedAt)
       return ready[0] ? modelOf(ready[0]) : undefined
     },
-    ensure: async (modelId) => modelOf((await instances.ensure(modelId)).instance)
+    ensure: async (modelId) => {
+      // A run never starts anything on a rental: it uses the model where it is already loaded, or says so.
+      const entry = library.list().find((m) => m.id === modelId)
+      if (entry?.remote) {
+        const ready = instances.readyFor(modelId)
+        if (!ready) throw new Error(`Load ${entry.name} on a rental first (vast.ai page).`)
+        return modelOf(ready)
+      }
+      return modelOf((await instances.ensure(modelId)).instance)
+    }
   }
 }

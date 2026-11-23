@@ -79,7 +79,7 @@ interface Harness {
   instances: {
     load: ReturnType<typeof vi.fn>
     unload: ReturnType<typeof vi.fn>
-    unloadAll: ReturnType<typeof vi.fn>
+    unloadAllLocal: ReturnType<typeof vi.fn>
     acquire: ReturnType<typeof vi.fn>
     baseUrl: ReturnType<typeof vi.fn>
   }
@@ -129,7 +129,7 @@ function harness(
       } as LoadedInstance
     }),
     unload: vi.fn(async () => undefined),
-    unloadAll: vi.fn(async () => undefined),
+    unloadAllLocal: vi.fn(async () => undefined),
     acquire: vi.fn(() => () => {
       h.released++
     }),
@@ -224,7 +224,7 @@ describe('BenchmarkRunner', () => {
     expect(run.results[0].draftAcceptance).toBeNull()
     expect(h.instances.unload.mock.calls.map((c) => c[0])).toEqual(['inst-1', 'inst-2', 'inst-3', 'inst-4'])
     expect(h.released).toBe(4)
-    expect(h.instances.unloadAll).toHaveBeenCalledTimes(2)
+    expect(h.instances.unloadAllLocal).toHaveBeenCalledTimes(2)
     expect(h.saved[h.saved.length - 1].status).toBe('done')
     // Running states were broadcast along the way.
     expect(h.changes.some((r) => r.results.some((x) => x.status === 'running'))).toBe(true)
@@ -360,13 +360,13 @@ describe('BenchmarkRunner', () => {
     const h = harness({ hangCompletion: true, onCompletion: () => started() })
     await h.runner.start(request([{ key: 'cacheType', values: ['f16', 'q8_0', 'q4_0'] }]))
     await inFlight
-    expect(h.instances.unloadAll).toHaveBeenCalledTimes(1)
+    expect(h.instances.unloadAllLocal).toHaveBeenCalledTimes(1)
     await h.runner.stop()
     const run = last(h)
     expect(run.status).toBe('stopped')
     expect(run.finishedAt).toBeTypeOf('number')
     expect(run.results.map((r) => r.status)).toEqual(['stopped', 'stopped', 'stopped'])
-    expect(h.instances.unloadAll.mock.calls.length).toBeGreaterThanOrEqual(2)
+    expect(h.instances.unloadAllLocal.mock.calls.length).toBeGreaterThanOrEqual(2)
     expect(h.instances.unload).toHaveBeenCalledWith('inst-1')
     expect(h.released).toBe(1)
     expect(h.loads).toHaveLength(1)
@@ -378,7 +378,7 @@ describe('BenchmarkRunner', () => {
     const h = harness()
     let rejectLoad!: (e: Error) => void
     h.instances.load.mockImplementation(() => new Promise((_, reject) => (rejectLoad = reject)))
-    h.instances.unloadAll.mockImplementation(async () => rejectLoad?.(new Error('Load cancelled')))
+    h.instances.unloadAllLocal.mockImplementation(async () => rejectLoad?.(new Error('Load cancelled')))
     await h.runner.start(request([{ key: 'cacheType', values: ['f16', 'q8_0'] }]))
     await vi.waitFor(() => expect(h.instances.load).toHaveBeenCalled())
     await h.runner.stop()
@@ -409,6 +409,14 @@ describe('BenchmarkRunner', () => {
     expect(last(h).status).toBe('stopped')
     expect(last(h).results.map((r) => r.status)).toEqual(['stopped', 'stopped'])
     expect(h.saved[h.saved.length - 1].status).toBe('stopped')
+  })
+
+  it('refuses a model on a rental, and never touches instances there', async () => {
+    const h = harness({ models: [model({ remote: true })] })
+    await expect(h.runner.start(request())).rejects.toThrow(/vast\.ai rental/)
+    expect(h.runner.isRunning()).toBe(false)
+    expect(h.instances.load).not.toHaveBeenCalled()
+    expect(h.instances.unloadAllLocal).not.toHaveBeenCalled()
   })
 
   it('a stop during the baseline reading does not start a load', async () => {
@@ -491,13 +499,13 @@ describe('BenchmarkRunner', () => {
 
   it('ends as failed on an unexpected error and still unloads', async () => {
     const h = harness()
-    h.instances.unloadAll.mockRejectedValueOnce(new Error('cannot kill'))
+    h.instances.unloadAllLocal.mockRejectedValueOnce(new Error('cannot kill'))
     await h.runner.start(request())
     await finish(h)
     const run = last(h)
     expect(run.status).toBe('failed')
     expect(run.error).toContain('cannot kill')
-    expect(h.instances.unloadAll).toHaveBeenCalledTimes(2)
+    expect(h.instances.unloadAllLocal).toHaveBeenCalledTimes(2)
   })
 
   describe('refuses in start()', () => {

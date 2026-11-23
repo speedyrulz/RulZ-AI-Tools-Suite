@@ -26,7 +26,8 @@ const FILLER =
 export interface BenchInstances {
   load(modelId: string, config: LoadConfig | null): Promise<LoadedInstance>
   unload(instanceId: string): Promise<void>
-  unloadAll(): Promise<void>
+  /** Only what runs on this PC: a benchmark must never unload a model on a rental. */
+  unloadAllLocal(): Promise<void>
   acquire(instanceId: string): () => void
   baseUrl(instance: LoadedInstance): string
 }
@@ -160,6 +161,7 @@ export class BenchmarkRunner {
     if (problem) throw new Error(problem)
     const model = this.deps.getModel(req.modelId)
     if (!model) throw new Error('Model not found.')
+    if (model.remote) throw new Error('A model on a vast.ai rental cannot be benchmarked: the benchmark loads models on this computer and reads its GPUs.')
     if (!model.info) throw new Error('This model has no readable file information, so it cannot be benchmarked.')
     for (const axis of req.axes) {
       if (axis.key === 'cpuMoe' && axis.values.some((v) => v !== 'off') && !(model.info.expertCount && model.info.expertCount > 0))
@@ -219,7 +221,7 @@ export class BenchmarkRunner {
     if (!this.current) return
     this.stopping = true
     this.ctrl?.abort()
-    await this.deps.instances.unloadAll().catch(() => undefined)
+    await this.deps.instances.unloadAllLocal().catch(() => undefined)
     await this.loopDone
   }
 
@@ -238,7 +240,7 @@ export class BenchmarkRunner {
 
   private async execute(run: BenchmarkRun, model: ModelEntry): Promise<void> {
     try {
-      if (!this.stopping) await this.deps.instances.unloadAll()
+      if (!this.stopping) await this.deps.instances.unloadAllLocal()
       for (const result of run.results) {
         if (this.stopping) break
         try {
@@ -262,7 +264,7 @@ export class BenchmarkRunner {
       run.status = this.stopping ? 'stopped' : 'failed'
       if (!this.stopping) run.error = errText(err)
     } finally {
-      await this.deps.instances.unloadAll().catch(() => undefined)
+      await this.deps.instances.unloadAllLocal().catch(() => undefined)
       run.finishedAt = this.now()
       const noteSaveError = (): void => {
         if (this.saveError && !run.error) run.error = `The results could not be saved: ${this.saveError}`
