@@ -157,6 +157,24 @@ Discover/downloads, RAG and a CLI are planned.
     run here on the computer as jobs, so a result is kept while the phone sleeps. The phone can't start a job
     while the computer is generating, and phone jobs are not recorded as training data. LLM Suite has to be running (the tray is enough).
   - Not yet tried with a real model.
+- **Adventure mode** (`Ctrl+8`, 0.28.0) — choose-your-own-adventure stories played with the loaded model.
+  - **New adventure**: your own idea (title, genre, premise, your character, tone, passage length, 2 to 4 choices,
+    model, temperature; eight starter ideas fill the form) or **From a Writing project**, which copies the project's
+    characters, places and chapter summaries into the adventure as its world.
+  - **Playing**: the model writes a passage in the second person and offers choices; pick one (keys 1 to 4) or type
+    what you do. Every step is kept as a tree: **Go back here** on any passage, take another path, and switch between
+    paths with **Other paths** or the **Map**. A choice you already took shows as visited and goes to that path;
+    Shift+click writes it again. **Try again** writes the latest passage again as another path, **New choices**
+    replaces its choices, **Edit** changes the text, choices or state by hand, **Delete branch** removes a passage
+    and everything after it.
+  - **Tracked state**: inventory, stats and facts that the model updates after each passage and must stay
+    consistent with. Each passage keeps its own state, so going back also goes back to what you carried then.
+  - **Export** saves the path you are on as one Markdown story. Adventures are saved in the app's data folder
+    (`adventures\`); **Delete** sends one to the Recycle Bin.
+  - Only one model job runs at a time on the computer: an adventure turn, a phone Writing run or a desktop chat
+    waits for the other to finish. Also playable from [RulZ Writer for Android](../rulz-writer-android) (no deletes
+    on the phone). Design: [docs/adventure-mode-design.md](docs/adventure-mode-design.md).
+  - Not yet tried with a real model.
 - **Reverse Engineering mode** (`Ctrl+6`) — runs a local model as a reverse engineer with the REA MCP tools, and
   collects fine-tuning data while it works. Tuned first for Ornith 1.5 35B-A3B (Heretic MTP APEX I-Mini).
   - **Sessions**: pick a program, library, package or folder and a goal (overview, license check, network, config,

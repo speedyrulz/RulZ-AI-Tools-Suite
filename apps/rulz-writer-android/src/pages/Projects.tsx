@@ -1,4 +1,4 @@
-import { BookOpen, Plus, RefreshCw, Settings as SettingsIcon } from 'lucide-react'
+import { BookOpen, Plus, RefreshCw, Settings as SettingsIcon, Signpost } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { LogoMark } from '../components/Logo'
 import { Button, IconButton, Input, Sheet, Spinner, TopBar } from '../components/ui'
@@ -64,6 +64,7 @@ export function Projects() {
       </TopBar>
       <div className="px-safe pb-safe min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-lg space-y-3 px-4 py-4">
+          <Button className="w-full" onClick={() => go('adventures')}><Signpost size={18} /> Adventures</Button>
           <Button size="lg" variant="primary" className="w-full" onClick={() => setCreating(true)}>
             <Plus size={18} /> New project
           </Button>

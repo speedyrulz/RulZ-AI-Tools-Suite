@@ -1,4 +1,5 @@
 // Single source of truth for IPC channels between the renderer and the main process.
+import type { AdventureDesktopInvoke, AdventureIpcEvents, AdventureIpcInvoke } from './adventure'
 import type { BatchRun } from './batch'
 import type { BenchmarkRequest, BenchmarkRun } from './benchmark'
 import type { NovelIpcEvents, NovelIpcInvoke } from './novel'
@@ -49,7 +50,7 @@ export interface AppInfo {
 }
 
 /** Request/response channels (ipcRenderer.invoke ↔ ipcMain.handle). */
-export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke, PhoneIpcInvoke, WritingIpcInvoke {
+export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke, PhoneIpcInvoke, WritingIpcInvoke, AdventureIpcInvoke, AdventureDesktopInvoke {
   'app:info': () => AppInfo
   'settings:get': () => AppSettings
   'settings:update': (patch: Partial<AppSettings>) => AppSettings
@@ -157,7 +158,7 @@ export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke, PhoneI
 }
 
 /** Push channels (webContents.send → ipcRenderer.on). */
-export interface IpcEvents extends NovelIpcEvents, PhoneIpcEvents, WritingIpcEvents {
+export interface IpcEvents extends NovelIpcEvents, PhoneIpcEvents, WritingIpcEvents, AdventureIpcEvents {
   'models:changed': ModelEntry[]
   'adapters:changed': AdapterEntry[]
   /** One output line of the running adapter conversion. */

@@ -9,6 +9,7 @@ import { LogDialog } from './components/models/LogDialog'
 import { ToolApprovalDialog } from './components/chat/ToolCalls'
 import { ChatPage } from './pages/ChatPage'
 import { WritingPage } from './pages/WritingPage'
+import { AdventurePage } from './pages/AdventurePage'
 import { ModelsPage } from './pages/ModelsPage'
 import { ReversePage } from './pages/ReversePage'
 import { McpPage } from './pages/McpPage'
@@ -21,6 +22,7 @@ import { useShortcuts } from './hooks/useShortcuts'
 import { useApp } from './stores/app'
 import { useChat } from './stores/chat'
 import { useModels } from './stores/models'
+import { useAdventure } from './stores/adventure'
 import { useNovel } from './stores/novel'
 
 export function App() {
@@ -39,6 +41,7 @@ export function App() {
       await useServer.getState().init()
       await useChat.getState().init()
       await useNovel.getState().init()
+      await useAdventure.getState().init()
       if (!cancelled) setReady(true)
     })()
     return () => {
@@ -59,6 +62,7 @@ export function App() {
           <main className="min-h-0 flex-1">
             {page === 'chat' && <ChatPage />}
             {page === 'writing' && <WritingPage />}
+            {page === 'adventure' && <AdventurePage />}
             {page === 're' && <ReversePage />}
             {page === 'models' && <ModelsPage />}
             {page === 'mcp' && <McpPage />}
