@@ -113,7 +113,8 @@ export function choosingSchema(choiceCount: number): object {
   return {
     type: 'object',
     properties: {
-      choices: { type: 'array', items: { type: 'string' }, maxItems: n },
+      // minItems too: without it the grammar allows an empty list, which reads as "no choices".
+      choices: { type: 'array', items: { type: 'string', minLength: 1 }, minItems: MIN_CHOICES, maxItems: n },
       ended: { type: 'boolean' },
       changes: {
         type: 'object',

@@ -24,7 +24,7 @@ const CHOICES_JSON = JSON.stringify({
   changes: { addItems: ['lamp'], removeItems: [], setStats: [{ name: 'Health', value: 10 }], removeStats: [], addFlags: ['at the door'], removeFlags: [] }
 })
 
-type Reply = string | { chunks: string[]; hold?: Promise<void> }
+type Reply = string | { chunks: string[]; hold?: Promise<void>; stopReason?: string }
 
 /** A chat whose replies are scripted per request. Passage requests have no schema; choosing requests have one. */
 function makeChat(reply: (req: ChatRequest, n: number, isChoosing: boolean) => Reply) {
@@ -38,12 +38,12 @@ function makeChat(reply: (req: ChatRequest, n: number, isChoosing: boolean) => R
       requests.push(req)
       const send = (e: StreamEvent): void => handlers.get(req.requestId)?.(e)
       const r = reply(req, requests.length - 1, req.sampling.jsonSchema !== '')
-      const spec = typeof r === 'string' ? { chunks: [r], hold: undefined } : r
+      const spec: Exclude<Reply, string> = typeof r === 'string' ? { chunks: [r] } : r
       send({ type: 'progress', requestId: req.requestId, processed: 5, total: 10 })
       for (const c of spec.chunks) send({ type: 'delta', requestId: req.requestId, content: c })
       let stopped = false
       if (spec.hold) await Promise.race([spec.hold, new Promise<void>((res) => aborts.set(req.requestId, () => ((stopped = true), res())))])
-      send({ type: 'done', requestId: req.requestId, stats: { stopReason: stopped ? 'stopped' : 'stop' } })
+      send({ type: 'done', requestId: req.requestId, stats: { stopReason: stopped ? 'stopped' : (spec.stopReason ?? 'stop') } })
     },
     abort: (id) => aborts.get(id)?.(),
     subscribe: (id, h) => {
@@ -160,9 +160,11 @@ describe('the opening', () => {
     expect(passage.sampling).toMatchObject({ jsonSchema: '', thinking: 'off', maxTokens: 256, seed: 7, temperature: DEFAULT_SAMPLING.temperature })
     expect(passage.messages.map((m) => m.role)).toEqual(['system', 'user'])
     expect(passage.messages[1].content).toBe('Begin the story.')
-    expect(choosingReq.disableThinking).toBe(false)
+    // No thinking for the choices: a reasoning model would spend the small budget thinking and send no JSON.
+    expect(choosingReq.disableThinking).toBe(true)
     expect(choosingReq.sampling.jsonSchema).toContain('"setStats"')
-    expect(choosingReq.sampling.thinking).toBe('auto')
+    expect(choosingReq.sampling.jsonSchema).toContain('"minItems":2')
+    expect(choosingReq.sampling.thinking).toBe('off')
     expect(choosingReq.messages.map((m) => m.role)).toEqual(['system', 'user', 'assistant', 'user'])
     expect(choosingReq.messages[2].content).toBe('You stand at a gate. What now?')
     expect(String(choosingReq.messages[3].content)).toContain('exactly 3 options')
@@ -341,6 +343,13 @@ describe('stop and failure', () => {
     expect(done.status).toBe('error')
     expect(done.error).toContain('does not fit in the context')
     expect(t.requests).toHaveLength(0)
+  })
+
+  it('a choosing reply cut off at its limit says so', async () => {
+    const t = await setup({ reply: (_r, _n, choosing) => (choosing ? { chunks: ['{"choices": ["Run'], stopReason: 'length' } : 'The gate.') })
+    const done = await opening(t)
+    expect(done.status).toBe('done')
+    expect(done.warnings.join(' ')).toContain('The choices could not be read (the reply was cut off at its limit)')
   })
 
   it('an unreadable choosing reply keeps the passage, ends done with a warning', async () => {

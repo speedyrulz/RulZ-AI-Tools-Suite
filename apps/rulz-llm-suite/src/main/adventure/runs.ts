@@ -452,16 +452,19 @@ export class AdventureRuns {
     })
     this.checkStop(rec)
     this.noteFit(rec, fit)
+    // prose: true only turns thinking off, the schema still applies. A thinking model would reason through the whole
+    // small budget and send back no JSON at all; the schema already makes the reply the structured part.
     const res = await this.generate(
       rec,
-      { modelId: model.modelId, messages: fit.messages, sampling, adapters: null, action: 'checkScene', prose: false, seed: this.seed(), maxTokens: chooseTokens, schema: choosingSchema(setup.choiceCount) },
+      { modelId: model.modelId, messages: fit.messages, sampling, adapters: null, action: 'checkScene', prose: true, seed: this.seed(), maxTokens: chooseTokens, schema: choosingSchema(setup.choiceCount) },
       false
     )
     if (res.stopped) return this.finish(rec, 'stopped')
     if (res.error) throw new Error(res.error)
     const parsed = parseChoosing(res.text, setup.choiceCount)
     if (!parsed.ok) {
-      this.warn(rec, `The choices could not be read (${parsed.error.replace(/\.$/, '')}). Use New choices, or type what you do.`)
+      const why = res.stopReason === 'length' ? 'the reply was cut off at its limit' : parsed.error.replace(/\.$/, '').replace(/^The /, 'the ')
+      this.warn(rec, `The choices could not be read (${why}). Use New choices, or type what you do.`)
       return this.finish(rec, 'done')
     }
     for (const w of parsed.warnings) this.warn(rec, w)
