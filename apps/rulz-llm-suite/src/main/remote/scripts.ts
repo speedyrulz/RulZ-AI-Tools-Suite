@@ -530,7 +530,7 @@ sleep 0.2; continue
 fi
 r=$(cat "$f.rc")
 case "$r" in
-ok) if cat "$f" >>"$part"; then rm -f "$f" "$f.rc"; app=$((app+1)); else stop_workers; return 1; fi;;
+ok) if cat "$f" >>"$part"; then rm -f "$f" "$f.rc"; app=$((app+1)); nres=0; else stop_workers; return 1; fi;;
 whole) stop_workers; return 2;;
 missing) stop_workers; return 5;;
 auth)
@@ -547,7 +547,7 @@ esac
 done
 rm -rf "$W"; return 0; }
 dl(){
-local url=$1 name=$2 size=$3 sha=$4 again=$5 dest="$M/$2" part="$M/$2.part" cur code try wp rc ok=0 multi=1 mr nc
+local url=$1 name=$2 size=$3 sha=$4 again=$5 dest="$M/$2" part="$M/$2.part" cur code try=0 last wp rc ok=0 multi=1 mr nc
 if [ "$size" = - ] && [ -z "$CFG" ]; then size=$(curlc "$url" -sIL --max-time 60 2>/dev/null | tr -d '\r' | awk 'tolower($1)=="content-length:"{v=$2} END{print v+0}'); [ "$size" = 0 ] && size=-; fi
 # The file of this name may have come from another address (another revision, say): then do not keep it.
 src_check "$url" "$name"
@@ -557,8 +557,11 @@ if [ "$size" != - ] && [ "$cur" = "$size" ] && sha_ok "$dest" "$sha"; then emit 
 rm -f "$dest"
 fi
 [ -f "$part" ] || : >"$part"
-for try in 1 2 3 4 5 6; do
+last=$(stat -c%s "$part")
+while [ "$try" -lt 6 ]; do
 cur=$(stat -c%s "$part")
+# The tries are for a download that does not move: after another megabyte they start over.
+try=$((try+1)); if [ $((cur-last)) -ge 1048576 ]; then try=1; last=$cur; fi
 if [ "$size" != - ] && [ "$cur" -gt "$size" ]; then rm -f "$part"; : >"$part"; cur=0; fi
 if [ "$size" != - ] && [ "$cur" = "$size" ]; then ok=1; break; fi
 if [ "$multi" = 1 ] && [ "$size" != - ] && [ $((size-cur)) -ge "@{RZ_MULTI_MIN:-67108864}" ]; then

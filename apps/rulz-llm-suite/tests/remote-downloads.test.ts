@@ -91,7 +91,7 @@ ${this.sh('tail -n 20 $T/bg*.out 2>&1; ls -la $T $RZ_ROOT/models/*/ 2>&1; cat $T
  * Plays Hugging Face and its storage: serves $T/srv/<name>. A resolve (a ranged request for byte 0 that prints the final
  * address) answers 206 and a numbered signed address; a ranged request with the newest number gets its bytes. Switches:
  * FAKE_NORANGE (200 to a range), FAKE_403_AT=n (the nth ranged request revokes every address so far), FAKE_SHORT (the
- * first chunk is one byte short), FAKE_SLEEP (each request takes that long), FAKE_CODE (every request fails with it).
+ * first chunk is one byte short), FAKE_FLAKY (the first three requests of every chunk fail), FAKE_SLEEP (each request takes that long), FAKE_CODE (every request fails with it).
  */
 const FAKE_CURL = bash`
 #!/bin/bash
@@ -121,7 +121,9 @@ if [ -n "$range" ]; then
   mine=$(printf '%s' "$url" | sed -n 's/.*sig=\([^&]*\).*/\1/p')
   if [ -f "$T/revoked" ] && [ "$mine" != "$sig" ]; then code 403; exit 22; fi
   if [ -n "$FAKE_NORANGE" ]; then code 200; exit 63; fi
+  if [ -n "$FAKE_RANGE_FAIL" ]; then code 503; exit 22; fi
   a=@{range%-*}; b=@{range#*-}
+  if [ -n "$FAKE_FLAKY" ]; then echo x >>"$T/try.$a"; [ "$(wc -l <"$T/try.$a")" -le 3 ] && { code 503; exit 22; }; fi
   mkdir -p "$T/act.$$"; ls -d "$T"/act.* | wc -l >>"$T/par.log"
   echo "$a" >>"$T/offsets.log"
   len=$((b-a+1)); [ -n "$FAKE_SHORT" ] && [ ! -f "$T/short" ] && { touch "$T/short"; len=$((len-1)); }
@@ -236,6 +238,27 @@ describe.skipIf(!hasBash)('bash: several connections', () => {
       box.sh('rm -f "$T/revoked"')
       expect(box.run(hfDownloadScript('m1', file(f)), { data: hfConfigLine(signed), env: small }).code).toBe(0)
       expect(box.sh('sha256sum "$RZ_ROOT/models/m1/model.gguf" | cut -d" " -f1')).toBe(f.sha)
+    })
+  )
+
+  bashIt('a long download may fail more than six times as long as it moves on', () =>
+    withBox((box) => {
+      const f = serve(box, 9 * 1048576)
+      const env = { ...small, RZ_CHUNK: '1048576', RZ_CONNS: '1', FAKE_FLAKY: '1' }
+      const r = box.run(hfDownloadScript('m1', file(f)), { data: hfConfigLine(null), env })
+      expect(r.code, r.stdout + r.stderr).toBe(0)
+      expect(box.sh('sha256sum "$RZ_ROOT/models/m1/model.gguf" | cut -d" " -f1')).toBe(f.sha)
+      expect(markers(r.stdout, 'STAGE').length).toBeGreaterThan(7)
+    })
+  )
+
+  bashIt('gives up after six tries that do not move on, and keeps the part file', () =>
+    withBox((box) => {
+      const f = serve(box)
+      const r = box.run(hfDownloadScript('m1', file(f)), { data: hfConfigLine(null), env: { ...small, RZ_RETRY_SLEEP: '0', FAKE_RANGE_FAIL: '1' } })
+      expect(r.code, r.stdout + r.stderr).toBe(35)
+      expect(markers(r.stdout, 'STAGE')).toHaveLength(6)
+      expect(box.sh(`test -f ${part} && echo yes`)).toBe('yes')
     })
   )
 
