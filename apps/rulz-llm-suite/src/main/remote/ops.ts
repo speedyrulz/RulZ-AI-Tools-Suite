@@ -11,6 +11,7 @@ import {
   engineInstallScript,
   hfConfigLine,
   hfDownloadScript,
+  hfStopScript,
   keepaliveLoopScript,
   markCompleteScript,
   modelStateScript,
@@ -54,6 +55,30 @@ const parseUrl = (u: string, base: string): URL | null => (URL.canParse(u, base)
 const isHfHost = (u: URL): boolean => u.protocol === 'https:' && u.hostname === 'huggingface.co' && u.port === ''
 
 const LLAMA_REPO = 'ggml-org/llama.cpp'
+
+/** The moving rate over the last `windowMs` of the byte counts it is given: "840" Mbps, or null until two seconds are covered. */
+export class RateMeter {
+  private readonly samples: Array<{ at: number; bytes: number }> = []
+
+  constructor(
+    private readonly now: () => number = Date.now,
+    private readonly windowMs = 10_000
+  ) {}
+
+  add(bytes: number): void {
+    const at = this.now()
+    this.samples.push({ at, bytes })
+    while (this.samples.length > 2 && at - this.samples[1].at >= this.windowMs) this.samples.shift()
+  }
+
+  /** Megabits per second, rounded. */
+  mbps(): number | null {
+    const first = this.samples[0]
+    const last = this.samples[this.samples.length - 1]
+    if (!first || last.at - first.at < 2000) return null
+    return Math.max(0, Math.round(((last.bytes - first.bytes) * 8) / ((last.at - first.at) / 1000) / 1e6))
+  }
+}
 
 export const llamaAssetNames = (tag: string): { llama: string; cudart: string } => ({
   llama: `llama-${tag}-bin-ubuntu-cuda-12.8-x64.tar.gz`,
@@ -333,6 +358,7 @@ export class SshRentalOps implements RentalOps {
     const files = this.filesOf(def)
     const end = this.deps.directory.use(rentalId, 'setup', 'window')
     const t = this.track(rentalId, signal)
+    let downloading = false
     try {
       onProgress({ stage: 'Looking at the files', bytesDone: 0, bytesTotal: 0 })
       await this.resolveHf(files)
@@ -365,8 +391,24 @@ export class SshRentalOps implements RentalOps {
       }
       const downloads = files.filter((f) => f.url)
       if (downloads.length) {
+        downloading = true
         const sizes = new Map(downloads.map((f) => [f.name, f.size ?? 0]))
         const doneFiles = new Set<string>()
+        // The bar never goes back inside the downloads, and the stage says how fast they go.
+        let top = base
+        let meter = new RateMeter()
+        const send = (done: number): void => {
+          top = Math.max(top, done)
+          meter.add(top)
+          const mbps = meter.mbps()
+          onProgress({ stage: mbps === null ? stage : `${stage}, ${mbps} Mbps`, bytesDone: top, bytesTotal: total })
+        }
+        const startStage = (label: string): void => {
+          stage = label
+          // A new meter: what an earlier try left in a part file must not look like speed.
+          meter = new RateMeter()
+          onProgress({ stage, bytesDone: top, bytesTotal: total })
+        }
         const fetchOnto = (list: RemoteFile[], signedUrl: string | null): Promise<RunResult> =>
           this.deps.ssh.run(
             rentalId,
@@ -381,11 +423,11 @@ export class SshRentalOps implements RentalOps {
               onLine: (line) => {
                 const m = /^@rz (STAGE|PROG|FILE_DONE)=(.*)$/.exec(line)
                 if (!m) return
-                if (m[1] === 'STAGE') report(0, m[2])
+                if (m[1] === 'STAGE') startStage(m[2])
                 else if (m[1] === 'PROG') {
                   const d = m[2].split('|')[1]
                   const finished = [...doneFiles].reduce((a, n) => a + (sizes.get(n) ?? 0), 0)
-                  onProgress({ stage, bytesDone: base + finished + (Number(d) || 0), bytesTotal: total })
+                  send(base + finished + (Number(d) || 0))
                 } else doneFiles.add(m[2])
               }
             }
@@ -431,9 +473,23 @@ export class SshRentalOps implements RentalOps {
       const mark = await this.deps.ssh.run(rentalId, markCompleteScript(slug, entries), { timeoutMs: 30_000, signal: t.ctl.signal })
       if (mark.code !== 0) throw this.failure(mark, 'The files could not be marked complete.')
       onProgress({ stage: 'Model ready', bytesDone: total, bytesTotal: total })
+    } catch (err) {
+      // A cancelled setup or a closed connection leaves what runs on the instance running: ask it to stop.
+      if (downloading && t.ctl.signal.aborted) await this.stopDownloads(rentalId, slug)
+      throw err
     } finally {
       t.done()
       end()
+    }
+  }
+
+  /** Best effort, with its own short limit and not the cancelled signal: ends what a cancelled setup left running. */
+  private async stopDownloads(rentalId: number, slug: string): Promise<void> {
+    try {
+      const res = await this.deps.ssh.run(rentalId, hfStopScript(slug), { timeoutMs: 25_000 })
+      if (res.code !== 0) this.note(rentalId, `Could not stop the download on the instance: ${marker(res.stdout, 'ERR') ?? `exit ${res.code}`}`)
+    } catch (err) {
+      this.note(rentalId, `Could not stop the download on the instance: ${(err as Error).message}`)
     }
   }
 

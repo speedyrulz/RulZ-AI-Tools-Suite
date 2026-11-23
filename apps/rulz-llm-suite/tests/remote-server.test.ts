@@ -10,7 +10,7 @@ import type { RemoteLaunch } from '../src/main/engine/serverHandle'
 import type { RentalDirectory, RentalInfo, Secrets } from '../src/main/remote/contract'
 import { recordedComplete, toModelEntry } from '../src/main/remote/models'
 import { memoryHashCache } from '../src/main/remote/transfer'
-import { SshRentalOps, llamaAssetNames, type OpsSsh } from '../src/main/remote/ops'
+import { RateMeter, SshRentalOps, llamaAssetNames, type OpsSsh } from '../src/main/remote/ops'
 import { createRemoteLauncher, serverHash, TUNNEL_GIVE_UP_MS, type RemoteLauncherDeps } from '../src/main/remote/remoteServer'
 import { buildRemoteArgs } from '../src/main/remote/remoteArgs'
 import { PORT_PLACEHOLDER } from '../src/main/remote/scripts'
@@ -914,6 +914,101 @@ describe('model files through ops', () => {
     expect(mark).toContain("add 'a.gguf' 4096 '" + '9'.repeat(64) + "'")
     expect(progress.some((p) => p.stage === 'Downloading a.gguf' && p.bytesDone === 1024 && p.bytesTotal === 4096)).toBe(true)
     expect(progress[progress.length - 1].stage).toBe('Model ready')
+  })
+
+  describe('a running download', () => {
+    const isDownload = (text: string): boolean => text.includes('curlc()')
+
+    it('shows the speed in the stage; a part file that was already there does not count as speed, and the bar never goes back', async () => {
+      const BIG = 400_000_000
+      const o = opsFor(head(200, { 'x-linked-size': String(BIG), 'x-linked-etag': `"${'9'.repeat(64)}"` }))
+      o.setReply((text) => (text.includes('COMPLETE_B64') ? { stdout: `@rz FILE=a.gguf|${BIG}\n` } : { stdout: '' }))
+      const real = o.ssh.run
+      o.ssh.run = async (id, text, opts) => {
+        if (isDownload(text)) {
+          opts?.onLine?.('@rz STAGE=Downloading a.gguf, 16 connections')
+          vi.advanceTimersByTime(2000)
+          opts?.onLine?.(`@rz PROG=a.gguf|300000000|${BIG}`)
+          vi.advanceTimersByTime(4000)
+          opts?.onLine?.(`@rz PROG=a.gguf|350000000|${BIG}`)
+          opts?.onLine?.(`@rz PROG=a.gguf|340000000|${BIG}`)
+          opts?.onLine?.('@rz STAGE=Checking a.gguf')
+        }
+        return real(id, text, opts)
+      }
+      const progress: Array<{ stage: string; bytesDone: number }> = []
+      await o.ops.transferModel(7, hfDef, (p) => progress.push(p), new AbortController().signal)
+      const shown = progress.filter((p) => p.stage.includes('a.gguf')).map((p) => [p.stage, p.bytesDone])
+      expect(shown).toEqual([
+        ['Downloading a.gguf, 16 connections', 0],
+        ['Downloading a.gguf, 16 connections', 300_000_000],
+        ['Downloading a.gguf, 16 connections, 100 Mbps', 350_000_000],
+        ['Downloading a.gguf, 16 connections, 100 Mbps', 350_000_000],
+        ['Checking a.gguf', 350_000_000]
+      ])
+    })
+
+    /** A setup whose download never ends by itself, cancelled; the error it ends with. */
+    const cancelled = async (o: ReturnType<typeof opsFor>): Promise<Error> => {
+      const real = o.ssh.run
+      o.ssh.run = (id, text, opts) => {
+        if (!isDownload(text)) return real(id, text, opts)
+        o.runs.push({ id, text, opts })
+        return new Promise<RunResult>((_, reject) => opts?.signal?.addEventListener('abort', () => reject(new Error('aborted'))))
+      }
+      const ctl = new AbortController()
+      const done = o.ops.transferModel(7, hfDef, () => undefined, ctl.signal).catch((e: Error) => e)
+      await tick(10)
+      ctl.abort()
+      return (await done) as Error
+    }
+
+    it('is stopped on the instance when the setup is cancelled, with its own short limit', async () => {
+      const o = opsFor(head())
+      o.setReply(complete)
+      expect((await cancelled(o)).message).toBe('aborted')
+      const stop = o.runs[o.runs.length - 1]
+      expect(stop.text).toContain('STOPPED')
+      expect(stop.opts?.timeoutMs).toBe(25_000)
+      expect(stop.opts?.signal).toBeUndefined()
+    })
+
+    it('says in the log when the stop could not be sent, and still ends with the cancel', async () => {
+      const o = opsFor(head())
+      o.setReply((text) => (text.includes('STOPPED') ? new SshError('unreachable', 'down') : complete(text)))
+      expect((await cancelled(o)).message).toBe('aborted')
+      expect(o.ops.log(7).some((l) => l.includes('Could not stop the download on the instance'))).toBe(true)
+    })
+
+    it('is not stopped on the instance when it fails without a cancel', async () => {
+      const o = opsFor(head())
+      o.setReply((text) => (isDownload(text) ? new SshError('unreachable', 'down') : complete(text)))
+      await expect(o.ops.transferModel(7, hfDef, () => undefined, new AbortController().signal)).rejects.toThrow(/down/)
+      expect(o.runs.some((r) => r.text.includes('STOPPED'))).toBe(false)
+    })
+  })
+
+  it('measures a rate over the last ten seconds, and none before two seconds are covered', () => {
+    let now = 1000
+    const m = new RateMeter(() => now)
+    expect(m.mbps()).toBeNull()
+    m.add(0)
+    expect(m.mbps()).toBeNull()
+    now += 1000
+    m.add(10_000_000)
+    expect(m.mbps()).toBeNull()
+    now += 1000
+    m.add(50_000_000)
+    expect(m.mbps()).toBe(200)
+    // Fast for a while, then slow: the old burst leaves the window.
+    for (let i = 0; i < 12; i++) {
+      now += 1000
+      m.add(50_000_000 + (i + 1) * 1_000_000)
+    }
+    expect(m.mbps()).toBe(8)
+    now += 15000
+    m.add(62_000_000)
+    expect(m.mbps()).toBe(0)
   })
 
   it('fails when a file on the instance has another size than expected', async () => {

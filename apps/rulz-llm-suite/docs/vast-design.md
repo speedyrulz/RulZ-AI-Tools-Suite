@@ -78,6 +78,10 @@ through the ssh agent; the app says so. Neither leaves this PC: files are asked 
 gated file this PC gets the short-lived signed address from Hugging Face and sends only that, on ssh stdin (a fresh one
 for each try, because it expires). Log lines shown in the app are scrubbed of both values.
 
+A token the user put into the environment of their vast.ai account is on every instance of theirs. The app does not use it, and
+`llama-server` and its supervisor are started with `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` and `HUGGINGFACE_TOKEN` unset, because
+whoever drives the model could make it print its environment.
+
 Whoever owns the rented machine can read what is sent to the model and can make it answer anything, tool calls
 included. So with a remote model the approval settings (don't ask, always allowed, static analysis unasked) cover only
 static analysis and opening a program, and only on the RE session's own files (`runsWithoutAsking`, `argsStayInside`).
@@ -93,6 +97,13 @@ Windows OpenSSH (`ssh` on PATH). One known_hosts file per rental id, `StrictHost
 own `~/.ssh` key; before renting, if no local public key is on the account, the app offers to add it (a click).
 Scripts run as `bash -s` with the script on stdin. All interpolated values go through one `shq()` quoting function;
 paths on the instance are built from validated slugs.
+
+One script at a time downloads into a model folder. Every process of a download (the script, its subshells, every curl) has
+`models/.own-<slug>` open as file descriptor 9, which children inherit; a script that downloads, stops a download
+(`hfStopScript`) or removes the model opens it too and then ends everybody else who has it open (`take_dl`, exit 38 when one
+will not go). So a curl whose script is already dead is found as well. This is the normal case, not a rare one: `ssh.run` runs a
+script again on the next route after a transport error, and a dropped or cancelled ssh does not end remote children. A download
+script whose stdout is gone (its progress line cannot be printed) ends itself and its workers.
 
 Remote folder: `/workspace/rulz-llm` (or `/root/rulz-llm` if there is no `/workspace`):
 `engine/<tag>/`, `models/<slug>/`, `run/<instanceId>/{pid,port,args,log}`, `keepalive`, `watchdog.*`.
@@ -112,6 +123,19 @@ kept like any other model's defaults. It appears as a `ModelEntry` wherever mode
 up a rental for a model downloads or uploads its files there (resumable; size checked, sha256 checked for uploads and
 for HF files that report one), then the model can be loaded there. Files are named by slug, so a later upload of a
 changed local file is noticed by size and sha256.
+
+Hugging Face downloads (one curl per file measured 22-265 Mbps from a PC, 16 connections 226-246):
+
+- With a known size and 64 MB or more missing, `hfDownloadScript` fetches 16 MB chunks over 16 connections, each one ranged curl
+  with its address on stdin, and appends them to `.part` in order, so `.part` stays a plain prefix and is the only resume state.
+  The address of a public file is where huggingface.co redirects it, looked up again when a chunk gets 401 or 403; a signed
+  address of a gated file that is refused ends with exit 36 as before; a server that answers a range with 200 gets a single curl.
+  A worker that is gone without an answer is a failed try, and every download curl has a speed floor (1000 B/s for 60 s).
+- Hugging Face's own Xet downloader (`hf download`) was built and measured on 2026-11-23 and left out: on a PC it took 18-35 s for
+  531 MB without the checksum against 18.5 s with it here, cannot resume after a kill, and needs an install and a job of its own.
+- A cancelled or disconnected setup asks the instance to stop what runs (`hfStopScript`, its own 25 s limit); removing a model
+  does the same before it deletes the folder. The state script clears chunks no live download owns. The stage shows
+  the method and the moving rate, such as `Downloading model.gguf, 16 connections, 210 Mbps`.
 
 ## 7. Instances
 
