@@ -28,7 +28,7 @@ interface Harness {
   prompts: PendingPrompt[]
   requests: Awaited<ReturnType<typeof startMockRulz>>['requests']
   reSessions: Awaited<ReturnType<typeof startMockRulz>>['reSessions']
-  run: (text: string, opts?: { shown?: string; share?: boolean; howToRun?: boolean; re?: ReTaskInfo }) => Promise<TaskRecord>
+  run: (text: string, opts?: { shown?: string; share?: boolean; howToRun?: boolean; re?: ReTaskInfo; batch?: boolean }) => Promise<TaskRecord>
   /** Resolves when the next task ends (for tasks started some other way, such as redo). */
   nextEnd: () => Promise<TaskRecord>
   close: () => Promise<void>
@@ -1352,6 +1352,76 @@ describe('the checklist and the syntax check (0.20.0)', () => {
       expect(results[1]).toBe('Created b.py (1 lines).')
       // A write that failed has nothing to check.
       expect(seen).toEqual(['a.py', 'b.py'])
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+})
+
+describe('unattended batch tasks', () => {
+  const runCmd = (command: string) => ({ toolCalls: [call('run_command', { command, summary: 'Checking' })] })
+
+  it('approves what would be asked, without a prompt, in a batch task', async () => {
+    const h = await harness([runCmd('Get-Content a.txt'), { content: 'Done.' }], { answer: () => null })
+    try {
+      writeFileSync(join(h.root, 'a.txt'), 'hello')
+      const task = await h.run('Look', { batch: true })
+      expect(task.outcome).toBe('done')
+      expect(h.prompts).toEqual([])
+      expect(task.steps[0]).toMatchObject({ status: 'done' })
+      expect(task.steps[0].output).toContain('hello')
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('still asks in a normal task', async () => {
+    const h = await harness([runCmd('Get-Content a.txt'), { content: 'Done.' }])
+    try {
+      writeFileSync(join(h.root, 'a.txt'), 'hello')
+      await h.run('Look')
+      expect(h.prompts.map((p) => p.kind)).toEqual(['approval'])
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('does not approve what the safety rules refuse', async () => {
+    const h = await harness([runCmd('mkfs.ext4 disk.img'), { content: 'Done.' }], { answer: () => null })
+    try {
+      await h.run('Clean up', { batch: true })
+      expect(h.prompts).toEqual([])
+      const tool = h.requests[1].body.messages!.find((m) => m.role === 'tool')!
+      // Refused by the safety rules, not approved and run (mkfs is harmless here either way: it is no Windows command).
+      expect(tool.content).toContain('format or repartition a disk')
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('answers ask_user itself, and a later normal task asks again', async () => {
+    const h = await harness([{ toolCalls: [call('ask_user', { question: 'Blue or red?' })] }, { content: 'Red.' }, { toolCalls: [call('ask_user', { question: 'Again?' })] }, { content: 'Ok.' }], {
+      answer: (p) => (p.kind === 'question' ? { kind: 'question', text: 'Red please' } : null)
+    })
+    try {
+      await h.run('Pick', { batch: true })
+      expect(h.prompts).toEqual([])
+      expect(h.requests[1].body.messages!.find((m) => m.role === 'tool')!.content).toContain('Nobody is watching')
+      await h.run('Pick again')
+      expect(h.prompts.map((p) => p.kind)).toEqual(['question'])
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('ends a stuck batch task as an error instead of waiting', async () => {
+    const same = { toolCalls: [call('read_file', { path: 'missing.txt' })] }
+    const h = await harness([same, same, same, { content: 'never reached' }], { answer: () => null })
+    try {
+      const task = await h.run('Read it', { batch: true })
+      expect(h.prompts).toEqual([])
+      expect(task.outcome).toBe('error')
+      expect(h.session.data.timeline.some((i) => i.kind === 'notice' && i.text === 'Stopped: the agent got stuck.')).toBe(true)
     } finally {
       await h.close()
     }

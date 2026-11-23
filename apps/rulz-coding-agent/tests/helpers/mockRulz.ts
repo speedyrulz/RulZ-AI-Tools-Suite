@@ -90,6 +90,8 @@ export async function startMockRulz(opts: MockOptions = {}) {
     { index: 1, name: 'RTX 3090', memUsedMiB: 512, memTotalMiB: 24576 }
   ]
   const loadConfigPosts: unknown[] = []
+  /** POST /v1/re/kit bodies. */
+  const kits: { kitDir?: string }[] = []
   /** POST /v1/re/sessions/{id} bodies, as newer RulZ LLM Suite versions take them. */
   const reSessions: { id: string; body: Record<string, unknown> }[] = []
   const nextTurn = (req: MockRequest): MockTurn => {
@@ -149,16 +151,26 @@ export async function startMockRulz(opts: MockOptions = {}) {
         object: 're.overview',
         recording: true,
         sessions: [],
-        practice: { kitDir: 'k', tasks: [{ id: 'xor-1', family: 'xor', tier: 't1', binary: 'xor.exe', prompt: 'Key of {exe}?', attempts: 0, solved: 0 }] },
+        practice: { kitDir: 'k', tasks: [
+          { id: 'xor-1', family: 'xor', tier: 't1', binary: 'xor.exe', prompt: 'Key of {exe}?', attempts: 0, solved: 0 },
+          { id: 'xor-2', family: 'xor', tier: 't1', binary: 'xor.exe', prompt: 'Key of {exe}?', attempts: 0, solved: 0 }
+        ] },
         goals: [{ label: 'Overview', text: 'Analyze {target}.' }],
         clonePieces: [],
         cloneLanguages: ['']
       })
     }
-    if (url.pathname === '/v1/re/practice/xor-1/prepare' && req.method === 'POST' && !opts.lmStudio) {
-      return json(200, { target: 'C:\\work\\xor-1\\1\\xor.exe', prompt: 'What is the key in C:\\work\\xor-1\\1\\xor.exe?', family: 'xor', tier: 't1' })
+    if (url.pathname === '/v1/re/kit' && req.method === 'POST' && !opts.lmStudio) {
+      const body = JSON.parse(await readBody(req)) as { kitDir?: string }
+      kits.push(body)
+      return json(200, { kitDir: body.kitDir, tasks: [] })
     }
-    if (url.pathname === '/v1/re/practice/xor-1/grade' && req.method === 'POST' && !opts.lmStudio) {
+    const practice = /^\/v1\/re\/practice\/(xor-\d+)\/(prepare|grade)$/.exec(url.pathname)
+    if (practice && practice[2] === 'prepare' && req.method === 'POST' && !opts.lmStudio) {
+      const id = practice[1]
+      return json(200, { target: `C:\\work\\${id}\\1\\xor.exe`, prompt: `What is the key in C:\\work\\${id}\\1\\xor.exe?`, family: 'xor', tier: 't1' })
+    }
+    if (practice && practice[2] === 'grade' && req.method === 'POST' && !opts.lmStudio) {
       const body = JSON.parse(await readBody(req)) as { text: string }
       const m = /ANSWER:\s*(\S+)/.exec(body.text)
       return json(200, { answer: m?.[1] ?? null, passed: m?.[1] === '42', expected: '42' })
@@ -222,6 +234,7 @@ export async function startMockRulz(opts: MockOptions = {}) {
     requests,
     loadConfigPosts,
     reSessions,
+    kits,
     close: () => new Promise<void>((r) => server.close(() => r()))
   }
 }

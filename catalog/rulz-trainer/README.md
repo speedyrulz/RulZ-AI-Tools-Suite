@@ -410,6 +410,8 @@ and write the same files in `~/.rulz_vast/fleet`. The tab is not shown when the 
   A relay (`race_follow`) cannot be split: every configuration continues from each round's winner.
 - **Every run on record.** Each run seen on any instance is kept with its settings, numbers, probe scores, thinned
   loss, time and cost, also after the instance is destroyed. Runs already on an instance when it joins are listed too.
+  Tick two or more and *Compare* charts them together: face, body, combined and loss, then (since 4.3.0) their region
+  sweeps by region, training pictures solid and held-out dashed, from each run's downloaded logs, then the probe images.
 - **Downloads, each kind by its own rule.** Logs and settings, probe images, sample images, training maps, the best
   LoRA and every LoRA / checkpoint each have a rule: *never*, *when the run ends* or *while it runs* (every 300 s by
   default). A single run can have its own rules. Files land in `~/.rulz_vast/runs/<instance>/<job>`, each fetched once

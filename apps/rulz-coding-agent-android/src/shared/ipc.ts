@@ -2,6 +2,8 @@
 import type {
   AgentEvent,
   AppSettings,
+  BatchOptions,
+  BatchState,
   ConnectionInfo,
   FileDiff,
   FolderListing,
@@ -93,6 +95,17 @@ export interface IpcInvoke {
   're:overview': () => ReOverview
   /** Starts a reverse-engineering task (analyse, practice or clone) in the open project. */
   're:start': (projectPath: string, req: ReStartRequest) => void
+  /** Changes RulZ LLM Suite's practice kit folder (needs RulZ LLM Suite 0.27.0) and returns the kit's tasks. */
+  're:setKit': (kitDir: string) => ReOverview['practice']
+
+  /** Practice batch runs: the saved runs and the one going now. */
+  'batch:state': () => BatchState
+  /** Starts a batch run of practice tasks in the open project. Tools are approved automatically in its tasks. */
+  'batch:start': (projectPath: string, label: string, options: BatchOptions, record: boolean) => BatchState
+  /** 'after' finishes the task in progress, then stops; 'now' stops that task too. */
+  'batch:stop': (mode: 'after' | 'now') => BatchState
+  /** Removes a saved run from the scoreboard (not the running one). */
+  'batch:delete': (id: string) => BatchState
   /** Saves the owner's "Things to always remember" for the project. */
   'project:setMemory': (projectPath: string, text: string) => void
 
@@ -118,6 +131,8 @@ export interface IpcEvents {
   /** The open project changed (opened, closed or undone, possibly from the phone), so every screen follows. */
   'project:changed': ProjectState | null
   'remote:changed': RemoteStatus
+  /** A batch run started, moved on, stopped or was removed. */
+  'batch:changed': BatchState
 }
 
 export type InvokeChannel = keyof IpcInvoke

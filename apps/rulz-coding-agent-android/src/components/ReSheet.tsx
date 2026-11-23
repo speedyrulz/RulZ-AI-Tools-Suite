@@ -1,21 +1,20 @@
 import { Folder, Play, RefreshCw } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { ReKind, ReOutcome, ReOverview, ReStartRequest } from '@shared/types'
+import { familyCounts, nextPracticeTask } from '@shared/batch'
+import type { BatchState, ReKind, ReOutcome, ReOverview, ReStartRequest } from '@shared/types'
 import { toast } from 'sonner'
-import { errorMessage, invoke } from '../lib/api'
+import { invoke } from '../lib/api'
 import { cn, relativeTime } from '../lib/format'
 import { useWorkspace } from '../stores/workspace'
 import { FolderPicker } from './FolderPicker'
+import { BatchRunBox, BatchScoreboard, friendlyReError, useBatchState } from './PracticeBatch'
 import { Badge, Button, Field, Input, Select, Sheet, Spinner, Switch, Textarea } from './ui'
 
 const OUTCOME_TONE: Record<ReOutcome, 'neutral' | 'ok' | 'warn' | 'danger'> = { unrated: 'neutral', solved: 'ok', partial: 'warn', failed: 'danger' }
 const KIND_LABEL: Record<ReKind, string> = { analyse: 'Analyse', practice: 'Practice', 'clone-pieces': 'Clone pieces', 'clone-full': 'Full clone' }
 
-/** A computer running an older RulZ Coding Agent doesn't know the RE requests. */
-function friendly(e: unknown): string {
-  const m = errorMessage(e)
-  return /re:(overview|start)/.test(m) ? 'Update RulZ Coding Agent on the computer to 0.18.0 or later to use reverse engineering from the phone.' : m
-}
+/** A computer running an older RulZ Coding Agent doesn't know the RE or batch requests. */
+const friendly = friendlyReError
 
 /** RulZ LLM Suite's RE overview, through the computer. */
 export function useReOverview(open: boolean): { data: ReOverview | null; error: string | null; loading: boolean; reload: () => void } {
@@ -45,6 +44,9 @@ export function ReSheet({ open, onOpenChange, initialTab = 'start' }: { open: bo
   const project = useWorkspace((s) => s.project)
   const running = useWorkspace((s) => s.running)
   const { data, error, loading, reload } = useReOverview(open)
+  const { state: batch, supported: batchSupported, setState: setBatch } = useBatchState(open, reload)
+  const batchActive = Boolean(batch?.activeId)
+  const busy = running || batchActive
   const [tab, setTab] = useState<ReTab>(initialTab)
   const [record, setRecord] = useState(true)
   useEffect(() => {
@@ -96,7 +98,11 @@ export function ReSheet({ open, onOpenChange, initialTab = 'start' }: { open: bo
         </button>
       </div>
       <div className="px-4 pb-4">
-        {running && <div className="mb-3 text-[13px] text-warn">A task is running; wait for it to finish before starting another.</div>}
+        {batchActive ? (
+          <div className="mb-3 text-[13px] text-warn">A batch run is going; stop it before starting another task.</div>
+        ) : (
+          running && <div className="mb-3 text-[13px] text-warn">A task is running; wait for it to finish before starting another.</div>
+        )}
         {error ? (
           <div className="rounded-xl border border-warn/40 bg-warn/10 p-3 text-[14px]">{error}</div>
         ) : !data ? (
@@ -104,9 +110,18 @@ export function ReSheet({ open, onOpenChange, initialTab = 'start' }: { open: bo
             <Spinner /> Asking RulZ LLM Suite…
           </div>
         ) : tab === 'start' ? (
-          <StartForm data={data} busy={running} onStart={start} />
+          <StartForm data={data} busy={busy} onStart={start} />
         ) : tab === 'practice' ? (
-          <PracticeList data={data} busy={running} onStart={(taskId) => void start({ kind: 'practice', taskId })} />
+          <PracticeList
+            data={data}
+            busy={busy}
+            record={record}
+            batch={batch}
+            batchSupported={batchSupported}
+            onBatchChange={setBatch}
+            onReload={reload}
+            onStart={(taskId) => void start({ kind: 'practice', taskId })}
+          />
         ) : (
           <SessionList data={data} />
         )}
@@ -230,44 +245,176 @@ function StartForm({ data, busy, onStart }: { data: ReOverview; busy: boolean; o
   )
 }
 
-function PracticeList({ data, busy, onStart }: { data: ReOverview; busy: boolean; onStart: (taskId: string) => void }) {
+function PracticeList({
+  data,
+  busy,
+  record,
+  batch,
+  batchSupported,
+  onBatchChange,
+  onReload,
+  onStart
+}: {
+  data: ReOverview
+  busy: boolean
+  record: boolean
+  batch: BatchState | null
+  batchSupported: boolean
+  onBatchChange: (s: BatchState) => void
+  onReload: () => void
+  onStart: (taskId: string) => void
+}) {
+  const project = useWorkspace((s) => s.project)
   const [family, setFamily] = useState('')
   const [unsolved, setUnsolved] = useState(false)
-  const families = useMemo(() => [...new Set(data.practice.tasks.map((t) => t.family))].sort(), [data])
-  const tasks = data.practice.tasks.filter((t) => (!family || t.family === family) && (!unsolved || t.solved === 0))
-  if (data.practice.error) return <div className="rounded-xl border border-warn/40 bg-warn/10 p-3 text-[14px]">{data.practice.error}</div>
-  if (!data.practice.tasks.length) return <div className="text-[14px] text-muted">No practice tasks in {data.practice.kitDir}.</div>
+  const [kitDraft, setKitDraft] = useState(data.practice.kitDir)
+  const [browseKit, setBrowseKit] = useState(false)
+  const [savingKit, setSavingKit] = useState(false)
+
+  useEffect(() => {
+    setKitDraft(data.practice.kitDir)
+  }, [data.practice.kitDir])
+
+  const allTasks = data.practice.tasks
+  const familyTiles = useMemo(() => familyCounts(allTasks), [allTasks])
+  const families = useMemo(() => familyTiles.map((f) => f.family), [familyTiles])
+  const scopedTasks = useMemo(() => allTasks.filter((t) => !family || t.family === family), [allTasks, family])
+  const nextTask = useMemo(() => nextPracticeTask(scopedTasks), [scopedTasks])
+  const tasks = useMemo(() => scopedTasks.filter((t) => !unsolved || t.solved === 0), [scopedTasks, unsolved])
+
+  const saveKit = async (nextDir: string): Promise<void> => {
+    const trimmed = nextDir.trim()
+    if (!trimmed || trimmed === data.practice.kitDir) {
+      setKitDraft(data.practice.kitDir)
+      return
+    }
+    setSavingKit(true)
+    try {
+      await invoke('re:setKit', trimmed)
+      onReload()
+    } catch (e) {
+      toast.error(friendly(e))
+    } finally {
+      setSavingKit(false)
+    }
+  }
+
   return (
-    <div className="space-y-3">
-      <Select value={family} onChange={(e) => setFamily(e.target.value)}>
-        <option value="">Every family</option>
-        {families.map((f) => (
-          <option key={f} value={f}>
-            {f}
-          </option>
-        ))}
-      </Select>
-      <label className="flex items-center gap-3 text-[14px]">
-        <Switch checked={unsolved} onCheckedChange={setUnsolved} /> Only ones not solved yet
-        <span className="ml-auto text-[12px] text-faint">{tasks.length} tasks</span>
-      </label>
-      <div className="divide-y divide-border rounded-xl border border-border">
-        {tasks.map((t) => (
-          <div key={t.id} className="flex items-center gap-3 px-3 py-2.5">
-            <div className="min-w-0 flex-1">
-              <div className="font-mono text-[14px]">{t.id}</div>
-              <div className="mt-0.5 flex flex-wrap gap-1">
-                <Badge>{t.family}</Badge>
-                <Badge>{t.tier}</Badge>
-                {t.solved > 0 ? <Badge tone="ok">solved {t.solved}/{t.attempts}</Badge> : t.attempts > 0 ? <Badge tone="danger">0/{t.attempts}</Badge> : null}
-              </div>
-            </div>
-            <Button disabled={busy} onClick={() => onStart(t.id)}>
-              <Play size={15} /> Start
+    <div className="space-y-4">
+      <Field label="Kit folder">
+        <div className="flex gap-2">
+          <Input
+            className="font-mono text-[13px]"
+            value={kitDraft}
+            placeholder="C:\path\to\re-training-kit"
+            disabled={savingKit}
+            onChange={(e) => setKitDraft(e.target.value)}
+            onBlur={() => void saveKit(kitDraft)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') e.currentTarget.blur()
+            }}
+          />
+          <Button aria-label="Browse folders" disabled={savingKit} onClick={() => setBrowseKit(true)}>
+            <Folder size={16} />
+          </Button>
+        </div>
+      </Field>
+      <FolderPicker
+        open={browseKit}
+        onOpenChange={setBrowseKit}
+        title="Choose the practice kit folder"
+        start={kitDraft.trim() || data.practice.kitDir || project?.path || ''}
+        action="Use this folder"
+        onPick={(p) => {
+          setBrowseKit(false)
+          setKitDraft(p)
+          void saveKit(p)
+        }}
+      />
+
+      {data.practice.error ? (
+        <div className="rounded-xl border border-warn/40 bg-warn/10 p-3 text-[14px]">{data.practice.error}</div>
+      ) : !allTasks.length ? (
+        <div className="text-[14px] text-muted">No practice tasks in {data.practice.kitDir}.</div>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 gap-2">
+            {familyTiles.map((c) => (
+              <button
+                key={c.family}
+                type="button"
+                onClick={() => setFamily(family === c.family ? '' : c.family)}
+                className={cn(
+                  'rounded-xl border px-3 py-2 text-left transition-colors',
+                  family === c.family ? 'border-accent/60 bg-accent-soft text-accent' : 'border-border bg-panel-2/40 active:bg-hover'
+                )}
+              >
+                <div className="truncate text-[14px] font-medium">{c.family}</div>
+                <div className="text-[12px] text-faint tabular-nums">
+                  {c.solved}/{c.total} solved · {c.tried} tried
+                </div>
+              </button>
+            ))}
+          </div>
+
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[13px] text-faint tabular-nums">
+              {allTasks.length} tasks{family ? ` · only ${family}` : ''}
+            </span>
+            <Button variant="secondary" disabled={!nextTask || busy} onClick={() => nextTask && onStart(nextTask.id)}>
+              <Play size={15} /> Start next task
             </Button>
           </div>
-        ))}
-      </div>
+
+          {batchSupported && (
+            <BatchRunBox
+              tasks={allTasks}
+              family={family}
+              record={record}
+              busy={busy}
+              state={batch}
+              onStateChange={onBatchChange}
+            />
+          )}
+        </>
+      )}
+
+      {batchSupported && <BatchScoreboard state={batch} onStateChange={onBatchChange} />}
+
+      {!data.practice.error && allTasks.length > 0 && (
+        <div className="space-y-3 pt-1">
+          <div className="text-[14px] font-medium">All tasks</div>
+          <Select value={family} onChange={(e) => setFamily(e.target.value)}>
+            <option value="">Every family</option>
+            {families.map((f) => (
+              <option key={f} value={f}>
+                {f}
+              </option>
+            ))}
+          </Select>
+          <label className="flex items-center gap-3 text-[14px]">
+            <Switch checked={unsolved} onCheckedChange={setUnsolved} /> Only ones not solved yet
+            <span className="ml-auto text-[12px] text-faint tabular-nums">{tasks.length} tasks</span>
+          </label>
+          <div className="divide-y divide-border rounded-xl border border-border">
+            {tasks.map((t) => (
+              <div key={t.id} className="flex items-center gap-3 px-3 py-2.5">
+                <div className="min-w-0 flex-1">
+                  <div className="font-mono text-[14px]">{t.id}</div>
+                  <div className="mt-0.5 flex flex-wrap gap-1">
+                    <Badge>{t.family}</Badge>
+                    <Badge>{t.tier}</Badge>
+                    {t.solved > 0 ? <Badge tone="ok">solved {t.solved}/{t.attempts}</Badge> : t.attempts > 0 ? <Badge tone="danger">0/{t.attempts}</Badge> : null}
+                  </div>
+                </div>
+                <Button disabled={busy} onClick={() => onStart(t.id)}>
+                  <Play size={15} /> Start
+                </Button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -340,6 +340,21 @@ export class RulzClient {
     return this.reJson<ReOverview>('/v1/re/overview')
   }
 
+  /** Changes RulZ LLM Suite's practice kit folder (one folder for both apps) and returns the kit's tasks. */
+  async setReKit(kitDir: string): Promise<ReOverview['practice']> {
+    const { url, apiKey } = this.config()
+    const res = await fetch(`${url}/v1/re/kit`, {
+      method: 'POST',
+      headers: headers(apiKey, true),
+      body: JSON.stringify({ kitDir }),
+      signal: AbortSignal.timeout(30000)
+    })
+    const text = await res.text()
+    if (res.status === 404) throw new ServerError('Update RulZ LLM Suite to 0.27.0 or later to change the kit folder from here.', 404)
+    if (!res.ok) throw new ServerError(errorFromBody(res.status, text), res.status)
+    return JSON.parse(text) as ReOverview['practice']
+  }
+
   /** Has RulZ LLM Suite copy a practice task's program into a fresh work folder. */
   preparePractice(taskId: string): Promise<{ target: string; prompt: string; family: string; tier: string }> {
     return this.reJson(`/v1/re/practice/${encodeURIComponent(taskId)}/prepare`, {})
