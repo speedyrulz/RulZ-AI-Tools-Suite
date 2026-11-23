@@ -1,7 +1,7 @@
 {
   "name": "rulz-writer-android",
   "productName": "RulZ Writer for Android",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Write in RulZ LLM Suite's Writing mode from an Android phone, over Tailscale.",
   "author": "RulZ",
   "license": "MIT",

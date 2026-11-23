@@ -41,8 +41,11 @@ export function chatAdapter(chat: ChatService, tap: ChatEventTap): WritingChat {
  * A sentence when the chat service has a request in flight (the desktop or the API is generating), else null.
  * WritingRuns asks only while no phone job runs, so a running request belongs to the desktop or the API.
  */
-export function chatBusyReason(chat: ChatService, benchRunning?: () => boolean): () => string | null {
+export function chatBusyReason(chat: ChatService, benchRunning?: () => boolean, gate?: { busyReason(): string | null }): () => string | null {
   return () => {
+    // A job of ours that is preparing (or between two requests) has no chat request in flight; the gate knows it runs.
+    const held = gate?.busyReason()
+    if (held) return held
     if (chat.busy) return 'LLM Suite is writing something else on the computer.'
     if (benchRunning?.()) return 'LLM Suite is running a benchmark on the computer.'
     return null

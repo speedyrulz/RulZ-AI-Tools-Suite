@@ -8,6 +8,9 @@ import { link } from './lib/remote'
 import { isNative, onBackButton, onPairingLink, onResume } from './lib/native'
 import { Computers, Connecting } from './pages/Computers'
 import { Projects } from './pages/Projects'
+import { Adventures, AdventureNew } from './pages/Adventures'
+import { AdventurePlay } from './pages/AdventurePlay'
+import { listenForAdventureChanges, useAdventure } from './stores/adventure'
 import { Settings } from './pages/Settings'
 import { leaveProject, Workspace } from './pages/Workspace'
 import { useAlerts } from './stores/alerts'
@@ -32,6 +35,7 @@ function start(askToPair: (c: Omit<Computer, 'id'>) => void): void {
   void useInterview.getState().init()
   listenForProjectChanges()
   listenForFileChanges()
+  listenForAdventureChanges()
 
   // After every (re)connection: the computer let go of the project with the old connection, so open it again,
   // then send what was typed while away and pick up what happened on the computer.
@@ -40,6 +44,8 @@ function start(askToPair: (c: Omit<Computer, 'id'>) => void): void {
     useApp.setState({ connectedOnce: true })
     void (async () => {
       const project = useProject.getState().state
+      void useAdventure.getState().load()
+      void useAdventure.getState().refresh()
       if (project) {
         await useProject.getState().reopen()
         await useJobs.getState().refresh(project.folder)
@@ -74,6 +80,7 @@ function start(askToPair: (c: Omit<Computer, 'id'>) => void): void {
     }
     const ui = useUi.getState()
     if (ui.view === 'projects') return false
+    if (ui.view === 'adventure-play') useAdventure.getState().close()
     if (ui.view === 'workspace') {
       if (ui.tab !== 'write') {
         ui.setTab('write')
@@ -106,6 +113,7 @@ export function App() {
     useEntry.getState().drop()
     useProject.setState({ state: null, projects: [], trash: [] })
     useJobs.getState().clear()
+    useAdventure.getState().close()
     useUi.setState({ view: 'projects', sceneId: null })
   }, [currentId])
 
@@ -114,6 +122,9 @@ export function App() {
   else if (!currentId) page = <Computers />
   else if (!ready) page = <Connecting />
   else if (view === 'settings') page = <Settings />
+  else if (view === 'adventures') page = <Adventures />
+  else if (view === 'adventure-new') page = <AdventureNew />
+  else if (view === 'adventure-play') page = <AdventurePlay />
   else if (view === 'workspace' && project) page = <Workspace />
   else page = <Projects />
 

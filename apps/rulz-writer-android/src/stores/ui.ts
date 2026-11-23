@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 
-export type View = 'projects' | 'workspace' | 'settings'
+export type View = 'projects' | 'workspace' | 'settings' | 'adventures' | 'adventure-new' | 'adventure-play'
 export type Tab = 'write' | 'bible' | 'state' | 'check' | 'interview'
 
 interface UiState {
@@ -32,7 +32,7 @@ export const useUi = create<UiState>((set, get) => ({
   outlineOpen: false,
   jobsOpen: false,
   go: (view) => set((s) => ({ view, previous: view === 'settings' ? s.view : s.previous, tab: view === 'workspace' && s.view !== 'workspace' ? 'write' : s.tab })),
-  back: () => set({ view: get().view === 'settings' ? get().previous : 'projects' }),
+  back: () => set({ view: get().view === 'settings' ? get().previous : get().view === 'adventure-new' || get().view === 'adventure-play' ? 'adventures' : 'projects' }),
   setTab: (tab) => set({ tab }),
   setScene: (sceneId) => set({ sceneId }),
   setCharacter: (characterId) => set({ characterId }),

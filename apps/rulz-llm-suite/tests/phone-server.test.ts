@@ -238,7 +238,7 @@ describe('PhoneServer', () => {
     expect(await paired.next()).toEqual({ t: 'event', channel: 'novel:changed', payload: { kind: 'deleted', folder: 'f', path: 'p' } })
     expect(paired.messages).toEqual([])
     expect(unpaired.messages).toEqual([])
-    expect([...PHONE_EVENTS].sort()).toEqual(['novel:changed', 'writing:job'])
+    expect([...PHONE_EVENTS].sort()).toEqual(['adventure:changed', 'adventure:job', 'novel:changed', 'writing:job'])
   })
 
   it('disconnects phones when the pairing code changes, and one phone on request', async () => {

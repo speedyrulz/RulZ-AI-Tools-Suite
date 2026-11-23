@@ -54,6 +54,7 @@ import {
 } from '@shared/novelRun'
 import type { ChatRequest, StreamEvent, WireMessage } from '@shared/types'
 import type { WritingAlt, WritingJob, WritingJobStatus, WritingResult, WritingRunRequest, WritingStateItem } from '@shared/phone'
+import type { ModelGateLike } from '../modelGate'
 
 // ---------------------------------------------------------------------------------------------
 // What the service needs from its surroundings
@@ -101,6 +102,8 @@ export interface WritingRunsDeps {
   emit: (job: WritingJob) => void
   /** Why something else holds the model right now (the desktop is generating), or null. */
   busyReason?: () => string | null
+  /** The one-model-job-at-a-time gate shared with adventure jobs (src/main/modelGate.ts): taken where a job starts. */
+  gate?: ModelGateLike
   now?: () => number
   newId?: () => string
   /** Least gap between two streaming emits; default 250 (about 4 a second). */
@@ -125,6 +128,8 @@ interface JobRec {
   job: WritingJob
   stopRequested: boolean
   abort: (() => void) | null
+  /** Gives the model gate back; called once, where the job ends. */
+  release?: () => void
   lastEmit: number
   timer: ReturnType<typeof setTimeout> | null
   /** Update state: what the result's items would do, for applyState. */
@@ -203,6 +208,11 @@ export class WritingRuns {
       timer: null,
       owner,
       applyChain: Promise.resolve()
+    }
+    if (this.deps.gate) {
+      const got = this.deps.gate.take(`writing:${rec.job.id}`)
+      if (typeof got === 'string') throw new Error(`${got} Try again when it has finished.`)
+      rec.release = got
     }
     this.trim(req.folder)
     this.jobs.set(rec.job.id, rec)
@@ -471,6 +481,7 @@ export class WritingRuns {
       else this.fail(rec, errorMessage(e))
     } finally {
       if (held) await this.deps.store.release(req.folder, holder).catch(() => undefined)
+      rec.release?.()
       if (this.current === rec) this.current = null
     }
   }

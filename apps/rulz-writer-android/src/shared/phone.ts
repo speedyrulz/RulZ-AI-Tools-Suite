@@ -10,6 +10,7 @@
 //                    { t: 'event', channel, payload }           { t: 'denied', reason }
 //
 // Only the channels in PHONE_INVOKE are answered, and only the events in PHONE_EVENTS are sent.
+import { PHONE_ADVENTURE_CHANNELS, type AdventureIpcEvents, type AdventureIpcInvoke } from './adventure'
 import type {
   BibleEntry,
   CheckFinding,
@@ -233,16 +234,21 @@ export const PHONE_WRITING_CHANNELS = [
   'writing:models'
 ] as const satisfies readonly (keyof WritingIpcInvoke)[]
 
-export const PHONE_INVOKE: ReadonlySet<string> = new Set<string>([...PHONE_NOVEL_CHANNELS, ...PHONE_WRITING_CHANNELS])
+// Adventure mode (src/shared/adventure.ts): PHONE_ADVENTURE_CHANNELS leaves out the desktop-only deletes and the save
+// dialog. A computer older than the phone refuses these channels ("That is not available from the phone."); the
+// phone says to update RulZ LLM Suite then. PHONE_PROTOCOL stays 1, so older phones keep working with newer computers.
+export const PHONE_INVOKE: ReadonlySet<string> = new Set<string>([...PHONE_NOVEL_CHANNELS, ...PHONE_WRITING_CHANNELS, ...PHONE_ADVENTURE_CHANNELS])
 
-export type PhoneEventChannel = 'novel:changed' | 'writing:job'
-export const PHONE_EVENTS: ReadonlySet<string> = new Set<PhoneEventChannel>(['novel:changed', 'writing:job'])
+export type PhoneEventChannel = 'novel:changed' | 'writing:job' | 'adventure:job' | 'adventure:changed'
+export const PHONE_EVENTS: ReadonlySet<string> = new Set<PhoneEventChannel>(['novel:changed', 'writing:job', 'adventure:job', 'adventure:changed'])
 
 /** Typed view of what the phone can call (for the phone's remote.invoke). */
-export type PhoneInvoke = Pick<NovelIpcInvoke, (typeof PHONE_NOVEL_CHANNELS)[number]> & WritingIpcInvoke
+export type PhoneInvoke = Pick<NovelIpcInvoke, (typeof PHONE_NOVEL_CHANNELS)[number]> &
+  WritingIpcInvoke &
+  Pick<AdventureIpcInvoke, (typeof PHONE_ADVENTURE_CHANNELS)[number]>
 export type PhoneInvokeChannel = keyof PhoneInvoke
 
-export interface PhoneEvents {
+export interface PhoneEvents extends AdventureIpcEvents {
   'novel:changed': NovelChange
   'writing:job': WritingJob
 }

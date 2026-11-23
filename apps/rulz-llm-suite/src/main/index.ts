@@ -35,6 +35,12 @@ import { ChatEventTap, chatAdapter, chatBusyReason, modelsAdapter, storeAdapter 
 import { WritingEvents, writingHandlers } from './writing/ipc'
 import { WritingRuns } from './writing/runs'
 import { PHONE_WRITING_CHANNELS } from '@shared/phone'
+import { PHONE_ADVENTURE_CHANNELS } from '@shared/adventure'
+import { adventureDesktopHandlers, adventureHandlers } from './adventure/ipc'
+import { AdventureRuns } from './adventure/runs'
+import { AdventureStore } from './adventure/store'
+import { ModelGate } from './modelGate'
+import { writeTextAtomic } from './util/jsonFile'
 
 const MiB = 1024 * 1024
 const isDev = !app.isPackaged && !!process.env.ELECTRON_RENDERER_URL
@@ -567,11 +573,14 @@ async function main(): Promise<void> {
   handle('phone:disconnect', (clientId) => phone.access.disconnect(clientId))
   // Writing runs: AI actions started from the phone, run here (docs/phone-access-design.md, "Writing runs").
   const writingEvents = new WritingEvents()
+  // One model job at a time for the jobs main runs itself: the phone's Writing runs and adventure jobs.
+  const modelGate = new ModelGate()
   const writingRuns = new WritingRuns({
     store: storeAdapter(novel),
     chat: chatAdapter(chat, chatTap),
     models: modelsAdapter(library, instances),
-    busyReason: chatBusyReason(chat, () => bench.isRunning()),
+    busyReason: chatBusyReason(chat, () => bench.isRunning(), modelGate),
+    gate: modelGate,
     // A phone may use a project's jobs while it holds the project open (a reconnected phone has a new id).
     holds: (owner, folder) => novel.ownersOf(folder).includes(owner),
     emit: writingEvents.emit
@@ -581,6 +590,50 @@ async function main(): Promise<void> {
   for (const channel of PHONE_WRITING_CHANNELS) {
     // runAs: a state patch from Apply is announced as the phone's change, so the window hears about it.
     phone.handlers.register(channel, ((owner: string, ...args: unknown[]) => runAs(owner, () => writing[channel](owner, ...args))) as never)
+  }
+
+  // ---- Adventure mode (docs/adventure-mode-design.md): saved files, jobs, and the same channels for window and phone ----
+  const adventureStore = new AdventureStore({
+    dir: join(userData, 'adventures'),
+    trash: (path) => shell.trashItem(path),
+    emit: (change) => {
+      broadcast('adventure:changed', change)
+      phone.emit('adventure:changed', change)
+    }
+  })
+  const adventureRuns = new AdventureRuns({
+    store: adventureStore,
+    chat: chatAdapter(chat, chatTap),
+    models: modelsAdapter(library, instances),
+    gate: modelGate,
+    busyReason: chatBusyReason(chat, () => bench.isRunning(), modelGate),
+    emit: (job) => {
+      broadcast('adventure:job', job)
+      phone.emit('adventure:job', job)
+    }
+  })
+  const adventureDeps = { store: adventureStore, runs: adventureRuns, novel }
+  const adventureTable = adventureHandlers(adventureDeps)
+  const adventureDesktopTable = adventureDesktopHandlers({
+    ...adventureDeps,
+    chooseSavePath: async (defaultName) => {
+      const r = await dialog.showSaveDialog(mainWindow!, {
+        title: 'Export the story',
+        defaultPath: join(app.getPath('documents'), defaultName),
+        filters: [{ name: 'Markdown', extensions: ['md'] }]
+      })
+      return r.canceled || !r.filePath ? null : r.filePath
+    },
+    writeText: (path, text) => writeTextAtomic(path, text)
+  })
+  for (const channel of Object.keys({ ...adventureTable, ...adventureDesktopTable }) as (keyof typeof adventureTable | keyof typeof adventureDesktopTable)[]) {
+    const fn = channel in adventureTable ? adventureTable[channel as keyof typeof adventureTable] : adventureDesktopTable[channel as keyof typeof adventureDesktopTable]
+    handle(channel, ((...args: unknown[]) => fn(WINDOW_OWNER, ...args)) as never)
+  }
+  // The phone may call PHONE_ADVENTURE_CHANNELS only (no deletes, no save dialog); adventure:create's worldFolder is
+  // checked in the phone dispatcher (phone/registry.ts).
+  for (const channel of PHONE_ADVENTURE_CHANNELS) {
+    phone.handlers.register(channel, ((owner: string, ...args: unknown[]) => adventureTable[channel](owner, ...args)) as never)
   }
   void phone.access.start()
 

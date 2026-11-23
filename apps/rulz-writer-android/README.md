@@ -31,6 +31,9 @@ and pairing code) is kept in the app's private storage and left out of Android b
 
 ## What you can do
 
+**Adventures** lets you play branching stories on your computer's model. Start with an idea or a Writing project,
+choose a path or type an action, and use the map to return to earlier passages. Export shares the current path.
+
 - **Projects**: the projects in the computer's Writing folder; open one or start a new one.
 - **Write**: pick a scene from **Chapters and scenes** and write in it. Your text is saved on the computer about a
   second after you stop typing, with the same safety rules as the desktop: a save made on top of a file that changed

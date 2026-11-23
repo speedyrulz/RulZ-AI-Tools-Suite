@@ -82,6 +82,15 @@ export class PhoneHandlers {
       if (typeof folder !== 'string' || !isAbsolute(folder)) throw new Error('The project folder must be a full path.')
       const known = (await this.guards.projectFolders()).map(normalise)
       if (!known.includes(normalise(folder))) throw new Error('The phone can only open projects in the projects folder.')
+    } else if (channel === 'adventure:create') {
+      // A Writing project whose world is copied into the adventure: the same folders novel:openProject allows; the
+      // phone does not need to have opened it.
+      const folder = args[1]
+      if (folder !== undefined && folder !== null) {
+        if (typeof folder !== 'string' || !isAbsolute(folder)) throw new Error('The project folder must be a full path.')
+        const known = (await this.guards.projectFolders()).map(normalise)
+        if (!known.includes(normalise(folder))) throw new Error('The phone can only use projects in the projects folder.')
+      }
     } else if (channel === 'novel:saveFile') {
       const req = args[0] as { baseHash?: unknown; force?: unknown } | null | undefined
       if (!req || typeof req !== 'object') throw new Error('The save request is missing.')
