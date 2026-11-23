@@ -98,6 +98,8 @@ describe('messages', () => {
     const schema = choosingSchema(3) as { required: string[]; properties: Record<string, any> }
     expect(schema.required).toEqual(['choices', 'ended', 'changes'])
     expect(schema.properties.choices.maxItems).toBe(3)
+    expect(schema.properties.choices.minItems).toBe(2)
+    expect(schema.properties.choices.items.minLength).toBe(1)
     expect(schema.properties.changes.properties.setStats.type).toBe('array')
     expect(schema.properties.changes.properties.setStats.items.required).toEqual(['name', 'value'])
     expect(() => JSON.stringify(schema)).not.toThrow()
