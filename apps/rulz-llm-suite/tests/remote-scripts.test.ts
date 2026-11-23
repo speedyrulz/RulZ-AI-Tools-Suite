@@ -9,6 +9,7 @@ import {
   freeSpaceScript,
   hfConfigLine,
   hfDownloadScript,
+  hfStopScript,
   keepaliveLoopScript,
   launchCheckScript,
   markCompleteScript,
@@ -169,6 +170,7 @@ const builders: Array<[string, string]> = [
       { url: 'https://huggingface.co/o/r/resolve/main/mmproj.gguf', name: 'mmproj.gguf', size: null, sha256: null }
     ])
   ],
+  ['hf stop', hfStopScript('my-model')],
   ['mark complete', markCompleteScript('my-model', [{ name: 'a.gguf', size: 5, sha256: SHA, source: '-' }, { name: 'b.gguf', size: 6, sha256: '-', source: '-' }])],
   ['model state', modelStateScript('my-model')],
   ['remove model', removeModelScript('my-model')],
@@ -846,6 +848,19 @@ describe.skipIf(!hasBash)('bash: server start, status, log, stop', () => {
       expect(marker(box.run(serverStatusScript('inst1')).stdout, 'ALIVE')).toBe('0')
       // Stopping again is fine.
       expect(marker(box.run(serverStopScript('inst1')).stdout, 'STOPPED')).toBe('1')
+    })
+  )
+
+  bashIt('starts the server and its supervisor without the Hugging Face token of the instance', () =>
+    withBox((box) => {
+      const tokens = { HF_TOKEN: 'hf_secret_one', HUGGING_FACE_HUB_TOKEN: 'hf_secret_two', HUGGINGFACE_TOKEN: 'hf_secret_three' }
+      const r = start(box, 'env > "$T/srv.env"; sleep 300; :', tokens)
+      expect(r.code, r.stdout).toBe(0)
+      box.sh('sleep 0.5')
+      expect(box.sh('grep -c "^HF" "$T/srv.env"; grep -c hf_secret "$T/srv.env"')).toBe('0\n0')
+      // The supervisor (sup.sh) started from the same script: no token in its environment either.
+      expect(box.sh('for p in $(grep -la "sup.sh" /proc/[0-9]*/cmdline | sed "s|/proc/\\([0-9]*\\)/.*|\\1|"); do tr "\\0" "\\n" </proc/$p/environ; done | grep -c "hf_secret"')).toBe('0')
+      box.run(serverStopScript('inst1'))
     })
   )
 

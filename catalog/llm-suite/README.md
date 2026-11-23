@@ -187,7 +187,8 @@ Discover/downloads, RAG and a CLI are planned.
     enforces the same limits when the app or the PC is off. Stopping keeps the disk, which is still billed. The top bar
     shows what the rentals cost; quitting asks what to do with running ones.
   - **Models**: pick a model from this PC (its files are uploaded, with resume and checksums) or from Hugging Face
-    (downloaded on the instance; gated repositories need a token). **Set up** installs the llama.cpp Linux CUDA build
+    (downloaded on the instance over 16 connections, with the speed shown, 0.31.0; gated repositories need a token).
+    **Set up** installs the llama.cpp Linux CUDA build
     with the same build number as this PC's, checked against GitHub's checksums, and the model's files.
   - A loaded remote model works everywhere a local one does: chat, Reverse Engineering, Writing, Adventure and the API
     server. The API server and the phone only use one that is already loaded. The connection is an ssh tunnel that

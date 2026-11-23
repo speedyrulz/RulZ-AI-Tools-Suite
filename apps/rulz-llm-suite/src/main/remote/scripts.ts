@@ -405,12 +405,48 @@ export interface HfFileInput {
 
 const HF_URL_RE = /^https:\/\/huggingface\.co\/[A-Za-z0-9._~%/+@-]+$/
 
+// ---------- Owner of a model folder (design: docs/vast-design.md, section 6) ----------
+
+/**
+ * Only one script at a time may write into models/<slug>/. Every process of a download (the script, its subshells, every
+ * curl) has `models/.own-<slug>` (next to the folder, so that removing the model keeps it) open as file descriptor 9,
+ * which it inherits, so what an earlier script left running is found through /proc even when its parent is gone. take_dl opens the file first and then ends everybody else who has it open: of two
+ * scripts that start together at most one stays. This is the normal case, not a rare one: ssh.run runs a script again on the next
+ * route after a transport error, and a dropped or cancelled ssh does not end remote children. Needs emit.
+ * The scan starts no process of its own (a child would have the file open too).
+ */
+const OWNER_FN = bash`
+holds(){ local p; HOLD=(); for p in /proc/[0-9]*; do p=@{p#/proc/}; [ "$p" = "$$" ] || [ "$p" = "$BASHPID" ] || { [ "/proc/$p/fd/9" -ef "@{1%/*}/.own-@{1##*/}" ] && HOLD+=("$p"); }; done; return 0; }
+take_dl(){ local i
+mkdir -p "$1"; { exec 9>>"@{1%/*}/.own-@{1##*/}"; } 2>/dev/null || { emit ERR "The model folder on the instance cannot be written to."; exit 38; }
+for i in $(seq 1 40); do
+holds "$1"; [ "@{#HOLD[@]}" = 0 ] && return 0
+kill -KILL "@{HOLD[@]}" 2>/dev/null; sleep 0.25
+done
+emit ERR "An earlier download on the instance would not stop."; exit 38; }
+`
+
+/** A file of this name recorded as complete from another address (another revision, say) is not kept. Needs $M. */
+const SRC_FN = bash`
+src_check(){ local rec; rec=$(awk -F'\t' -v n="$2" '$1==n{print $4}' "$M/.complete" 2>/dev/null)
+if [ -n "$rec" ] && [ "$rec" != - ] && [ "$rec" != "$1" ]; then
+rm -f "$M/$2" "$M/$2.part"
+awk -F'\t' -v n="$2" '$1!=n' "$M/.complete" >"$M/.complete.tmp" 2>/dev/null && mv "$M/.complete.tmp" "$M/.complete"
+fi; }
+`
+
 /**
  * Downloads files into models/<slug>/ with curl. The Hugging Face token never reaches the instance. The first line of
  * stdin is empty (public files), or, for one gated file, a curl config line with the short-lived signed address this
  * PC got for it: it reaches curl through a pipe from printf, a shell builtin, so it is not in argv, the environment or
  * a file. Exit 36: the signed address was refused (they expire after about an hour). Resumes with -C - into `<name>.part`, checks size and
  * sha256 (once more from scratch if a resumed file fails the hash), then renames.
+ *
+ * With a known size and at least 64 MB missing it fetches 16 MB chunks over 16 connections (one curl per chunk, ranged,
+ * address on stdin) and appends them to `.part` in order, so `.part` is always a plain prefix of the file and the only
+ * resume state. A server that answers a ranged request with 200 gets the single curl. A script whose stdout is gone
+ * (the progress line cannot be printed) ends itself and its workers. It takes over the folder first (see OWNER_FN).
+ * RZ_CHUNK, RZ_CONNS, RZ_MULTI_MIN and RZ_POLL are for tests.
  */
 export function hfDownloadScript(slug: string, files: HfFileInput[]): string {
   assertSlug(slug)
@@ -428,30 +464,126 @@ ${PRELUDE}
 IFS= read -r CFG
 M="$R/models/"${shq(slug)}
 mkdir -p "$M"
+${OWNER_FN}
+${SRC_FN}
+# With stdout gone, printf fails instead of killing the subshell that prints: that failure ends the whole script.
+trap '' PIPE
+take_dl "$M"
+rm -rf "$M/.dl"
+trap 'rm -rf "$M/.dl"' EXIT
+CH=@{RZ_CHUNK:-16777216}; NC=@{RZ_CONNS:-16}; ACFG=
+bye(){ holds "$M"; kill -KILL $$ @{HOLD[@]+"@{HOLD[@]}"} 2>/dev/null; exit 0; }
+tree(){ cat /proc/[0-9]*/stat 2>/dev/null | awk -v r="$1" '{s=$0; sub(/^.*\) /,"",s); split(s,a," "); pp[$1]=a[2]} END{k[r]=1; do{c=0; for(p in pp) if(!(p in k) && (pp[p] in k)){k[p]=1; c=1}}while(c); for(p in k) print p}'; }
+pbytes(){ local p c; p=$(stat -c%s "$1" 2>/dev/null || echo 0); c=$(stat -c%s "$M"/.dl/*[0-9] 2>/dev/null | awk '{t+=$1}END{print t+0}'); echo $((p+c)); }
 curlc(){ if [ -n "$CFG" ]; then printf '%s\n' "$CFG" | curl --globoff --config - "@{@:2}"; else curl "@{@:2}" "$1"; fi; }
 sha_ok(){ [ "$2" = - ] || [ "$(sha256sum "$1" | cut -d' ' -f1)" = "$2" ]; }
-dl(){
-local url=$1 name=$2 size=$3 sha=$4 again=$5 dest="$M/$2" part="$M/$2.part" cur code try wp rc rec ok=0
-if [ "$size" = - ] && [ -z "$CFG" ]; then size=$(curlc "$url" -sIL --max-time 60 2>/dev/null | tr -d '\r' | awk 'tolower($1)=="content-length:"{v=$2} END{print v+0}'); [ "$size" = 0 ] && size=-; fi
-rec=$(awk -F'\t' -v n="$name" '$1==n{print $4}' "$M/.complete" 2>/dev/null)
-if [ -n "$rec" ] && [ "$rec" != - ] && [ "$rec" != "$url" ]; then
-# The file of this name came from another address (another revision, say): do not keep it.
-rm -f "$dest" "$part"
-awk -F'\t' -v n="$name" '$1!=n' "$M/.complete" >"$M/.complete.tmp" 2>/dev/null && mv "$M/.complete.tmp" "$M/.complete"
+# The address a ranged fetch of a public file uses: where huggingface.co sends it (a signed storage address). Returns 0 = RES set,
+# 1 = try again later, 2 = no ranges (single curl), 4 = refused, 5 = not found.
+resolve(){ local o c
+o=$(curl -sSL -r 0-0 --connect-timeout 20 -m 60 -o /dev/null -w '%{http_code} %{url_effective}' "$1" 2>/dev/null); c=@{o%% *}; RES=@{o#* }
+case "$RES" in https://*) ;; *) RES=;; esac
+case "$RES" in *[!!-~]*|*\"*|*\\*) RES=;; esac
+case "$c" in 206) [ -n "$RES" ] && return 0; return 2;; 401|403) return 4;; 404) return 5;; 200|2??|3??) return 2;; *) return 1;; esac; }
+# One chunk (name, offset, length, curl config line), up to 3 tries; the answer is written to <chunk>.rc: ok, whole (the server
+# ignored the range), auth, missing or fail. --max-filesize keeps a server that sends the whole file for a range from doing so.
+chunk(){ local f="$M/.dl/$1.$2" t c sz r=fail
+for t in 1 2 3; do
+rm -f "$f"
+c=$(printf '%s\n' "$4" | curl --globoff --config - -sSL -r "$2-$(($2+$3-1))" --max-filesize "$3" --connect-timeout 20 --speed-limit 1000 --speed-time 60 -o "$f" -w '%{http_code}' 2>/dev/null)
+sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+case "$c" in
+206) if [ "$sz" = "$3" ]; then r=ok; break; fi; r=fail;;
+200) r=whole; break;;
+401|403) r=auth; break;;
+404) r=missing; break;;
+*) r=fail;;
+esac
+sleep @{RZ_RETRY_SLEEP:-3}
+done
+rm -f "$f.rc.tmp"; printf '%s\n' "$r" >"$f.rc.tmp" && mv "$f.rc.tmp" "$f.rc"; }
+# These three use the locals of mfetch (bash scopes by call).
+launch(){ local off=$((start+$1*CH)) len; len=$((size-off)); [ "$len" -gt "$CH" ] && len=$CH
+gn[$1]=$gen; ( chunk "$name" "$off" "$len" "$ACFG" ) & wp[$1]=$!; }
+stop_workers(){ local k x; for ((k=app;k<next;k++)); do [ -f "$W/$name.$((start+k*CH)).rc" ] && continue; for x in $(tree "@{wp[k]}"); do kill -KILL "$x" 2>/dev/null; done; wait "@{wp[k]}" 2>/dev/null; done; rm -rf "$W"; }
+# Fetches the rest of a file (after the bytes of .part) in chunks over several connections, appended to .part in order as
+# they finish. Returns 0 = done, 1 = try again later, 2 = no ranges, 3 = the signed address was refused, 4 = refused, 5 = not found.
+mfetch(){ local url=$1 name=$2 size=$3 part=$4 W="$M/.dl" start n next=0 app=0 gen=0 nres=0 r f rr k run
+local -a wp=() gn=()
+start=$(stat -c%s "$part" 2>/dev/null || echo 0)
+n=$(( (size-start+CH-1)/CH ))
+rm -rf "$W"; mkdir -p "$W"
+if [ -n "$CFG" ]; then ACFG=$CFG; else resolve "$url"; rr=$?; [ "$rr" = 0 ] || { rm -rf "$W"; return "$rr"; }; ACFG="url = \"$RES\""; fi
+while [ "$app" -lt "$n" ]; do
+# One slow connection must not hold the others back: they go up to three rounds ahead of the chunk that is appended next.
+run=0; for ((k=app;k<next;k++)); do [ -f "$W/$name.$((start+k*CH)).rc" ] || run=$((run+1)); done
+# Chunks that were refused with an older address are fetched again side by side, not one by one when their turn comes.
+for ((k=app+1;k<next&&run<NC;k++)); do
+[ "@{gn[k]}" != "$gen" ] && read -r r 2>/dev/null <"$W/$name.$((start+k*CH)).rc" && [ "$r" = auth ] || continue
+rm -f "$W/$name.$((start+k*CH)).rc"; launch "$k"; run=$((run+1))
+done
+while [ "$next" -lt "$n" ] && [ "$run" -lt "$NC" ] && [ $((next-app)) -lt $((NC*3)) ]; do launch "$next"; next=$((next+1)); run=$((run+1)); done
+f="$W/$name.$((start+app*CH))"
+if [ ! -f "$f.rc" ]; then
+# A worker that is gone without an answer (killed, or a full disk) must not be waited for.
+if ! kill -0 "@{wp[app]}" 2>/dev/null && [ ! -f "$f.rc" ]; then stop_workers; return 1; fi
+sleep 0.2; continue
 fi
+r=$(cat "$f.rc")
+case "$r" in
+ok) if cat "$f" >>"$part"; then rm -f "$f" "$f.rc"; app=$((app+1)); nres=0; else stop_workers; return 1; fi;;
+whole) stop_workers; return 2;;
+missing) stop_workers; return 5;;
+auth)
+if [ -n "$CFG" ]; then stop_workers; return 3; fi
+if [ "@{gn[app]}" = "$gen" ]; then
+# Only a chunk that was started with the newest address may ask for another one.
+if [ "$nres" -ge 6 ]; then stop_workers; return 4; fi
+nres=$((nres+1)); resolve "$url"; rr=$?; [ "$rr" = 0 ] || { stop_workers; return "$rr"; }
+gen=$((gen+1)); ACFG="url = \"$RES\""
+fi
+rm -f "$f.rc"; launch "$app";;
+*) stop_workers; return 1;;
+esac
+done
+rm -rf "$W"; return 0; }
+dl(){
+local url=$1 name=$2 size=$3 sha=$4 again=$5 dest="$M/$2" part="$M/$2.part" cur code try=0 last wp rc ok=0 multi=1 mr nc
+if [ "$size" = - ] && [ -z "$CFG" ]; then size=$(curlc "$url" -sIL --max-time 60 2>/dev/null | tr -d '\r' | awk 'tolower($1)=="content-length:"{v=$2} END{print v+0}'); [ "$size" = 0 ] && size=-; fi
+# The file of this name may have come from another address (another revision, say): then do not keep it.
+src_check "$url" "$name"
 if [ -f "$dest" ]; then
 cur=$(stat -c%s "$dest")
 if [ "$size" != - ] && [ "$cur" = "$size" ] && sha_ok "$dest" "$sha"; then emit FILE_DONE "$name"; return 0; fi
 rm -f "$dest"
 fi
 [ -f "$part" ] || : >"$part"
-for try in 1 2 3 4 5 6; do
+last=$(stat -c%s "$part")
+while [ "$try" -lt 6 ]; do
 cur=$(stat -c%s "$part")
+# The tries are for a download that does not move: after another megabyte they start over.
+try=$((try+1)); if [ $((cur-last)) -ge 1048576 ]; then try=1; last=$cur; fi
 if [ "$size" != - ] && [ "$cur" -gt "$size" ]; then rm -f "$part"; : >"$part"; cur=0; fi
 if [ "$size" != - ] && [ "$cur" = "$size" ]; then ok=1; break; fi
+if [ "$multi" = 1 ] && [ "$size" != - ] && [ $((size-cur)) -ge "@{RZ_MULTI_MIN:-67108864}" ]; then
+nc=$(( (size-cur+CH-1)/CH )); [ "$nc" -gt "$NC" ] && nc=$NC
+emit STAGE "Downloading $name, $nc connections"
+# Never lower than before and never over the size: a chunk is counted twice for an instant while it is appended.
+( mx=0; while sleep "@{RZ_POLL:-2}"; do v=$(pbytes "$part"); [ "$v" -gt "$size" ] && v=$size; [ "$v" -lt "$mx" ] && v=$mx; mx=$v; emit PROG "$name|$v|$size" || bye; done ) & wp=$!
+mfetch "$url" "$name" "$size" "$part"; mr=$?
+kill "$wp" 2>/dev/null; wait "$wp" 2>/dev/null
+case "$mr" in
+0) ok=1; break;;
+2) multi=0; continue;;
+3) emit ERR "The download address of $name was refused (http 403)."; exit 36;;
+4) emit ERR "Hugging Face refused the download of $name. A gated or private repository needs a token with access."; exit 31;;
+5) emit ERR "Hugging Face has no file $name at this address (http 404)."; exit 32;;
+esac
+sleep @{RZ_RETRY_SLEEP:-3}
+continue
+fi
 emit STAGE "Downloading $name"
-( while sleep 2; do emit PROG "$name|$(stat -c%s "$part" 2>/dev/null || echo 0)|$size"; done ) & wp=$!
-code=$(curlc "$url" -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 -C - -o "$part" -w '%{http_code}' 2>/dev/null); rc=$?
+( while sleep "@{RZ_POLL:-2}"; do emit PROG "$name|$(stat -c%s "$part" 2>/dev/null || echo 0)|$size" || bye; done ) & wp=$!
+code=$(curlc "$url" -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -C - -o "$part" -w '%{http_code}' 2>/dev/null); rc=$?
 kill "$wp" 2>/dev/null; wait "$wp" 2>/dev/null
 case "$code" in
 401|403) if [ -n "$CFG" ]; then emit ERR "The download address of $name was refused (http $code)."; exit 36; fi; emit ERR "Hugging Face refused the download of $name (http $code). A gated or private repository needs a token with access."; exit 31;;
@@ -486,6 +618,21 @@ export function hfConfigLine(signedUrl: string | null): string {
   if (!signedUrl) return '\n'
   if (!/^https:\/\/[!-~]+$/.test(signedUrl) || /["\\]/.test(signedUrl)) throw new Error('The download address has characters that cannot be sent.')
   return `url = "${signedUrl}"\n`
+}
+
+/** Ends a download that still runs on the instance (a cancelled setup) and clears its chunks; `.part` stays for the next try. */
+export function hfStopScript(slug: string): string {
+  assertSlug(slug)
+  return bash`
+set -u
+${PRELUDE}
+M="$R/models/"${shq(slug)}
+${OWNER_FN}
+[ -d "$M" ] || { emit STOPPED 1; exit 0; }
+take_dl "$M"
+rm -rf "$M/.dl"
+emit STOPPED 1
+`
 }
 
 export interface CompleteFile {
@@ -541,32 +688,40 @@ export function parseComplete(text: string): CompleteEntry[] {
   return out
 }
 
-/** Sizes of the files of a model folder: FILE=name|size, PART=name|size, and the .complete content (base64). */
+/**
+ * Sizes of the files of a model folder: FILE=name|size, PART=name|size, the .complete content (base64) and the free disk.
+ * Chunks that a download left behind are cleared first, so that they do not count against the free disk.
+ */
 export function modelStateScript(slug: string): string {
   assertSlug(slug)
   return bash`
 ${PRELUDE}
 M="$R/models/"${shq(slug)}
+${OWNER_FN}
+holds "$M"; [ "@{#HOLD[@]}" = 0 ] && rm -rf "$M/.dl"
 for f in "$M"/*; do [ -f "$f" ] || continue; n=$(basename "$f"); case "$n" in *.part) emit PART "$n|$(stat -c%s "$f")";; *) emit FILE "$n|$(stat -c%s "$f")";; esac; done
 emit COMPLETE_B64 "$(base64 -w0 "$M/.complete" 2>/dev/null)"
 emit DISK_FREE "$(df -PB1 "$R" 2>/dev/null | awk 'NR==2{print $4}')"
 `
 }
 
-/** Refuses (exit 60) while a live server of ours was started on this model. */
+/** Refuses (exit 60) while a live server of ours was started on this model; ends a download into the folder first (exit 38 when it will not stop). */
 export function removeModelScript(slug: string): string {
   assertSlug(slug)
   return bash`
 ${PRELUDE}
 ${STATUS_FN}
 S=${shq(slug)}
+M="$R/models/$S"
+${OWNER_FN}
 for D in "$R"/run/*/; do
 id=$(basename "$D"); [ -f "$D/args" ] || continue
 if grep -qF "/models/$S/" "$D/args" 2>/dev/null; then
 out=$(rzs "$id"); case "$out" in *"@rz ALIVE=1"*) emit ERR "A server is running on this model. Unload it first."; exit 60;; esac
 fi
 done
-rm -rf "$R/models/$S"
+take_dl "$M"
+rm -rf "$M"
 emit REMOVED 1
 `
 }
@@ -661,6 +816,8 @@ ${PRELUDE}
 ID=${shq(id)}
 E="$R/engine/"${shq(tag)}
 [ -f "$E/.ok" ] || { emit ERR "The engine is not installed on the instance."; exit 40; }
+# A token of the user's account environment must not reach the server or its supervisor (a model could print its environment).
+unset HF_TOKEN HUGGING_FACE_HUB_TOKEN HUGGINGFACE_TOKEN
 . "$E/run-env" || { emit ERR "The engine's environment file is broken."; exit 41; }
 D="$R/run/$ID"
 mkdir -p "$D"
