@@ -3,11 +3,13 @@
 // (docs/vast-design.md, section 8). Everything it touches comes in through SessionDeps, so tests run it against
 // a scripted model.
 import { DEFAULT_SAMPLING } from '@shared/defaults'
-import { UNATTENDED_DENIAL, type TurnEndReason } from '@shared/batch'
+import { isRemoteModelId } from '@shared/remote'
+import { REMOTE_DENIAL, UNATTENDED_DENIAL, type TurnEndReason } from '@shared/batch'
 import {
   RE_STARTER_TOOLS,
   RE_SYSTEM_PROMPT,
   reFirstMessage,
+  remoteRoots,
   reSampling,
   runsWithoutAsking,
   shouldGradePractice
@@ -92,6 +94,8 @@ export interface SessionSpec {
   /** 0 = no limit. Counted from the first request: loading is not the model's working time. */
   minutesPerTask: number
   collect: boolean
+  /** The instance is a rented one: its tool calls are held to the task's folder. A remote model id says so too. */
+  remote?: boolean
   /** Aborting it with 'stopNow', 'skip' or 'timeout' as the reason stops the session. */
   signal: AbortSignal
   /** Rounds of tool calls before the session must answer; default settings.re.maxToolRounds. */
@@ -350,6 +354,8 @@ export async function runSession(deps: SessionDeps, spec: SessionSpec): Promise<
   }
 
   // ---- tools ----
+  // Decided once, not read off the instance, which may be gone by the time a call is checked.
+  const remote = spec.remote === true || isRemoteModelId(spec.modelId ?? '')
   /** Marks calls that have not finished as stopped. */
   const stopCalls = (messageId: string): void =>
     patchMessage(messageId, (m) => ({
@@ -391,8 +397,8 @@ export async function runSession(deps: SessionDeps, spec: SessionSpec): Promise<
         conv = { ...conv, activeTools: loadToolNames(conv.activeTools ?? [], [target.qualifiedName], budget, tokensOf).active }
       }
       // Static analysis runs without asking; anything else is refused, because nobody is there to ask.
-      if (!runsWithoutAsking(s, target, true)) {
-        updateCall(messageId, call.id, { status: 'denied', result: UNATTENDED_DENIAL })
+      if (!runsWithoutAsking(s, target, true, remote ? { args: call.arguments, roots: remoteRoots(conv.re), rea: 'private' } : undefined)) {
+        updateCall(messageId, call.id, { status: 'denied', result: remote ? REMOTE_DENIAL : UNATTENDED_DENIAL })
         continue
       }
       updateCall(messageId, call.id, { status: 'running' })

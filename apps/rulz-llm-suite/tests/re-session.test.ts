@@ -2,7 +2,7 @@
 // expectations are what the old loop did: lib/batchRunner.ts driving the chat store (startRe, startGeneration,
 // handleEvent, runToolRound, gradePractice, failRePractice), read off that code before it was removed.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { itemResult, sessionStats, UNATTENDED_DENIAL } from '@shared/batch'
+import { itemResult, REMOTE_DENIAL, sessionStats, UNATTENDED_DENIAL } from '@shared/batch'
 import { DEFAULT_SAMPLING } from '@shared/defaults'
 import { extractAnswer, RE_SYSTEM_PROMPT, reFirstMessage, reSampling } from '@shared/re'
 import { META_LOAD, META_SEARCH, META_UNLOAD } from '@shared/tools'
@@ -161,6 +161,33 @@ function harness(
 }
 
 const assistants = (c: Conversation) => c.messages.filter((m) => m.role === 'assistant')
+
+describe('a session on a rented instance', () => {
+  const steps: Step[] = [
+    { tools: [{ name: 'rea__open_binary', args: '{"path":"C:\\\\Users\\\\u\\\\secret.db"}' }, { name: 'rea__open_binary', args: '{"path":"C:\\\\work\\\\xor-1\\\\1\\\\xor-1.exe"}' }, { name: 'rea__start_gdb_session' }, { name: 'rea__xrefs', args: '{"address":"0x10"}' }] },
+    { content: 'ANSWER: 42' }
+  ]
+  const loose = settings({ confirmToolCalls: false, allowedTools: ['rea__start_gdb_session', 'rea__open_binary'] })
+
+  it('runs static analysis of the task folder only, whatever the approval settings are', async () => {
+    for (const how of ['flag', 'model id'] as const) {
+      const h = harness(structuredClone(steps), { settings: loose })
+      const r = await runSession(h.deps, { ...h.spec, ...(how === 'flag' ? { remote: true } : { modelId: 'vast/m' }) })
+      expect(h.toolCalls.map((c) => c.arguments)).toEqual(['{"path":"C:\\\\work\\\\xor-1\\\\1\\\\xor-1.exe"}', '{"address":"0x10"}'])
+      const calls = r.conversation.messages.flatMap((m) => m.toolCalls ?? [])
+      expect(calls.map((c) => c.status)).toEqual(['denied', 'done', 'denied', 'done'])
+      expect(calls[0].result).toBe(REMOTE_DENIAL)
+      expect(sessionStats(r.conversation)).toMatchObject({ denied: 2 })
+      expect(r.conversation.re?.outcome).toBe('solved')
+    }
+  })
+
+  it('leaves a model on this PC with the approval settings', async () => {
+    const h = harness(structuredClone(steps), { settings: loose })
+    await runSession(h.deps, h.spec)
+    expect(h.toolCalls).toHaveLength(4)
+  })
+})
 
 describe('a practice session', () => {
   it('builds the chat the way the chat store did, and solves a task', async () => {

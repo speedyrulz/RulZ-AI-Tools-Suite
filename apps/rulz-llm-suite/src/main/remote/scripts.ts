@@ -406,10 +406,11 @@ export interface HfFileInput {
 const HF_URL_RE = /^https:\/\/huggingface\.co\/[A-Za-z0-9._~%/+@-]+$/
 
 /**
- * Downloads files into models/<slug>/ with curl. The first line of stdin is a curl config line carrying the token
- * (`header = "Authorization: Bearer ..."`), or empty: the token reaches curl through a pipe from printf, a shell
- * builtin, so it is never in argv, the environment or a file. Resumes with -C - into `<name>.part`, checks size and
- * sha256 (once more from scratch if a resumed file fails the hash), then renames. Cross-host redirects drop the header.
+ * Downloads files into models/<slug>/ with curl. The Hugging Face token never reaches the instance. The first line of
+ * stdin is empty (public files), or, for one gated file, a curl config line with the short-lived signed address this
+ * PC got for it: it reaches curl through a pipe from printf, a shell builtin, so it is not in argv, the environment or
+ * a file. Exit 36: the signed address was refused (they expire after about an hour). Resumes with -C - into `<name>.part`, checks size and
+ * sha256 (once more from scratch if a resumed file fails the hash), then renames.
  */
 export function hfDownloadScript(slug: string, files: HfFileInput[]): string {
   assertSlug(slug)
@@ -427,11 +428,11 @@ ${PRELUDE}
 IFS= read -r CFG
 M="$R/models/"${shq(slug)}
 mkdir -p "$M"
-curlc(){ if [ -n "$CFG" ]; then printf '%s\n' "$CFG" | curl --config - "$@"; else curl "$@"; fi; }
+curlc(){ if [ -n "$CFG" ]; then printf '%s\n' "$CFG" | curl --globoff --config - "@{@:2}"; else curl "@{@:2}" "$1"; fi; }
 sha_ok(){ [ "$2" = - ] || [ "$(sha256sum "$1" | cut -d' ' -f1)" = "$2" ]; }
 dl(){
 local url=$1 name=$2 size=$3 sha=$4 again=$5 dest="$M/$2" part="$M/$2.part" cur code try wp rc rec ok=0
-if [ "$size" = - ]; then size=$(curlc -sIL --max-time 60 "$url" 2>/dev/null | tr -d '\r' | awk 'tolower($1)=="content-length:"{v=$2} END{print v+0}'); [ "$size" = 0 ] && size=-; fi
+if [ "$size" = - ] && [ -z "$CFG" ]; then size=$(curlc "$url" -sIL --max-time 60 2>/dev/null | tr -d '\r' | awk 'tolower($1)=="content-length:"{v=$2} END{print v+0}'); [ "$size" = 0 ] && size=-; fi
 rec=$(awk -F'\t' -v n="$name" '$1==n{print $4}' "$M/.complete" 2>/dev/null)
 if [ -n "$rec" ] && [ "$rec" != - ] && [ "$rec" != "$url" ]; then
 # The file of this name came from another address (another revision, say): do not keep it.
@@ -450,10 +451,10 @@ if [ "$size" != - ] && [ "$cur" -gt "$size" ]; then rm -f "$part"; : >"$part"; c
 if [ "$size" != - ] && [ "$cur" = "$size" ]; then ok=1; break; fi
 emit STAGE "Downloading $name"
 ( while sleep 2; do emit PROG "$name|$(stat -c%s "$part" 2>/dev/null || echo 0)|$size"; done ) & wp=$!
-code=$(curlc -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 -C - -o "$part" -w '%{http_code}' "$url" 2>/dev/null); rc=$?
+code=$(curlc "$url" -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 -C - -o "$part" -w '%{http_code}' 2>/dev/null); rc=$?
 kill "$wp" 2>/dev/null; wait "$wp" 2>/dev/null
 case "$code" in
-401|403) emit ERR "Hugging Face refused the download of $name (http $code). A gated or private repository needs a token with access."; exit 31;;
+401|403) if [ -n "$CFG" ]; then emit ERR "The download address of $name was refused (http $code)."; exit 36; fi; emit ERR "Hugging Face refused the download of $name (http $code). A gated or private repository needs a token with access."; exit 31;;
 404) emit ERR "Hugging Face has no file $name at this address (http 404)."; exit 32;;
 esac
 if [ "$rc" = 0 ]; then ok=1; break; fi
@@ -480,11 +481,11 @@ exit 0
   )
 }
 
-/** The data line that follows hfDownloadScript on stdin. */
-export function hfConfigLine(token: string | null): string {
-  if (!token) return '\n'
-  if (/[\r\n"\\\0]/.test(token)) throw new Error('The Hugging Face token has characters that cannot be sent.')
-  return `header = "Authorization: Bearer ${token}"\n`
+/** The data line that follows hfDownloadScript on stdin: the signed address of its one file, or nothing. */
+export function hfConfigLine(signedUrl: string | null): string {
+  if (!signedUrl) return '\n'
+  if (!/^https:\/\/[!-~]+$/.test(signedUrl) || /["\\]/.test(signedUrl)) throw new Error('The download address has characters that cannot be sent.')
+  return `url = "${signedUrl}"\n`
 }
 
 export interface CompleteFile {

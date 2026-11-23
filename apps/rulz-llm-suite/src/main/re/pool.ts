@@ -419,6 +419,7 @@ export class PracticePool {
         goal: prepared.prompt,
         modelId: run.modelId,
         instanceId: lane.host.instanceId,
+        remote: lane.host.rentalId !== undefined,
         practice: { taskId: item.taskId, family: prepared.family, tier: prepared.tier, kitDir: run.kitDir },
         minutesPerTask: run.options.minutesPerTask,
         collect: this.deps.settings().re.collect ?? true,

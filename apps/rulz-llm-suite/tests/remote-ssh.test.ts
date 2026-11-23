@@ -389,6 +389,21 @@ describe('SshRunner.run', () => {
     expect(lines).toEqual(['@rz A=1', '@rz B=2', 'last'])
   })
 
+  it('cuts an endless line instead of filling the memory, and reads the next line again', async () => {
+    const lines: string[] = []
+    const { runner } = setup(
+      () => info(),
+      (c) => {
+        for (let i = 0; i < 40; i++) c.child.stdout.write('x'.repeat(8 * 1024))
+        c.child.stdout.write('\n@rz A=1\n')
+        setImmediate(() => c.child.finish(0))
+      }
+    )
+    await runner.run(7, 'x', { onLine: (l) => lines.push(l) })
+    expect(lines.map((l) => l.length)).toEqual([64 * 1024, 7])
+    expect(lines[1]).toBe('@rz A=1')
+  })
+
   it('reports a missing ssh program', async () => {
     const { runner } = setup(
       () => info(),

@@ -129,6 +129,10 @@ export function sameBatchAdapters(a: { name: string; scale: number }[] | undefin
 export const UNATTENDED_DENIAL =
   'Not run: this tool needs the user’s approval and this session runs unattended. Continue with the tools that read the target.'
 
+/** The same for a call by a model on a rented instance. */
+export const REMOTE_DENIAL =
+  'Not run: without asking, a model on a rented instance may only use static analysis, on absolute paths in this task’s folder. Continue with the given target.'
+
 const clampInt = (v: unknown, min: number, max: number, fallback: number): number => {
   const n = typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : fallback
   return Math.min(max, Math.max(min, n))
@@ -192,7 +196,7 @@ export function sessionStats(conv: Pick<Conversation, 'messages'>): Pick<BatchIt
     if (m.toolCalls?.length) toolRounds++
     promptTokens = Math.max(promptTokens, m.stats?.promptTokens ?? 0)
     outputTokens += m.stats?.predictedTokens ?? 0
-    for (const c of m.toolCalls ?? []) if (c.status === 'denied' && c.result === UNATTENDED_DENIAL) denied++
+    for (const c of m.toolCalls ?? []) if (c.status === 'denied' && (c.result === UNATTENDED_DENIAL || c.result === REMOTE_DENIAL)) denied++
   }
   return { toolRounds, promptTokens, outputTokens, denied }
 }

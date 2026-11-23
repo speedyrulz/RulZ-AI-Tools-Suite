@@ -220,6 +220,8 @@ export interface RemoteSsh extends ScriptRunner {
 }
 
 const MAX_OUTPUT = 2 * 1024 * 1024
+/** Longest line handed to onLine; an instance that sends more without a newline is cut off. */
+const MAX_LINE = 64 * 1024
 
 export interface SshRunnerDeps {
   directory: RentalDirectory
@@ -375,11 +377,13 @@ export class SshRunner implements RemoteSsh {
         const text = d.toString()
         if (stdout.length < MAX_OUTPUT) stdout += text
         if (opts.onLine) {
-          pending += text
-          let nl: number
-          while ((nl = pending.indexOf('\n')) >= 0) {
-            const line = pending.slice(0, nl).replace(/\r$/, '')
-            pending = pending.slice(nl + 1)
+          // Only the new text is searched for newlines, and an endless line is cut, so a hostile instance cannot fill the memory.
+          const parts = text.split('\n')
+          for (let i = 0; i < parts.length; i++) {
+            if (pending.length < MAX_LINE) pending += parts[i].slice(0, MAX_LINE - pending.length)
+            if (i === parts.length - 1) break
+            const line = pending.replace(/\r$/, '')
+            pending = ''
             try {
               opts.onLine(line)
             } catch {

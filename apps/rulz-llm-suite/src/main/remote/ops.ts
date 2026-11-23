@@ -47,6 +47,12 @@ export interface OpsDeps {
 
 const KEEPALIVE_MS = 60_000
 const MAX_LOG = 400
+/** How often a gated download asks for a fresh signed address. */
+const GATED_TRIES = 12
+
+const parseUrl = (u: string, base: string): URL | null => (URL.canParse(u, base) ? new URL(u, base) : null)
+const isHfHost = (u: URL): boolean => u.protocol === 'https:' && u.hostname === 'huggingface.co' && u.port === ''
+
 const LLAMA_REPO = 'ggml-org/llama.cpp'
 
 export const llamaAssetNames = (tag: string): { llama: string; cudart: string } => ({
@@ -225,13 +231,21 @@ export class SshRentalOps implements RentalOps {
     return fileList(def, d)
   }
 
-  /** Size and sha256 of a Hugging Face file from a HEAD request (the first answer, so the redirect is not followed with the token). */
-  async headFile(url: string, token: string | null): Promise<{ size: number | null; sha256: string | null }> {
-    const headers: Record<string, string> = { 'User-Agent': 'rulz-llm-suite' }
-    if (token) headers.Authorization = `Bearer ${token}`
+  /**
+   * Size and sha256 of a Hugging Face file from HEAD requests by this PC. Asked without the token first; only a file
+   * that is refused that way is asked with it. Such a gated file also comes with `signedUrl`, the short-lived address
+   * Hugging Face redirects to: the instance downloads from that, so the token never leaves this PC ('' = there is no
+   * such address). Redirects within huggingface.co (a renamed repository) are followed; no other host sees the token.
+   */
+  async headFile(url: string, token: string | null): Promise<{ size: number | null; sha256: string | null; signedUrl?: string }> {
     let res: Response
+    let gated = false
     try {
-      res = await this.fetchFn(url, { method: 'HEAD', redirect: 'manual', headers })
+      res = await this.hfHead(url, null)
+      if (token && (res.status === 401 || res.status === 403 || res.status === 404)) {
+        res = await this.hfHead(url, token)
+        gated = true
+      }
     } catch {
       return { size: null, sha256: null }
     }
@@ -242,6 +256,8 @@ export class SshRentalOps implements RentalOps {
     const etag = (res.headers.get('x-linked-etag') ?? '').replace(/^W\//, '').replace(/"/g, '')
     const sha256 = /^[0-9a-f]{64}$/.test(etag) ? etag : null
     const loc = res.headers.get('location')
+    // An error page's length is not the file's.
+    if (res.status >= 400) return { size: null, sha256: null }
     if (size === null && res.status >= 300 && res.status < 400 && loc && /^https:\/\//.test(loc)) {
       try {
         const next = await this.fetchFn(loc, { method: 'HEAD', redirect: 'follow', headers: { 'User-Agent': 'rulz-llm-suite' } })
@@ -250,7 +266,24 @@ export class SshRentalOps implements RentalOps {
         // the script asks again
       }
     }
-    return { size, sha256 }
+    if (!gated) return { size, sha256 }
+    const redirect = res.status >= 300 && loc ? parseUrl(loc, url) : null
+    return { size, sha256, signedUrl: redirect && redirect.protocol === 'https:' && !isHfHost(redirect) ? redirect.href : '' }
+  }
+
+  /** A HEAD request to huggingface.co, following its redirects only within that host. */
+  private async hfHead(url: string, token: string | null): Promise<Response> {
+    const headers: Record<string, string> = { 'User-Agent': 'rulz-llm-suite' }
+    if (token) headers.Authorization = `Bearer ${token}`
+    let at = url
+    for (let hop = 0; ; hop++) {
+      const res = await this.fetchFn(at, { method: 'HEAD', redirect: 'manual', headers })
+      const loc = res.status >= 300 && res.status < 400 ? res.headers.get('location') : null
+      const next = loc ? parseUrl(loc, at) : null
+      // Only a redirect to another address of the Hub itself; the one to the file's storage is the answer.
+      if (!next || !isHfHost(next) || res.headers.get('x-linked-size') || hop >= 3) return res
+      at = next.href
+    }
   }
 
   private async resolveHf(files: RemoteFile[]): Promise<void> {
@@ -332,32 +365,54 @@ export class SshRentalOps implements RentalOps {
       }
       const downloads = files.filter((f) => f.url)
       if (downloads.length) {
-        const token = (await this.deps.secrets.hfToken())?.value ?? null
         const sizes = new Map(downloads.map((f) => [f.name, f.size ?? 0]))
         const doneFiles = new Set<string>()
-        const res = await this.deps.ssh.run(
-          rentalId,
-          hfDownloadScript(
-            slug,
-            downloads.map((f) => ({ url: f.url as string, name: f.name, size: f.size, sha256: f.sha256 }))
-          ),
-          {
-            stdin: hfConfigLine(token),
-            timeoutMs: 0,
-            signal: t.ctl.signal,
-            onLine: (line) => {
-              const m = /^@rz (STAGE|PROG|FILE_DONE)=(.*)$/.exec(line)
-              if (!m) return
-              if (m[1] === 'STAGE') report(0, m[2])
-              else if (m[1] === 'PROG') {
-                const d = m[2].split('|')[1]
-                const finished = [...doneFiles].reduce((a, n) => a + (sizes.get(n) ?? 0), 0)
-                onProgress({ stage, bytesDone: base + finished + (Number(d) || 0), bytesTotal: total })
-              } else doneFiles.add(m[2])
+        const fetchOnto = (list: RemoteFile[], signedUrl: string | null): Promise<RunResult> =>
+          this.deps.ssh.run(
+            rentalId,
+            hfDownloadScript(
+              slug,
+              list.map((f) => ({ url: f.url as string, name: f.name, size: f.size, sha256: f.sha256 }))
+            ),
+            {
+              stdin: hfConfigLine(signedUrl),
+              timeoutMs: 0,
+              signal: t.ctl.signal,
+              onLine: (line) => {
+                const m = /^@rz (STAGE|PROG|FILE_DONE)=(.*)$/.exec(line)
+                if (!m) return
+                if (m[1] === 'STAGE') report(0, m[2])
+                else if (m[1] === 'PROG') {
+                  const d = m[2].split('|')[1]
+                  const finished = [...doneFiles].reduce((a, n) => a + (sizes.get(n) ?? 0), 0)
+                  onProgress({ stage, bytesDone: base + finished + (Number(d) || 0), bytesTotal: total })
+                } else doneFiles.add(m[2])
+              }
             }
+          )
+        const token = (await this.deps.secrets.hfToken())?.value ?? null
+        const open: RemoteFile[] = []
+        const gated: RemoteFile[] = []
+        for (const f of downloads) {
+          const h = token ? await this.headFile(f.url as string, token) : null
+          ;(h?.signedUrl === undefined ? open : gated).push(f)
+        }
+        if (open.length) {
+          const res = await fetchOnto(open, null)
+          if (res.code !== 0) throw this.failure(res, 'The download failed.')
+        }
+        for (const f of gated) {
+          // A fresh address for each try: they expire while a long download runs; the next try resumes.
+          for (let tries = 1; ; tries++) {
+            t.ctl.signal.throwIfAborted()
+            const { signedUrl } = await this.headFile(f.url as string, token)
+            if (!signedUrl) throw new Error(`Hugging Face gives no download address for ${f.name} that works without your token, and the token is not sent to the instance. Download it to this PC and add it from here.`)
+            const res = await fetchOnto([f], signedUrl)
+            if (res.code === 0) break
+            if (res.code !== 36 && res.code !== 35) throw this.failure(res, 'The download failed.')
+            if (tries >= GATED_TRIES) throw this.failure(res, 'The download failed.')
           }
-        )
-        if (res.code !== 0) throw this.failure(res, 'The download failed.')
+        }
         base += downloads.reduce((a, f) => a + (f.size ?? 0), 0)
       }
       report(0, 'Checking the files')

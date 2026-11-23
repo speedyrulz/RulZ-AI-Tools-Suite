@@ -23,6 +23,7 @@ import { editMessages, idsToDelete, removeMessages, restoreMessages } from '../l
 import { once } from '../lib/once'
 import { WBENCH_BUSY, wbenchRunning } from '../lib/wbenchFlag'
 import { buildWire } from '../lib/wire'
+import { isRemoteModelId } from '@shared/remote'
 import { useApp } from './app'
 import { availableTools, effectiveToolMode, tokensOf, toolBudget, toolRequestFor } from './mcp'
 import {
@@ -34,6 +35,7 @@ import {
   RE_STARTER_TOOLS,
   RE_SYSTEM_PROMPT,
   reFirstMessage,
+  remoteRoots,
   reSampling,
   shouldGradePractice,
   unquotePath
@@ -61,8 +63,15 @@ export type ToolDecision = 'deny' | 'once' | 'always'
 
 export interface ToolApproval {
   call: ToolCall
+  /** The model runs on a rented instance: "always" then means in this chat, until the app closes. */
+  remote: boolean
   resolve: (decision: ToolDecision) => void
 }
+
+/** Tools the user allowed for one chat with a model on a rented instance ("<chat id> <tool>"); never saved. */
+const allowedInChat = new Set<string>()
+/** The chat whose program the shared REA process has open; null = not known (nothing yet, or an open failed). */
+let reaOpener: string | null = null
 
 /** Share of the context window at which the user is offered a handoff. */
 export const HANDOFF_THRESHOLD = 0.85
@@ -567,13 +576,20 @@ export const useChat = create<ChatState>((set, get) => {
       // Calling a tool keeps it loaded and marks it recently used.
       if (effectiveToolMode({ re: isRe, files: scope }) === 'dynamic') loadTools([target.qualifiedName])
       const s = useApp.getState().settings
+      const gen = get().genConversation
+      const remote = isRemoteModelId(gen?.modelId ?? '')
+      const chatKey = `${gen?.id ?? ''} ${call.name}`
       // RE sessions make dozens of read-only analysis calls; those run without asking.
-      let approved = !s || runsWithoutAsking(s, target, isRe)
+      let approved =
+        (!s && !remote) ||
+        (!!s && runsWithoutAsking(s, target, isRe, remote ? { args: call.arguments, roots: remoteRoots(gen?.re), rea: !!gen && reaOpener === gen.id ? 'opened' : 'other' } : undefined)) ||
+        (remote && allowedInChat.has(chatKey))
       if (!approved) {
-        const decision = await new Promise<ToolDecision>((resolve) => set({ toolApproval: { call, resolve } }))
+        const decision = await new Promise<ToolDecision>((resolve) => set({ toolApproval: { call, remote, resolve } }))
         set({ toolApproval: null })
         if (!inToolPhase(requestId)) return
-        if (decision === 'always' && s) {
+        if (decision === 'always' && remote) allowedInChat.add(chatKey)
+        else if (decision === 'always' && s) {
           await useApp.getState().updateSettings({ allowedTools: [...new Set([...s.allowedTools, call.name])] })
           // Stop may have been pressed while that saved; the tool must not run after it.
           if (!inToolPhase(requestId)) return
@@ -590,6 +606,7 @@ export const useChat = create<ChatState>((set, get) => {
       const r = await invoke('mcp:callTool', call.name, call.arguments, callKey, scope)
         .catch((e) => ({ text: errorMessage(e), isError: true }))
         .finally(() => runningToolCalls.delete(callKey))
+      if (target.server === 'rea' && target.name.startsWith('open_')) reaOpener = r.isError ? null : (gen?.id ?? null)
       if (!inToolPhase(requestId)) return
       updateCall(call.id, { status: r.isError ? 'error' : 'done', result: r.text })
     }

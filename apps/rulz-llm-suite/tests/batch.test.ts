@@ -20,7 +20,7 @@ import {
   type BatchOptions,
   type BatchRun
 } from '@shared/batch'
-import { runsWithoutAsking, starterToolsThatAsk } from '@shared/re'
+import { argsStayInside, remoteRoots, runsWithoutAsking, starterToolsThatAsk } from '@shared/re'
 import type { ChatMessage, Conversation, RePracticeTask, ReSession } from '@shared/types'
 import { BatchStore, MAX_BATCH_RUNS } from '../src/main/re/batches'
 
@@ -300,4 +300,75 @@ describe('saved batch runs', () => {
     await Promise.all([0, 1, 2, 3].map((i) => store.save(makeRun([], { id: `r${i}`, createdAt: i }))))
     expect((await store.list()).map((r) => r.id)).toEqual(['r3', 'r2'])
   }, 20_000)
+})
+
+describe('tool calls of a model on a rented instance', () => {
+  const roots = ['C:\\work\\t\\1']
+  const tool = (server: string, name: string) => ({ qualifiedName: `${server}__${name}`, server, name })
+  const open = { confirmToolCalls: false, allowedTools: ['rea__start_gdb_session', 'shell__run'], re: { autoApproveStatic: true } }
+  const call = (args: unknown) => ({ args: typeof args === 'string' ? args : JSON.stringify(args), roots, rea: 'private' as const })
+
+  it('does not count "do not ask" or the always-allowed tools, inside or outside RE', () => {
+    expect(runsWithoutAsking(open, tool('rea', 'start_gdb_session'), true, call({}))).toBe(false)
+    expect(runsWithoutAsking(open, tool('shell', 'run'), true, call({}))).toBe(false)
+    expect(runsWithoutAsking(open, tool('shell', 'run'), false, call({}))).toBe(false)
+    expect(runsWithoutAsking(open, tool('rea', 'xrefs'), false, call({}))).toBe(false)
+    const ask = { confirmToolCalls: true, allowedTools: [] as string[], re: { autoApproveStatic: false } }
+    expect(runsWithoutAsking(ask, tool('rea', 'xrefs'), true, call({}))).toBe(false)
+    expect(runsWithoutAsking(ask, tool('rea', 'open_binary'), true, call({ path: 'C:\\work\\t\\1\\a.exe' }))).toBe(false)
+    expect(runsWithoutAsking({ ...ask, allowedTools: ['rea__open_binary'] }, tool('rea', 'open_binary'), true, call({ path: 'C:\\work\\t\\1\\a.exe' }))).toBe(true)
+    expect(runsWithoutAsking(open, tool('rea', 'xrefs'), true, call({ address: '0x1000' }))).toBe(true)
+    expect(runsWithoutAsking(open, tool('calc', 'calc'), true, call({ expression: '~5 / 2' }))).toBe(true)
+    // A local model keeps its settings.
+    expect(runsWithoutAsking(open, tool('shell', 'run'), false)).toBe(true)
+  })
+
+  it('lets static analysis open the task folder only', () => {
+    const opens = (path: string): boolean => runsWithoutAsking(open, tool('rea', 'open_binary'), true, call({ path }))
+    for (const p of ['C:\\work\\t\\1\\a.exe', 'c:/WORK/t/1/a.exe', 'C:\\work\\t\\1', 'C:\\work\\\\t\\1\\sub\\b.dll']) expect(opens(p), p).toBe(true)
+    for (const p of [
+      'C:\\work\\t\\1\\..\\2\\a.exe', 'C:\\work\\t\\1\\.. \\x', 'C:\\work\\t\\10\\a.exe', 'C:\\work\\t', 'C:\\Users\\u\\.ssh\\id_ed25519', 'D:\\work\\t\\1\\a.exe',
+      '\\\\host\\share\\a', '//host/share/a', '\\\\?\\C:\\work\\t\\1\\a.exe', '\\work\\t\\1\\a.exe', 'C:a.exe', 'C:\\work\\t\\1\\a.exe:stream', '%USERPROFILE%\\a', '~/a', 'a.exe', '', '/mnt/c/work/t/1/a.exe', 'file:///C:/work/t/1/a.exe', 'http://127.0.0.1:9222'
+    ]) expect(opens(p), p).toBe(false)
+    expect(runsWithoutAsking(open, tool('rulz', 'list_directory'), true, call({ path: 'C:\\Users' }))).toBe(false)
+    expect(runsWithoutAsking(open, tool('rulz', 'find_files'), true, call({ root: 'C:\\work\\t\\1', pattern: '*.exe' }))).toBe(true)
+    expect(runsWithoutAsking(open, tool('rulz', 'find_files'), true, call({ root: 'C:\\', pattern: '*.key' }))).toBe(false)
+  })
+
+  it('does not read a program another chat opened, or files next to the target in a clone', () => {
+    const other = { ...call({}), rea: 'other' as const }
+    expect(runsWithoutAsking(open, tool('rea', 'list_strings'), true, other)).toBe(false)
+    expect(runsWithoutAsking(open, tool('rea', 'list_strings'), true, call({}))).toBe(true)
+    expect(runsWithoutAsking(open, tool('rea', 'open_binary'), true, { ...call({ path: 'C:\\work\\t\\1\\a.exe' }), rea: 'other' })).toBe(true)
+    for (const n of ['get_evidence_bundle', 'compare_functions']) {
+      expect(runsWithoutAsking(open, tool('rea', n), true, { ...call({}), rea: 'opened' }), n).toBe(false)
+      expect(runsWithoutAsking(open, tool('rea', n), true, call({})), n).toBe(true)
+    }
+    const reads = (path: string): boolean => runsWithoutAsking(open, tool('rulz', 'read_file'), true, call({ path }))
+    for (const p of ['src/main.c', 'NOTES.md', 'C:\\work\\t\\1\\src\\a.c']) expect(reads(p), p).toBe(true)
+    for (const p of ['C:\\work\\t\\secrets.txt', '..\\x', 'a/../../x', 'C:x', '\\x', '"C:\\x"', "'\\x'", '%TEMP%\\x', '\\\\host\\share\\x', '']) expect(reads(p), p).toBe(false)
+    expect(runsWithoutAsking(open, tool('rulz', 'write_file'), true, call({ path: 'src/main.c', content: 'C:\\Windows' }))).toBe(true)
+  })
+
+  it('checks nested and list arguments and paths under any key, but not search text', () => {
+    expect(argsStayInside('{"pattern":"C:\\\\Windows"}', roots)).toBe(true)
+    expect(argsStayInside('{"query":"http://example"}', roots)).toBe(true)
+    expect(argsStayInside('{"anything":"C:\\\\Windows\\\\x"}', roots)).toBe(false)
+    expect(argsStayInside('{"cdp_endpoint":"http://127.0.0.1:9222","target_id":"1"}', roots)).toBe(false)
+    expect(argsStayInside('{"additional_paths":["C:\\\\work\\\\t\\\\1\\\\a.js","C:\\\\x.js"]}', roots)).toBe(false)
+    expect(argsStayInside('{"a":{"b":[{"local_path":"C:\\\\x"}]}}', roots)).toBe(false)
+    expect(argsStayInside('', roots)).toBe(true)
+    expect(argsStayInside('not json', roots)).toBe(false)
+    expect(argsStayInside('{"overwrite":true}', roots)).toBe(false)
+    expect(argsStayInside('{"overwrite":false}', roots)).toBe(true)
+    expect(argsStayInside('[]', roots)).toBe(false)
+    expect(argsStayInside('{"path":"C:\\\\work\\\\t\\\\1\\\\a"}', [])).toBe(false)
+  })
+
+  it('roots: the target, the work folder of a practice task, the output folder of a clone', () => {
+    const practice = { taskId: 'a', family: 'f', tier: 'easy', kitDir: 'C:\\kit' }
+    expect(remoteRoots({ target: 'C:\\dl\\a.exe' })).toEqual(['C:\\dl\\a.exe'])
+    expect(remoteRoots({ target: '"C:\\work\\t\\1\\a.exe"', practice })).toEqual(['C:\\work\\t\\1\\a.exe', 'C:\\work\\t\\1'])
+    expect(remoteRoots(undefined)).toEqual([])
+  })
 })

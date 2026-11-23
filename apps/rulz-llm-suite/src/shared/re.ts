@@ -178,8 +178,93 @@ export function isStaticReTool(server: string, name: string): boolean {
 type ApprovalSettings = { confirmToolCalls: boolean; allowedTools: string[]; re: Pick<ReSettings, 'autoApproveStatic'> }
 type NamedTool = { qualifiedName: string; server: string; name: string }
 
-/** Does this tool run without asking the user? `re`: in an RE session, where static analysis may run unasked. */
-export function runsWithoutAsking(s: ApprovalSettings, tool: NamedTool, re: boolean): boolean {
+/** A call by a model on a rented instance: its arguments (JSON text) and the files and folders it may use unasked. */
+export interface RemoteCall {
+  args: string
+  roots: string[]
+  /** REA is this session's alone (a batch lane), or chats share it and this one ('opened') or another one opened its program. */
+  rea: 'private' | 'opened' | 'other'
+}
+
+/** REA keeps its evidence and notes when it switches to another program, so in a shared REA these read other chats' findings. */
+const REA_SESSION_WIDE = new Set(['get_evidence_bundle', 'list_unknowns', 'update_unknown', 'inspect_analysis_view', 'build_reconstruction_obligation_ledger', 'find_changed_behavior'])
+
+/** Free text: a search for "C:\\" or a comment is not a path. Anything else that looks like one is checked. */
+const TEXT_KEYS = new Set(['pattern', 'query', 'text', 'comment', 'name', 'new_name', 'value', 'regex', 'expression'])
+const PATH_KEY = /(^|_)(path|paths|file|files|dir|directory|directories|folder|folders|root|roots|cwd|manifest|source|sources|output|destination|url|urls|endpoint|origin|origins)$/i
+const LOOKS_LIKE_PATH = /^\s*([a-z]:(?!:)|[\\/]|~([\\/]|$)|%\w+%|\w[\w+.-]*:\/\/|file:)|(^|[\\/])\.\.([\\/]|$)/i
+
+/** Is this an absolute Windows path that is one of the roots or inside one? No "..", variables, streams or UNC. */
+function insideRoots(value: string, roots: string[]): boolean {
+  const norm = (p: string): string => p.replace(/[\\/]+/g, '\\').replace(/\\+$/, '').toLowerCase()
+  if (!/^[a-z]:[\\/]/i.test(value) || /[%*?"<>|\0]/.test(value) || value.indexOf(':', 2) >= 0) return false
+  const path = norm(value)
+  // ". ." and the like: Windows drops trailing dots and spaces, so such a segment is not what it reads as.
+  if (path.split('\\').slice(1).some((seg) => /[. ]$/.test(seg))) return false
+  return roots.some((r) => {
+    const root = norm(unquotePath(r))
+    return /^[a-z]:\\./.test(root) && (path === root || path.startsWith(`${root}\\`))
+  })
+}
+
+/** Every argument that is or looks like a path or address is inside the roots. */
+export function argsStayInside(args: string, roots: string[]): boolean {
+  let parsed: unknown
+  try {
+    parsed = args.trim() ? JSON.parse(args) : {}
+  } catch {
+    return false
+  }
+  const ok = (v: unknown, key: string): boolean => {
+    if (typeof v === 'string') {
+      if (PATH_KEY.test(key)) return insideRoots(v, roots)
+      return TEXT_KEYS.has(key.toLowerCase()) || !LOOKS_LIKE_PATH.test(v) || insideRoots(v, roots)
+    }
+    if (Array.isArray(v)) return v.every((x) => ok(x, key))
+    if (v && typeof v === 'object') return Object.entries(v).every(([k, x]) => ok(x, k))
+    // Replacing a file, even one of the session's own (close_binary over the target), is never unasked.
+    return !(key === 'overwrite' && v)
+  }
+  return !!parsed && typeof parsed === 'object' && !Array.isArray(parsed) && ok(parsed, '')
+}
+
+/** What an RE session's remote model may open unasked: the target, the task's own work folder, a clone's output folder. */
+export function remoteRoots(re: Pick<ReSession, 'target' | 'practice' | 'clone'> | undefined): string[] {
+  if (!re) return []
+  const target = unquotePath(re.target)
+  const dir = target.replace(/[\\/][^\\/]*$/, '')
+  return [target, ...(re.practice && dir !== target ? [dir] : []), ...(re.clone ? [re.clone.outputDir] : [])]
+}
+
+/** Is this static analysis of the session's own files (or opening one of them)? */
+function insideRemoteFence(tool: NamedTool, call: RemoteCall): boolean {
+  if (!isStaticReTool(tool.server, tool.name) && !(tool.server === 'rea' && tool.name === 'open_binary')) return false
+  if (tool.server === 'calc') return true
+  // The main process holds writes to the clone's output folder. Reads it also allows next to the target, which is more than this session's files.
+  if (tool.server === 'rulz' && tool.name === 'write_file') return true
+  if (tool.server === 'rulz' && tool.name === 'read_file' && isPlainRelative(call.args)) return true
+  if (tool.server === 'rea' && tool.name !== 'open_binary' && call.rea === 'other') return false
+  if (tool.server === 'rea' && call.rea !== 'private' && (REA_SESSION_WIDE.has(tool.name) || tool.name.startsWith('compare_'))) return false
+  return argsStayInside(call.args, call.roots)
+}
+
+/** A read_file path below the output folder: relative, with nothing that could lead out of it. */
+function isPlainRelative(args: string): boolean {
+  try {
+    const path: unknown = (JSON.parse(args) as { path?: unknown } | null)?.path
+    return typeof path === 'string' && !!path.trim() && !/^\s*[\\/]|[:%*?"'<>|\0]/.test(path) && !path.split(/[\\/]/).some((s) => s.trim() === '..')
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Does this tool run without asking the user? `re`: in an RE session, where static analysis may run unasked.
+ * `remote`: the model runs on a rented instance. Whoever owns that machine can make it ask for any call, so those
+ * settings, chosen for models on this PC, then cover only static analysis of the session's own files.
+ */
+export function runsWithoutAsking(s: ApprovalSettings, tool: NamedTool, re: boolean, remote?: RemoteCall): boolean {
+  if (remote && !(re && insideRemoteFence(tool, remote))) return false
   return !s.confirmToolCalls || s.allowedTools.includes(tool.qualifiedName) || (re && s.re.autoApproveStatic && isStaticReTool(tool.server, tool.name))
 }
 

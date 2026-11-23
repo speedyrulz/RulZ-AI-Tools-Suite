@@ -122,8 +122,8 @@ printf '%s\n' "$@" >>"$T/curl.argv"
 out=; head=0; url=; wcode=0; cfg=0
 args=("$@")
 for ((i=0;i<@{#args[@]};i++)); do a=@{args[i]}; case "$a" in -o) out=@{args[i+1]};; -w) wcode=1;; --config) cfg=1;; -sIL|-I|-sI) head=1;; https://*) url=$a;; esac; done
-[ $cfg = 1 ] && cat >>"$T/curl.stdin"
-name=$(basename "$url")
+if [ $cfg = 1 ]; then c=$(cat); printf '%s\n' "$c" >>"$T/curl.stdin"; u=$(printf '%s\n' "$c" | sed -n 's/^url = "\(.*\)"$/\1/p'); [ -n "$u" ] && url=$u; fi
+name=$(basename "@{url%%\?*}")
 src="$T/srv/$name"
 if [ -n "$FAKE_CODE" ]; then [ $wcode = 1 ] && printf '%s' "$FAKE_CODE"; exit 22; fi
 if [ ! -f "$src" ]; then [ $wcode = 1 ] && printf 404; exit 22; fi
@@ -221,11 +221,13 @@ describe('script text', () => {
     expect(WATCHDOG_PROGRAM).not.toMatch(/curl[^\n]*Bearer/)
     const dl = hfDownloadScript('m', [{ url: 'https://huggingface.co/o/r/resolve/main/a.gguf', name: 'a.gguf', size: 1, sha256: null }])
     expect(dl).toContain('IFS= read -r CFG')
-    expect(dl).toContain("printf '%s\\n' \"$CFG\" | curl --config -")
-    expect(hfConfigLine('hf_abc')).toBe('header = "Authorization: Bearer hf_abc"\n')
+    expect(dl).toContain("printf '%s\\n' \"$CFG\" | curl --globoff --config -")
+    expect(dl).not.toContain('Authorization')
+    expect(hfConfigLine('https://cdn.example/x?sig=1')).toBe('url = "https://cdn.example/x?sig=1"\n')
     expect(hfConfigLine(null)).toBe('\n')
-    expect(() => hfConfigLine('bad"token')).toThrow()
-    expect(() => hfConfigLine('bad\ntoken')).toThrow()
+    for (const bad of ['hf_abc', 'http://cdn.example/x', 'https://cdn.example/"x', 'https://cdn.example/x\nurl = "file:///etc/passwd"', 'https://cdn.example/\\x', 'https://cdn.example/a b']) {
+      expect(() => hfConfigLine(bad), bad).toThrow()
+    }
   })
 
   it('installs only the missing packages, checks digests and resumes both downloads', () => {
@@ -569,7 +571,7 @@ describe.skipIf(!hasBash)('bash: model files', () => {
   bashIt('downloads, checks size and sha256, moves the file and reports progress markers', () =>
     withBox((box) => {
       const f = serve(box)
-      const r = box.run(hfDownloadScript('m1', [{ url: URL, name: 'model.gguf', size: f.size, sha256: f.sha }]), { data: hfConfigLine('hf_secret_token') })
+      const r = box.run(hfDownloadScript('m1', [{ url: URL, name: 'model.gguf', size: f.size, sha256: f.sha }]), { data: hfConfigLine(null) })
       expect(r.code).toBe(0)
       expect(markers(r.stdout, 'FILE_DONE')).toEqual(['model.gguf'])
       expect(box.sh('sha256sum "$RZ_ROOT/models/m1/model.gguf" | cut -d" " -f1')).toBe(f.sha)
@@ -577,14 +579,32 @@ describe.skipIf(!hasBash)('bash: model files', () => {
     })
   )
 
-  bashIt('never lets the token reach argv, the environment or a file; curl gets it on stdin', () =>
+  const SIGNED = 'https://cdn.example/blob/model.gguf?sig=s3cret_sig&x=[1]'
+
+  bashIt('downloads a gated file from its signed address, which is never in argv or a file; curl gets it on stdin', () =>
     withBox((box) => {
       const f = serve(box)
-      box.run(hfDownloadScript('m1', [{ url: URL, name: 'model.gguf', size: f.size, sha256: f.sha }]), { data: hfConfigLine('hf_secret_token') })
-      expect(box.sh('cat "$T/curl.argv"')).not.toContain('hf_secret_token')
-      expect(box.sh('cat "$T/curl.log"')).toContain('--config -')
-      expect(box.sh('cat "$T/curl.stdin"')).toContain('Authorization: Bearer hf_secret_token')
-      expect(box.sh('grep -rl hf_secret_token "$RZ_ROOT" | wc -l')).toBe('0')
+      const r = box.run(hfDownloadScript('m1', [{ url: URL, name: 'model.gguf', size: f.size, sha256: f.sha }]), { data: hfConfigLine(SIGNED) })
+      expect(r.code).toBe(0)
+      expect(box.sh('sha256sum "$RZ_ROOT/models/m1/model.gguf" | cut -d" " -f1')).toBe(f.sha)
+      expect(box.sh('cat "$T/curl.argv"')).not.toContain('s3cret_sig')
+      expect(box.sh('cat "$T/curl.argv"')).not.toContain('huggingface.co')
+      expect(box.sh('cat "$T/curl.argv"')).toContain('--globoff')
+      expect(box.sh('cat "$T/curl.stdin"')).toContain('s3cret_sig')
+      expect(box.sh('grep -rl s3cret_sig "$RZ_ROOT" | wc -l')).toBe('0')
+    })
+  )
+
+  bashIt('says with exit 36 that a signed address was refused, and keeps the part file for the next one', () =>
+    withBox((box) => {
+      const f = serve(box)
+      box.sh('mkdir -p "$RZ_ROOT/models/m1"; head -c 100000 "$T/srv/model.gguf" > "$RZ_ROOT/models/m1/model.gguf.part"')
+      const file = [{ url: URL, name: 'model.gguf', size: f.size, sha256: f.sha }]
+      const r = box.run(hfDownloadScript('m1', file), { data: hfConfigLine(SIGNED), env: { FAKE_CODE: '403' } })
+      expect(r.code).toBe(36)
+      expect(box.sh('stat -c%s "$RZ_ROOT/models/m1/model.gguf.part"')).toBe('100000')
+      expect(box.run(hfDownloadScript('m1', file), { data: hfConfigLine(SIGNED) }).code).toBe(0)
+      expect(box.sh('sha256sum "$RZ_ROOT/models/m1/model.gguf" | cut -d" " -f1')).toBe(f.sha)
     })
   )
 

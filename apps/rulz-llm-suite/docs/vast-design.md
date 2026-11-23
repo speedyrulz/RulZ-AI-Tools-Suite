@@ -73,9 +73,16 @@ the instance can stop itself; the remote model works everywhere a model is used.
 
 vast key: saved here (safeStorage) > `VAST_API_KEY` > the CLI's key file. HF token: saved here > `HF_TOKEN` > HF's
 token file. The window only learns where a key came from. A key file that needs a passphrase works only
-through the ssh agent; the app says so. The token reaches the instance on ssh stdin, is used through
-a curl config on stdin, and is never on a command line, in a file or in a log. Log lines shown in the app are scrubbed
-of both values.
+through the ssh agent; the app says so. Neither leaves this PC: files are asked for without the token first, and for a
+gated file this PC gets the short-lived signed address from Hugging Face and sends only that, on ssh stdin (a fresh one
+for each try, because it expires). Log lines shown in the app are scrubbed of both values.
+
+Whoever owns the rented machine can read what is sent to the model and can make it answer anything, tool calls
+included. So with a remote model the approval settings (don't ask, always allowed, static analysis unasked) cover only
+static analysis and opening a program, and only on the RE session's own files (`runsWithoutAsking`, `argsStayInside`).
+Everything else asks, and an unattended run refuses it. Chats share one REA process, so a chat with a remote model must
+have opened the program itself before it may look into it unasked, and reading REA's stored evidence always asks. Known limit: paths are compared as text, so a link
+the user already has inside the analysed folder is followed. "Allow this tool in this chat" lasts until the app closes.
 
 ## 4. ssh
 

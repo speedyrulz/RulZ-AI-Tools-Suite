@@ -780,8 +780,16 @@ describe('model files through ops', () => {
     return { ...o, ops }
   }
 
-  it('reads size and sha256 of a Hugging Face file from the first answer', async () => {
-    const o = opsFor(head())
+  it('reads size and sha256 of a Hugging Face file from the first answer, without the token when that is enough', async () => {
+    const seen: unknown[] = []
+    const plain = head()
+    const o = opsFor(((u: string, init?: RequestInit) => {
+      seen.push((init?.headers as Record<string, string>).Authorization)
+      return plain(u, init)
+    }) as typeof fetch)
+    const r = await o.ops.headFile('https://huggingface.co/o/r/resolve/main/a.gguf', 'tok')
+    expect(r).not.toHaveProperty('signedUrl')
+    expect(seen).toEqual([undefined])
     expect(await o.ops.headFile('https://huggingface.co/o/r/resolve/main/a.gguf', 'tok')).toEqual({ size: 4096, sha256: '9'.repeat(64) })
   })
 
@@ -804,7 +812,82 @@ describe('model files through ops', () => {
     expect(await o.ops.headFile('https://huggingface.co/o/r/resolve/main/a.gguf', null)).toEqual({ size: null, sha256: null })
   })
 
-  it('downloads through one script with the token on stdin only, then marks the files complete', async () => {
+  // ---- gated files: the token stays here ----
+  const SIGNED = 'https://cas.example/x/y?sig='
+  /** Hugging Face as a gated file sees it: 401 without the token, a redirect to a numbered signed address with it. */
+  const gatedHub = (location: (n: number) => string | null = (n) => SIGNED + n) => {
+    const calls: Array<{ url: string; auth: string | undefined }> = []
+    let n = 0
+    const f = (async (u: string | URL | Request, init?: RequestInit) => {
+      const auth = (init?.headers as Record<string, string>).Authorization
+      calls.push({ url: String(u), auth })
+      if (!auth) return new Response(null, { status: 401 })
+      const loc = location(++n)
+      return new Response(null, { status: loc ? 302 : 200, headers: { 'x-linked-size': '4096', 'x-linked-etag': `"${'9'.repeat(64)}"`, ...(loc ? { location: loc } : {}) } })
+    }) as typeof fetch
+    return { f, calls }
+  }
+  const complete = (text: string): { stdout: string } => (text.includes('COMPLETE_B64') || text.includes('FILE=') ? { stdout: '@rz FILE=a.gguf|4096\n@rz COMPLETE_B64=\n' } : { stdout: '@rz COMPLETE=1\n' })
+
+  it('downloads a gated file from a signed address and never sends the token to the instance or the storage host', async () => {
+    const hub = gatedHub()
+    const o = opsFor(hub.f)
+    o.setReply((text) => (text.includes('curlc()') ? { stdout: '' } : complete(text)))
+    await o.ops.transferModel(7, hfDef, () => undefined, new AbortController().signal)
+    const down = o.runs.filter((r) => r.text.includes('curlc()'))
+    expect(down).toHaveLength(1)
+    expect(String(down[0].opts?.stdin)).toMatch(/^url = "https:\/\/cas\.example\/x\/y\?sig=\d+"\n$/)
+    expect(o.runs.every((r) => !r.text.includes('hf_secret') && !String(r.opts?.stdin ?? '').includes('hf_secret'))).toBe(true)
+    expect(hub.calls.filter((c) => c.auth).every((c) => new URL(c.url).hostname === 'huggingface.co')).toBe(true)
+  })
+
+  it('gets a fresh address when one has expired, and gives up after some tries', async () => {
+    const o = opsFor(gatedHub().f)
+    let downloads = 0
+    o.setReply((text) => (text.includes('curlc()') ? (++downloads < 3 ? { code: 36, stdout: '@rz ERR=refused\n' } : { stdout: '' }) : complete(text)))
+    await o.ops.transferModel(7, hfDef, () => undefined, new AbortController().signal)
+    const used = o.runs.filter((r) => r.text.includes('curlc()')).map((r) => String(r.opts?.stdin))
+    expect(new Set(used).size).toBe(3)
+    const never = opsFor(gatedHub().f)
+    let tries = 0
+    never.setReply((text) => (text.includes('curlc()') ? (tries++, { code: 36, stdout: '@rz ERR=refused\n' }) : complete(text)))
+    await expect(never.ops.transferModel(7, hfDef, () => undefined, new AbortController().signal)).rejects.toThrow(/refused/)
+    expect(tries).toBe(12)
+  })
+
+  it('refuses rather than send the token when a gated file has no signed address', async () => {
+    for (const loc of [null, 'http://cas.example/plain', 'https://huggingface.co/o/r/raw/main/a.gguf']) {
+      const o = opsFor(gatedHub(() => loc).f)
+      o.setReply(complete)
+      await expect(o.ops.transferModel(7, hfDef, () => undefined, new AbortController().signal), String(loc)).rejects.toThrow(/not sent to the instance/)
+      expect(o.runs.some((r) => r.text.includes('curlc()'))).toBe(false)
+    }
+  })
+
+  it('follows a renamed repository only within huggingface.co', async () => {
+    const calls: Array<{ url: string; auth: string | undefined }> = []
+    const f = (async (u: string | URL | Request, init?: RequestInit) => {
+      const auth = (init?.headers as Record<string, string>).Authorization
+      calls.push({ url: String(u), auth })
+      if (!auth) return new Response(null, { status: 401 })
+      if (String(u).includes('/o/r/')) return new Response(null, { status: 307, headers: { location: '/o/new/resolve/main/a.gguf' } })
+      return new Response(null, { status: 302, headers: { location: 'https://cas.example/z', 'x-linked-size': '4096' } })
+    }) as typeof fetch
+    const r = await opsFor(f).ops.headFile('https://huggingface.co/o/r/resolve/main/a.gguf', 'hf_secret')
+    expect(r).toEqual({ size: 4096, sha256: null, signedUrl: 'https://cas.example/z' })
+    expect(calls.map((c) => c.url)).toEqual([
+      'https://huggingface.co/o/r/resolve/main/a.gguf',
+      'https://huggingface.co/o/r/resolve/main/a.gguf',
+      'https://huggingface.co/o/new/resolve/main/a.gguf'
+    ])
+  })
+
+  it('does not take the length of an error page for the size', async () => {
+    const o = opsFor((async () => new Response(null, { status: 429, headers: { 'content-length': '29' } })) as typeof fetch)
+    expect(await o.ops.headFile('https://huggingface.co/o/r/resolve/main/a.gguf', null)).toEqual({ size: null, sha256: null })
+  })
+
+  it('downloads a public file through one script without a token, then marks the files complete', async () => {
     const o = opsFor(head())
     const progress: Array<{ stage: string; bytesDone: number; bytesTotal: number }> = []
     o.setReply((text) => {
@@ -823,8 +906,8 @@ describe('model files through ops', () => {
     }
     await o.ops.transferModel(7, hfDef, (p) => progress.push(p), new AbortController().signal)
     const download = o.runs.find((r) => r.text.includes('curlc()'))
-    expect(download?.opts?.stdin).toBe('header = "Authorization: Bearer hf_secret"\n')
-    expect(download?.text).not.toContain('hf_secret')
+    expect(download?.opts?.stdin).toBe('\n')
+    expect(o.runs.every((r) => !r.text.includes('hf_secret') && !String(r.opts?.stdin ?? '').includes('hf_secret'))).toBe(true)
     expect(download?.text).toContain(`'${'9'.repeat(64)}'`)
     expect(download?.opts?.timeoutMs).toBe(0)
     const mark = o.runs[o.runs.length - 1].text
