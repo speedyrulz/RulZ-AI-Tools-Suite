@@ -194,6 +194,8 @@ export interface IpcEvents extends NovelIpcEvents, PhoneIpcEvents, WritingIpcEve
   'chat:event': StreamEvent
   'mcp:changed': McpServerStatus[]
   'mcp:config': McpConfigState
+  /** A practice lane opened a program in the REA the chats use. */
+  'mcp:reaTaken': undefined
   'server:changed': ApiServerStatus
   'server:request': ApiRequestLog
   /** An app recorded or described an RE session through the API server. */

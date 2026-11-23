@@ -151,10 +151,10 @@ s.tool('${tool}', 'Tells which process answered', async () => ({ content: [{ typ
 s.connect(new StdioServerTransport())
 `
 
-function setup(servers: Record<string, unknown>): McpManager {
+function setup(servers: Record<string, unknown>, onReaTaken?: () => void): McpManager {
   const file = join(root, `mcp-${Math.random().toString(36).slice(2)}.json`)
   writeFileSync(file, JSON.stringify({ mcpServers: servers }))
-  return new McpManager(file, () => undefined)
+  return new McpManager(file, () => undefined, undefined, undefined, onReaTaken)
 }
 
 describe('McpManager.openScope', () => {
@@ -222,7 +222,8 @@ describe('McpManager.openScope', () => {
   }, 30_000)
 
   it('lets a lane that has REA to itself fall back to the shared connection when REA is an HTTP server or is missing', async () => {
-    const http = setup({ rea: { url: 'http://127.0.0.1:9/mcp' }, other: stdio(other) })
+    let taken = 0
+    const http = setup({ rea: { url: 'http://127.0.0.1:9/mcp' }, other: stdio(other) }, () => taken++)
     await http.init()
     try {
       expect(() => http.openScope()).toThrow(/HTTP server/)
@@ -230,6 +231,10 @@ describe('McpManager.openScope', () => {
       expect((await alone.callTool({ name: 'other__hello', arguments: '{}' })).isError).toBe(false)
       // Shared, not private: the shared connection answers for REA's tools (here: it has none, so it says so).
       expect((await alone.callTool({ name: 'rea__whoami', arguments: '{}' })).text).toMatch(/not available/)
+      // Opening a program there is reported before and after, so a chat does not take it for its own.
+      expect(taken).toBe(0)
+      await alone.callTool({ name: 'rea__open_binary', arguments: '{}' })
+      expect(taken).toBe(2)
       await alone.close()
     } finally {
       await http.dispose()

@@ -259,7 +259,8 @@ async function main(): Promise<void> {
     (s) => broadcast('mcp:changed', s),
     (c) => broadcast('mcp:config', c),
     (): Record<string, McpServerConfig> =>
-      python ? { calc: { command: python.command, args: [...python.args, '-I', calcScript] } } : {}
+      python ? { calc: { command: python.command, args: [...python.args, '-I', calcScript] } } : {},
+    () => broadcast('mcp:reaTaken', undefined)
   )
   void findPython()
     .then((p) => {

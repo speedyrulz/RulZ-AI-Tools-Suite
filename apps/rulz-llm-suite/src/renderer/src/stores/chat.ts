@@ -70,7 +70,7 @@ export interface ToolApproval {
 
 /** Tools the user allowed for one chat with a model on a rented instance ("<chat id> <tool>"); never saved. */
 const allowedInChat = new Set<string>()
-/** The chat whose program the shared REA process has open; null = not known (nothing yet, an open failed, or another open tool ran). */
+/** The chat whose program the shared REA process has open; null = not known (nothing yet, an open failed, another open tool or a practice lane ran). */
 let reaOpener: string | null = null
 
 /** Share of the context window at which the user is offered a handoff. */
@@ -847,6 +847,9 @@ export const useChat = create<ChatState>((set, get) => {
 
     init: once(async () => {
       on('chat:event', handleEvent)
+      on('mcp:reaTaken', () => {
+        reaOpener = null
+      })
       // The practice pool writes its chats in the main process: list entries, the chats it owns, and the one on screen.
       on('conversations:saved', (summary) => set((st) => ({ summaries: upsertSummary(st.summaries, summary) })))
       on('re:poolChats', (ids) => {

@@ -55,7 +55,9 @@ export class McpManager {
     private readonly onChange: (status: McpServerStatus[]) => void,
     private readonly onConfig: (config: McpConfigState) => void = () => undefined,
     /** Servers the app provides itself (the RE calculator). A server of the same name in mcp.json wins. */
-    private readonly appServers: () => Record<string, McpServerConfig> = () => ({})
+    private readonly appServers: () => Record<string, McpServerConfig> = () => ({}),
+    /** A practice lane that uses the shared REA is opening, or has opened, a program there. */
+    private readonly onReaTaken: () => void = () => undefined
   ) {}
 
   private withAppServers(servers: Record<string, McpServerConfig>): Record<string, McpServerConfig> {
@@ -323,7 +325,15 @@ export class McpManager {
         const found = this.findTool(qualified)
         return found ? { server: found.conn.status.name, tool: found.tool.name } : undefined
       },
-      shared: (call, signal, files) => this.callTool(call, signal, files),
+      shared: async (call, signal, files) => {
+        if (!call.name.startsWith('rea__open_')) return this.callTool(call, signal, files)
+        this.onReaTaken()
+        try {
+          return await this.callTool(call, signal, files)
+        } finally {
+          this.onReaTaken()
+        }
+      },
       start: (server) => this.startScoped(own.get(server)!),
       onClose: () => void this.scopes.delete(scope)
     })
