@@ -2385,6 +2385,42 @@ Seed twins in one run: a race row may set its own `seed`, which gives it its own
 noise (the other rows keep sharing theirs); with `race_drop_lowest: false` every twin trains to the end and keeps its
 `_best` file.
 
+## Test LoRAs (since 4.4.0)
+
+The **Test LoRAs** tab answers "which of my finished LoRAs is best, and at what strength?". It renders LoRA files from
+your own runs side by side on the same prompts and seeds, at several strengths, with the same renderer the run's
+probes use, and scores every picture on the trainer's likeness scale. Untested on a real GPU so far: compare by eye
+too.
+
+- **LoRAs:** tick files from Previous Runs (final, `_best` and step saves found in the run's job folder, or in the
+  Fleet downloads folder for a vast.ai run). Runs whose files are gone are listed apart. Every LoRA in one test must
+  come from the same base model and LoRA layout (type, targets, blocks, rank); the tab says why when they do not.
+- **Prompts, seeds, strengths:** probe presets or typed prompts, each marked face, body or both (which likeness score
+  the picture gets); a seed list; strengths from 0 to 2 (default 0.8, 1.0, 1.2). The size, steps, guidance and
+  negative are the first run's sample settings, the same for every LoRA so the grid is fair. Strength scales the
+  LoRA's change while rendering; 1.0 is exactly the probes' render, and no file is rewritten. At most 2000 pictures.
+- **Seed soups (optional):** average two or more of the ticked LoRA or LoKr files into one more contestant (exact for
+  LoRA files, the config's rank for LoKr; not OFT, DoRA or kohya files). The soup is saved in the test's folder.
+- **Where it runs:** this PC's GPUs (a GPU a training job uses cannot be picked, and the training queue waits while a
+  test runs), or a vast.ai instance from the **Run on** list, which renders with the instance's own files and GPUs and
+  is downloaded when it ends. Each test runs as its own process (`python -m rulztrainer.loratest run <folder>`), so the
+  WebUI stays responsive and a page reload does not stop it. **Stop** finishes the picture in hand and scores what is
+  there.
+- **Results:** a grid (rows prompt x seed, columns LoRA x strength) with each picture's combined score, a table of
+  column means (face, body, gold, combined), the best strength per LoRA and the winner. Scores use the run's own scale
+  when every LoRA comes from runs with the same face model, body score and gold face and the run's recorded scale can
+  be read; otherwise they use the references' own scale and the page says so. **Pick** puts a label on that run in
+  Previous Runs; nothing is moved.
+- **Saved and exported:** each test is kept in `output/_tests/<test id>/` (spec, status, pictures, results) and
+  reopens without rendering again. Export writes the grid as JPEG pages (8 x 8 pictures each, with row labels),
+  `scores.xlsx` and a PDF report.
+- **Limits:** clip models (probes of more than one frame) cannot be tested. Two or more GPUs need plain LoRA or LoKr
+  files that cover the same layers. The Renderer loads the whole sampling model on one GPU without block swap, so
+  large models may not fit a 16 GB card: use an instance.
+
+The file format and the instance commands (`rulz_agent.py test-start | test-status | test-stop`, `rulz_remote.py
+pull --tests`) are in `docs/lora-test-contract.md`.
+
 ## Post-hoc EMA (`scripts/posthoc_ema.py`)
 
 `lora_ema` averages the LoRA while it trains, with a decay chosen before the run. Post-hoc EMA (musubi-tuner's

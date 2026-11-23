@@ -434,6 +434,17 @@ def cmd_files(args) -> int:
     """A job's files to fetch: {"base": folder, "files": [{"path" under base, "size", "mtime"}]}. --what picks logs
     (default), probes, samples, maps (the training_maps folder), loras, best or all; --step keeps that step's images
     and LoRA."""
+    if getattr(args, "tests", None):
+        if args.name or args.what or args.step is not None:
+            raise Refused("--tests cannot be combined with a job, --what or --step")
+        d = test_dir(args.tests)
+        files = []
+        for p in sorted(d.rglob("*")):
+            if p.is_file() and not p.is_symlink() and d.resolve() in p.resolve().parents:
+                st = p.stat()
+                files.append({"path": p.relative_to(d).as_posix(), "size": st.st_size, "mtime": int(st.st_mtime)})
+        show({"base": str(d.resolve()), "files": files})
+        return 0
     d = job_dir(args.name)
     tag = f"{args.step:06d}" if args.step is not None else None
     what = set(args.what or ["logs"])
@@ -461,6 +472,127 @@ def cmd_files(args) -> int:
 
 
 # ---------------------------------------------------------------- act
+
+TEST_FINAL = {"refused", "done", "stopped", "failed"}
+
+
+def tests_root():
+    root = OUTPUT / "_tests"
+    if root.is_symlink() or not root.resolve().is_relative_to(OUTPUT.resolve()):
+        raise Refused("Tests folder is outside output")
+    return root
+
+
+def test_dir(test_id, must_exist=True):
+    if not isinstance(test_id, str) or not re.fullmatch(r"[a-z0-9-]+", test_id):
+        raise Refused(f"Bad test_id: {test_id!r}")
+    d = tests_root() / test_id
+    if d.is_symlink() or (must_exist and not d.is_dir()):
+        raise Refused(f"No test named {test_id!r}")
+    return d
+
+
+def test_status(d):
+    status = read_json(d / "status.json") or {}
+    if status.get("state") not in TEST_FINAL:
+        pid = status.get("pid")
+        if (pid is None and time.time() - d.stat().st_mtime > 120) or (
+                pid is not None and live_process(pid, created=status.get("pid_created")) is None):
+            status = dict(status, state="failed", error="Test process is no longer running")
+    return status
+
+
+def running_tests():
+    root = tests_root()
+    active = []
+    for d in root.iterdir() if root.is_dir() else ():
+        if d.is_dir() and not d.is_symlink():
+            status = test_status(d)
+            if status.get("state") not in TEST_FINAL:
+                active.append((d, status))
+    return active
+
+
+def cmd_test_start(args):
+    try:
+        spec = json.loads(base64.b64decode(SENT_CONFIG).decode("utf-8") if SENT_CONFIG else sys.stdin.read())
+    except (ValueError, UnicodeError) as e:
+        raise Refused(f"Invalid spec JSON: {e}")
+    if not isinstance(spec, dict):
+        raise Refused("Spec must be a JSON object")
+    if spec.get("test_id") is not None:
+        test_dir(spec["test_id"], must_exist=False)
+    lock = hold_lock(OUTPUT / "_test-start.lock")
+    if lock is None:
+        raise Refused("Another test start is in progress")
+    with lock:
+        return start_test_locked(spec)
+
+
+def start_test_locked(spec):
+    if job_process() is not None:
+        # Training can use auxiliary GPUs dynamically, including auto placement.
+        raise Refused("A training job is running; its GPU use cannot be determined safely")
+    test_id = spec.get("test_id")
+    d = test_dir(test_id, must_exist=False) if test_id else None
+    for other, status in running_tests():
+        if other == d:
+            show({"test_id": test_id, "state": status.get("state")})
+            return 0
+        raise Refused(f"Test {other.name} is already running")
+    if d is not None and d.exists():
+        status = read_json(d / "status.json") or {}
+        if status.get("state") in TEST_FINAL:
+            raise Refused(f"Test {test_id} already ran")
+        status.update(state="queued", pid=None, pid_created=None)
+        write_json(d / "status.json", status)
+    else:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "spec.json"
+            path.write_text(json.dumps(spec), encoding="utf-8")
+            result = subprocess.run([sys.executable, "-m", "rulztrainer.loratest", "new", "--spec", str(path)],
+                                    capture_output=True, text=True)
+        if result.returncode:
+            raise Refused((result.stderr or result.stdout or "Could not create test").strip())
+        test_id = result.stdout.strip()
+        d = test_dir(test_id)
+    try:
+        with (d / "run.log").open("ab") as log:
+            proc = subprocess.Popen([sys.executable, "-m", "rulztrainer.loratest", "run", str(d)],
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        status = read_json(d / "status.json") or {}
+        if status.get("pid") is None and status.get("state") not in TEST_FINAL:
+            import psutil
+            try:
+                created = psutil.Process(proc.pid).create_time()
+            except psutil.Error:
+                created = None
+            status.update(pid=proc.pid, pid_created=created)
+            write_json(d / "status.json", status)
+    except OSError as e:
+        raise Refused(f"Could not start test: {e}")
+    show({"test_id": test_id, "state": "queued"})
+    return 0
+
+
+def cmd_test_status(args):
+    if args.test_id:
+        show(test_status(test_dir(args.test_id)))
+    else:
+        root = tests_root()
+        dirs = [p for p in root.iterdir() if p.is_dir() and not p.is_symlink()] if root.is_dir() else []
+        entries = [(d, test_status(d), read_json(d / "spec.json") or {}) for d in dirs]
+        entries.sort(key=lambda e: (e[1].get("started") or e[2].get("created") or e[0].name, e[0].name), reverse=True)
+        show({"tests": [status for _, status, _ in entries]})
+    return 0
+
+
+def cmd_test_stop(args):
+    d = test_dir(args.test_id)
+    (d / "STOP").touch()
+    show({"test_id": args.test_id, "stopping": True})
+    return 0
 
 
 def parse_overrides(items: list[str]) -> dict:
@@ -527,6 +659,9 @@ def moved_aside_name(job_dir: Path) -> Path:
 def cmd_start(args) -> int:
     """Queue a run. The checks of the WebUI's queue_run, the trainer's own validate, and refusing to overwrite an
     earlier run's folder."""
+    active_tests = running_tests()
+    if active_tests:
+        raise Refused(f"Test {active_tests[0][0].name} is already running")
     from rulztrainer.config import TrainConfig, apply_preset
 
     data = base_config(args).to_dict()
@@ -996,8 +1131,14 @@ def parser() -> argparse.ArgumentParser:
     command("record", cmd_record, True)
     command("poll", cmd_poll, True)
     p = command("files", cmd_files, True)
+    p.add_argument("--tests", metavar="TEST_ID")
     p.add_argument("--what", action="append", choices=("logs", "probes", "samples", "maps", "loras", "best", "all"))
     p.add_argument("--step", type=int, help="only this step's images and LoRA")
+    command("test-start", cmd_test_start)
+    p = command("test-status", cmd_test_status)
+    p.add_argument("test_id", nargs="?")
+    p = command("test-stop", cmd_test_stop)
+    p.add_argument("test_id")
     p = command("start", cmd_start)
     p.add_argument("--job", required=True, help="the new run's job name")
     p.add_argument("--from", dest="base", metavar="JOB", help="start from this job's config")
