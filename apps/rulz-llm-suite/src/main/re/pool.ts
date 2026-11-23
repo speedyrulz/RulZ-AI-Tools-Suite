@@ -75,7 +75,7 @@ export interface PoolDeps {
   /** The shared MCP connections' status. */
   servers(): McpServerStatus[]
   /**
-   * One scope per lane; throws a sentence when REA cannot run privately. `alone`: this is the run's only lane, so
+   * One scope per lane; throws a sentence when REA cannot run privately. `alone`: this is the run's only lane, on this PC, so
    * with no local REA program (an HTTP server, or none) the scope falls back to the shared connection, as the
    * old loop did.
    */
@@ -277,7 +277,8 @@ export class PracticePool {
     // One scope per lane, opened (not yet started) here so a run that cannot work fails before it exists.
     const lanes: Lane[] = []
     const releases: (() => void)[] = []
-    const alone = hosts.length * target.sessionsPerHost === 1
+    // A rented host never gets the shared REA: what chats have open there is not for its model to read.
+    const alone = hosts.length * target.sessionsPerHost === 1 && hosts[0].rentalId === undefined
     try {
       for (const [hostIndex, host] of hosts.entries()) {
         releases.push(this.deps.useHost(host.instanceId))

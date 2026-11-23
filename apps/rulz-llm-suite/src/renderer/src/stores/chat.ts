@@ -70,7 +70,7 @@ export interface ToolApproval {
 
 /** Tools the user allowed for one chat with a model on a rented instance ("<chat id> <tool>"); never saved. */
 const allowedInChat = new Set<string>()
-/** The chat whose program the shared REA process has open; null = not known (nothing yet, or an open failed). */
+/** The chat whose program the shared REA process has open; null = not known (nothing yet, an open failed, or another open tool ran). */
 let reaOpener: string | null = null
 
 /** Share of the context window at which the user is offered a handoff. */
@@ -606,7 +606,7 @@ export const useChat = create<ChatState>((set, get) => {
       const r = await invoke('mcp:callTool', call.name, call.arguments, callKey, scope)
         .catch((e) => ({ text: errorMessage(e), isError: true }))
         .finally(() => runningToolCalls.delete(callKey))
-      if (target.server === 'rea' && target.name.startsWith('open_')) reaOpener = r.isError ? null : (gen?.id ?? null)
+      if (target.server === 'rea' && target.name.startsWith('open_')) reaOpener = target.name === 'open_binary' && !r.isError ? (gen?.id ?? null) : null
       if (!inToolPhase(requestId)) return
       updateCall(call.id, { status: r.isError ? 'error' : 'done', result: r.text })
     }

@@ -309,7 +309,7 @@ export class McpManager {
       if (!cfg || cfg.disabled) continue
       // A lane that has the program to itself may use the shared connection, whatever kind it is.
       if (cfg.url && alone) continue
-      if (cfg.url) throw new Error(`Practice sessions side by side need "${n}" to be a local program (a "command") in mcp.json; it is an HTTP server there.`)
+      if (cfg.url) throw new Error(`Practice sessions side by side or on a rented instance need "${n}" to be a local program (a "command") in mcp.json; it is an HTTP server there.`)
       own.set(n, cfg)
     }
     if (!alone && (!own.has('rea') || this.connections.get('rea')?.status.state !== 'connected')) {

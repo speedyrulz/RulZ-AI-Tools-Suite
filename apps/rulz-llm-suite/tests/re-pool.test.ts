@@ -424,7 +424,7 @@ describe('PracticePool', () => {
       expect(t.log.usedHosts.size).toBe(0)
     })
 
-    it('tells openScope whether the lane is alone', async () => {
+    it('tells openScope whether the lane is alone; a rented host never shares REA', async () => {
       const seen: boolean[] = []
       const open = (opts: { alone: boolean }): PoolScope => {
         seen.push(opts.alone)
@@ -436,7 +436,10 @@ describe('PracticePool', () => {
       const many = make({ hosts: [host(1)], openScope: open })
       await many.pool.start(request(2, target([1], 2)))
       await many.pool.whenIdle()
-      expect(seen).toEqual([true, false, false])
+      const rented = make({ hosts: [host(1)], openScope: open })
+      await rented.pool.start(request(1, target([1], 1)))
+      await rented.pool.whenIdle()
+      expect(seen).toEqual([true, false, false, false])
     })
 
     it('marks a task whose chat could not be saved as an error instead of recording its grade', async () => {

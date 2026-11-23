@@ -80,7 +80,8 @@ for each try, because it expires). Log lines shown in the app are scrubbed of bo
 Whoever owns the rented machine can read what is sent to the model and can make it answer anything, tool calls
 included. So with a remote model the approval settings (don't ask, always allowed, static analysis unasked) cover only
 static analysis and opening a program, and only on the RE session's own files (`runsWithoutAsking`, `argsStayInside`).
-Everything else asks, and an unattended run refuses it. Chats share one REA process, so a chat with a remote model must
+Everything else asks, and an unattended run refuses it. A run on an instance always has
+its own REA process. Chats share one, so a chat with a remote model must
 have opened the program itself before it may look into it unasked, and reading REA's stored evidence always asks. Known limit: paths are compared as text, so a link
 the user already has inside the analysed folder is followed. "Allow this tool in this chat" lasts until the app closes.
 
