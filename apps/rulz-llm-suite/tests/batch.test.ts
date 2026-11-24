@@ -350,6 +350,23 @@ describe('tool calls of a model on a rented instance', () => {
     expect(runsWithoutAsking(open, tool('rulz', 'write_file'), true, call({ path: 'src/main.c', content: 'C:\\Windows' }))).toBe(true)
   })
 
+  it('asks before read_pdf: not static, never unasked on a rented instance, and only the normal settings let it run', () => {
+    const ask = { confirmToolCalls: true, allowedTools: [], re: { autoApproveStatic: true } }
+    const pdf = tool('rulz', 'read_pdf')
+    const inside = call({ path: 'C:\\work\\t\\1\\doc.pdf' })
+    // RE session with auto-approve of static tools on: other rulz tools run, read_pdf asks.
+    expect(runsWithoutAsking(ask, tool('rulz', 'list_directory'), true)).toBe(true)
+    expect(runsWithoutAsking(ask, pdf, true)).toBe(false)
+    expect(runsWithoutAsking(ask, pdf, false)).toBe(false)
+    // The user's own settings still work as for any tool.
+    expect(runsWithoutAsking({ ...ask, allowedTools: ['rulz__read_pdf'] }, pdf, true)).toBe(true)
+    expect(runsWithoutAsking({ ...ask, confirmToolCalls: false }, pdf, false)).toBe(true)
+    // A model on a rented instance never gets it unasked, not even for a file inside the session's folder, with every setting open.
+    expect(runsWithoutAsking({ ...ask, allowedTools: ['rulz__read_pdf'], confirmToolCalls: false }, pdf, true, inside)).toBe(false)
+    expect(runsWithoutAsking({ ...ask, allowedTools: ['rulz__read_pdf'], confirmToolCalls: false }, pdf, false, inside)).toBe(false)
+    expect(runsWithoutAsking(open, pdf, true, inside)).toBe(false)
+  })
+
   it('checks nested and list arguments and paths under any key, but not search text', () => {
     expect(argsStayInside('{"pattern":"C:\\\\Windows"}', roots)).toBe(true)
     expect(argsStayInside('{"query":"http://example"}', roots)).toBe(true)

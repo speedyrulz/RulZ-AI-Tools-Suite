@@ -209,9 +209,9 @@ export function fileScope(c: Conversation | null | undefined): FileToolScope | u
 }
 
 /** Tool options for a chat: RE sessions use the RE budget, clone sessions get the file tools. */
-function toolOpts(c: Conversation | null | undefined): { re: boolean; files?: FileToolScope } {
+function toolOpts(c: Conversation | null | undefined): { re: boolean; files?: FileToolScope; practice?: boolean } {
   const files = fileScope(c)
-  return { re: !!c?.re, ...(files ? { files } : {}) }
+  return { re: !!c?.re, ...(files ? { files } : {}), ...(c?.re?.practice ? { practice: true } : {}) }
 }
 
 /** A copy of an RE session's details for a new chat (branch, copy, handoff): it needs grading again. */
@@ -519,7 +519,7 @@ export const useChat = create<ChatState>((set, get) => {
   /** Runs one of the built-in loader tools; these change chat state only, so they need no approval. */
   const runMetaTool = (call: ToolCall): ToolResult => {
     const gen = get().genConversation
-    const tools = availableTools({ clone: !!fileScope(gen) })
+    const tools = availableTools({ clone: !!fileScope(gen), practice: !!gen?.re?.practice })
     const active = gen?.activeTools ?? []
     const r = runLoaderTool(call, tools, active, toolBudget({ re: !!gen?.re }), tokensOf)
     if (r.active !== active) setActiveTools(() => r.active)
@@ -563,7 +563,7 @@ export const useChat = create<ChatState>((set, get) => {
       }
       // The model may call a tool by its bare name; map it to the real one.
       const scope = fileScope(get().genConversation)
-      const target = resolveTool(availableTools({ clone: !!scope }), call.name)
+      const target = resolveTool(availableTools({ clone: !!scope, practice: !!get().genConversation?.re?.practice }), call.name)
       if (!target) {
         updateCall(call.id, { status: 'error', result: `Tool "${call.name}" is not available or is switched off.` })
         continue
@@ -574,7 +574,7 @@ export const useChat = create<ChatState>((set, get) => {
       }
       const isRe = !!get().genConversation?.re
       // Calling a tool keeps it loaded and marks it recently used.
-      if (effectiveToolMode({ re: isRe, files: scope }) === 'dynamic') loadTools([target.qualifiedName])
+      if (effectiveToolMode({ re: isRe, files: scope, practice: !!get().genConversation?.re?.practice }) === 'dynamic') loadTools([target.qualifiedName])
       const s = useApp.getState().settings
       const gen = get().genConversation
       const remote = isRemoteModelId(gen?.modelId ?? '')
@@ -1245,7 +1245,7 @@ export const useChat = create<ChatState>((set, get) => {
       const modelId = opts.modelId && models.models.some((m) => m.id === opts.modelId) ? opts.modelId : models.activeModelId
       // Messages go to the active model, so the session's model becomes it (loaded on send if needed).
       if (modelId) models.setActive(modelId)
-      const available = availableTools({ clone: !!opts.clone })
+      const available = availableTools({ clone: !!opts.clone, practice: !!opts.practice })
       const starter = [...RE_STARTER_TOOLS, ...(opts.clone ? CLONE_STARTER_TOOLS : [])].flatMap((n) => {
         const t = resolveTool(available, n)
         return t ? [t.qualifiedName] : []

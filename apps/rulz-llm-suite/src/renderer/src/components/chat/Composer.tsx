@@ -2,8 +2,9 @@ import { ArrowUp, Clock, CornerDownRight, FileText, LoaderCircle, Paperclip, Squ
 import { forwardRef, useImperativeHandle, useLayoutEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import type { Attachment } from '@shared/types'
-import { filesToAttachments } from '../../lib/attachments'
-import { formatBytes } from '../../lib/format'
+import { isPdfFile } from '@shared/pdf'
+import { cancelPdfRead, filesToAttachments, pdfToAttachment } from '../../lib/attachments'
+import { formatBytes, uid } from '../../lib/format'
 import { useApp } from '../../stores/app'
 import { isPoolChat, useChat } from '../../stores/chat'
 import { modelById, useModels } from '../../stores/models'
@@ -17,6 +18,12 @@ export interface ComposerHandle {
 export const Composer = forwardRef<ComposerHandle>(function Composer(_props, ref) {
   const [text, setText] = useState('')
   const [attachments, setAttachments] = useState<Attachment[]>([])
+  /** PDFs being read in the main process; their text is added when it is ready. */
+  const [reading, setReading] = useState<{ id: string; name: string }[]>([])
+  /** Reads the user stopped waiting for (their result is dropped). */
+  const stopped = useRef(new Set<string>())
+  const mounted = useRef(true)
+  const running = useRef(new Set<string>())
   const textRef = useRef<HTMLTextAreaElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const generating = useChat((s) => !!s.generation)
@@ -39,8 +46,39 @@ export const Composer = forwardRef<ComposerHandle>(function Composer(_props, ref
   const instances = useModels((s) => s.instances)
   const openPicker = useApp((s) => s.openPicker)
 
+  useLayoutEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+      for (const id of running.current) cancelPdfRead(id)
+    }
+  }, [])
+
+  /** A PDF is read on its own, so it never holds up the other files. Its text is dropped if the chat changed meanwhile. */
+  const addPdf = async (file: File): Promise<void> => {
+    const id = uid()
+    const name = file.name || 'document.pdf'
+    const chat = useChat.getState().current?.id
+    setReading((r) => [...r, { id, name }])
+    running.current.add(id)
+    const res = await pdfToAttachment(file, id)
+    running.current.delete(id)
+    setReading((r) => r.filter((x) => x.id !== id))
+    if (stopped.current.delete(id) || !mounted.current) return
+    if (useChat.getState().current?.id !== chat) {
+      toast.warning(`${name} was not attached: you went to another chat while it was being read.`)
+      return
+    }
+    if (res.error) toast.error(res.error)
+    if (res.note) toast.warning(res.note)
+    if (res.attachment) setAttachments((a) => [...a, res.attachment!])
+  }
+
   const addFiles = async (files: File[]): Promise<void> => {
-    const { attachments: added, errors } = await filesToAttachments(files)
+    for (const f of files) if (isPdfFile(f)) void addPdf(f)
+    const others = files.filter((f) => !isPdfFile(f))
+    if (!others.length) return
+    const { attachments: added, errors } = await filesToAttachments(others)
     if (errors.length) toast.error(errors.join('\n'))
     if (added.length) setAttachments((a) => [...a, ...added])
   }
@@ -55,7 +93,8 @@ export const Composer = forwardRef<ComposerHandle>(function Composer(_props, ref
   }, [text])
 
   const hasInput = text.trim().length > 0 || attachments.length > 0
-  const canSend = hasInput && !autoLoading && !poolOwned && (!generating || replyingHere)
+  // A PDF still being read would be left out of the message, so sending waits for it (or for it to be stopped).
+  const canSend = hasInput && reading.length === 0 && !autoLoading && !poolOwned && (!generating || replyingHere)
 
   /** While a reply streams here: "now" stops it and sends the note, "later" queues the note for when it ends. */
   const submit = (when: 'now' | 'later' = 'now'): void => {
@@ -102,8 +141,28 @@ export const Composer = forwardRef<ComposerHandle>(function Composer(_props, ref
         </div>
       )}
       <div className="rounded-2xl border border-border bg-panel shadow-sm focus-within:border-accent/60">
-        {attachments.length > 0 && (
+        {(attachments.length > 0 || reading.length > 0) && (
           <div className="flex flex-wrap gap-2 px-3 pt-3">
+            {reading.map((p) => (
+              <div key={p.id} className="group relative flex items-center gap-2 rounded-lg border border-border bg-panel-2 py-1 pr-7 pl-1 text-xs">
+                <LoaderCircle size={15} className="ml-1 animate-spin text-muted" />
+                <div className="max-w-40">
+                  <div className="truncate">{p.name}</div>
+                  <div className="text-[10px] text-faint">Reading the PDF…</div>
+                </div>
+                <button
+                  aria-label={`Stop reading ${p.name}`}
+                  className="absolute top-1 right-1 rounded p-0.5 text-faint hover:bg-hover hover:text-text"
+                  onClick={() => {
+                    stopped.current.add(p.id)
+                    cancelPdfRead(p.id)
+                    setReading((list) => list.filter((x) => x.id !== p.id))
+                  }}
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            ))}
             {attachments.map((a) => (
               <div key={a.id} className="group relative flex items-center gap-2 rounded-lg border border-border bg-panel-2 py-1 pr-7 pl-1 text-xs">
                 {a.kind === 'image' && a.dataUrl ? (
@@ -152,7 +211,7 @@ export const Composer = forwardRef<ComposerHandle>(function Composer(_props, ref
           }}
         />
         <div className="flex items-center gap-1 px-2 pb-2">
-          <IconButton label="Attach images or text files" onClick={() => fileRef.current?.click()} disabled={poolOwned}>
+          <IconButton label="Attach images, PDFs or text files" onClick={() => fileRef.current?.click()} disabled={poolOwned}>
             <Paperclip size={16} />
           </IconButton>
           <input

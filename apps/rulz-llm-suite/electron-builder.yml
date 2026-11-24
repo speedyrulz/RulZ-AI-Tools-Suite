@@ -12,6 +12,9 @@ extraResources:
     to: icon.ico
   - from: resources/calc_mcp.py
     to: calc_mcp.py
+  # pdf.js character maps: read from disk when a PDF needs them (Chinese, Japanese and Korean text).
+  - from: node_modules/pdfjs-dist/cmaps
+    to: pdfjs-cmaps
 win:
   icon: build/icon.ico
   target:

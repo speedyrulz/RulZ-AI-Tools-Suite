@@ -2,7 +2,8 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { extractAnswer, isStaticReTool, reFirstMessage, reSampling } from '@shared/re'
+import { extractAnswer, isStaticReTool, PRACTICE_HIDDEN_TOOLS, reFirstMessage, reSampling } from '@shared/re'
+import { availableToolsOf, effectiveToolModeOf, toolRequestOf, type ToolSettings } from '@shared/toolSession'
 import { DEFAULT_SAMPLING } from '@shared/defaults'
 import type { ChatMessage, Conversation, ReSession, WireMessage } from '@shared/types'
 import type { RecordedRound } from '../src/main/chat/service'
@@ -26,10 +27,31 @@ describe('RE answers and tools', () => {
     expect(isStaticReTool('rea', 'procedure_pseudo_code')).toBe(true)
     expect(isStaticReTool('calc', 'calc')).toBe(true)
     expect(isStaticReTool('rulz', 'list_directory')).toBe(true)
+    // read_pdf reads a file anywhere on disk, so it is never static.
+    expect(isStaticReTool('rulz', 'read_pdf')).toBe(false)
     for (const n of ['execute_rizin_command', 'cutter_command', 'start_frida_session', 'install_adb_package', 'capture_process_scenario', 'start_gdb_session']) {
       expect(isStaticReTool('rea', n)).toBe(false)
     }
     expect(isStaticReTool('other', 'xrefs')).toBe(false)
+  })
+
+  it('never offers read_pdf in practice sessions, and does in other chats', () => {
+    const t = (name: string) => ({ qualifiedName: `rulz__${name}`, server: 'rulz', name, inputSchema: { type: 'object' } })
+    const servers = [{ name: 'rulz', transport: 'builtin' as const, state: 'connected' as const, tools: [t('list_directory'), t('read_pdf'), t('read_file')], log: [] }]
+    const settings: ToolSettings = { toolsEnabled: true, toolMode: 'all', toolBudgetTokens: 6000, disabledTools: [], re: { toolBudgetTokens: 6000 } }
+    const names = (o: { clone?: boolean; practice?: boolean }) => availableToolsOf(servers, settings, o).map((x) => x.name)
+    expect(PRACTICE_HIDDEN_TOOLS).toEqual(['rulz__read_pdf'])
+    expect(names({})).toEqual(['list_directory', 'read_pdf'])
+    expect(names({ clone: true })).toEqual(['list_directory', 'read_pdf', 'read_file'])
+    expect(names({ practice: true })).toEqual(['list_directory'])
+    expect(names({ practice: true, clone: true })).toEqual(['list_directory', 'read_file'])
+    // The request tells the main process, which builds the definitions, to leave it out too.
+    expect(toolRequestOf(servers, settings, [], { re: true })).toEqual({ mode: 'all', active: [] })
+    expect(toolRequestOf(servers, settings, [], { re: true, practice: true })).toEqual({ mode: 'all', active: [], practice: true })
+    // A practice session whose only tool is read_pdf has no tools at all.
+    const only = [{ ...servers[0], tools: [t('read_pdf')] }]
+    expect(effectiveToolModeOf(only, settings, { re: true, practice: true })).toBeNull()
+    expect(effectiveToolModeOf(only, settings, { re: true })).toBe('all')
   })
 
   it('puts the target in the first message', () => {

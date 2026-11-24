@@ -5,6 +5,8 @@ import { promises as fs, type Dirent } from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { unquotePath } from '@shared/re'
 import type { FileToolScope } from '@shared/types'
+import type { PdfReader } from '../pdf/reader'
+import { readPdfTool } from '../pdf/tool'
 
 export const FILE_TOOLS_SERVER = 'rulz'
 
@@ -71,6 +73,22 @@ export const FILE_TOOL_DEFS: FileToolDef[] = [
         path: { type: 'string', description: 'File path, relative to the output folder or absolute.' },
         offset: { type: 'integer', description: 'First line to show, from 1 (default 1).' },
         limit: { type: 'integer', description: 'Lines to show (default 400, at most 2000).' }
+      },
+      required: ['path']
+    }
+  },
+  {
+    name: 'read_pdf',
+    description:
+      'Read the text of a PDF on this computer (text only, no OCR). Pages come as "--- Page N ---"; long PDFs are read in parts, ' +
+      'and the result says what to ask for next. Use query to find which pages mention something.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute path of the PDF. %VARIABLES% are expanded.' },
+        pages: { type: 'string', description: 'Pages to read or search: "3", "2-5" or "1,4-6". Default: from page 1.' },
+        query: { type: 'string', description: 'Plain text to search for (not case-sensitive). Returns page numbers with short snippets instead of pages.' },
+        offset: { type: 'integer', description: 'For a very long page: the character of the first page to continue from, as the previous result says.' }
       },
       required: ['path']
     }
@@ -387,14 +405,29 @@ export async function readFile(args: { path?: unknown; offset?: unknown; limit?:
   }
 }
 
+/** What the main process hands the file tools: the reader that parses PDFs off the main thread (none = no PDF reading). */
+export interface FileToolDeps {
+  pdf?: PdfReader
+}
+
 export function runFileTool(
   name: string,
   args: Record<string, unknown>,
   signal?: AbortSignal,
-  scope?: FileToolScope
+  scope?: FileToolScope,
+  deps: FileToolDeps = {}
 ): Promise<{ text: string; isError: boolean }> {
   if (name === 'list_directory') return listDirectory(args)
   if (name === 'find_files') return findFiles(args, signal)
+  if (name === 'read_pdf') {
+    let full: string
+    try {
+      full = expandPath(args.path)
+    } catch (e) {
+      return Promise.resolve({ text: (e as Error).message, isError: true })
+    }
+    return readPdfTool(full, args, deps.pdf, signal)
+  }
   if (SCOPED_FILE_TOOLS.has(name) && !scope?.writeRoot) return Promise.resolve({ text: `${name} only works in a clone session.`, isError: true })
   // A pasted path may keep its quotes; "C:\app" in quotes resolves as a relative path, and the
   // guard against writing to the target would then miss it.

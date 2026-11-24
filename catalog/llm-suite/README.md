@@ -52,7 +52,7 @@ Discover/downloads, RAG and a CLI are planned.
   row's settings as the model's defaults. A run unloads every loaded model first and leaves nothing loaded; runs are
   kept in `%APPDATA%\RulZ LLM Suite\benchmarks.json` (newest 100).
 - **Chat** — streaming replies, collapsible reasoning ("thinking") blocks, Markdown with tables, LaTeX and
-  highlighted code, image and text-file attachments (drag-drop / paste), copy, edit, regenerate, continue, branch,
+  highlighted code, image, PDF and text-file attachments (drag-drop / paste), copy, edit, regenerate, continue, branch,
   delete (with undo); per-chat adapter strengths (on/off and 0–2 in the side panel, applied per request without
   reloading; a change makes the model process the chat again from the start); a note typed while the model replies is sent now (stopping the reply, keeping its thinking) or
   after it; tok/s, time-to-first-token and token stats; context usage meter with "truncate middle" or "stop" overflow
@@ -71,7 +71,8 @@ Discover/downloads, RAG and a CLI are planned.
     sent, within a token budget (least recently used are unloaded first). "Auto" switches to this once the
     enabled tools exceed the budget.
   - **Built-in file tools**: read-only `list_directory` and `find_files`, so the model can find exact paths (such as a
-    program's `.exe`) before handing them to other tools.
+    program's `.exe`) before handing them to other tools, and `read_pdf`, which reads or searches the text of a PDF
+    (no OCR) in a separate thread.
   - **Tool-result compaction**: once you send a new message, tool results from earlier turns are sent to the
     model as their beginning and end only (the chat still shows them in full); the latest results of the turn in
     progress stay complete.

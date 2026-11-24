@@ -215,7 +215,8 @@ describe('a practice session', () => {
       { role: 'user', content: reFirstMessage(h.spec.goal, h.spec.target) }
     ])
     expect(first).toMatchObject({ modelId: 'm/model.gguf', instanceId: 'inst-7', adapters: null, overflow: 'truncateMiddle', record: { conversationId: 'chat-1' } })
-    expect(first.tools).toEqual({ mode: 'all', active: [] })
+    // practice: the main process leaves read_pdf out of the definitions for practice sessions.
+    expect(first.tools).toEqual({ mode: 'all', active: [], practice: true })
     // Second request: the tool call, its result, and the model's thinking kept (interleaved thinking).
     expect(h.requests[1].messages.slice(2)).toEqual([
       {
@@ -431,7 +432,7 @@ describe('a practice session', () => {
         { settings: dynamic(total(all) - 1) }
       )
       const r = await runSession(h.deps, h.spec)
-      expect(h.requests[0].tools).toEqual({ mode: 'dynamic', active: STARTER })
+      expect(h.requests[0].tools).toEqual({ mode: 'dynamic', active: STARTER, practice: true })
       const results = assistants(r.conversation).map((m) => m.toolCalls?.[0]?.result)
       expect(results[0]).toBe('- xrefs (rea) [loaded]: xrefs does a thing')
       expect(results[1]).toBe(
@@ -440,7 +441,7 @@ describe('a practice session', () => {
           'Unknown tools: nonexistent.'
       )
       expect(results[2]).toBe('Unloaded: rea__xrefs.')
-      expect(h.requests[2].tools).toEqual({ mode: 'dynamic', active: STARTER.filter((n) => n !== 'rea__open_binary').concat('rea__start_gdb_session') })
+      expect(h.requests[2].tools).toEqual({ mode: 'dynamic', active: STARTER.filter((n) => n !== 'rea__open_binary').concat('rea__start_gdb_session'), practice: true })
       expect(r.conversation.activeTools).toEqual(['rea__binary_overview', 'rea__search_strings', 'rea__search_procedures', 'rea__procedure_pseudo_code', 'rea__start_gdb_session'])
       // The loader tools are not sent to the MCP servers.
       expect(h.toolCalls).toEqual([])

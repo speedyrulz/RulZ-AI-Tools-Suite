@@ -427,6 +427,8 @@ export interface ToolRequest {
   active: string[]
   /** Clone sessions: offer the write/read file tools, limited to this scope. */
   files?: FileToolScope
+  /** Practice sessions: leave out the built-in tools they never get (read_pdf). */
+  practice?: boolean
 }
 
 /** Where the built-in write_file and read_file tools may work (clone sessions only). */

@@ -149,7 +149,7 @@ export function ChatView() {
       {drag.active && (
         <div className="pointer-events-none absolute inset-3 flex flex-col items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-accent bg-bg/85 text-accent">
           <Upload size={28} />
-          <div className="text-sm font-medium">Drop images or text files to attach</div>
+          <div className="text-sm font-medium">Drop images, PDFs or text files to attach</div>
         </div>
       )}
     </div>

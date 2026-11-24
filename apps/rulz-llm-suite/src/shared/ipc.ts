@@ -3,6 +3,7 @@ import type { AdventureDesktopInvoke, AdventureIpcEvents, AdventureIpcInvoke } f
 import type { BatchOptions, BatchRun } from './batch'
 import type { BenchmarkRequest, BenchmarkRun } from './benchmark'
 import type { NovelIpcEvents, NovelIpcInvoke } from './novel'
+import type { PdfAttachmentResult } from './pdf'
 import type { PhoneIpcEvents, PhoneIpcInvoke, WritingIpcEvents, WritingIpcInvoke } from './phone'
 import type { BatchTarget, RemoteIpcEvents, RemoteIpcInvoke } from './remote'
 import type { WritingBenchIpcInvoke } from './writingBench'
@@ -130,6 +131,9 @@ export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke, PhoneI
   /** `files` lets the built-in write/read file tools work (clone sessions). */
   'mcp:callTool': (name: string, args: string, callKey?: string, files?: FileToolScope) => ToolResult
   'mcp:cancelTool': (callKey: string) => void
+  /** The text of a PDF attached to a chat (read in a worker thread); `ok: false` says why there is none. */
+  'attachments:readPdf': (name: string, bytes: Uint8Array, readKey: string) => PdfAttachmentResult
+  'attachments:cancelPdf': (readKey: string) => void
   /** The tool round asked for by `requestId` is over (next round started, or the turn ended). */
   'chat:releaseTurn': (requestId: string) => void
 

@@ -23,7 +23,9 @@ import { ApiServer } from './server/apiServer'
 import { parseLoadConfig } from './settings/schema'
 import { SettingsStore } from './settings/store'
 import { FILE_TOOLS_SERVER } from './files/fileTools'
-import { API_RE_PREFIX, CLONE_FILE_TOOLS, extractAnswer } from '@shared/re'
+import { PdfWorkerReader } from './pdf/reader'
+import { readPdfAttachment } from './pdf/tool'
+import { API_RE_PREFIX, CLONE_FILE_TOOLS, extractAnswer, PRACTICE_HIDDEN_TOOLS } from '@shared/re'
 import { BatchStore } from './re/batches'
 import { PracticePool, type PoolHost } from './re/pool'
 import { poolHandlers } from './re/poolIpc'
@@ -254,13 +256,20 @@ async function main(): Promise<void> {
   // The RE calculator (a sandboxed Python MCP server from the RE training kit) runs when Python 3 is installed.
   const calcScript = app.isPackaged ? join(process.resourcesPath, 'calc_mcp.py') : join(__dirname, '../../resources/calc_mcp.py')
   let python: PythonCommand | null = null
+  // PDFs are parsed in worker threads (out/main/pdfWorker.js), never here. pdf.js's character maps (for Chinese, Japanese
+  // and Korean text) ship next to the app as a resource folder.
+  const pdfReader = new PdfWorkerReader({
+    workerPath: join(__dirname, 'pdfWorker.js'),
+    cmapDir: () => (app.isPackaged ? join(process.resourcesPath, 'pdfjs-cmaps') : join(__dirname, '../../node_modules/pdfjs-dist/cmaps'))
+  })
   const mcp = new McpManager(
     mcpConfigPath,
     (s) => broadcast('mcp:changed', s),
     (c) => broadcast('mcp:config', c),
     (): Record<string, McpServerConfig> =>
       python ? { calc: { command: python.command, args: [...python.args, '-I', calcScript] } } : {},
-    () => broadcast('mcp:reaTaken', undefined)
+    () => broadcast('mcp:reaTaken', undefined),
+    pdfReader
   )
   void findPython()
     .then((p) => {
@@ -355,6 +364,8 @@ async function main(): Promise<void> {
     const disabled = new Set(settings.get().disabledTools)
     // The write/read file tools exist only in clone sessions.
     if (!req.files) for (const n of CLONE_FILE_TOOLS) disabled.add(n)
+    // Practice sessions keep the tools and prompts their recorded data was made with.
+    if (req.practice) for (const n of PRACTICE_HIDDEN_TOOLS) disabled.add(n)
     if (req.mode === 'all') return { defs: mcp.toolDefinitions(disabled) }
     // On demand: the three loader tools, the loaded tools' full descriptions, and a name catalog.
     const available = mcp.availableTools(disabled)
@@ -506,6 +517,19 @@ async function main(): Promise<void> {
   })
   handle('mcp:cancelTool', (callKey) => {
     toolCalls.get(callKey)?.abort()
+  })
+  const pdfReads = new Map<string, AbortController>()
+  handle('attachments:readPdf', async (name, bytes, readKey) => {
+    const ctrl = new AbortController()
+    pdfReads.set(readKey, ctrl)
+    try {
+      return await readPdfAttachment(name, bytes, pdfReader, ctrl.signal)
+    } finally {
+      pdfReads.delete(readKey)
+    }
+  })
+  handle('attachments:cancelPdf', (readKey) => {
+    pdfReads.get(readKey)?.abort()
   })
 
   handle('server:status', () => apiServer.getStatus())
