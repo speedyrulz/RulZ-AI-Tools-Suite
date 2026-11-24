@@ -47,17 +47,27 @@ export function describeExitCode(code: number | null): string | undefined {
   }
 }
 
-/** Explains load failures that llama-server's log names plainly but buries among follow-on errors. */
-export function describeLoadLog(log: readonly string[]): string | undefined {
+/**
+ * Explains load failures that llama-server's log names plainly but buries among follow-on errors.
+ * `rental` is set for a server on a vast.ai rental, where the fix is another build tag, not a rebuild.
+ */
+export function describeLoadLog(log: readonly string[], rental?: { label: string; tag: string }): string | undefined {
   for (const line of log) {
     const arch = line.match(/unknown model architecture:\s*'([^']*)'/i)?.[1]
-    if (arch !== undefined) {
+    if (arch === undefined) continue
+    if (rental) {
       return (
-        `This llama.cpp build does not support the model type '${arch}'. ` +
-        'Update llama.cpp and rebuild llama-server to get newer model types. ' +
-        'If the newest llama.cpp does not list this type either, the model needs a llama.cpp fork or a later llama.cpp release.'
+        `The llama.cpp build on ${rental.label} (${rental.tag}) does not support the model type '${arch}'. ` +
+        'On the vast.ai page, open Advanced, set "llama.cpp build for instances" to a newer build and save. ' +
+        'Then install the engine on the rental (the button can take a minute to appear) and load again; the model files stay. ' +
+        'Build tags are listed at github.com/ggml-org/llama.cpp/releases. If the newest build does not support this type either, the model needs a later llama.cpp release.'
       )
     }
+    return (
+      `This llama.cpp build does not support the model type '${arch}'. ` +
+      'Update llama.cpp and rebuild llama-server to get newer model types. ' +
+      'If the newest llama.cpp does not list this type either, the model needs a llama.cpp fork or a later llama.cpp release.'
+    )
   }
   return undefined
 }
