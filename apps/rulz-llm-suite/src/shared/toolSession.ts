@@ -1,7 +1,7 @@
 // Which tools a chat or an unattended session offers, and what the built-in loader tools do. Pure
 // functions over the connected servers and a few settings, so the chat store (window) and the
 // practice sessions (main process) behave the same.
-import { CLONE_FILE_TOOLS } from './re'
+import { CLONE_FILE_TOOLS, PRACTICE_HIDDEN_TOOLS } from './re'
 import { META_LOAD, META_SEARCH, resolveTool, searchTools, toolTokens } from './tools'
 import type { FileToolScope, McpServerStatus, McpToolInfo, ToolCall, ToolMode, ToolRequest, ToolResult } from './types'
 
@@ -19,12 +19,15 @@ export interface ToolOptions {
   re?: boolean
   /** Clone sessions: where the write/read file tools may work. */
   files?: FileToolScope
+  /** Practice sessions (attended or batch): no read_pdf. */
+  practice?: boolean
 }
 
-/** Connected, switched-on tools. The write/read file tools are included only for clone sessions. */
-export function availableToolsOf(servers: McpServerStatus[], settings: Pick<ToolSettings, 'disabledTools'> | null | undefined, opts: { clone?: boolean } = {}): McpToolInfo[] {
+/** Connected, switched-on tools. The write/read file tools are included only for clone sessions, read_pdf never in practice sessions. */
+export function availableToolsOf(servers: McpServerStatus[], settings: Pick<ToolSettings, 'disabledTools'> | null | undefined, opts: { clone?: boolean; practice?: boolean } = {}): McpToolInfo[] {
   const disabled = new Set(settings?.disabledTools ?? [])
   if (!opts.clone) for (const n of CLONE_FILE_TOOLS) disabled.add(n)
+  if (opts.practice) for (const n of PRACTICE_HIDDEN_TOOLS) disabled.add(n)
   return servers
     .filter((s) => s.state === 'connected')
     .flatMap((s) => s.tools)
@@ -51,7 +54,7 @@ export function toolBudgetOf(settings: Pick<ToolSettings, 'toolBudgetTokens' | '
 export function effectiveToolModeOf(servers: McpServerStatus[], settings: ToolSettings | null | undefined, opts: ToolOptions = {}): 'all' | 'dynamic' | null {
   const s = settings
   if (!s || (!s.toolsEnabled && !opts.re)) return null
-  const tools = availableToolsOf(servers, s, { clone: !!opts.files })
+  const tools = availableToolsOf(servers, s, { clone: !!opts.files, practice: opts.practice })
   if (!tools.length) return null
   if (s.toolMode !== 'auto') return s.toolMode
   return tools.reduce((sum, t) => sum + toolTokens(t), 0) > toolBudgetOf(s, opts) ? 'dynamic' : 'all'
@@ -66,11 +69,12 @@ export function toolRequestOf(
 ): ToolRequest | undefined {
   const mode = effectiveToolModeOf(servers, settings, opts)
   if (!mode) return undefined
-  const available = new Set(availableToolsOf(servers, settings, { clone: !!opts.files }).map((t) => t.qualifiedName))
+  const available = new Set(availableToolsOf(servers, settings, { clone: !!opts.files, practice: opts.practice }).map((t) => t.qualifiedName))
   return {
     mode,
     active: mode === 'dynamic' ? (activeTools ?? []).filter((n) => available.has(n)) : [],
-    ...(opts.files ? { files: opts.files } : {})
+    ...(opts.files ? { files: opts.files } : {}),
+    ...(opts.practice ? { practice: true } : {})
   }
 }
 

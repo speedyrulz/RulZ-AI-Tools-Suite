@@ -1,4 +1,6 @@
+import { MAX_PDF_ATTACH_BYTES } from '@shared/pdf'
 import type { Attachment } from '@shared/types'
+import { errorMessage, invoke } from './api'
 import { uid } from './format'
 
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024
@@ -27,7 +29,31 @@ function readDataUrl(file: File): Promise<string> {
   })
 }
 
-/** Turns dropped/pasted/picked files into attachments; returns errors for unsupported ones. */
+/**
+ * The text of a PDF as an attachment. The main process reads it (in a worker thread), so a big file does not
+ * hold up the window. `note` is set when the text had to be cut; `error` when there is nothing to attach. `readKey`
+ * lets cancelPdfRead stop it.
+ */
+export async function pdfToAttachment(file: File, readKey: string): Promise<{ attachment?: Attachment; error?: string; note?: string }> {
+  const name = file.name || 'document.pdf'
+  if (file.size > MAX_PDF_ATTACH_BYTES) return { error: `${name} is larger than 50 MB` }
+  try {
+    const r = await invoke('attachments:readPdf', name, new Uint8Array(await file.arrayBuffer()), readKey)
+    if (!r.ok) return { error: r.error }
+    return {
+      attachment: { id: uid(), kind: 'text', name, mime: 'application/pdf', sizeBytes: file.size, text: r.text },
+      note: r.cut ? `${name}: only the first ${r.pagesIncluded} of ${r.pageCount} pages fit in an attachment (400,000 characters of text), so the rest is left out.` : undefined
+    }
+  } catch (e) {
+    return { error: `${name}: ${errorMessage(e)}` }
+  }
+}
+
+export function cancelPdfRead(readKey: string): void {
+  void invoke('attachments:cancelPdf', readKey).catch(() => undefined)
+}
+
+/** Turns dropped/pasted/picked files (other than PDFs, see pdfToAttachment) into attachments; returns errors for unsupported ones. */
 export async function filesToAttachments(files: File[]): Promise<{ attachments: Attachment[]; errors: string[] }> {
   const attachments: Attachment[] = []
   const errors: string[] = []
@@ -46,7 +72,7 @@ export async function filesToAttachments(files: File[]): Promise<{ attachments: 
       }
       attachments.push({ id: uid(), kind: 'text', name, mime: file.type || 'text/plain', sizeBytes: file.size, text: await file.text() })
     } else {
-      errors.push(`${name}: only images and text/code files can be attached`)
+      errors.push(`${name}: only images, PDFs and text/code files can be attached`)
     }
   }
   return { attachments, errors }

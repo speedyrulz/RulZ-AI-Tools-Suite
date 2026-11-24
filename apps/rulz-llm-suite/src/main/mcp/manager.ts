@@ -5,6 +5,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import type { McpConfigState, McpServerConfig, McpServerStatus, McpToolInfo, ToolResult, WireToolCall } from '@shared/types'
 import { FILE_TOOL_DEFS, FILE_TOOLS_SERVER, runFileTool } from '../files/fileTools'
 import type { FileToolScope } from '@shared/types'
+import type { PdfReader } from '../pdf/reader'
 import { contentToText, EMPTY_CONFIG, parseMcpConfig, qualifyToolName, qualifyToolNames, readMcpConfigFile } from './config'
 import { killTree, killTreesSync, launcherDirs, McpScope, SCOPED_SERVERS, SCOPES_OPEN_MESSAGE, type ScopedProcess } from './scopes'
 
@@ -57,7 +58,9 @@ export class McpManager {
     /** Servers the app provides itself (the RE calculator). A server of the same name in mcp.json wins. */
     private readonly appServers: () => Record<string, McpServerConfig> = () => ({}),
     /** A practice lane that uses the shared REA is opening, or has opened, a program there. */
-    private readonly onReaTaken: () => void = () => undefined
+    private readonly onReaTaken: () => void = () => undefined,
+    /** Reads PDFs for the built-in read_pdf tool, off the main thread. Without one the tool answers that it is unavailable. */
+    private readonly pdf?: PdfReader
   ) {}
 
   private withAppServers(servers: Record<string, McpServerConfig>): Record<string, McpServerConfig> {
@@ -412,7 +415,7 @@ export class McpManager {
       } catch {
         return { text: `The tool arguments were not valid JSON: ${call.arguments}`, isError: true }
       }
-      const res = await runFileTool(found.tool.name, args, signal, files)
+      const res = await runFileTool(found.tool.name, args, signal, files, { pdf: this.pdf })
       if (signal?.aborted) return stopped
       return res.text.length > MAX_RESULT_CHARS
         ? { ...res, text: `${res.text.slice(0, MAX_RESULT_CHARS)}\n…[truncated ${res.text.length - MAX_RESULT_CHARS} characters]` }

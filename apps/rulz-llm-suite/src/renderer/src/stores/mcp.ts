@@ -38,8 +38,8 @@ export function findTool(qualifiedName: string): McpToolInfo | undefined {
   return undefined
 }
 
-/** Connected, switched-on tools. The write/read file tools are included only for clone sessions. */
-export function availableTools(opts: { clone?: boolean } = {}): McpToolInfo[] {
+/** Connected, switched-on tools. The write/read file tools are included only for clone sessions, read_pdf never in practice sessions. */
+export function availableTools(opts: { clone?: boolean; practice?: boolean } = {}): McpToolInfo[] {
   return availableToolsOf(useMcp.getState().servers, useApp.getState().settings, opts)
 }
 

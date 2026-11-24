@@ -140,7 +140,7 @@ function abortReasonOf(signal: AbortSignal): AbortReason {
 
 export async function runSession(deps: SessionDeps, spec: SessionSpec): Promise<SessionResult> {
   const first = deps.settings()
-  const starterTools = availableToolsOf(deps.servers(), first, { clone: false })
+  const starterTools = availableToolsOf(deps.servers(), first, { clone: false, practice: true })
   const starter = RE_STARTER_TOOLS.flatMap((n) => {
     const t = resolveTool(starterTools, n)
     return t ? [t.qualifiedName] : []
@@ -300,7 +300,7 @@ export async function runSession(deps: SessionDeps, spec: SessionSpec): Promise<
       sampling: conv.sampling,
       adapters: conv.adapters ?? null,
       overflow: s.contextOverflow ?? 'truncateMiddle',
-      tools: toolRequestOf(servers, s, conv.activeTools, { re: true }),
+      tools: toolRequestOf(servers, s, conv.activeTools, { re: true, practice: true }),
       record: conv.re?.collect ? { conversationId: conv.id } : undefined
     }
     currentRequest = requestId
@@ -372,7 +372,7 @@ export async function runSession(deps: SessionDeps, spec: SessionSpec): Promise<
       }
       const s = deps.settings()
       const servers = deps.servers()
-      const tools = availableToolsOf(servers, s, { clone: false })
+      const tools = availableToolsOf(servers, s, { clone: false, practice: true })
       const tokensOf = (names: string[]): number => tokensOfNames(servers, names)
       const budget = toolBudgetOf(s, { re: true })
       if (META_TOOLS.has(call.name)) {
@@ -393,7 +393,7 @@ export async function runSession(deps: SessionDeps, spec: SessionSpec): Promise<
         updateCall(messageId, call.id, { name: call.name })
       }
       // Calling a tool keeps it loaded and marks it recently used.
-      if (effectiveToolModeOf(servers, s, { re: true }) === 'dynamic') {
+      if (effectiveToolModeOf(servers, s, { re: true, practice: true }) === 'dynamic') {
         conv = { ...conv, activeTools: loadToolNames(conv.activeTools ?? [], [target.qualifiedName], budget, tokensOf).active }
       }
       // Static analysis runs without asking; anything else is refused, because nobody is there to ask.

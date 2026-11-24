@@ -82,6 +82,9 @@ export const RE_GOALS: { label: string; text: string }[] = [
 /** Built-in tools only clone sessions get (they write and read in the output folder). */
 export const CLONE_FILE_TOOLS = ['rulz__write_file', 'rulz__read_file']
 
+/** Built-in tools practice sessions (attended or batch) are never offered: their prompts and recorded data stay as they are. */
+export const PRACTICE_HIDDEN_TOOLS = ['rulz__read_pdf']
+
 /** Starting points for "Specific pieces"; the text fills the details box. */
 export const CLONE_PIECES: { label: string; text: string }[] = [
   { label: 'File format', text: 'The code that reads and writes its data/save files: a reader and writer that produce byte-identical files.' },
@@ -171,7 +174,8 @@ const STATIC_SET = new Set(REA_STATIC)
 export function isStaticReTool(server: string, name: string): boolean {
   // Only the calculator's own tool: a "calc" server in mcp.json replaces the built-in one.
   if (server === 'calc') return name === 'calc'
-  if (server === 'rulz') return true
+  // read_pdf reads a file anywhere on this computer, so it always follows the normal approval rules.
+  if (server === 'rulz') return name !== 'read_pdf'
   return server === 'rea' && STATIC_SET.has(name)
 }
 
