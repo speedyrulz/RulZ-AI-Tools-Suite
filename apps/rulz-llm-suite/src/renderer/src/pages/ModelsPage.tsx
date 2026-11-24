@@ -7,6 +7,7 @@ import { AdapterConvertDialog } from '../components/models/AdapterConvertDialog'
 import { BenchmarkView } from '../components/models/BenchmarkView'
 import { EstimateView, useEstimate } from '../components/models/EstimateView'
 import { LoadSettingsForm } from '../components/models/LoadSettingsForm'
+import { ModeDefaultsEditor, type ModeScope } from '../components/models/ModeDefaultsEditor'
 import { Badge, Button, Dialog, DropdownMenu, IconButton, Input } from '../components/ui'
 import { errorMessage, invoke } from '../lib/api'
 import { cn, formatBytes, formatTokens } from '../lib/format'
@@ -322,6 +323,7 @@ function ModelDetails({ model, onClose, onBenchmark }: { model: ModelEntry; onCl
   const settings = useApp((s) => s.settings)
   const [config, setConfig] = useState<LoadConfig | null>(null)
   const [custom, setCustom] = useState(false)
+  const [scope, setScope] = useState<ModeScope>('all')
   const estimate = useEstimate(model.id, config ?? settings!.defaultLoadConfig)
 
   useEffect(() => {
@@ -379,14 +381,25 @@ function ModelDetails({ model, onClose, onBenchmark }: { model: ModelEntry; onCl
               </div>
             ))}
         </dl>
-        <div>
-          <div className="mb-3 flex items-center justify-between">
-            <h3 className="text-[11px] font-semibold tracking-wide text-faint uppercase">Default load settings</h3>
-            {custom ? <Badge tone="accent">Custom</Badge> : <Badge>App defaults</Badge>}
-          </div>
-          {config && <LoadSettingsForm model={model} config={config} onChange={setConfig} estimate={estimate} remote={model.remote} />}
-        </div>
-        <EstimateView estimate={estimate} />
+        <ModeDefaultsEditor
+          modelId={model.id}
+          model={model}
+          remote={model.remote}
+          scope={scope}
+          onScope={setScope}
+          allView={
+            <>
+              <div>
+                <div className="mb-3 flex items-center justify-between">
+                  <h3 className="text-[11px] font-semibold tracking-wide text-faint uppercase">Default load settings</h3>
+                  {custom ? <Badge tone="accent">Custom</Badge> : <Badge>App defaults</Badge>}
+                </div>
+                {config && <LoadSettingsForm model={model} config={config} onChange={setConfig} estimate={estimate} remote={model.remote} />}
+              </div>
+              <EstimateView estimate={estimate} />
+            </>
+          }
+        />
       </div>
       <div className="flex justify-end gap-2 border-t border-border px-5 py-3">
         {!model.remote && (
@@ -394,7 +407,7 @@ function ModelDetails({ model, onClose, onBenchmark }: { model: ModelEntry; onCl
             <Gauge size={14} /> Benchmark
           </Button>
         )}
-        {custom && (
+        {scope === 'all' && custom && (
           <Button
             variant="ghost"
             onClick={async () => {
@@ -407,18 +420,20 @@ function ModelDetails({ model, onClose, onBenchmark }: { model: ModelEntry; onCl
             Reset
           </Button>
         )}
-        <Button
-          variant="primary"
-          disabled={!config}
-          onClick={async () => {
-            if (!config) return
-            await invoke('models:setDefaults', model.id, config)
-            setCustom(true)
-            toast.success('Saved default load settings')
-          }}
-        >
-          Save as default
-        </Button>
+        {scope === 'all' && (
+          <Button
+            variant="primary"
+            disabled={!config}
+            onClick={async () => {
+              if (!config) return
+              await invoke('models:setDefaults', model.id, config)
+              setCustom(true)
+              toast.success('Saved default load settings')
+            }}
+          >
+            Save as default
+          </Button>
+        )}
       </div>
     </aside>
   )

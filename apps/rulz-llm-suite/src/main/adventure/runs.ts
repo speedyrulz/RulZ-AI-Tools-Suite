@@ -16,6 +16,7 @@ import {
   type RetryRequest
 } from '@shared/adventure'
 import { choosingFinal, choosingSchema, cleanPassage, fitStory, parseChoosing, passageFinal, systemMessage, type StoryFit } from '@shared/adventurePrompts'
+import { modePromptExtra, modeSampling, withPromptExtra, type ModelModeDefaults } from '@shared/modes'
 import { startGeneration, type GenBackend, type GenInput, type GenResult } from '@shared/novelRun'
 import type { WireMessage } from '@shared/types'
 import type { ModelGateLike } from '../modelGate'
@@ -30,6 +31,8 @@ export interface AdventureRunsDeps {
   gate: ModelGateLike
   /** Called with a copy of the job on every status change and, throttled, while text streams. */
   emit: (job: AdventureJob) => void
+  /** The model's own settings per mode, read for each job (sampling and prompt text of Adventure); none = as always. */
+  modeDefaults?: (modelId: string) => ModelModeDefaults | undefined
   /** Why something else holds the model right now (the desktop is generating, a benchmark runs, the gate), or null. */
   busyReason?: () => string | null
   now?: () => number
@@ -327,7 +330,7 @@ export class AdventureRuns {
     if (!inst) {
       if (setup.modelId === null) throw new Error('No model is loaded. Load one in LLM Suite, or choose a model in the adventure\'s settings.')
       try {
-        inst = await models.ensure(setup.modelId)
+        inst = await models.ensure(setup.modelId, 'adventure')
       } catch (e) {
         throw new Error(`The adventure's model could not be loaded: ${errorMessage(e)} Load it in LLM Suite first.`)
       }
@@ -395,8 +398,13 @@ export class AdventureRuns {
     const setup = adv.setup
     const model = await this.resolveModel(setup)
     this.checkStop(rec)
-    const sampling = setup.temperature === null ? DEFAULT_SAMPLING : { ...DEFAULT_SAMPLING, temperature: setup.temperature }
-    const system = systemMessage(setup)
+    const modes = this.deps.modeDefaults?.(model.modelId)
+    const sampling = modeSampling('adventure', modes, DEFAULT_SAMPLING)
+    if (setup.temperature !== null) sampling.temperature = setup.temperature
+    // The choices request asks for a JSON object by schema: a stop word, a banned word or a sampler that bends the
+    // text must not cut it short or break it.
+    const choosingSampling = { ...sampling, stop: [], avoidWords: [], dryMultiplier: 0, xtcProbability: 0 }
+    const system = withPromptExtra(systemMessage(setup), modePromptExtra(modes, 'adventure'))
     const margin = Math.max(256, Math.ceil(model.contextLength * 0.03))
     const countMessages = (m: { role: string; content: string }[]): Promise<number | null> => chat.countTokens(model.modelId, m as WireMessage[]).catch(() => null)
 
@@ -456,7 +464,7 @@ export class AdventureRuns {
     // small budget and send back no JSON at all; the schema already makes the reply the structured part.
     const res = await this.generate(
       rec,
-      { modelId: model.modelId, messages: fit.messages, sampling, adapters: null, action: 'checkScene', prose: true, seed: this.seed(), maxTokens: chooseTokens, schema: choosingSchema(setup.choiceCount) },
+      { modelId: model.modelId, messages: fit.messages, sampling: choosingSampling, adapters: null, action: 'checkScene', prose: true, seed: this.seed(), maxTokens: chooseTokens, schema: choosingSchema(setup.choiceCount) },
       false
     )
     if (res.stopped) return this.finish(rec, 'stopped')

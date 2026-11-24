@@ -31,6 +31,8 @@ export interface RemoteServiceDeps {
   getLocalModel: (id: string) => ModelEntry | undefined
   getAdapter: (id: string) => AdapterEntry | undefined
   getDefaults: (modelId: string) => LoadConfig
+  /** The load settings of the model's modes (their adapters and draft go to a rental with it); none = no mode has its own. */
+  getModeLoads?: (modelId: string) => LoadConfig[]
   draftFor: (model: ModelEntry, cfg: LoadConfig) => SidecarFile | undefined
   adapterBytes: (cfg: LoadConfig) => number
   /** Build number of this PC's llama-server; null = unknown. */
@@ -95,7 +97,8 @@ export function createRemoteService(deps: RemoteServiceDeps): RemoteService {
     models: store,
     getModel: deps.getLocalModel,
     getAdapter: deps.getAdapter,
-    getDefaults: deps.getDefaults
+    getDefaults: deps.getDefaults,
+    getModeLoads: deps.getModeLoads
   })
   const manager = new RentalManager({
     api: new VastApi({ key: async () => (await secrets.vastKey())?.value ?? null }),
@@ -131,6 +134,8 @@ export function createRemoteService(deps: RemoteServiceDeps): RemoteService {
     getDef: (id) => store.get(id),
     getModel: deps.getLocalModel,
     getAdapter: deps.getAdapter,
+    getDefaults: deps.getDefaults,
+    getModeLoads: deps.getModeLoads,
     draftFor: deps.draftFor,
     estimate
   })

@@ -12,6 +12,7 @@ import { useModels } from '../../stores/models'
 import { isChannelBusy, useRemote } from '../../stores/remote'
 import { EstimateView, useEstimate } from '../models/EstimateView'
 import { LoadSettingsForm } from '../models/LoadSettingsForm'
+import { ModeDefaultsEditor, type ModeScope } from '../models/ModeDefaultsEditor'
 import { Button, Dialog, Field, IconButton, Input, Select, Switch } from '../ui'
 import { ConfirmDialog } from './ConfirmDialog'
 
@@ -193,6 +194,7 @@ function SettingsDialog({ def, state, onClose }: { def: RemoteModelDef; state: R
   const appDefault = useApp((s) => s.settings?.defaultLoadConfig)
   const [config, setConfig] = useState<LoadConfig | null>(null)
   const [custom, setCustom] = useState(false)
+  const [scope, setScope] = useState<ModeScope>('all')
   const running = state.rentals.filter((r) => r.rentalStatus === 'running')
   const [rentalId, setRentalId] = useState<number | null>(running[0]?.id ?? null)
   const estimate = useEstimate(def.id, config ?? appDefault ?? DEFAULT_LOAD_CONFIG, rentalId)
@@ -211,12 +213,12 @@ function SettingsDialog({ def, state, onClose }: { def: RemoteModelDef; state: R
     <Dialog
       open
       onOpenChange={(o) => !o && onClose()}
-      title={`Load settings: ${def.name}`}
-      description="Used when this model is loaded on a rental. They are saved for this model."
+      title={`Settings: ${def.name}`}
+      description="Load settings are used when this model is loaded on a rental. Each mode can have its own. They are saved for this model."
       className="w-[min(680px,calc(100vw-32px))]"
       footer={
         <>
-          {custom && (
+          {scope === 'all' && custom && (
             <Button
               variant="ghost"
               onClick={async () => {
@@ -235,21 +237,23 @@ function SettingsDialog({ def, state, onClose }: { def: RemoteModelDef; state: R
           <Button autoFocus variant="ghost" onClick={onClose}>
             Close
           </Button>
-          <Button
-            disabled={!config}
-            onClick={async () => {
-              if (!config) return
-              try {
-                await invoke('models:setDefaults', def.id, config)
-                toast.success('Saved the load settings')
-                onClose()
-              } catch (e) {
-                toast.error(errorMessage(e))
-              }
-            }}
-          >
-            Save
-          </Button>
+          {scope === 'all' && (
+            <Button
+              disabled={!config}
+              onClick={async () => {
+                if (!config) return
+                try {
+                  await invoke('models:setDefaults', def.id, config)
+                  toast.success('Saved the load settings')
+                  onClose()
+                } catch (e) {
+                  toast.error(errorMessage(e))
+                }
+              }}
+            >
+              Save
+            </Button>
+          )}
         </>
       }
     >
@@ -266,9 +270,21 @@ function SettingsDialog({ def, state, onClose }: { def: RemoteModelDef; state: R
             </Select>
           </Field>
         )}
-        {config && <LoadSettingsForm model={entry} config={config} onChange={setConfig} estimate={estimate} remote />}
-        {running.length === 0 && <p className="text-xs text-muted">No instance is running, so there is no memory estimate. The settings are saved either way.</p>}
-        <EstimateView estimate={estimate} />
+        <ModeDefaultsEditor
+          modelId={def.id}
+          model={entry}
+          remote
+          rentalId={rentalId}
+          scope={scope}
+          onScope={setScope}
+          allView={
+            <>
+              {config && <LoadSettingsForm model={entry} config={config} onChange={setConfig} estimate={estimate} remote />}
+              {running.length === 0 && <p className="text-xs text-muted">No instance is running, so there is no memory estimate. The settings are saved either way.</p>}
+              <EstimateView estimate={estimate} />
+            </>
+          }
+        />
       </div>
     </Dialog>
   )

@@ -3,9 +3,11 @@ import { ChevronRight, RotateCcw, Save, Trash2 } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
 import { useShallow } from 'zustand/react/shallow'
 import { breakersToText, textToBreakers, textToWords } from '@shared/variety'
+import { modeSampling } from '@shared/modes'
 import { REASONING_EFFORTS, type ReasoningEffort, type SamplingParams } from '@shared/types'
 import { useApp } from '../../stores/app'
 import { useChat } from '../../stores/chat'
+import { modeDefaultsOf, useModels } from '../../stores/models'
 import { effectiveToolMode, findTool, tokensOf, useMcp } from '../../stores/mcp'
 import { formatCompact } from '../../lib/format'
 import { Button, Dialog, Field, IconButton, Input, NumberInput, Select, Slider, Switch, Textarea } from '../ui'
@@ -48,6 +50,50 @@ function Section({ title, children, action }: { title: string; children: ReactNo
       </div>
       {children}
     </section>
+  )
+}
+
+/**
+ * The core sampling controls of the chat panel; also used for a model's per-mode defaults. `limits` = max tokens, seed
+ * and stop strings, which the Adventure and Writing modes set themselves.
+ */
+export function SamplingFields({
+  sampling: s,
+  onChange: setS,
+  limits = true
+}: {
+  sampling: SamplingParams
+  onChange: <K extends keyof SamplingParams>(key: K, value: SamplingParams[K]) => void
+  limits?: boolean
+}) {
+  return (
+    <>
+      <SliderRow label="Temperature" value={s.temperature} min={0} max={2} step={0.01} onChange={(v) => setS('temperature', v)} />
+      <SliderRow label="Top K" hint="0 = off" value={s.topK} min={0} max={200} step={1} onChange={(v) => setS('topK', Math.round(v))} />
+      <SliderRow label="Top P" value={s.topP} min={0} max={1} step={0.01} onChange={(v) => setS('topP', v)} />
+      <SliderRow label="Min P" value={s.minP} min={0} max={1} step={0.01} onChange={(v) => setS('minP', v)} />
+      <SliderRow label="Repeat penalty" value={s.repeatPenalty} min={0.8} max={2} step={0.01} onChange={(v) => setS('repeatPenalty', v)} />
+      <SliderRow label="Presence penalty" value={s.presencePenalty} min={-2} max={2} step={0.05} onChange={(v) => setS('presencePenalty', v)} />
+      <SliderRow label="Frequency penalty" value={s.frequencyPenalty} min={-2} max={2} step={0.05} onChange={(v) => setS('frequencyPenalty', v)} />
+      {limits && (
+        <>
+          <Field inline label="Max response tokens" hint="Empty = no limit">
+            <NumberInput value={s.maxTokens} placeholder="∞" min={1} onChange={(v) => setS('maxTokens', v === null ? null : Math.max(1, Math.round(v)))} />
+          </Field>
+          <Field inline label="Seed" hint="Empty = random">
+            <NumberInput value={s.seed} placeholder="Random" onChange={(v) => setS('seed', v === null ? null : Math.round(v))} />
+          </Field>
+          <Field label="Stop strings" hint="One per line">
+            <Textarea
+              rows={2}
+              className="font-mono text-xs"
+              value={s.stop.join('\n')}
+              onChange={(e) => setS('stop', e.target.value.split('\n').filter((x) => x.length > 0))}
+            />
+          </Field>
+        </>
+      )}
+    </>
   )
 }
 
@@ -360,32 +406,21 @@ export function InferencePanel() {
       <Section
         title="Sampling"
         action={
-          <IconButton size="sm" label="Reset to defaults" onClick={() => mutate((c) => ({ ...c, sampling: settings.defaultSampling }))}>
+          <IconButton
+            size="sm"
+            label="Reset to defaults"
+            onClick={() =>
+              mutate((c) => ({
+                ...c,
+                sampling: modeSampling(c.re ? 're' : 'chat', modeDefaultsOf(useModels.getState().activeModelId ?? c.modelId), settings.defaultSampling)
+              }))
+            }
+          >
             <RotateCcw size={13} />
           </IconButton>
         }
       >
-        <SliderRow label="Temperature" value={s.temperature} min={0} max={2} step={0.01} onChange={(v) => setS('temperature', v)} />
-        <SliderRow label="Top K" hint="0 = off" value={s.topK} min={0} max={200} step={1} onChange={(v) => setS('topK', Math.round(v))} />
-        <SliderRow label="Top P" value={s.topP} min={0} max={1} step={0.01} onChange={(v) => setS('topP', v)} />
-        <SliderRow label="Min P" value={s.minP} min={0} max={1} step={0.01} onChange={(v) => setS('minP', v)} />
-        <SliderRow label="Repeat penalty" value={s.repeatPenalty} min={0.8} max={2} step={0.01} onChange={(v) => setS('repeatPenalty', v)} />
-        <SliderRow label="Presence penalty" value={s.presencePenalty} min={-2} max={2} step={0.05} onChange={(v) => setS('presencePenalty', v)} />
-        <SliderRow label="Frequency penalty" value={s.frequencyPenalty} min={-2} max={2} step={0.05} onChange={(v) => setS('frequencyPenalty', v)} />
-        <Field inline label="Max response tokens" hint="Empty = no limit">
-          <NumberInput value={s.maxTokens} placeholder="∞" min={1} onChange={(v) => setS('maxTokens', v === null ? null : Math.max(1, Math.round(v)))} />
-        </Field>
-        <Field inline label="Seed" hint="Empty = random">
-          <NumberInput value={s.seed} placeholder="Random" onChange={(v) => setS('seed', v === null ? null : Math.round(v))} />
-        </Field>
-        <Field label="Stop strings" hint="One per line">
-          <Textarea
-            rows={2}
-            className="font-mono text-xs"
-            value={s.stop.join('\n')}
-            onChange={(e) => setS('stop', e.target.value.split('\n').filter((x) => x.length > 0))}
-          />
-        </Field>
+        <SamplingFields sampling={s} onChange={setS} />
       </Section>
 
       <section className="border-b border-border px-4 py-4">

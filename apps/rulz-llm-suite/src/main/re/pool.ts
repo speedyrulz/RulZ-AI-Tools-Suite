@@ -86,6 +86,8 @@ export interface PoolDeps {
   instanceState(instanceId: string): InstanceState
   prepare(kitDir: string, taskId: string): Promise<{ target: string; prompt: string; family: string; tier: string }>
   grade: SessionDeps['grade']
+  /** The model's own settings per mode, for the sessions' sampling and prompt. */
+  modeDefaults?: SessionDeps['modeDefaults']
   /** A run ended: the rentals to stop when the target asked for it (empty otherwise). */
   onEnded(run: BatchRun, rentalIds: number[]): void
   warn?(message: string): void
@@ -490,6 +492,7 @@ export class PracticePool {
       },
       onLive: (conv) => d.events.chatLive(conv),
       watched: (id) => id === this.watchedId,
+      modeDefaults: d.modeDefaults ? (id) => d.modeDefaults!(id) : undefined,
       warn: (m) => d.warn?.(m)
     }
   }
