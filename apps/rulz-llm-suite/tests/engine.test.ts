@@ -202,6 +202,14 @@ describe('describeLoadLog', () => {
     expect(msg).toMatch(/Update llama\.cpp and rebuild/)
   })
 
+  it('points to the build setting, not to a rebuild, for a server on a rental', () => {
+    const msg = describeLoadLog(["E llama_model_load: error loading model: unknown model architecture: 'inkling2_loop'"], { label: 'rulz-llm-ab12', tag: 'b12407' })
+    expect(msg).toContain('rulz-llm-ab12 (b12407)')
+    expect(msg).toContain("model type 'inkling2_loop'")
+    expect(msg).toContain('llama.cpp build for instances')
+    expect(msg).not.toMatch(/rebuild/)
+  })
+
   it('leaves other failures to the raw log', () => {
     expect(describeLoadLog(['E llama_model_load: error loading model: out of memory'])).toBeUndefined()
     expect(describeLoadLog([])).toBeUndefined()

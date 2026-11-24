@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto'
 import { connect } from 'node:net'
 import type { RemoteGpu, RemoteHost, RemoteModelDef } from '@shared/remote'
 import type { AdapterEntry, InstanceAdapter, LoadConfig, MemoryEstimate, ModelEntry, SidecarFile } from '@shared/types'
-import { freePort } from '../engine/process'
+import { describeLoadLog, freePort } from '../engine/process'
 import type { RemoteLaunch, RemoteLauncher, ServerExit, ServerHandle } from '../engine/serverHandle'
 import type { RentalDirectory, RentalInfo } from './contract'
 import { fileList, recordedComplete, slugOf, type RemoteFile } from './models'
@@ -149,11 +149,13 @@ async function startRemote(deps: RemoteLauncherDeps, live: Registry, rentalId: n
       remotePort = Number(marker(res.stdout, 'PORT'))
       if (res.code !== 0 || marker(res.stdout, 'STARTED') !== '1' || !Number.isInteger(remotePort)) {
         const tail = Buffer.from(marker(res.stdout, 'LOG') ?? '', 'base64').toString('utf8').trim()
+        const known = describeLoadLog(tail.split(/\r?\n/), { label: info.label, tag })
+        if (known) throw new Error(known)
         throw new Error(`${marker(res.stdout, 'ERR') ?? 'llama-server could not be started on the instance.'}${tail ? `\n${tail}` : ''}`)
       }
     }
     const localPort = await (deps.pickPort ?? freePort)()
-    const handle = new RemoteHandle(deps, host, rentalId, runId, localPort, remotePort, () => owned.delete(runId))
+    const handle = new RemoteHandle(deps, host, rentalId, tag, runId, localPort, remotePort, () => owned.delete(runId))
     handle.begin()
     return handle
   } catch (err) {
@@ -271,6 +273,8 @@ class RemoteHandle implements ServerHandle {
     private readonly deps: RemoteLauncherDeps,
     readonly host: RemoteHost,
     private readonly rentalId: number,
+    /** The llama.cpp build the server runs. */
+    private readonly tag: string,
     private readonly id: string,
     localPort: number,
     private readonly remotePort: number,
@@ -382,6 +386,14 @@ class RemoteHandle implements ServerHandle {
     return this.buffer.join('').split(/\r?\n/).filter((l) => l.trim()).slice(-lines).join('\n')
   }
 
+  /** Why the server ended: a plain explanation of a load failure, else `what` and the tail of its log. */
+  private endReason(what: string): string {
+    const known = this.loaded ? undefined : describeLoadLog(this.buffer.join('').split(/\r?\n/), { label: this.host.label, tag: this.tag })
+    if (known) return known
+    const tail = this.tailText()
+    return `${what}${tail ? `\nLast lines of its log:\n${tail}` : ''}`
+  }
+
   // ---------- Tunnel ----------
 
   private spawnTunnel(): void {
@@ -452,7 +464,7 @@ class RemoteHandle implements ServerHandle {
       if (this.closed) return
       if (!alive) {
         await this.pollOnce().catch(() => undefined)
-        this.finish({ code: null, reason: `llama-server on ${this.host.label} is no longer running.${this.tailText() ? `\nLast lines of its log:\n${this.tailText()}` : ''}` }, true)
+        this.finish({ code: null, reason: this.endReason(`llama-server on ${this.host.label} is no longer running.`) }, true)
         return
       }
       this.aliveVerifications++
@@ -495,7 +507,7 @@ class RemoteHandle implements ServerHandle {
       if (Number.isFinite(next)) this.logOffset = next
       if (bytes.length >= 65536) continue
       if (marker(out, 'ALIVE') === '0' && !this.stopping && !this.closed) {
-        this.finish({ code: null, reason: `llama-server stopped on ${this.host.label}.${this.tailText() ? `\nLast lines of its log:\n${this.tailText()}` : ''}` }, true)
+        this.finish({ code: null, reason: this.endReason(`llama-server stopped on ${this.host.label}.`) }, true)
       }
       return
     }

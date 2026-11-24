@@ -203,9 +203,38 @@ describe('starting', () => {
 
   it('explains a failed start with the log tail the instance sent', async () => {
     const h = harness()
-    h.reply.start = { code: 44, stdout: `@rz LOG=${b64('error: unknown model architecture')}\n@rz ERR=llama-server stopped right after starting.\n` }
-    await expect(createRemoteLauncher(h.deps).start(7, h.launch)).rejects.toThrow(/stopped right after starting[\s\S]*unknown model architecture/)
+    h.reply.start = { code: 44, stdout: `@rz LOG=${b64('CUDA error: out of memory')}\n@rz ERR=llama-server stopped right after starting.\n` }
+    await expect(createRemoteLauncher(h.deps).start(7, h.launch)).rejects.toThrow(/stopped right after starting[\s\S]*out of memory/)
     expect(h.tunnels).toHaveLength(0)
+  })
+
+  it('says plainly that the build on the rental does not know the model type, without the raw log', async () => {
+    const h = harness()
+    const log = [
+      "0.00.562.697 E llama_model_load: error loading model: unknown model architecture: 'inkling2_loop'",
+      '0.00.612.882 E srv  server_run_i: exiting due to model loading error'
+    ].join('\n')
+    h.reply.start = { code: 44, stdout: `@rz LOG=${b64(log)}\n@rz ERR=llama-server stopped right after starting.\n` }
+    const err = (await createRemoteLauncher(h.deps).start(7, h.launch).catch((e: Error) => e)) as Error
+    expect(err.message).toContain("build on rulz-llm-ab12 (b12407) does not support the model type 'inkling2_loop'")
+    expect(err.message).toContain('llama.cpp build for instances')
+    expect(err.message).not.toContain('exiting due to')
+  })
+
+  it('says the same when the server ends while it is still loading, and keeps the log tail once it had loaded', async () => {
+    const line = "E llama_model_load: error loading model: unknown model architecture: 'inkling2_loop'\n"
+    const reasonFor = async (text: string): Promise<string> => {
+      const h = harness()
+      const handle = await createRemoteLauncher(h.deps).start(7, h.launch)
+      const exits: Array<{ reason?: string }> = []
+      handle.onExit((e) => exits.push(e))
+      h.logs.push({ stdout: logOut(text, text.length, false) })
+      await tick(1500)
+      expect(exits).toHaveLength(1)
+      return exits[0].reason ?? ''
+    }
+    expect(await reasonFor(line)).toMatch(/^The llama\.cpp build on rulz-llm-ab12 \(b12407\)/)
+    expect(await reasonFor(`server is listening\n${line}`)).toMatch(/^llama-server stopped on rulz-llm-ab12\.\nLast lines of its log:/)
   })
 
   it('refuses on an attached instance with a foreign process or too little memory, and only notes it on an app rental', async () => {
