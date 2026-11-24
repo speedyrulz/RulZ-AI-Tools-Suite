@@ -1,7 +1,7 @@
 // Reads text out of a PDF with pdf.js. It runs inside the PDF worker thread (or, in tests, in-process); the
 // main thread never parses a file. pdf.js is used for text only: no rendering, no scripts, no fonts, no network.
 import { existsSync } from 'node:fs'
-import { itemsToText, matchesOnPage, PdfProblem, parsePageRange, type PageMatches, type PageText, type TextItemLike } from './text'
+import { itemsToText, matchesOnPage, MAX_PAGE_CHARS, PdfProblem, parsePageRange, SEARCH_PAGES_SHOWN, type PageMatches, type PageText, type TextItemLike } from './text'
 
 /** What to read. `pages` is the text the tool was given ("2-5"), checked against the real page count here. */
 export type PdfJob =
@@ -17,9 +17,6 @@ export interface PdfJobResult {
   hits?: PageMatches[]
   searched?: number
 }
-
-/** A page longer than this is cut: it is already far more than any chat can use. */
-const MAX_PAGE_CHARS = 2_000_000
 
 // The few browser classes pdf.js touches while loading in Node. Rendering is never used, so empty stand-ins do.
 class StubMatrix {}
@@ -143,7 +140,8 @@ export async function runPdfJob(data: Uint8Array, job: PdfJob, opts: { cmapDir?:
     for (const n of wanted) {
       const p = await readPage(n)
       const m = matchesOnPage(n, p.text, job.query)
-      if (m) hits.push(m)
+      // Pages past the ones a result shows are only counted.
+      if (m) hits.push(hits.length < SEARCH_PAGES_SHOWN ? m : { ...m, snippets: [] })
     }
     return { pageCount, title, hits, searched: wanted.length }
   } finally {

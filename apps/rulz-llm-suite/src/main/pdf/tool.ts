@@ -7,6 +7,7 @@ import type { PdfReader } from './reader'
 import {
   attachmentText,
   MAX_ATTACH_CHARS,
+  MAX_PAGE_CHARS,
   MAX_QUERY_CHARS,
   parsePageRange,
   PdfProblem,
@@ -120,7 +121,7 @@ export async function readPdfTool(full: string, args: { pages?: unknown; query?:
       const r = await reader.run(bytes, { type: 'search', pages: spec, query }, signal)
       return { text: renderSearch({ name, pageCount: r.pageCount, title: r.title }, query, spec ?? '', r.hits ?? [], r.searched ?? 0), isError: false }
     }
-    const r = await reader.run(bytes, { type: 'pages', pages: spec, maxChars: RESULT_BUDGET + (offset ?? 0) }, signal)
+    const r = await reader.run(bytes, { type: 'pages', pages: spec, maxChars: RESULT_BUDGET + Math.min(offset ?? 0, MAX_PAGE_CHARS) }, signal)
     const asked = parsePageRange(spec, r.pageCount)
     const out = renderPages({ name, pageCount: r.pageCount, title: r.title }, asked, r.pages ?? [], { offset })
     return { text: out.text, isError: false }

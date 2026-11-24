@@ -19,7 +19,7 @@ import {
   renderSearch
 } from '../src/main/pdf/text'
 import { runPdfJob } from '../src/main/pdf/extract'
-import { buildJapanesePdf, buildPdf, InProcessPdfReader } from './helpers/pdfBuilder'
+import { buildFakeCountPdf, buildJapanesePdf, buildPdf, InProcessPdfReader } from './helpers/pdfBuilder'
 
 const root = mkdtempSync(join(tmpdir(), 'rulz-pdf-'))
 afterAll(() => rmSync(root, { recursive: true, force: true }))
@@ -43,6 +43,14 @@ describe('page ranges', () => {
     expect(() => parsePageRange('two', 10)).toThrow(/not a page/)
     expect(() => parsePageRange('1;2', 10)).toThrow(PdfProblem)
     expect(() => parsePageRange({}, 10)).toThrow(/must be text/)
+  })
+  it('goes through overlapping ranges once, and refuses made-up page counts and endless lists', () => {
+    expect(parsePageRange('5-7,1-3,2-6,9,9', 10)).toEqual([1, 2, 3, 4, 5, 6, 7, 9])
+    expect(parsePageRange(Array.from({ length: 600 }, () => '1-').join(','), 100_000)).toHaveLength(100_000)
+    expect(() => parsePageRange(null, 100_001)).toThrow(/100,001 pages/)
+    expect(() => parsePageRange('1', 110_000_000)).toThrow(/up to 100,000/)
+    expect(() => parsePageRange('1', 1.5)).toThrow(/pages/)
+    expect(() => parsePageRange('1,'.repeat(1001) + '1', 10)).toThrow(/at most 2,000/)
   })
   it('writes a page list back the way it is read', () => {
     expect(formatPageList([1, 2, 3, 7, 9, 10])).toBe('1-3,7,9-10')
@@ -310,6 +318,25 @@ describe('reading real PDFs (pdf.js)', () => {
     for (const d of [dir, `${dir}\\`, `${dir}/`, dir.split('\\').join('/')]) if (process.platform === 'win32' || !d.endsWith('\\')) expect(await read(d)).toBe(japanese)
     expect(await read(join(dir, 'missing'))).toBe('')
     expect(await read()).toBe('')
+  })
+  it('refuses a made-up page count before building any page list', async () => {
+    const read = (count: number) => runPdfJob(new Uint8Array(buildFakeCountPdf(count)), { type: 'pages', pages: null, maxChars: 20_000 })
+    expect((await read(1000)).pageCount).toBe(1000)
+    await expect(read(110_000_000)).rejects.toMatchObject({ code: 'damaged', message: expect.stringContaining('110,000,000') })
+    const file = join(root, 'fake-count.pdf')
+    writeFileSync(file, buildFakeCountPdf(110_000_000))
+    expect((await readPdf({ path: file, query: 'line' })).isError).toBe(true)
+    // The main process checks the count again, whatever the reader says.
+    const lying = { pdf: { run: () => Promise.resolve({ pageCount: 110_000_000, title: '', pages: [{ page: 1, text: 'x' }] }) } }
+    const r = await runFileTool('read_pdf', { path: doc }, undefined, undefined, lying as never)
+    expect(r.isError).toBe(true)
+    expect(r.text).toMatch(/up to 100,000/)
+  })
+  it('does not let offset raise the amount of text read without limit', async () => {
+    const asked: number[] = []
+    const spy = { pdf: { run: (_d: Uint8Array, j: { maxChars: number }) => (asked.push(j.maxChars), Promise.resolve({ pageCount: 1, title: '', pages: [{ page: 1, text: 'x' }] })) } }
+    await runFileTool('read_pdf', { path: doc, pages: '1', offset: 10 ** 15 }, undefined, undefined, spy as never)
+    expect(asked).toEqual([2_020_000])
   })
   it('refuses a link to a network share without contacting it', async () => {
     const link = vi.spyOn(fsp, 'lstat').mockImplementation((async (p: string) => ({ isSymbolicLink: () => String(p).endsWith('.pdf') })) as never)

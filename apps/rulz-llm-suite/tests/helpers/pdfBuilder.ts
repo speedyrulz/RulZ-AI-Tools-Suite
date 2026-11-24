@@ -41,6 +41,21 @@ export function buildJapanesePdf(): Buffer {
   ])
 }
 
+/** A PDF that claims `count` pages: a page tree node in its middle has a made-up count. Its first page has real text. */
+export function buildFakeCountPdf(count: number): Buffer {
+  const content = `BT /F1 8 Tf 72 720 Td 9 TL ${Array.from({ length: 600 }, (_, i) => `(line ${i} of ordinary text that fills up the page) Tj T*`).join(' ')} ET`
+  const page = '<< /Type /Page /Parent 2 0 R /MediaBox [0 -20000 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>'
+  return assemble([
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    `<< /Type /Pages /Kids [4 0 R 6 0 R 7 0 R] /Count ${count} >>`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    page,
+    `<< /Length ${content.length} >>\nstream\n${content}\nendstream`,
+    `<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count ${count - 2} >>`,
+    page
+  ])
+}
+
 function assemble(objs: string[], trailer = ''): Buffer {
   let out = '%PDF-1.4\n'
   const offsets: number[] = []

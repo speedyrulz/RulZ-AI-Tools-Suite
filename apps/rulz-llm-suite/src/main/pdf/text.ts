@@ -27,6 +27,15 @@ export const FAILED_PAGE = '(this page could not be read; the file may be damage
 
 /** Pages are written out at about this many characters per tool result, cut at page boundaries. */
 export const RESULT_BUDGET = 20_000
+/**
+ * Most pages a PDF may have. The count comes from the file and can be made up, and page lists are also built in the
+ * main process, outside the worker's limits.
+ */
+export const MAX_PAGES = 100_000
+/** Longest `pages` text. */
+const MAX_RANGE_CHARS = 2000
+/** A page longer than this is cut: it is already far more than any chat can use. */
+export const MAX_PAGE_CHARS = 2_000_000
 /** Longest search text: it is repeated in every snippet. */
 export const MAX_QUERY_CHARS = 200
 /** Characters of context on each side of a search match. */
@@ -41,10 +50,14 @@ const n = (v: number): string => v.toLocaleString('en-US')
 
 /** Turns "3", "2-5", "1,4-6" or "7-" into ascending, unique page numbers. A plain number is accepted too. */
 export function parsePageRange(spec: unknown, pageCount: number): number[] {
+  if (!Number.isInteger(pageCount) || pageCount < 0 || pageCount > MAX_PAGES) {
+    throw new PdfProblem('damaged', `This PDF says it has ${n(pageCount)} pages; only PDFs of up to ${n(MAX_PAGES)} pages can be read.`)
+  }
   if (spec === undefined || spec === null || spec === '') return Array.from({ length: pageCount }, (_, i) => i + 1)
   const text = typeof spec === 'number' ? String(spec) : typeof spec === 'string' ? spec.trim() : ''
   if (!text) throw new PdfProblem('range', 'pages must be text such as "3", "2-5" or "1,4-6".')
-  const wanted = new Set<number>()
+  if (text.length > MAX_RANGE_CHARS) throw new PdfProblem('range', `pages can be at most ${n(MAX_RANGE_CHARS)} characters long.`)
+  const ranges: [number, number][] = []
   for (const part of text.split(',')) {
     const m = /^\s*(\d+)\s*(?:(-)\s*(\d*))?\s*$/.exec(part)
     if (!m) throw new PdfProblem('range', `"${part.trim()}" is not a page or page range. Use "3", "2-5" or "1,4-6".`)
@@ -54,9 +67,17 @@ export function parsePageRange(spec: unknown, pageCount: number): number[] {
     if (to < from) throw new PdfProblem('range', `"${part.trim()}" runs backwards; write the lower page first.`)
     if (from > pageCount) throw new PdfProblem('range', `This PDF has ${pageCount} page${pageCount === 1 ? '' : 's'}; page ${from} does not exist.`)
     if (to > pageCount) throw new PdfProblem('range', `This PDF has ${pageCount} page${pageCount === 1 ? '' : 's'}; "${part.trim()}" goes past the end.`)
-    for (let p = from; p <= to; p++) wanted.add(p)
+    ranges.push([from, to])
   }
-  return [...wanted].sort((a, b) => a - b)
+  // In order, so a page named by several ranges is only gone through once.
+  ranges.sort((a, b) => a[0] - b[0])
+  const out: number[] = []
+  let last = 0
+  for (const [from, to] of ranges) {
+    for (let p = Math.max(from, last + 1); p <= to; p++) out.push(p)
+    last = Math.max(last, to)
+  }
+  return out
 }
 
 /** Page numbers as a short range text, the form `pages` accepts: [1,2,3,7] -> "1-3,7". */
@@ -187,7 +208,7 @@ export function renderPages(info: PdfInfo, asked: number[], pages: PageText[], o
   if (!pages.length) return { text: `${head}\nNo pages were read.`, next: null, noText: false }
   if (pages.every((p) => !p.failed && !p.text.trim())) {
     const range = pages.length === 1 ? `page ${pages[0].page}` : `${pages.length} pages (${formatPageList(pages.map((p) => p.page))})`
-    const rest = asked.filter((p) => !pages.some((q) => q.page === p))
+    const rest = asked.filter((a) => a > pages[pages.length - 1].page)
     return {
       text: `${head}\nNo readable text on ${range}: it looks like scanned images. This tool reads text only, with no OCR.`,
       next: rest.length ? { pages: formatPageList(rest) } : null,
