@@ -41,6 +41,8 @@ export interface OpsDeps {
   getAdapter?: (id: string) => AdapterEntry | undefined
   /** The model's load settings (its adapters go with it). */
   getDefaults?: (id: string) => LoadConfig | undefined
+  /** The load settings of the model's modes (their adapters and draft go with it too); none = no mode has its own. */
+  getModeLoads?: (id: string) => LoadConfig[]
   /** Default: the global fetch. */
   fetch?: typeof fetch
   hashCache?: HashCache
@@ -252,7 +254,7 @@ export class SshRentalOps implements RentalOps {
   // ---------- Models ----------
 
   private filesOf(def: RemoteModelDef): RemoteFile[] {
-    const d: FileListDeps = { getModel: this.deps.getModel, getAdapter: this.deps.getAdapter, config: this.deps.getDefaults?.(def.id) }
+    const d: FileListDeps = { getModel: this.deps.getModel, getAdapter: this.deps.getAdapter, config: this.deps.getDefaults?.(def.id), extra: this.deps.getModeLoads?.(def.id) }
     return fileList(def, d)
   }
 

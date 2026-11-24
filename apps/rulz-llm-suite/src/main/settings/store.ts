@@ -1,16 +1,21 @@
 import { basename, join } from 'node:path'
+import { APP_MODES, modeDefaultsEmpty, modeLoad, type AllModeDefaults, type AppMode, type ModeDefaults, type ModelModeDefaults } from '@shared/modes'
 import type { AppSettings, LoadConfig, Preset } from '@shared/types'
 import { readJson, writeJsonAtomic } from '../util/jsonFile'
-import { parseLoadConfig, parsePresets, parseSettings } from './schema'
+import { parseLoadConfig, parseModeDefaults, parseModeEntry, parsePresets, parseSettings } from './schema'
 
 /** App settings, per-model load defaults and presets, each persisted as JSON in userData. */
 export class SettingsStore {
   private settings!: AppSettings
   private modelDefaults: Record<string, LoadConfig> = {}
+  /** Per model and mode; its own file so older versions keep reading model-defaults.json. A Map, so ids like '__proto__' are plain keys. */
+  private modeMap = new Map<string, ModelModeDefaults>()
+  private modeChain: Promise<unknown> = Promise.resolve()
   private presets: Preset[] = []
   private readonly settingsPath: string
   private readonly modelDefaultsPath: string
   private readonly presetsPath: string
+  private readonly modeDefaultsPath: string
   /** Files that exist but couldn't be read at startup. Writing them would replace the user's data with defaults. */
   private readonly unreadable = new Set<string>()
 
@@ -18,6 +23,7 @@ export class SettingsStore {
     this.settingsPath = join(dir, 'settings.json')
     this.modelDefaultsPath = join(dir, 'model-defaults.json')
     this.presetsPath = join(dir, 'presets.json')
+    this.modeDefaultsPath = join(dir, 'model-mode-defaults.json')
   }
 
   async init(): Promise<void> {
@@ -25,6 +31,7 @@ export class SettingsStore {
     const rawDefaults = await this.load<Record<string, unknown>>(this.modelDefaultsPath, {})
     for (const [id, cfg] of Object.entries(rawDefaults)) this.modelDefaults[id] = parseLoadConfig(cfg)
     this.presets = parsePresets(await this.load(this.presetsPath, []))
+    this.modeMap = new Map(Object.entries(parseModeDefaults(await this.load(this.modeDefaultsPath, {}))))
   }
 
   /** The app still starts on defaults when a file is locked; that file is then left alone. */
@@ -56,7 +63,7 @@ export class SettingsStore {
   }
 
   getModelDefaults(modelId: string): { config: LoadConfig; custom: boolean } {
-    const custom = this.modelDefaults[modelId]
+    const custom = Object.prototype.hasOwnProperty.call(this.modelDefaults, modelId) ? this.modelDefaults[modelId] : undefined
     return custom ? { config: custom, custom: true } : { config: this.settings.defaultLoadConfig, custom: false }
   }
 
@@ -64,6 +71,54 @@ export class SettingsStore {
     if (config) this.modelDefaults[modelId] = parseLoadConfig(config)
     else delete this.modelDefaults[modelId]
     await this.save(this.modelDefaultsPath, this.modelDefaults)
+  }
+
+  /** Every model's settings per mode (a copy). */
+  allModeDefaults(): AllModeDefaults {
+    return structuredClone(Object.fromEntries(this.modeMap))
+  }
+
+  /** One model's settings per mode (a copy); {} when it has none. */
+  modeDefaults(modelId: string): ModelModeDefaults {
+    return structuredClone(this.modeMap.get(modelId) ?? {})
+  }
+
+  /** Saves one mode of one model; null, or an entry that sets nothing, forgets it. Memory only changes when the file was written. */
+  async setModeDefaults(modelId: string, mode: AppMode, defaults: ModeDefaults | null): Promise<void> {
+    if (!APP_MODES.includes(mode)) throw new Error(`Unknown mode: ${String(mode)}`)
+    const entry = defaults ? parseModeEntry(defaults) : null
+    await this.changeModes((all) => {
+      const next: ModelModeDefaults = { ...all.get(modelId) }
+      if (entry && !modeDefaultsEmpty(entry)) next[mode] = entry
+      else delete next[mode]
+      if (Object.keys(next).length) all.set(modelId, next)
+      else all.delete(modelId)
+    })
+  }
+
+  /** Changes to the modes file go one after another: each starts from what the one before it saved, so none is lost. */
+  private changeModes(change: (all: Map<string, ModelModeDefaults>) => void): Promise<void> {
+    const run = this.modeChain.then(async () => {
+      const all = new Map(this.modeMap)
+      change(all)
+      await this.save(this.modeDefaultsPath, Object.fromEntries(all))
+      this.modeMap = all
+    })
+    this.modeChain = run.catch(() => undefined)
+    return run
+  }
+
+  /** A deleted or forgotten model: its default load settings and all its modes go; only the files that change are written. */
+  async forgetModel(modelId: string): Promise<void> {
+    if (Object.prototype.hasOwnProperty.call(this.modelDefaults, modelId)) await this.setModelDefaults(modelId, null)
+    // After a save still under way, which may be this model's first.
+    await this.modeChain
+    if (this.modeMap.has(modelId)) await this.changeModes((all) => all.delete(modelId))
+  }
+
+  /** The load settings a model gets in a mode (its default ones without a mode, or when the mode sets none). */
+  loadFor(modelId: string, mode?: AppMode): LoadConfig {
+    return structuredClone(modeLoad(this.getModelDefaults(modelId).config, this.modeMap.get(modelId), mode))
   }
 
   listPresets(): Preset[] {

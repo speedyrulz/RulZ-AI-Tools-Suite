@@ -344,3 +344,67 @@ describe('a Hugging Face projector', () => {
     expect(buildRemoteArgs({ model: e, config: { ...DEFAULT_LOAD_CONFIG, useMmproj: false }, port: 1, alias: 'a', paths })).not.toContain('--mmproj')
   })
 })
+
+describe('fileList for the load settings of the modes', () => {
+  const adapters: Record<string, AdapterEntry> = {
+    'a/one.gguf': { id: 'a/one.gguf', name: 'one', path: 'C:\\LLM\\a\\one.gguf', sizeBytes: 40, architecture: 'qwen3', info: null, modifiedAt: 1 },
+    'b/one.gguf': { id: 'b/one.gguf', name: 'one', path: 'C:\\LLM\\b\\one.gguf', sizeBytes: 41, architecture: 'qwen3', info: null, modifiedAt: 1 },
+    'c/two.gguf': { id: 'c/two.gguf', name: 'two', path: 'C:\\LLM\\c\\two.gguf', sizeBytes: 42, architecture: 'qwen3', info: null, modifiedAt: 1 }
+  }
+  const getAdapter = (id: string): AdapterEntry | undefined => adapters[id]
+  const base: LoadConfig = { ...DEFAULT_LOAD_CONFIG, adapters: [{ id: 'a/one.gguf', scale: 1 }] }
+  const modeA: LoadConfig = { ...DEFAULT_LOAD_CONFIG, adapters: [{ id: 'a/one.gguf', scale: 0.5 }, { id: 'c/two.gguf', scale: 1 }] }
+  const modeB: LoadConfig = { ...DEFAULT_LOAD_CONFIG, draftFile: 'C:\\LLM\\drafts\\other-draft.gguf', adapters: [{ id: 'b/one.gguf', scale: 1 }] }
+  const d = { ...deps, getAdapter, localSize: () => 5 }
+  const names = (files: ReturnType<typeof fileList>) => files.map((f) => `${f.role}:${f.name}`)
+
+  it('without other settings is exactly the list of the default config', () => {
+    expect(fileList(localDef, { ...d, config: base, extra: [] })).toEqual(fileList(localDef, { ...d, config: base }))
+    expect(fileList(localDef, { ...d, config: base, extra: undefined })).toEqual(fileList(localDef, { ...d, config: base }))
+  })
+
+  it('adds the adapters and drafts of the modes after the default ones, once each', () => {
+    const all = fileList(localDef, { ...d, config: base, extra: [modeA, modeB] })
+    expect(names(all)).toEqual([
+      'main:m-00001-of-00002.gguf',
+      'main:m-00002-of-00002.gguf',
+      'mmproj:mmproj-M-F16.gguf',
+      'draft:m-draft.gguf',
+      'adapter:one.gguf',
+      'adapter:two.gguf',
+      'draft:other-draft.gguf',
+      'adapter:adapter-one.gguf'
+    ])
+    expect(new Set(all.map((f) => f.name)).size).toBe(all.length)
+    // the default's files keep the names and order they have without modes
+    expect(names(all).slice(0, 5)).toEqual(names(fileList(localDef, { ...d, config: base })))
+  })
+
+  it('a mode added later never takes a name one of the default files already has on the rental', () => {
+    const before = fileList(localDef, { ...d, config: base })
+    const clash: LoadConfig = { ...DEFAULT_LOAD_CONFIG, draftFile: 'C:\\LLM\\drafts\\one.gguf' }
+    const after = fileList(localDef, { ...d, config: base, extra: [clash], for: base })
+    expect(names(after)).toEqual(names(before))
+    expect(names(fileList(localDef, { ...d, config: base, extra: [clash], for: clash }))).toContain('draft:draft-one.gguf')
+  })
+
+  it('a load gets only its own draft and adapters, under the names of the full list', () => {
+    const extra = [modeA, modeB]
+    const all = fileList(localDef, { ...d, config: base, extra })
+    const nameOf = (role: string, path: string) => all.find((f) => f.role === role && f.localPath === path)!.name
+    const forB = fileList(localDef, { ...d, config: base, extra, for: modeB })
+    expect(names(forB)).toEqual(['main:m-00001-of-00002.gguf', 'main:m-00002-of-00002.gguf', 'mmproj:mmproj-M-F16.gguf', 'draft:other-draft.gguf', 'adapter:adapter-one.gguf'])
+    expect(forB.find((f) => f.role === 'draft')!.name).toBe(nameOf('draft', 'C:\\LLM\\drafts\\other-draft.gguf'))
+    expect(forB.find((f) => f.role === 'adapter')!.name).toBe(nameOf('adapter', 'C:\\LLM\\b\\one.gguf'))
+    // the default config's draft is the built-in one, not the other file
+    const forBase = fileList(localDef, { ...d, config: base, extra, for: base })
+    expect(names(forBase)).toEqual(['main:m-00001-of-00002.gguf', 'main:m-00002-of-00002.gguf', 'mmproj:mmproj-M-F16.gguf', 'draft:m-draft.gguf', 'adapter:one.gguf'])
+    const forA = fileList(localDef, { ...d, config: base, extra, for: modeA })
+    expect(names(forA).filter((n) => n.startsWith('adapter'))).toEqual(['adapter:one.gguf', 'adapter:two.gguf'])
+    expect(forA.filter((f) => f.role === 'draft')).toHaveLength(1)
+  })
+
+  it('without a full list `for` names the files alone, as before', () => {
+    expect(fileList(localDef, { ...d, for: modeB })).toEqual(fileList(localDef, { ...d, config: modeB }))
+  })
+})

@@ -10,16 +10,19 @@ import type {
   Preset,
   ReOutcome,
   ReSession,
+  SamplingParams,
   StreamEvent,
   ToolCall,
   ToolResult,
   WireMessage
 } from '@shared/types'
 import { DEFAULT_SAMPLING } from '@shared/defaults'
+import { type AllModeDefaults, modePromptExtra, modeSampling, withPromptExtra } from '@shared/modes'
 import { errorMessage, invoke, on } from '../lib/api'
 import { uid } from '../lib/format'
 import { type QueuedNote, takeQueued } from '../lib/interject'
 import { editMessages, idsToDelete, removeMessages, restoreMessages } from '../lib/messages'
+import { chatDefaultsFor, followChatDefaults, isFollowable, modesFor } from '../lib/modes'
 import { once } from '../lib/once'
 import { WBENCH_BUSY, wbenchRunning } from '../lib/wbenchFlag'
 import { buildWire } from '../lib/wire'
@@ -36,11 +39,10 @@ import {
   RE_SYSTEM_PROMPT,
   reFirstMessage,
   remoteRoots,
-  reSampling,
   shouldGradePractice,
   unquotePath
 } from '@shared/re'
-import { readyInstance, useModels } from './models'
+import { modeDefaultsOf, readyInstance, useModels } from './models'
 import { META_TOOLS, resolveTool } from '@shared/tools'
 import { loadToolNames, runLoaderTool } from '@shared/toolSession'
 import { isStaleChatError } from '@shared/batch'
@@ -660,7 +662,7 @@ export const useChat = create<ChatState>((set, get) => {
       void persistNow(conv)
       set({ autoLoadingModelId: modelId })
       // A load still running (from the picker, with its own settings) is waited for, not replaced.
-      inst = (await useModels.getState().ensure(modelId)) ?? undefined
+      inst = (await useModels.getState().ensure(modelId, conv.re ? 're' : 'chat')) ?? undefined
       set({ autoLoadingModelId: null })
       if (!inst || deletedIds.has(conv.id)) return
       const latest = get().current
@@ -773,6 +775,43 @@ export const useChat = create<ChatState>((set, get) => {
     return true
   }
 
+  /** What the empty chat on screen was last given from its model's defaults (sampling and prompt followed separately). */
+  let followed: { id: string; sampling: SamplingParams; systemPrompt: string } | null = null
+  const appChatDefaults = (): { defaultSampling: SamplingParams; defaultSystemPrompt: string } => {
+    const s = useApp.getState().settings
+    return { defaultSampling: s?.defaultSampling ?? DEFAULT_SAMPLING, defaultSystemPrompt: s?.defaultSystemPrompt ?? '' }
+  }
+
+  /**
+   * An empty chat whose sampling or prompt nobody has touched follows the active model's chat defaults (separately for
+   * each); one that was edited, has messages, belongs to the pool or is busy is left alone. `before` = the mode settings
+   * as they were when the change happened, for a chat whose starting point was not recorded here.
+   */
+  const followEmptyChat = (before?: AllModeDefaults): void => {
+    const cur = get().current
+    if (!cur || !isFollowable(cur) || deletedIds.has(cur.id)) return
+    if (get().generation || get().handoff || get().autoLoadingModelId || get().poolChats.includes(cur.id)) return
+    // With no model loaded the chat keeps its own: sending a message loads it.
+    const activeId = useModels.getState().activeModelId ?? cur.modelId
+    const app = appChatDefaults()
+    const next = chatDefaultsFor(modeDefaultsOf(activeId), app)
+    const base =
+      followed?.id === cur.id ? followed : { id: cur.id, ...chatDefaultsFor(modesFor(before ?? useModels.getState().modeDefaults, cur.modelId), app) }
+    const r = followChatDefaults(cur, base, next)
+    if (!r.followed.sampling && !r.followed.prompt) return
+    followed = {
+      id: cur.id,
+      sampling: r.followed.sampling ? next.sampling : base.sampling,
+      systemPrompt: r.followed.prompt ? next.systemPrompt : base.systemPrompt
+    }
+    if (r.conv === cur && cur.modelId === activeId) return
+    // Not a change by the user: updatedAt stays.
+    const out = { ...r.conv, modelId: activeId }
+    set({ current: out, tokenCount: null })
+    persistSoon(out)
+    get().refreshTokenCount()
+  }
+
   /**
    * Reads a saved chat. null: it no longer exists. undefined: it exists but couldn't be read
    * (locked by another program, say); that is reported here and the chat stays in the list.
@@ -878,6 +917,9 @@ export const useChat = create<ChatState>((set, get) => {
       useChat.subscribe((st, prev) => {
         if (st.current?.id !== prev.current?.id) syncWatch()
       })
+      useModels.subscribe((st, prev) => {
+        if (st.activeModelId !== prev.activeModelId || st.modeDefaults !== prev.modeDefaults) followEmptyChat(prev.modeDefaults)
+      })
       const [summaries, folders, presets, poolChats] = await Promise.all([
         invoke('conversations:list'),
         invoke('folders:list'),
@@ -890,9 +932,13 @@ export const useChat = create<ChatState>((set, get) => {
 
     newChat: async () => {
       const { current } = get()
-      if (current && current.messages.length === 0) return current
-      const s = useApp.getState().settings
+      if (current && current.messages.length === 0) {
+        followEmptyChat()
+        return get().current ?? current
+      }
       const now = Date.now()
+      const modelId = useModels.getState().activeModelId
+      const defaults = chatDefaultsFor(modeDefaultsOf(modelId), appChatDefaults())
       const conv: Conversation = {
         id: uid(),
         title: NEW_CHAT_TITLE,
@@ -900,16 +946,19 @@ export const useChat = create<ChatState>((set, get) => {
         pinned: false,
         createdAt: now,
         updatedAt: now,
-        modelId: useModels.getState().activeModelId,
-        systemPrompt: s?.defaultSystemPrompt ?? '',
-        sampling: s?.defaultSampling ?? DEFAULT_SAMPLING,
+        modelId,
+        systemPrompt: defaults.systemPrompt,
+        sampling: defaults.sampling,
         adapters: null,
         presetId: null,
         messages: []
       }
+      followed = { id: conv.id, sampling: defaults.sampling, systemPrompt: defaults.systemPrompt }
       set({ current: conv, tokenCount: null })
       await persistNow(conv)
-      return conv
+      // It may have followed another model's defaults while it was saved.
+      const latest = get().current
+      return latest?.id === conv.id ? latest : conv
     },
 
     open: async (id) => {
@@ -1196,7 +1245,7 @@ export const useChat = create<ChatState>((set, get) => {
       set({ handoff: { requestId, source: conv, modelId, text: '', status: 'loading', promptProgress: null } })
 
       let inst = readyInstance(modelId)
-      if (!inst) inst = (await useModels.getState().ensure(modelId)) ?? undefined
+      if (!inst) inst = (await useModels.getState().ensure(modelId, conv.re ? 're' : 'chat')) ?? undefined
       if (get().handoff?.requestId !== requestId) return // cancelled while loading
       if (!inst) return set({ handoff: null })
 
@@ -1259,8 +1308,11 @@ export const useChat = create<ChatState>((set, get) => {
         createdAt: now,
         updatedAt: now,
         modelId,
-        systemPrompt: opts.clone ? `${RE_SYSTEM_PROMPT}\n\n${clonePrompt(opts.clone)}` : RE_SYSTEM_PROMPT,
-        sampling: reSampling(s?.defaultSampling ?? DEFAULT_SAMPLING),
+        systemPrompt: withPromptExtra(
+          opts.clone ? `${RE_SYSTEM_PROMPT}\n\n${clonePrompt(opts.clone)}` : RE_SYSTEM_PROMPT,
+          modePromptExtra(modeDefaultsOf(modelId), 're')
+        ),
+        sampling: modeSampling('re', modeDefaultsOf(modelId), s?.defaultSampling ?? DEFAULT_SAMPLING),
         adapters: null,
         presetId: null,
         activeTools: starter,

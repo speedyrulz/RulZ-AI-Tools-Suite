@@ -205,3 +205,49 @@ describe('InstanceManager shutdown and cancelled loads', () => {
     }
   })
 })
+
+describe('InstanceManager.ensure with a mode', () => {
+  const planned = { ...DEFAULT_LOAD_CONFIG, contextLength: 4096 }
+
+  it('starts a new instance with the load settings of the mode', async () => {
+    const asked: (string | undefined)[] = []
+    const mgr = manager([], {
+      getDefaults: (_id, mode) => {
+        asked.push(mode)
+        return mode === 'writing' ? planned : DEFAULT_LOAD_CONFIG
+      }
+    })
+    const ensured = mgr.ensure('a', 'writing')
+    ensured.catch(() => undefined)
+    await vi.waitFor(() => expect(mgr.list()).toHaveLength(1))
+    expect(mgr.list()[0].config.contextLength).toBe(4096)
+    expect(asked).toEqual(['writing'])
+    await mgr.unloadAll()
+    await expect(ensured).rejects.toThrow(/cancelled/)
+  })
+
+  it("without a mode asks for the model's own defaults", async () => {
+    const asked: (string | undefined)[] = []
+    const mgr = manager([], { getDefaults: (_id, mode) => (asked.push(mode), DEFAULT_LOAD_CONFIG) })
+    const ensured = mgr.ensure('a')
+    ensured.catch(() => undefined)
+    await vi.waitFor(() => expect(mgr.list()).toHaveLength(1))
+    expect(asked).toEqual([undefined])
+    await mgr.unloadAll()
+    await expect(ensured).rejects.toThrow(/cancelled/)
+  })
+
+  it('still uses an instance that runs with other settings, and does not restart it', async () => {
+    const events: string[] = []
+    const mgr = manager(events, { getDefaults: (_id, mode) => (mode === 're' ? planned : DEFAULT_LOAD_CONFIG) })
+    mgr.load('a', { ...DEFAULT_LOAD_CONFIG, contextLength: 2048 }).catch(() => undefined)
+    const ensured = mgr.ensure('a', 're')
+    ensured.catch(() => undefined)
+    await vi.waitFor(() => expect(mgr.list()).toHaveLength(1))
+    await new Promise((r) => setTimeout(r, 20))
+    expect(events).toEqual(['spawn a'])
+    expect(mgr.list()[0].config.contextLength).toBe(2048)
+    await mgr.unloadAll()
+    await expect(ensured).rejects.toThrow(/cancelled/)
+  })
+})

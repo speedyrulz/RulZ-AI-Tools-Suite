@@ -32,6 +32,7 @@ import { scenePositions } from '@shared/novelState'
 import { defaultProject } from '@shared/novelPrompts'
 import { applyOutlineOps, emptyOutline, validSceneFile, findChapter, findScene, newId, removeChapter, removeScene, reinsert, sceneFileName, slugify } from '@shared/novelOutline'
 import { wordCount } from '@shared/novelText'
+import type { SamplingParams } from '@shared/types'
 import { USER_PATH, assertAppPath, assertNoLinks, cleanRelPath, decodeBytes, encodeText, isInside, NEW_FILE_META, readBytes, realInside, serialized, sha256, writeBytesAtomic } from './files'
 import { listHistory, takeSnapshot } from './history'
 import { deleteJournal, discardJournal, readJournal, writeJournal } from './journal'
@@ -59,6 +60,11 @@ export interface StoreOptions {
   appVersion?: () => string
   /** The clock (tests): names the day's records file and the export folder. */
   now?: () => Date
+  /**
+   * The start sampling of a NEW project: the model's own Writing sampling, or null for the built-in fiction preset.
+   * Only createProject asks; projects already on disk keep what they saved.
+   */
+  newProjectSampling?: () => SamplingParams | null
 }
 
 /** The owner of the window's open projects; each phone connection is 'phone:<clientId>'. */
@@ -290,6 +296,13 @@ export class NovelStore {
     const tmp = join(folder, '.rulz', 'tmp')
     for (const d of ['bible', 'manuscript', '.rulz']) await fs.mkdir(join(folder, d), { recursive: true })
     const project = defaultProject(clean)
+    try {
+      const own = this.opts.newProjectSampling?.()
+      if (own) project.sampling = structuredClone(own)
+    } catch (err) {
+      // A start sampling that cannot be read must not stop a project from being created.
+      console.warn('Could not read the start sampling for the new project:', err)
+    }
     const now = new Date().toISOString()
     if (!project.id) project.id = newId('p')
     project.createdAt ||= now

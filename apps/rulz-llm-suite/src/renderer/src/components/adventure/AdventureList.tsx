@@ -3,6 +3,8 @@ import { useState } from 'react'
 import type { AdventureMeta } from '@shared/adventure'
 import { relativeTime } from '../../lib/format'
 import { useAdventure } from '../../stores/adventure'
+import { useModels } from '../../stores/models'
+import { ModeReloadBar } from '../models/ModeReloadBar'
 import { Badge, Button, DropdownMenu } from '../ui'
 import { ConfirmDialog, NameDialog } from '../writing/common'
 import { NewAdventureDialog } from './NewAdventureDialog'
@@ -12,13 +14,16 @@ export function AdventureList() {
   const list = useAdventure((s) => s.list)
   const loaded = useAdventure((s) => s.listLoaded)
   const opening = useAdventure((s) => s.opening)
+  const activeModelId = useModels((s) => s.activeModelId)
   const [creating, setCreating] = useState(false)
   const [renaming, setRenaming] = useState<AdventureMeta | null>(null)
   const [deleting, setDeleting] = useState<AdventureMeta | null>(null)
   const store = useAdventure.getState()
 
   return (
-    <div className="h-full overflow-y-auto">
+    <div className="flex h-full flex-col">
+      <ModeReloadBar modelId={activeModelId} mode="adventure" />
+      <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto max-w-2xl space-y-6 px-6 py-10">
         <div>
           <h1 className="font-[family-name:var(--font-display)] text-lg font-semibold">Adventure</h1>
@@ -79,6 +84,7 @@ export function AdventureList() {
             </div>
           )}
         </section>
+      </div>
       </div>
       <NewAdventureDialog open={creating} onOpenChange={setCreating} />
       <NameDialog

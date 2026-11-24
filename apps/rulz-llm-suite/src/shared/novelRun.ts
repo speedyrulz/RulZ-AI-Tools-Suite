@@ -25,6 +25,7 @@ import type {
 import type { ChatRequest, LoadAdapter, SamplingParams, StreamEvent, WireMessage } from '@shared/types'
 import { assembleRequest, type AssemblyRequest } from '@shared/novelAssembly'
 import { findScene } from '@shared/novelOutline'
+import { withPromptExtra } from '@shared/modes'
 import { cleanProse, entryListText, entryShortText, entryText, interviewSystem, isProseAction, resolveEntryRef, summaryText, sceneText, taskText, systemText } from '@shared/novelPrompts'
 import { findingKey, locateQuote } from '@shared/novelChecks'
 import { factsAtScene, formatStateLines, stateBefore } from '@shared/novelState'
@@ -164,6 +165,8 @@ export interface RunContext {
   facts?: StateFact[]
   contextLength: number
   templateOverhead: number
+  /** The model's own Writing prompt, added after the built-in system prompt. */
+  promptExtra?: string
 }
 
 export interface CandidateInfo {
@@ -419,7 +422,7 @@ export async function buildRequest(ctx: RunContext, count: CountFn, estimated: {
   const { before, selected, after } = splitAt(ctx)
 
   // --- text parts
-  const systemStr = systemText(action, ctx.style, project.povTense)
+  const systemStr = withPromptExtra(systemText(action, ctx.style, project.povTense), ctx.promptExtra)
   const facts = ctx.facts ?? []
   // Update state: what held before the scene (with ids) and what is already recorded at it, so a re-run does not repeat it.
   let stateBeforeText = ''
@@ -975,15 +978,16 @@ export function interviewSummaries(outline: NovelOutline, characterId: string, s
 }
 
 /** The interview's system prompt: the entry (live text), the character's state before the scene, and the scenes they were in. */
-export function buildInterviewSystem(opts: { entry: BibleEntry; body: string; facts: StateFact[]; sceneId: string; outline: NovelOutline; bible: BibleEntry[] }): string {
+export function buildInterviewSystem(opts: { entry: BibleEntry; body: string; facts: StateFact[]; sceneId: string; outline: NovelOutline; bible: BibleEntry[]; promptExtra?: string }): string {
   const { entry, body, facts, sceneId, outline, bible } = opts
   const mine = stateBefore(facts, sceneId, outline, bible).filter((f) => f.entity === entry.id)
-  return interviewSystem({
+  const system = interviewSystem({
     name: entry.name,
     body,
     stateLines: mine.length ? formatStateLines(mine, bible) : '',
     summaries: interviewSummaries(outline, entry.id, sceneId)
   })
+  return withPromptExtra(system, opts.promptExtra)
 }
 
 export interface InterviewFit {

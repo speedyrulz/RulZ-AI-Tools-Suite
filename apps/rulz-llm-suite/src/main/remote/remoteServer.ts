@@ -19,6 +19,12 @@ export interface RemoteLauncherDeps {
   getDef: (modelId: string) => RemoteModelDef | undefined
   getModel: (id: string) => ModelEntry | undefined
   getAdapter?: (id: string) => AdapterEntry | undefined
+  /**
+   * The model's default load settings and those of its modes: the files were uploaded for all of them under the names
+   * of that full list, so a load finds its own draft and adapters there. Without them a load's files are named alone.
+   */
+  getDefaults?: (modelId: string) => LoadConfig | undefined
+  getModeLoads?: (modelId: string) => LoadConfig[]
   /** The draft this load uses (InstanceManager's own choice); undefined = none. */
   draftFor: (model: ModelEntry, cfg: LoadConfig) => SidecarFile | undefined
   /** Memory estimate for the rental's GPUs; null = unknown. */
@@ -99,7 +105,7 @@ async function startRemote(deps: RemoteLauncherDeps, live: Registry, rentalId: n
   const def = deps.getDef(launch.model.id)
   if (!def) throw new Error(`The remote model "${launch.model.name}" is not saved any more.`)
   const slug = slugOf(def.id)
-  const files = fileList(def, { getModel: deps.getModel, getAdapter: deps.getAdapter, config: launch.config })
+  const files = fileList(def, { getModel: deps.getModel, getAdapter: deps.getAdapter, config: deps.getDefaults?.(def.id), extra: deps.getModeLoads?.(def.id), for: launch.config })
   const tag = info.engineTag
   const host: RemoteHost = { kind: 'vast', rentalId, label: info.label }
 

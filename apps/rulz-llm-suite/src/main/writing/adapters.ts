@@ -85,7 +85,7 @@ export function modelsAdapter(library: { list(): ModelEntry[] }, instances: Inst
       ready.sort((a, b) => b.startedAt - a.startedAt)
       return ready[0] ? modelOf(ready[0]) : undefined
     },
-    ensure: async (modelId) => {
+    ensure: async (modelId, mode) => {
       // A run never starts anything on a rental: it uses the model where it is already loaded, or says so.
       const entry = library.list().find((m) => m.id === modelId)
       if (entry?.remote) {
@@ -93,7 +93,7 @@ export function modelsAdapter(library: { list(): ModelEntry[] }, instances: Inst
         if (!ready) throw new Error(`Load ${entry.name} on a rental first (vast.ai page).`)
         return modelOf(ready)
       }
-      return modelOf((await instances.ensure(modelId)).instance)
+      return modelOf((await instances.ensure(modelId, mode)).instance)
     }
   }
 }

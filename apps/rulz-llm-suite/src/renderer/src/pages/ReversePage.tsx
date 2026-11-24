@@ -4,6 +4,7 @@ import { toast } from 'sonner'
 import { CLONE_LANGUAGES, CLONE_PIECES, outputInsideTarget, RE_DEFAULT_MODEL_ID, RE_GOALS } from '@shared/re'
 import type { ReClone, ReOutcome, RePracticeInfo, ReSettings, ReTraceInfo } from '@shared/types'
 import { OutcomeButtons } from '../components/chat/ReBanner'
+import { ModeReloadBar } from '../components/models/ModeReloadBar'
 import { BatchResults, BatchStart } from '../components/re/BatchRuns'
 import { Badge, Button, Field, IconButton, Input, NumberInput, Select, Switch, Textarea, Tooltip } from '../components/ui'
 import { errorMessage, invoke, on } from '../lib/api'
@@ -35,12 +36,18 @@ const baseName = (p: string): string => p.split(/[\\/]/).filter(Boolean).at(-1) 
 export function ReversePage() {
   const settings = useApp((s) => s.settings)
   const update = useApp((s) => s.updateSettings)
+  const models = useModels((s) => s.models)
+  const activeModelId = useModels((s) => s.activeModelId)
   if (!settings) return null
   const re = settings.re
+  // Sessions start with the model chosen here when it is in the library, else with the active one.
+  const sessionModelId = re.modelId && models.some((m) => m.id === re.modelId) ? re.modelId : activeModelId
   const setRe = <K extends keyof ReSettings>(key: K, value: ReSettings[K]): void => void update({ re: { ...re, [key]: value } })
 
   return (
-    <div className="h-full overflow-y-auto">
+    <div className="flex h-full flex-col">
+    <ModeReloadBar modelId={sessionModelId} mode="re" />
+    <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto max-w-5xl space-y-4 px-6 py-5">
         <div>
           <h1 className="font-[family-name:var(--font-display)] text-base font-semibold">Reverse Engineering</h1>
@@ -89,6 +96,7 @@ export function ReversePage() {
           </Field>
         </Card>
       </div>
+    </div>
     </div>
   )
 }

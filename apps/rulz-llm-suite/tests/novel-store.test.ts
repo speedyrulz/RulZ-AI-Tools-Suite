@@ -2,7 +2,9 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSy
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { DEFAULT_SAMPLING } from '@shared/defaults'
 import type { NovelChange, NovelProjectState } from '@shared/novel'
+import { defaultProject } from '@shared/novelPrompts'
 import { decodeBytes, encodeText } from '../src/main/novel/files'
 import { stampOf, thinSnapshots } from '../src/main/novel/history'
 import { NovelStore } from '../src/main/novel/store'
@@ -614,5 +616,41 @@ describe('changes made outside the app', () => {
     await s.store.onExternalChange(st.folder, '.rulz/history/x.md')
     await s.store.onExternalChange(st.folder, 'manuscript')
     expect(s.events).toEqual([])
+  })
+})
+
+describe('the sampling of a new project', () => {
+  const own = { ...DEFAULT_SAMPLING, temperature: 1.7, topK: 11, jsonSchema: '' }
+
+  function withSampling(newProjectSampling?: () => typeof own | null) {
+    const base = mkdtempSync(join(tmpdir(), 'rulz-novel-'))
+    return new NovelStore({ rootSetting: () => '', documents: () => join(base, 'Documents'), trashItem: async () => undefined, emit: () => undefined, watch: false, newProjectSampling })
+  }
+
+  it('is the fiction preset without a start sampling, or when it gives none', async () => {
+    const a = await withSampling().createProject('A')
+    const b = await withSampling(() => null).createProject('B')
+    expect(a.project.sampling).toEqual(defaultProject('A').sampling)
+    expect(b.project.sampling).toEqual(a.project.sampling)
+  })
+
+  it("is the model's sampling when one is given, saved with the project, and as a copy", async () => {
+    let shared = own
+    const store = withSampling(() => shared)
+    const st = await store.createProject('Own')
+    expect(st.project.sampling).toEqual(own)
+    shared.stop.push('X')
+    expect(st.project.sampling.stop).not.toContain('X')
+    const reopened = await store.openProject(st.folder)
+    expect(reopened.project.sampling.topK).toBe(11)
+    shared = { ...own, topK: 12 }
+    expect((await store.createProject('Second')).project.sampling.topK).toBe(12)
+  })
+
+  it('a start sampling that throws never stops the project from being created', async () => {
+    const st = await withSampling(() => {
+      throw new Error('boom')
+    }).createProject('Safe')
+    expect(st.project.sampling).toEqual(defaultProject('Safe').sampling)
   })
 })

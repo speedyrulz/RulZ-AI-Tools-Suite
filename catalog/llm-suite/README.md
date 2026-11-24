@@ -28,6 +28,11 @@ Discover/downloads, RAG and a CLI are planned.
   on the GPU) and custom tensor overrides (`--override-tensor`), single-GPU or split across GPUs, flash attention, KV cache quantization, threads, batch sizes, mmap/mlock, chat template override and
   extra arguments; per-model saved defaults; memory estimate with a fits/partial/likely-OOM verdict; load progress;
   live server log; several models loaded at once.
+  - **Settings per mode** (0.33.0): each model can have its own load settings, sampling and system prompt for Chat,
+    Reverse engineering, Adventure and Writing (**My Models**, pick a model, **Settings for**). Anything a mode leaves
+    out stays as it is without it. The load dialog has **Load for**. When a model is loaded with other settings than the
+    mode wants, a bar offers to reload it; it never reloads by itself. Existing chats, sessions and Writing projects keep
+    their settings.
   - **Speculative decoding**: a draft-head sidecar next to the model (`mtp-*.gguf`, or eagle3/dflash/dspark) is
     detected and used automatically (`--spec-type draft-<kind>`), with a per-model switch and draft length.
     MTP layers built into the model file (Qwen3.5+ "MTP" GGUFs) are detected too and preferred. A **Draft model**

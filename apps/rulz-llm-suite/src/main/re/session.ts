@@ -3,6 +3,7 @@
 // (docs/vast-design.md, section 8). Everything it touches comes in through SessionDeps, so tests run it against
 // a scripted model.
 import { DEFAULT_SAMPLING } from '@shared/defaults'
+import { modePromptExtra, modeSampling, withPromptExtra, type ModelModeDefaults } from '@shared/modes'
 import { isRemoteModelId } from '@shared/remote'
 import { REMOTE_DENIAL, UNATTENDED_DENIAL, type TurnEndReason } from '@shared/batch'
 import {
@@ -10,7 +11,6 @@ import {
   RE_SYSTEM_PROMPT,
   reFirstMessage,
   remoteRoots,
-  reSampling,
   runsWithoutAsking,
   shouldGradePractice
 } from '@shared/re'
@@ -78,6 +78,8 @@ export interface SessionDeps {
   /** The chat as it is now, for a window that watches it. Called at most 4 times a second. */
   onLive(conversation: Conversation): void
   watched(conversationId: string): boolean
+  /** The model's own settings per mode (read when the session starts); none = what RE practice always used. */
+  modeDefaults?(modelId: string): ModelModeDefaults | undefined
   /** A save failed, or something else worth a line in the log. */
   warn?(message: string): void
 }
@@ -146,6 +148,7 @@ export async function runSession(deps: SessionDeps, spec: SessionSpec): Promise<
     return t ? [t.qualifiedName] : []
   })
   const startedAt = deps.now()
+  const modes = spec.modelId ? deps.modeDefaults?.(spec.modelId) : undefined
   let conv: Conversation = {
     id: spec.conversationId,
     title: `Practice: ${spec.practice.taskId}`.slice(0, 60),
@@ -154,8 +157,8 @@ export async function runSession(deps: SessionDeps, spec: SessionSpec): Promise<
     createdAt: startedAt,
     updatedAt: startedAt,
     modelId: spec.modelId,
-    systemPrompt: RE_SYSTEM_PROMPT,
-    sampling: reSampling(first.defaultSampling ?? DEFAULT_SAMPLING),
+    systemPrompt: withPromptExtra(RE_SYSTEM_PROMPT, modePromptExtra(modes, 're')),
+    sampling: modeSampling('re', modes, first.defaultSampling ?? DEFAULT_SAMPLING),
     adapters: null,
     presetId: null,
     activeTools: starter,

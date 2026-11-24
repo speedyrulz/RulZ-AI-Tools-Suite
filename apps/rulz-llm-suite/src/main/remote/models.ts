@@ -265,6 +265,16 @@ export interface FileListDeps {
   getAdapter?: (id: string) => AdapterEntry | undefined
   /** The load config whose draft and adapters go with the model; none = the model's own draft file only. */
   config?: LoadConfig
+  /**
+   * The load settings of the model's modes. Their drafts and adapters go with the model too (after the ones of `config`),
+   * so a load in any mode finds its files on the rental.
+   */
+  extra?: LoadConfig[]
+  /**
+   * Only the files this load config needs, named as they are in the full list (the one a rental was set up with), so two
+   * loads with different drafts or adapters each find their own files. Without it: every file.
+   */
+  for?: LoadConfig
   /** Size of a local file; default reads the disk. */
   localSize?: (path: string) => number | null
 }
@@ -282,6 +292,15 @@ const diskSize = (path: string): number | null => {
  * Throws a sentence when a library source is gone. Main parts keep their names so split files still find each other.
  */
 export function fileList(def: RemoteModelDef, deps: FileListDeps): RemoteFile[] {
+  const all = buildFileList(def, deps, [deps.config, ...(deps.extra ?? [])])
+  if (!deps.for) return all
+  const keyOf = (f: RemoteFile): string => `${f.role}|${f.localPath ?? f.url ?? f.name}`
+  const named = new Map(all.map((f) => [keyOf(f), f]))
+  // A file the full list does not know (a config nothing was set up for) keeps its own name, as before.
+  return buildFileList(def, deps, [deps.for]).map((f) => named.get(keyOf(f)) ?? f)
+}
+
+function buildFileList(def: RemoteModelDef, deps: FileListDeps, configs: (LoadConfig | undefined)[]): RemoteFile[] {
   const size = deps.localSize ?? diskSize
   const used = new Set<string>()
   const files: RemoteFile[] = []
@@ -297,7 +316,10 @@ export function fileList(def: RemoteModelDef, deps: FileListDeps): RemoteFile[] 
     files.push({ role, name: uniqueName(basename(path.replace(/\\/g, '/')), role), localPath: path, url: null, size: knownSize ?? size(path), sha256: null })
   }
 
+  const has = (role: RemoteFile['role'], path: string): boolean => files.some((f) => f.role === role && f.localPath === path)
+
   const src = def.source
+  let draftSource: ModelEntry | null = null
   if (src.kind === 'hf') {
     for (const f of expandShards(src.file)) files.push({ role: 'main', name: uniqueName(f.slice(f.lastIndexOf('/') + 1), 'main'), localPath: null, url: hfUrl(src, f), size: null, sha256: null })
     if (src.mmproj) files.push({ role: 'mmproj', name: uniqueName(src.mmproj.slice(src.mmproj.lastIndexOf('/') + 1), 'mmproj'), localPath: null, url: hfUrl(src, src.mmproj), size: null, sha256: null })
@@ -307,17 +329,23 @@ export function fileList(def: RemoteModelDef, deps: FileListDeps): RemoteFile[] 
     const parts = model.files.length ? model.files : [model.path]
     for (const p of parts) local('main', p)
     if (model.mmproj) local('mmproj', model.mmproj.path, model.mmproj.sizeBytes || null)
-    const c = deps.config
-    const wantsDraft = !c || c.useDraft
-    if (wantsDraft) {
-      if (c?.draftFile && c.draftFile !== 'builtin') local('draft', c.draftFile)
-      else if (model.draftSidecar && c?.draftFile !== 'builtin') local('draft', model.draftSidecar.path, model.draftSidecar.sizeBytes || null)
-    }
+    draftSource = model
   }
-  for (const a of deps.config?.adapters ?? []) {
-    const entry = deps.getAdapter?.(a.id)
-    if (!entry) continue
-    local('adapter', entry.path, entry.sizeBytes || null)
+  // One config after another, the default first: a mode added later never takes a name the default's files already have.
+  for (const c of configs) {
+    if (draftSource && (!c || c.useDraft)) {
+      const sidecar = draftSource.draftSidecar
+      if (c?.draftFile && c.draftFile !== 'builtin') {
+        if (!has('draft', c.draftFile)) local('draft', c.draftFile)
+      } else if (sidecar && c?.draftFile !== 'builtin') {
+        if (!has('draft', sidecar.path)) local('draft', sidecar.path, sidecar.sizeBytes || null)
+      }
+    }
+    for (const a of c?.adapters ?? []) {
+      const entry = deps.getAdapter?.(a.id)
+      if (!entry || has('adapter', entry.path)) continue
+      local('adapter', entry.path, entry.sizeBytes || null)
+    }
   }
   return files
 }

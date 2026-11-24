@@ -4,6 +4,7 @@ import type { BibleEntry, NovelOutline, NovelProjectState, NovelTextFile, StateO
 import { defaultProject } from '@shared/novelPrompts'
 import { applyResult, hashText, scenePath } from '@shared/novelRun'
 import type { WritingJob, WritingRunRequest } from '@shared/phone'
+import type { ModelModeDefaults } from '@shared/modes'
 import type { ChatRequest, StreamEvent } from '@shared/types'
 import { WritingEvents, writingHandlers } from '../src/main/writing/ipc'
 import { WritingRuns, type WritingChat, type WritingModels, type WritingStore } from '../src/main/writing/runs'
@@ -123,8 +124,9 @@ function makeChat(reply: (req: ChatRequest, n: number) => string | { chunks: str
   return { chat, requests, aborted }
 }
 
-function setup(opts: { disk?: Record<string, string>; reply?: Parameters<typeof makeChat>[0]; busy?: () => string | null; throttleMs?: number; max?: number } = {}) {
+function setup(opts: { disk?: Record<string, string>; reply?: Parameters<typeof makeChat>[0]; busy?: () => string | null; throttleMs?: number; max?: number; modes?: Record<string, ModelModeDefaults> } = {}) {
   const s = makeStore(opts.disk)
+  const ensured: { id: string; mode?: string }[] = []
   const c = makeChat(opts.reply ?? (() => 'Generated text.'))
   const models: WritingModels = {
     list: () => [
@@ -132,7 +134,9 @@ function setup(opts: { disk?: Record<string, string>; reply?: Parameters<typeof 
       { id: 'm2', name: 'Model Two' }
     ],
     ready: (id) => (id === null || id === 'm1' ? { modelId: 'm1', instanceId: `inst-${++instanceNo}`, contextLength: 8192 } : undefined),
-    ensure: async () => {
+    ensure: async (id, mode) => {
+      ensured.push({ id, mode })
+      if (id === 'm3') return { modelId: 'm3', instanceId: 'inst-m3', contextLength: 8192 }
       throw new Error('no GPU in tests')
     }
   }
@@ -144,11 +148,12 @@ function setup(opts: { disk?: Record<string, string>; reply?: Parameters<typeof 
     models,
     emit: (j) => events.push(j),
     busyReason: opts.busy,
+    modeDefaults: opts.modes ? (id) => opts.modes![id] : undefined,
     newId: () => `job${++ids}`,
     throttleMs: opts.throttleMs ?? 250,
     maxJobsPerFolder: opts.max
   })
-  return { ...s, ...c, runs, events, models }
+  return { ...s, ...c, runs, events, models, ensured }
 }
 
 const request = (over: Partial<WritingRunRequest> = {}): WritingRunRequest => ({
@@ -693,3 +698,57 @@ describe('phone handlers', () => {
     off()
   })
 })
+
+describe('the model\'s own Writing prompt', () => {
+  const own = (text: string): Record<string, ModelModeDefaults> => ({ m1: { writing: { load: null, sampling: null, systemPrompt: text } } })
+  const interviewRequest = request({ action: 'interview', text: '', interview: { characterId: 'mara', turns: [{ role: 'user', text: 'Who are you?' }] } })
+
+  it('is added after the built-in system prompt of a prose request', async () => {
+    const plain = setup()
+    await finished(plain.runs, plain.runs.run(request()).id)
+    const t = setup({ modes: own('  Write in second person.  ') })
+    await finished(t.runs, t.runs.run(request()).id)
+    const system = String(t.requests[0].messages[0].content)
+    expect(t.requests[0].messages[0].role).toBe('system')
+    expect(system.endsWith('\n\nWrite in second person.')).toBe(true)
+    expect(system.startsWith(String(plain.requests[0].messages[0].content))).toBe(true)
+  })
+
+  it('is added to the interview system prompt', async () => {
+    const t = setup({ modes: own('Stay in character.'), reply: () => 'Mara.' })
+    await finished(t.runs, t.runs.run(interviewRequest).id)
+    expect(String(t.requests[0].messages[0].content).endsWith('\n\nStay in character.')).toBe(true)
+  })
+
+  it('changes nothing without own settings', async () => {
+    const a = setup()
+    await finished(a.runs, a.runs.run(request()).id)
+    const b = setup({ modes: {} })
+    await finished(b.runs, b.runs.run(request()).id)
+    expect(b.requests[0].messages).toEqual(a.requests[0].messages)
+  })
+
+  it('the text counts toward the context: a long one makes the request not fit', async () => {
+    const t = setup({ modes: own('word '.repeat(20000)) })
+    const done = await finished(t.runs, t.runs.run(request()).id)
+    expect(done.status).toBe('error')
+    expect(done.error).toContain('does not fit')
+  })
+
+  it('does not touch the project\'s own sampling', async () => {
+    const t = setup({ modes: { m1: { writing: { load: null, sampling: { ...t0().sampling, topK: 3 }, systemPrompt: '' } } } })
+    await finished(t.runs, t.runs.run(request()).id)
+    expect(t.requests[0].sampling.topK).toBe(t.state.project.sampling.topK)
+  })
+
+  it('loads the model with the Writing settings when it has to start it', async () => {
+    const t = setup()
+    t.state.project.modelId = 'm3'
+    await finished(t.runs, t.runs.run(request()).id)
+    expect(t.ensured).toEqual([{ id: 'm3', mode: 'writing' }])
+  })
+})
+
+function t0() {
+  return defaultProject('x')
+}

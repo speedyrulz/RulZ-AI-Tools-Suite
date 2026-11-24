@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { noChanges, type AdventureJob, type AdventureSetup } from '../src/shared/adventure'
 import { DEFAULT_SAMPLING } from '../src/shared/defaults'
 import { LEFT_OUT_LINE } from '../src/shared/adventurePrompts'
+import type { ModelModeDefaults } from '../src/shared/modes'
 import type { ChatRequest, StreamEvent } from '../src/shared/types'
 import { AdventureRuns } from '../src/main/adventure/runs'
 import { AdventureStore } from '../src/main/adventure/store'
@@ -61,6 +62,7 @@ interface Opts {
   maxFinished?: number
   contextLength?: number | null
   setup?: Partial<AdventureSetup>
+  modes?: Record<string, ModelModeDefaults>
 }
 
 async function setup(opts: Opts = {}) {
@@ -69,15 +71,15 @@ async function setup(opts: Opts = {}) {
   let ids = 0
   const store = new AdventureStore({ dir: join(dir, 'adventures'), newId: () => `id-${String(++ids).padStart(8, '0')}` })
   const c = makeChat(opts.reply ?? ((_r, _n, choosing) => (choosing ? CHOICES_JSON : 'You stand at a gate. What now?')))
-  const ensured: string[] = []
+  const ensured: { id: string; mode?: string }[] = []
   const models: WritingModels = {
     list: () => [
       { id: 'm1', name: 'Model One' },
       { id: 'm2', name: 'Model Two' }
     ],
     ready: (id) => (id === null || id === 'm1' ? { modelId: 'm1', instanceId: 'inst-1', contextLength: opts.contextLength === undefined ? 8192 : opts.contextLength } : undefined),
-    ensure: async (id) => {
-      ensured.push(id)
+    ensure: async (id, mode) => {
+      ensured.push({ id, mode })
       if (id === 'm2') return { modelId: 'm2', instanceId: 'inst-2', contextLength: 8192 }
       throw new Error('no GPU in tests')
     }
@@ -91,6 +93,7 @@ async function setup(opts: Opts = {}) {
     gate,
     emit: (j) => events.push(j),
     busyReason: opts.busy,
+    modeDefaults: opts.modes ? (id) => opts.modes![id] : undefined,
     newId: () => `job${++ids}`.padEnd(8, '0'),
     seed: () => 7,
     throttleMs: opts.throttleMs ?? 250,
@@ -583,7 +586,7 @@ describe('the model and sampling', () => {
   it('loads the setup\'s model when it is not loaded, and fails plainly when it cannot', async () => {
     const ok = await setup({ setup: { modelId: 'm2' } })
     expect((await opening(ok)).status).toBe('done')
-    expect(ok.ensured).toEqual(['m2'])
+    expect(ok.ensured).toEqual([{ id: 'm2', mode: 'adventure' }])
     expect(ok.requests[0].modelId).toBe('m2')
     const bad = await setup({ setup: { modelId: 'm3' } })
     const job = await bad.runs.play({ adventureId: bad.advId, parentId: null, input: { kind: 'start' } })
@@ -641,5 +644,61 @@ describe('fitting a long story', () => {
     expect(done.status).toBe('error')
     expect(done.error).toContain('does not fit in the context')
     expect(t.requests).toHaveLength(0)
+  })
+})
+
+describe('the model\'s own Adventure settings', () => {
+  const sampling = { ...DEFAULT_SAMPLING, temperature: 1.4, topK: 77, stop: ['STOP'], avoidWords: ['gate'], dryMultiplier: 0.8, xtcProbability: 0.3, jsonSchema: '{"x":1}' }
+  const own: Record<string, ModelModeDefaults> = { m1: { adventure: { load: null, sampling, systemPrompt: '  Always rhyme.  ' } } }
+
+  it('without own settings sends the built-in sampling and prompt, as before', async () => {
+    const plain = await setup()
+    await opening(plain)
+    const t = await setup({ modes: {} })
+    await opening(t)
+    expect(t.requests.map((r) => r.sampling)).toEqual(plain.requests.map((r) => r.sampling))
+    expect(t.requests.map((r) => r.messages)).toEqual(plain.requests.map((r) => r.messages))
+    expect(t.requests[0].sampling).toMatchObject({ topK: DEFAULT_SAMPLING.topK, temperature: DEFAULT_SAMPLING.temperature, stop: [], avoidWords: [] })
+  })
+
+  it('uses the sampling and adds the prompt text after the built-in one', async () => {
+    const t = await setup({ modes: own })
+    await opening(t)
+    const passage = t.requests[0]
+    expect(passage.sampling.topK).toBe(77)
+    expect(passage.sampling.temperature).toBe(1.4)
+    expect(passage.sampling.stop).toEqual(['STOP'])
+    expect(passage.sampling.avoidWords).toEqual(['gate'])
+    expect(passage.sampling.jsonSchema).toBe('')
+    const system = String(passage.messages[0].content)
+    expect(system.endsWith('\n\nAlways rhyme.')).toBe(true)
+    expect(system).toContain('narrator')
+  })
+
+  it('the adventure\'s own temperature wins over the model\'s sampling', async () => {
+    const t = await setup({ modes: own, setup: { temperature: 0.3 } })
+    await opening(t)
+    expect(t.requests[0].sampling.temperature).toBe(0.3)
+    expect(t.requests[0].sampling.topK).toBe(77)
+  })
+
+  it('the choices request keeps its schema: no stop words, banned words, DRY or XTC', async () => {
+    const t = await setup({ modes: own })
+    await opening(t)
+    const choosing = t.requests[1]
+    expect(choosing.sampling.jsonSchema).not.toBe('')
+    expect(choosing.sampling.stop).toEqual([])
+    expect(choosing.sampling.avoidWords).toEqual([])
+    expect(choosing.sampling.dryMultiplier).toBe(0)
+    expect(choosing.sampling.xtcProbability).toBe(0)
+    expect(choosing.sampling.topK).toBe(77)
+    // the prompt text is part of the system message there too
+    expect(String(choosing.messages[0].content)).toContain('Always rhyme.')
+  })
+
+  it('reads the settings of the model that is used, not of another one', async () => {
+    const t = await setup({ modes: { m2: own.m1 } })
+    await opening(t)
+    expect(t.requests[0].sampling.topK).toBe(DEFAULT_SAMPLING.topK)
   })
 })
