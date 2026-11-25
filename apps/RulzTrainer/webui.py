@@ -43,6 +43,11 @@ from rulztrainer.caption_text import read_caption_text
 from rulztrainer.pictures import to_rgb
 from rulztrainer.losswatch import read_verdicts
 from rulztrainer.regionwatch import describe as region_watch_line
+try:  # renting a vast.ai GPU and sending a run there: a missing or broken module only leaves it out
+    from rulztrainer import vastui
+except Exception as _vast_error:  # noqa: BLE001
+    print(f"[vast] the Rent GPUs parts are off: {type(_vast_error).__name__}", flush=True)
+    vastui = None
 
 ROOT = Path(__file__).resolve().parent
 os.chdir(ROOT)
@@ -298,11 +303,17 @@ HAS_DISPLAY = sys.platform in ("win32", "darwin") or bool(os.environ.get("DISPLA
 _native_dialogs = HAS_DISPLAY
 
 
+# a request that came through a proxy or a tunnel (it connects from 127.0.0.1 too) carries one of these; a browser
+# opened on this machine, and the launcher's window, send none of them
+PROXY_HEADERS = ("tailscale-user-login", "x-forwarded-for", "x-real-ip", "forwarded", "x-forwarded-host",
+                 "x-forwarded-proto", "cf-connecting-ip", "via")
+
+
 def is_local_viewer(request) -> bool:
     """True when the page was opened on this machine. `tailscale serve` connects from 127.0.0.1 too, but adds the
     Tailscale-User-Login / X-Forwarded-For headers."""
     host = request.client.host if request.client else ""
-    proxied = "tailscale-user-login" in request.headers or "x-forwarded-for" in request.headers
+    proxied = any(h in request.headers for h in PROXY_HEADERS)
     return host in ("127.0.0.1", "::1", "localhost") and not proxied
 
 
@@ -2827,6 +2838,8 @@ h1, h2, h3, .rz-pane-title { font-family: "Segoe UI Variable Display", "Segoe UI
 .q-toggle__label, .q-checkbox__label, .q-radio__label { color: var(--rz-text-3); }
 .q-tooltip { background: var(--rz-tooltip-bg); border: 1px solid var(--rz-border-strong); color: var(--rz-text); font-size: 14px; max-width: 460px; line-height: 1.5; padding: 8px 12px; }
 .q-menu { background: var(--rz-menu-bg); border: 1px solid var(--rz-border-strong); }
+/* a dropdown's list is open: its control's help text must not cover the options (the pointer still hovers it) */
+body:has(.q-menu[role="listbox"], .q-menu [role="listbox"]) .q-tooltip { visibility: hidden !important; }
 
 /* Train tab: the section list on the left picks the one section shown on the right */
 .rz-nav { position: sticky; top: 108px; width: 236px; flex-shrink: 0; gap: 1px; }
@@ -2885,6 +2898,49 @@ h1, h2, h3, .rz-pane-title { font-family: "Segoe UI Variable Display", "Segoe UI
 .rz-log-tall { height: min(68vh, 760px); }
 .rz-fleet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 400px), 1fr)); gap: 14px; }
 .rz-fleet-card { gap: 8px; min-width: 0; }
+/* Rent GPUs and sending to vast.ai (rulztrainer/vastui.py): filters left, offers right; on a phone the filters go on top */
+.rz-vast-layout { display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 16px; width: 100%; align-items: start; }
+.rz-vast-filters { background: var(--rz-surface); border: 1px solid var(--rz-border); border-radius: 12px; padding: 12px 14px; gap: 4px; min-width: 0; }
+.rz-vast-group { border-top: 1px solid var(--rz-border); }
+.rz-vast-group > .q-expansion-item__container > .q-item { padding: 8px 0; min-height: 40px; color: var(--rz-text-2); font-weight: 500; }
+.rz-vast-scroll { overflow-x: auto; max-width: 100%; background: var(--rz-surface); border: 1px solid var(--rz-border); border-radius: 12px; }
+.rz-vast-table { background: transparent; }
+.rz-vast-table th, .rz-vast-table td { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.rz-vast-table .q-btn .q-btn__content { flex-wrap: nowrap; white-space: nowrap; }
+.rz-vast-link { color: var(--rz-link); font-size: 13px; }
+.rz-vast-link:focus-visible { outline: 2px solid var(--rz-red); outline-offset: 2px; }
+.rz-vast-code { font-size: 13px; background: var(--rz-code-bg); color: var(--rz-code); padding: 2px 8px; border-radius: 6px; }
+.rz-vast-status { gap: 4px; }
+.rz-vast-inst { display: grid; grid-template-columns: 150px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 10px 0; border-top: 1px solid var(--rz-border); width: 100%; }
+.rz-vast-inst:first-child { border-top: 0; }
+.rz-vast-inst-btns { flex-wrap: wrap; justify-content: flex-end; }
+.rz-vast-steps { display: flex; flex-direction: column; border: 1px solid var(--rz-border); border-radius: 10px; }
+.rz-vast-step { display: grid; grid-template-columns: 22px 84px minmax(0, 1fr); gap: 8px; align-items: start; padding: 8px 12px; border-top: 1px solid var(--rz-border); }
+.rz-vast-step:first-child { border-top: 0; }
+.rz-vast-sect { border-top: 1px solid var(--rz-border); padding-top: 12px; margin-top: 4px; }
+.rz-vast-pick { display: flex; align-items: center; gap: 10px; border: 1px solid var(--rz-border); border-radius: 10px; padding: 8px 12px; cursor: pointer; width: 100%; }
+.rz-vast-pick:hover { border-color: var(--rz-hover-border); }
+.rz-vast-pick.on { border-color: var(--rz-red); background: var(--rz-red-soft); }
+.rz-vast-pick.off { cursor: default; opacity: .55; }
+.rz-vast-pick.off:hover { border-color: var(--rz-border); }
+.rz-vast-file { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 12px; align-items: center; border: 1px solid var(--rz-border); border-radius: 10px; padding: 10px 12px; width: 100%; }
+.rz-vast-path { overflow-wrap: anywhere; }
+.rz-vast-why { color: var(--rz-warn-text); }
+.rz-vast-bucket { border: 1px solid var(--rz-border); border-radius: 10px; padding: 12px; }
+.rz-vast-max { min-height: 100vh; }
+.rz-vast-dialog { max-width: 96vw; }
+.rz-vast-how { width: 100%; }
+.rz-vast-inst-state { min-width: 0; }
+.rz-vast-inst-btns .q-btn, .rz-vast-send .q-btn--dense, .rz-vast-bucket .q-btn--dense, .rz-vast-pick .q-btn,
+.rz-vast-dialog .q-btn--dense, .rz-banner .q-btn--dense.rz-vast-btn { padding: 4px 12px; min-height: 32px; }
+.rz-vast-table .q-btn--dense { padding: 2px 12px; min-height: 28px; }
+.rz-vast-send { min-width: 0; }
+@media (max-width: 900px) {
+  .rz-vast-layout { grid-template-columns: minmax(0, 1fr); }
+  .rz-vast-inst, .rz-vast-file { grid-template-columns: minmax(0, 1fr); }
+  .rz-vast-inst-btns { justify-content: flex-start; }
+}
+@media (max-width: 760px) { .rz-vast-wide { display: none; } }
 .rz-tile { background: var(--rz-surface); border: 1px solid var(--rz-border); border-radius: 12px; padding: 12px 16px; min-width: 150px; flex: 1 1 150px; }
 .rz-tile-label { font-size: 12px; color: var(--rz-muted); text-transform: uppercase; letter-spacing: .08em; }
 .rz-tile-value { font-size: 20px; font-weight: 600; color: var(--rz-heading); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
@@ -3585,6 +3641,9 @@ class SectionNav:
             ui.run_javascript("window.scrollTo({top: 0, behavior: 'smooth'})")
 
 
+TIP_TARGET = re.compile(r"""[#="']([A-Za-z]+-?\d+)["'\]]*$""")  # the element id a tooltip's target names
+
+
 def inline_descriptions(root) -> None:
     """Shows the tooltip of every setting under `root` as a description beside the setting (the Train tab): the two
     become one row, hidden together with the setting. Buttons keep their tooltips, and so does anything inside an
@@ -3602,7 +3661,9 @@ def inline_descriptions(root) -> None:
     elements = {el.html_id: el for el in root.descendants(include_self=True)}
     for tip in [el for el in elements.values() if isinstance(el, ui.tooltip)]:
         target = tip.props.get("target")  # NiceGUI 3 places the tooltip beside its element; 2 inside it
-        target = elements.get(target.lstrip("#")) if isinstance(target, str) else tip.parent_slot.parent
+        # (3: "#c5"; 4: '#ng-5', and for an input or a dropdown the control inside it: '[for="ng-5"]')
+        found = TIP_TARGET.search(target) if isinstance(target, str) else None
+        target = elements.get(found.group(1)) if found else tip.parent_slot.parent
         if not isinstance(target, ValueElement) or keeps_tip(target):
             continue
         control = target.parent_slot.parent if "rz-path" in target.parent_slot.parent.classes else target
@@ -7147,10 +7208,12 @@ def start_warnings(cfg: TrainConfig) -> list[str]:
     return out
 
 
-def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus: int) -> list[tuple[str, str]]:
-    """What the wizard's last step points out before starting: (error | warning | info, text)."""
+def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus: int,
+                  remote: bool = False) -> list[tuple[str, str]]:
+    """What the wizard's last step points out before starting: (error | warning | info, text). `remote`: the run goes
+    to vast.ai, so what only matters on this PC (a run going here, a job name taken here) is left out."""
     out: list[tuple[str, str]] = []
-    if _running():
+    if _running() and not remote:
         out.append(("error", "A training job is already running. Stop it (Monitor tab) before starting another."))
     specs = [sp for sp in cfg.dataset_specs() if sp.path]
     missing = [sp.path for sp in specs if not Path(sp.path).is_dir()]
@@ -7165,7 +7228,7 @@ def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus:
             out += [("warning", w) for w in start_warnings(cfg)]
     if cfg.reg_dir and not Path(cfg.reg_dir).is_dir():
         out.append(("error", f"Regularisation folder not found: {cfg.reg_dir}"))
-    taken = job_name_refusal(cfg, _waiting_job_names())  # Start and Add to queue refuse it: say so here first
+    taken = None if remote else job_name_refusal(cfg, _waiting_job_names())  # Start and Add to queue refuse it
     if taken:
         out.append(("error", taken))
     try:
@@ -7740,6 +7803,8 @@ class Wizard:
         self.review_task = None  # the pending (debounced) re-render of the review on the last page
         self.last_save_path = ""  # the "Save as" path the wizard itself last put in the field
         self.save_path_typed = False  # the user typed their own "Save as" path: it no longer follows the job name
+        self.vast = None  # set before build(): remote() -> bool, control(), send(cfg): Run on and Send to vast.ai
+        self.queue_btn = None
 
     # ------------------------------------------------------------ building blocks
 
@@ -7758,14 +7823,35 @@ class Wizard:
             return
         ds_paths = [sp.path for sp in cfg.dataset_specs() if sp.path]
         data = await run.io_bound(datasets_summary, ds_paths)
-        errors = [text for level, text in review_issues(cfg, self.goal, data, len(self.gpus)) if level == "error"]
+        remote = self.is_remote()
+        issues = review_issues(cfg, self.goal, data, len(self.gpus), remote=remote)
+        errors = [text for level, text in issues if level == "error"]
         if errors:
-            ui.notify(f"Not started: {errors[0]}", type="negative", multi_line=True)
+            ui.notify(f"{'Not sent' if remote else 'Not started'}: {errors[0]}", type="negative", multi_line=True)
             await self.render_review()
+            return
+        if remote:  # the send dialog lists the warnings, which do not block
+            await self.vast.send(cfg, [text for level, text in issues if level == "warning"])
             return
         result = self.start()
         if asyncio.iscoroutine(result):
             await result
+
+    def is_remote(self) -> bool:
+        """The Run on control says vast.ai (and this is a PC that can send)."""
+        return self.vast is not None and bool(self.vast.remote())
+
+    def mark_run_on(self) -> None:
+        """The review's red button reads Send to vast.ai (and Add to queue goes) while Run on is vast.ai; the review
+        is read again, as what blocks a run there is not what blocks one here."""
+        if not hasattr(self, "start_btn"):
+            return
+        remote = self.is_remote()
+        self.start_btn.text = "Send to vast.ai" if remote else "Start the race" if self.racing() else "Start training"
+        self.start_btn.props(f"icon={'cloud_upload' if remote else 'play_arrow'}")
+        if self.queue_btn is not None:
+            self.queue_btn.visible = not remote
+        background_tasks.create(self.render_review(), name="wizard review")
 
     def bind(self, widget, key: str):
         """Bind a wizard control to the form widget `key` and keep the recommendations current."""
@@ -8695,12 +8781,17 @@ class Wizard:
                 .classes("w-80 max-w-full")
             ui.button("Save config", icon="save", on_click=self.save).props("outline")
             ui.space()
+            if self.vast is not None:
+                self.vast.control()
             if self.enqueue is not None:
-                ui.button("Add to queue", icon="playlist_add", on_click=self.enqueue).props("outline size=lg") \
+                self.queue_btn = ui.button("Add to queue", icon="playlist_add", on_click=self.enqueue) \
+                    .props("outline size=lg") \
                     .tooltip("Start this run after the current one (and any queued before it) is done")
             self.start_btn = ui.button("Start the race" if self.racing() else "Start training", icon="play_arrow",
                                        on_click=self.start_checked).props("unelevated size=lg")
             self.start_btn.set_enabled(False)  # the review turns it on once it has run with no error
+            if self.is_remote():
+                self.mark_run_on()
         with ui.stepper_navigation():
             ui.button("Back", icon="arrow_back", on_click=lambda: self.move(-1)).props("flat")
 
@@ -9062,7 +9153,7 @@ class Wizard:
         self.last_save_path = f"configs/{cfg.job_name}.yaml"  # set first: on_save_path_change compares with it
         if path != self.cfg_path.value:
             self.cfg_path.value = path
-        issues = review_issues(cfg, self.goal, self.data, len(self.gpus))
+        issues = review_issues(cfg, self.goal, self.data, len(self.gpus), remote=self.is_remote())
         self.start_btn.set_enabled(not any(level == "error" for level, _ in issues))  # Add to queue stays
         data = self.data or {}
         multi = {"off": f"single GPU ({cfg.device})", "data_parallel": f"data parallel on {cfg.devices}",
@@ -9104,7 +9195,8 @@ class Wizard:
 
     def mark_race(self):
         if hasattr(self, "start_btn"):
-            self.start_btn.text = "Start the race" if self.racing() else "Start training"
+            self.start_btn.text = "Send to vast.ai" if self.is_remote() else \
+                "Start the race" if self.racing() else "Start training"
 
 
 # ---------------------------------------------------------------- previous runs
@@ -11972,6 +12064,10 @@ def fleet():
     return _FLEET
 
 
+if vastui is not None:  # the SendManager works with the Fleet this WebUI shows
+    vastui.SERVICES.install(fleet=fleet)
+
+
 _RENDER_HELPERS = None
 
 
@@ -12070,7 +12166,13 @@ def fleet_event_text(e: dict) -> str:
              "instance_rebooted": f"{on} is back after its reboot",
              "instance_updated": f"{on} updated RulZ AI Trainer" + (f" from {e['was']}" if e.get("was") else "")
              + (f" to {e['version']}" if e.get("version") else "") + (f" · {e['note']}" if e.get("note") else ""),
-             "update_failed": f"{on} could not update RulZ AI Trainer: {e.get('error')}"}
+             "update_failed": f"{on} could not update RulZ AI Trainer: {e.get('error')}",
+             "send_started": f"{job} was sent to {on} and started" if job else f"A sent run started on {on}",
+             "send_failed": f"Sending {job or 'a run'} to {on} failed: {e.get('error')}",
+             "send_alert": f"Sending {job or 'a run'} to {on} needs a look: "
+             f"{e.get('text') or e.get('error') or e.get('note') or 'see the Sends card'}",
+             "instance_stopped_after_run": f"{on} was stopped after its run (the GPU no longer bills; the disk stays)",
+             "instance_destroyed_after_run": f"{on} was destroyed after its run (its disk is gone)"}
     return table.get(kind, str(kind))
 
 
@@ -12763,7 +12865,7 @@ async def confirm_clear_queue(detail: str) -> bool:
     return bool(go)
 
 
-def build_fleet_tab(form_config=None, charts: list | None = None):
+def build_fleet_tab(form_config=None, charts: list | None = None, sends_card=None):
     """Fleet: every vast.ai instance's run on one page, a queue whose next run goes to the first idle instance,
     the download rules, the watches, and every run on record. All of it is scripts/vast/rulz_fleet.py's Fleet;
     this page draws its state and calls it."""
@@ -12851,6 +12953,8 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
             ui.notify(note, type="info", multi_line=True)
         refresh(force=True)
 
+    if sends_card is not None:  # the runs being sent to vast.ai: a card, hidden while there are none
+        sends_card()
     with card():
         with ui.row().classes("w-full items-center gap-3"):
             with ui.column().classes("gap-0"):
@@ -12878,8 +12982,9 @@ def build_fleet_tab(form_config=None, charts: list | None = None):
         hint("Your vast.ai instances from this computer, over ssh (the vastai CLI with your API key, and your ssh "
              "key on your vast.ai account). This WebUI looks at them every few seconds while it runs; closed, "
              "nothing moves the queue, downloads files or checks the watches unless "
-             "python scripts/vast/rulz_fleet.py daemon runs instead. Nothing here rents, stops or destroys an "
-             "instance; an instance's menu can reboot it or update its RulZ AI Trainer when you ask.")
+             "python scripts/vast/rulz_fleet.py daemon runs instead. Renting, starting, stopping and destroying "
+             "an instance happen on the Rent GPUs tab and in a send's after-run step, never from here; an "
+             "instance's menu can reboot it or update its RulZ AI Trainer when you ask.")
     with card() as pull_strip:
         ui.label("Downloads").classes("text-base font-medium")
         pull_list = ui.column().classes("w-full gap-2")
@@ -14232,6 +14337,18 @@ def build_page(local: bool = True):
         for chart in charts:
             recolor_chart(chart, light)
 
+    def current_tab() -> str:
+        value = tabs.value
+        return value if isinstance(value, str) else (value.props.get("name") if value is not None else "")
+
+    # renting a vast.ai GPU and sending a run there: the credit chip, the Rent GPUs tab, Run on (not on an instance)
+    vast_ui = None
+    if VAST_INSTANCE is None and vastui is not None:
+        vast_ui = vastui.VastUI(SimpleNamespace(
+            card=card, hint=hint, root=ROOT, version=__version__, while_connected=while_connected,
+            goto=lambda name: goto(name), current_tab=current_tab, step_seconds=None, local=local,
+            resume_queue=lambda: fleet().queue_edit("resume")))
+
     with ui.header().classes("rz-header"):
         with ui.row().classes("rz-header-row w-full items-center"):
             with ui.row().classes("rz-brand items-center no-wrap gap-2"):
@@ -14252,6 +14369,7 @@ def build_page(local: bool = True):
                 tab_loratest = ui.tab(LT_TAB, icon="compare")
                 # several vast.ai instances from this computer; an instance itself has no fleet to show
                 tab_fleet = ui.tab("Fleet", icon="dns") if VAST_INSTANCE is None else None
+                tab_rent = ui.tab(vastui.TAB, icon="cloud_queue") if vast_ui is not None else None
                 ui.element("span").classes("rz-tab-sep")
                 tab_help = ui.tab("Help", icon="help_outline")
             with ui.row().classes("rz-header-tools items-center no-wrap gap-1"):
@@ -14260,6 +14378,8 @@ def build_page(local: bool = True):
                     machine_icon = ui.icon("storage")
                     machine_text = ui.label("").classes("rz-chip-text")
                     machine_tip = ui.tooltip("")
+                if vast_ui is not None:  # the vast.ai credit and how long it lasts, while anything is billed
+                    vast_ui.build_chip()
                 # sun in the dark look (switch to light), moon in the light look; CSS picks the icon, so it is right
                 # from the first paint
                 with ui.button(on_click=lambda: set_look(not look["light"]), color=None)                         .props("flat round dense").classes("rz-theme-btn") as theme_btn:
@@ -14330,6 +14450,33 @@ def build_page(local: bool = True):
         if started:
             tabs.value = tab_monitor
         return started
+
+    def run_on_remote() -> bool:
+        return vast_ui is not None and vast_ui.run_on == "vast"
+
+    async def send_job(cfg: TrainConfig | None = None, warnings: list | None = None) -> bool:
+        """Send the run to vast.ai: the form's own checks first (a setting that is invalid), then the dialog. What only
+        matters on this PC's GPUs (start_warnings) is listed in the dialog and does not block."""
+        if vast_ui is None or vast_ui.sending_busy:  # one send dialog per page: a second click does nothing
+            return False
+        vast_ui.sending_busy = True
+        try:
+            if cfg is None:
+                cfg = form_config()
+                if cfg is None:
+                    return False
+                warnings = await run.io_bound(start_warnings, cfg)
+            await vast_ui.open_send(cfg.to_dict(), cfg.job_name, warnings or [], ROOT, held=True)
+        finally:
+            vast_ui.sending_busy = False
+        return True
+
+    async def start_or_send():
+        """The action bar's red button: start here, or send to vast.ai, as Run on says."""
+        if run_on_remote():
+            await send_job()
+        else:
+            await start_job()
 
     run_strip.on("click", lambda: goto("Monitor"))
     machine_chip.on("click", lambda: goto("Monitor"))
@@ -17327,6 +17474,8 @@ def build_page(local: bool = True):
         # ------------------------------------------------------------ Wizard (bound to the Train tab's widgets)
         with ui.tab_panel(tab_wizard):
             wizard = Wizard(f, gpus, lambda: start_job(confirm=False), goto, queue_job)
+            if vast_ui is not None:
+                wizard.vast = SimpleNamespace(remote=run_on_remote, control=vast_ui.build_run_on, send=send_job)
             wizard.build()  # its review lists the warnings
             wizard.adv_switch.bind_value(train_adv_switch, "value")  # one Advanced switch for both tabs
             f.extras["wizard_cfg_path"] = wizard.cfg_path
@@ -18238,7 +18387,13 @@ def build_page(local: bool = True):
         if tab_fleet is not None:
             with ui.tab_panel(tab_fleet):
                 with ui.column().classes("rz-page gap-4"):
-                    build_fleet_tab(form_config, charts)
+                    build_fleet_tab(form_config, charts, vast_ui.build_sends_card if vast_ui is not None else None)
+
+        # ------------------------------------------------------------ Rent GPUs
+        if tab_rent is not None:
+            with ui.tab_panel(tab_rent):
+                with ui.column().classes("rz-page gap-4"):
+                    vast_ui.build_tab()
 
         # ------------------------------------------------------------ Help
         with ui.tab_panel(tab_help):
@@ -18260,10 +18415,12 @@ def build_page(local: bool = True):
             with ui.row().classes("items-center gap-2 no-wrap rz-footer-btns"):
                 queue_note = ui.label("").classes("rz-hint text-sm cursor-pointer")
                 queue_note.on("click", lambda: goto("Monitor"))
-                ui.button("Add to queue", icon="playlist_add", on_click=queue_job, color=None).props("outline") \
-                    .classes("rz-icon-only") \
+                if vast_ui is not None:
+                    vast_ui.build_run_on()  # This PC | vast.ai
+                queue_btn = ui.button("Add to queue", icon="playlist_add", on_click=queue_job, color=None) \
+                    .props("outline").classes("rz-icon-only") \
                     .tooltip("Start this run after the current one (and any queued before it) is done")
-                start_btn = ui.button("Start training", icon="play_arrow", on_click=start_job).props("unelevated")
+                start_btn = ui.button("Start training", icon="play_arrow", on_click=start_or_send).props("unelevated")
                 stop_btn = ui.button("Stop", icon="stop",
                                      on_click=lambda: setattr(status_msg, "text", stop_training()), color=None) \
                     .props("outline").tooltip("Stop after the current step and save the LoRA")
@@ -18271,7 +18428,20 @@ def build_page(local: bool = True):
                                      on_click=lambda: setattr(status_msg, "text", kill_training())) \
                     .props("flat color=negative").classes("rz-icon-only rz-danger") \
                     .tooltip("End the process now, without a final save")
-    footer.bind_value_from(tabs, "value", lambda t: t in ("Train", "Monitor", tab_train, tab_monitor))
+    footer.bind_value_from(tabs, "value", lambda t: t in ("Train", "Dataset", "Monitor", tab_train, tab_dataset,
+                                                         tab_monitor))
+
+    def apply_run_on(value: str = "") -> None:
+        """Run on changed: the red button sends instead of starting, Add to queue goes, the wizard follows."""
+        remote = run_on_remote()
+        start_btn.text = "Send to vast.ai" if remote else "Start training"
+        start_btn.props(f"icon={'cloud_upload' if remote else 'play_arrow'}")
+        queue_btn.visible = not remote
+        start_btn.set_enabled(remote or not _running())  # a run here does not stop one from being sent
+        wizard.mark_run_on()
+
+    if vast_ui is not None:
+        vast_ui.on_run_on(apply_run_on)
 
     def task_tick():
         if not _task_progress["active"]:
@@ -18344,9 +18514,10 @@ def build_page(local: bool = True):
         if title != strip_shown["title"]:  # a background browser tab shows how far the run is
             strip_shown["title"] = title
             ui.page_title(title)
-        if running != strip_shown["running"]:
-            strip_shown["running"] = running
-            start_btn.set_enabled(not running)
+        remote = run_on_remote()
+        if running != strip_shown["running"] or remote != strip_shown.get("remote"):
+            strip_shown["running"], strip_shown["remote"] = running, remote
+            start_btn.set_enabled(remote or not running)
             stop_btn.set_enabled(running)
             kill_btn.set_enabled(running)
 
@@ -18377,7 +18548,7 @@ def build_page(local: bool = True):
     machine_tick()
 
     tab_names = ("Wizard", "Train", "Dataset", "Monitor", "Samples", "Training maps", "Previous Runs", LT_TAB, "Fleet",
-                 "Help")
+                 "Rent GPUs", "Help")
 
     def remember_tab(e):
         name = e.value if isinstance(e.value, str) else e.value.props.get("name")
@@ -18396,6 +18567,11 @@ def build_page(local: bool = True):
 
     tabs.on_value_change(remember_tab)
     ui.timer(0.05, restore_tab, once=True)
+    if vast_ui is not None:
+        # the Rent GPUs tab is drawn when first opened; the chip and the tab follow the shared account snapshot
+        tabs.on_value_change(lambda _: vast_ui.tab_shown() if current_tab() == vastui.TAB else None)
+        ui.timer(1.0, while_connected(vast_ui.tick))
+        ui.timer(0.05, vast_ui.restore_run_on, once=True)
 
     def choose_look() -> None:
         """First visit in this browser (no saved look): pick Dark or Light. Closing the dialog keeps Dark."""
@@ -18557,6 +18733,24 @@ Red marks the one main action of a view and whatever is switched on; every other
 - The page reconnects by itself after a dropped connection; a run does not depend on the page being open, and
   neither do the queue and the stop switch.
 
+## Training on vast.ai (from your own computer)
+The **Rent GPUs** tab shows your vast.ai credit and how long it lasts at what bills now, your instances (Start, Stop,
+Destroy, each after a question that says what it costs or what is lost), and every filter of vast.ai's own search page.
+It needs your API key: make one at https://cloud.vast.ai/manage-keys/ and run `vastai set api-key <your key>` once; this
+page never asks for it. **Search** and Enter only look; a rent happens only when you press the red button of the rent
+dialog, which shows the price. On-demand and interruptible offers can be rented (an interruptible run can be paused
+when someone bids more); reserved offers link to vast.ai. The chip at the top right shows the credit and the time
+left while anything bills (amber under 6 hours, red under 1); hover over it for the split. Traffic is not included.
+
+**Run on** (beside the buttons on Train, Dataset and Monitor, and on the Wizard's last page) switches the red button
+to **Send to vast.ai**: pick a running instance, start a stopped one or rent a new one, then choose what goes up.
+Datasets are uploaded; for each model file that is only on this PC pick *Upload to the instance*, *Via a Hugging Face
+bucket* (a private one of yours; the instance downloads from it) or *Use the standard file*. After the run the
+instance is **stopped** (the default: the GPU stops billing, the disk stays), **destroyed** (only an instance this app
+rented, and only when every file is downloaded here) or **left running**. A send's steps, its countdown with **Keep
+running** and **Retry** are on the Fleet tab, and the send goes on when you close the dialog. A safety stop on the
+instance stops it if this computer is off.
+
 ## Fleet: several vast.ai instances
 The **Fleet** tab (on your own computer, not on an instance) shows every vast.ai instance you have running on one
 page, over ssh: it needs the `vastai` CLI with your API key and your ssh key on your vast.ai account. **Find
@@ -18600,7 +18794,8 @@ run whose probe images are not downloaded says so: use the cloud icon on its row
 
 The WebUI does the looking while it runs. Closed, run `python scripts/vast/rulz_fleet.py daemon` instead, or nothing
 moves the queue, downloads files or checks the watches. The same file is the command line for all of this
-(`rulz_fleet.py --help`). Nothing here rents or destroys an instance; rebooting one can kill its run.
+(`rulz_fleet.py --help`). Nothing on this tab rents or destroys an instance (the Rent GPUs tab does); rebooting
+one can kill its run.
 
 **An instance's own controls**: **Open WebUI** on its card opens that instance's RulZ AI Trainer page in a new tab, signed
 in through vast.ai's Instance Portal (the same token as vast.ai's Open button). Its **⋮** menu has **Update
@@ -19434,6 +19629,8 @@ if __name__ in {"__main__", "__mp_main__"}:
                                             daemon=True).start())
     if VAST_INSTANCE is None:  # this computer looks after the vast.ai instances; an instance looks after itself
         app.on_startup(lambda: threading.Thread(target=fleet_loop, name="rulz-fleet", daemon=True).start())
+        if vastui is not None:  # the account's credit once a minute, and the sends' beat every 3 s
+            app.on_startup(vastui.start_loops)
         app.on_shutdown(stop_render_helpers)  # the "Render on this PC" helpers end with the WebUI
 
     @ui.page("/", reconnect_timeout=PAGE_KEEP_SECONDS)

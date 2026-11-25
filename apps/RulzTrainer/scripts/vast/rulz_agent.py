@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import inspect
 import json
 import os
@@ -23,8 +24,12 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from pathlib import Path
+import types
+import urllib.error
+import urllib.request
+from pathlib import Path, PurePosixPath
 
 OUTPUT = Path("output")
 JOB_FILE = Path(".webui_job.json")
@@ -84,7 +89,7 @@ def read_text(path) -> str:
 
 def write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(data, indent=1, default=str), encoding="utf-8")
     tmp.replace(path)
 
@@ -310,8 +315,24 @@ def job_state(status: dict, running: bool) -> str:
     return "done" if status.get("done") else "ended"
 
 
+def all_job_dirs() -> list[Path]:
+    """Every folder of output/ that can be a job (no limit, with or without a status.json), newest first."""
+    dirs = [d for d in OUTPUT.iterdir() if d.is_dir() and not d.name.startswith(("_", ".")) and d.name not in NOT_JOBS
+            ] if OUTPUT.is_dir() else []
+    return sorted(dirs, key=lambda d: d.stat().st_mtime, reverse=True)
+
+
 def cmd_jobs(args) -> int:
     active = running_dir()
+    if getattr(args, "all", False):
+        lines = []
+        for d in all_job_dirs():
+            status = read_json(d / "status.json", {}) or {}
+            running = active is not None and d.resolve() == active.resolve()
+            lines.append(dict(job_line(d, active), run_id=status.get("run_id"), state=job_state(status, running),
+                              has_status=(d / "status.json").is_file()))
+        show(lines)
+        return 0
     show([job_line(d, active) for d in job_dirs()])
     return 0
 
@@ -327,6 +348,9 @@ def cmd_snapshot(args) -> int:
         running = active is not None and d.resolve() == active.resolve()
         jobs.append(dict(job_line(d, active), run_id=status.get("run_id"), state=job_state(status, running)))
     data["jobs"] = jobs
+    data["tests_running"] = tests_running_count()
+    data["watchdog"] = watchdog_block(data["now"])
+    data["autostop"] = autostop_block()
     current = current_job_dir()
     if current is not None:
         status = read_json(current / "status.json", {}) or {}
@@ -448,6 +472,11 @@ def cmd_files(args) -> int:
     d = job_dir(args.name)
     tag = f"{args.step:06d}" if args.step is not None else None
     what = set(args.what or ["logs"])
+    if "tree" in what:  # every file of the run but its resume states (the check before a destroy)
+        if what != {"tree"}:
+            raise Refused("--what tree cannot be combined with other kinds")
+        show({"base": str(d.parent.resolve()), "files": tree_listing(d)})
+        return 0
     picked: list[Path] = []
     if what & {"logs", "all"}:  # sub-folders too: a race's race.json, a soup's soup.json (the WebUI's job_logs)
         picked += sorted(p for pattern in ("*", "*/*") for p in d.glob(pattern)
@@ -1100,6 +1129,1146 @@ def cmd_webui(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- files sent from the PC: models/sent
+
+SENT_DIR = Path("models") / "sent"
+SENT_RECORDS = SENT_DIR / ".ok"  # one small record per finished file or folder (path, size, sha256)
+FETCH_DIR = OUTPUT / "_fetch"  # file-fetch's state files
+WATCH_DIR = OUTPUT / "_watchdog"
+WATCH_FILE = WATCH_DIR / "watch.py"
+WATCH_STATE = WATCH_DIR / "state.json"
+WATCH_ALIVE = WATCH_DIR / "alive"  # touched by the PC's manager at each look (amendment 1)
+AUTOSTOP_FILE = OUTPUT / "_autostop.json"  # machine.AutoStop's record
+WATCH_CONF = Path("/etc/supervisor/conf.d/rulz-watch.conf")
+WATCH_PROGRAM_NAME = "rulz-watch"
+WATCH_START_WAIT = 6.0  # seconds arm waits to see the program write its pid
+VAST_API = "https://console.vast.ai/api/v0"
+HASH_BLOCK = 8 * 1024 * 1024
+
+
+def sent_parts(rel) -> tuple[str, ...]:
+    """The parts of a posix path below models/sent/<12 hex digits>/, or a refusal. Names come from digests and a cleaned
+    basename on the PC; nothing here may leave models/sent."""
+    if not isinstance(rel, str) or not rel or any(c in rel for c in "\\\0\n\r"):
+        raise Refused(f"Not a path below models/sent: {rel!r}")
+    parts = PurePosixPath(rel).parts
+    if ("/".join(parts) != rel or len(parts) < 4 or parts[:2] != ("models", "sent")
+            or not re.fullmatch(r"[0-9a-f]{12}", parts[2]) or any(p in (".", "..", "") for p in parts)):
+        raise Refused(f"Not a path below models/sent: {rel!r}")
+    return parts
+
+
+def sent_path(rel: str) -> Path:
+    sent_parts(rel)
+    full = Path(rel)
+    if not full.resolve().is_relative_to(SENT_DIR.resolve()):  # a link that leads out
+        raise Refused(f"Not a path below models/sent: {rel!r}")
+    return full
+
+
+def inner_parts(rel) -> tuple[str, ...]:
+    """A path inside a sent folder (from the manifest): relative, no '..', no odd characters."""
+    if not isinstance(rel, str) or not rel or any(c in rel for c in "\\\0\n\r"):
+        raise Refused(f"Not a path inside the folder: {rel!r}")
+    parts = PurePosixPath(rel).parts
+    if "/".join(parts) != rel or rel.startswith("/") or any(p in (".", "..", "") for p in parts):
+        raise Refused(f"Not a path inside the folder: {rel!r}")
+    return parts
+
+
+def sent_record_path(rel: str) -> Path:
+    return SENT_RECORDS / (hashlib.sha1(rel.encode("utf-8")).hexdigest()[:24] + ".json")
+
+
+def sent_record(rel: str) -> dict | None:
+    data = read_json(sent_record_path(rel))
+    return data if isinstance(data, dict) and data.get("path") == rel else None
+
+
+def write_sent_record(rel: str, size: int, sha256: str = "", tree: bool = False) -> None:
+    write_json(sent_record_path(rel), {"path": rel, "size": size, "sha256": sha256, "tree": tree,
+                                       "at": round(time.time())})
+
+
+def sent_complete(rel: str, size: int | None = None, tree: bool = False) -> bool:
+    """Whole and recorded: the final name is there, with a record that agrees."""
+    rec, path = sent_record(rel), Path(rel)
+    if not rec or bool(rec.get("tree")) != tree:
+        return False
+    if tree:
+        return path.is_dir()
+    return path.is_file() and path.stat().st_size == rec.get("size") and (size is None or size == rec.get("size"))
+
+
+def sha256_file(path, block: int = HASH_BLOCK) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            data = f.read(block)
+            if not data:
+                return h.hexdigest()
+            h.update(data)
+
+
+def manifest() -> list[list]:
+    """The files of a folder being sent, [[path inside it, size, sha256 or ""]], from the sent config."""
+    try:
+        data = json.loads(base64.b64decode(SENT_CONFIG).decode("utf-8")) if SENT_CONFIG else None
+        rows = [[str(r[0]), int(r[1]), str(r[2]) if len(r) > 2 and r[2] else ""] for r in data["files"]]
+    except (ValueError, KeyError, TypeError, IndexError, UnicodeError) as e:
+        raise Refused(f"The folder's file list is missing or unreadable: {type(e).__name__}") from e
+    for row in rows:
+        inner_parts(row[0])
+    return rows
+
+
+def cmd_file_state(args) -> int:
+    """How much of a file is on this machine: {"path", "done", "have", "size"}. have = bytes of <path>.part (cut back
+    to nothing when it is longer than --size). --tree: a folder, its file list in the sent config; done says whether it
+    was finished and recorded, missing lists the files absent or of another size."""
+    rel = args.path
+    path = sent_path(rel)
+    if args.tree:
+        missing = []
+        for name, size, _ in manifest():
+            f = path.joinpath(*inner_parts(name))
+            if not f.is_file() or f.stat().st_size != size:
+                missing.append(name)
+        show({"path": rel, "done": sent_complete(rel, tree=True) and not missing, "missing": missing})
+        return 0
+    if sent_complete(rel, args.size):
+        size = path.stat().st_size
+        show({"path": rel, "done": True, "have": size, "size": size})
+        return 0
+    part = Path(rel + ".part")
+    have = part.stat().st_size if part.is_file() else 0
+    if args.size is not None and have > args.size:  # not a part of this file: start again
+        part.unlink()
+        have = 0
+    show({"path": rel, "done": False, "have": have, "size": None})
+    return 0
+
+
+def cmd_file_done(args) -> int:
+    """Close a file: check <path>.part has --size bytes and --sha256, rename it to <path>, record it. --tree: a folder;
+    every file of its list (sent config) is checked (size, and sha256 where given and not recorded by its own file-done),
+    the stage folder is removed, the folder is recorded. A wrong checksum removes the part (answer state "mismatch",
+    exit 1); a part of the wrong length is refused and kept."""
+    rel = args.path
+    path = sent_path(rel)
+    if args.tree:
+        path.mkdir(parents=True, exist_ok=True)
+        rows, total = manifest(), 0
+        for name, size, sha in rows:
+            f = path.joinpath(*inner_parts(name))
+            if not f.is_file() or f.stat().st_size != size:
+                raise Refused(f"{name} is missing or of another size: send the folder again.")
+            record = sent_record(f"{rel}/{name}")
+            if sha and not (record and record.get("sha256") == sha and record.get("size") == size):
+                if sha256_file(f) != sha.lower():
+                    show({"path": rel, "state": "mismatch", "file": name})
+                    return 1
+            total += size
+        for folder, dirs, _ in os.walk(path):  # the stage folders of staged sends, at any depth
+            for name in [d for d in dirs if d == ".rulz_incoming"]:
+                shutil.rmtree(Path(folder) / name, ignore_errors=True)
+                dirs.remove(name)
+        write_sent_record(rel, total, args.sha256 or "", tree=True)
+        show({"path": rel, "state": "done", "size": total, "files": len(rows)})
+        return 0
+    if args.size is None or not args.sha256 or not re.fullmatch(r"[0-9a-fA-F]{64}", args.sha256):
+        raise Refused("file-done needs --size and a 64 digit --sha256.")
+    sha = args.sha256.lower()
+    part = Path(rel + ".part")
+    if sent_complete(rel, args.size) and (sent_record(rel) or {}).get("sha256") == sha:
+        show({"path": rel, "state": "done", "size": args.size})
+        return 0
+    if path.is_file() and not part.exists():  # renamed by an earlier call whose answer was lost
+        if path.stat().st_size == args.size and sha256_file(path) == sha:
+            write_sent_record(rel, args.size, sha)
+            show({"path": rel, "state": "done", "size": args.size})
+            return 0
+        path.unlink()
+        show({"path": rel, "state": "mismatch"})
+        return 1
+    if not part.is_file():
+        raise Refused(f"Nothing of {rel} has arrived.")
+    have = part.stat().st_size
+    if have != args.size:
+        raise Refused(f"{have} of {args.size} bytes of {rel} are here.")
+    if sha256_file(part) != sha:
+        part.unlink()
+        show({"path": rel, "state": "mismatch"})
+        return 1
+    os.replace(part, path)
+    write_sent_record(rel, args.size, sha)
+    show({"path": rel, "state": "done", "size": args.size})
+    return 0
+
+
+# ---------------------------------------------------------------- file-fetch: a signed address downloaded here
+
+FETCH_PROGRAM = r'''#!/usr/bin/env python3
+"""Downloads one file from a signed address, detached from the agent that started it (rulz_agent.py file-fetch).
+The job (address, size, sha256, destination, state file) arrives as one JSON line on stdin: the address is never on a
+command line or on disk. 16 connections fetch 16 MB ranges into a preallocated .fpart; a sidecar .fmap says which
+ranges are whole, so a restart goes on. Every hop of a redirect must be an allowed host. A 401 or 403 ends it with the
+state "expired": the PC asks for a fresh address and starts it again."""
+import hashlib
+import json
+import os
+import re
+import signal
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CHUNK = 16 * 1024 * 1024
+CONNECTIONS = 16
+TRIES = 6
+ALLOW_LOOPBACK = False  # tests only
+SLEEP = time.sleep
+LOOPBACK = ("127.0.0.1", "localhost", "[::1]", "::1")
+
+
+class Expired(Exception):
+    pass
+
+
+class Failed(Exception):
+    pass
+
+
+def host_allowed(url):
+    parts = urllib.parse.urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if ALLOW_LOOPBACK and host in LOOPBACK and parts.scheme in ("http", "https"):
+        return True
+    if parts.scheme != "https":
+        return False
+    return host == "huggingface.co" or host.endswith(".huggingface.co") or host.endswith(".hf.co")
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+
+
+def scrub(text):
+    return re.sub(r"https?://\S+", "<address>", str(text))[:300]
+
+
+def open_url(url, headers=None, timeout=60):
+    """GET with redirects followed by hand, each hop host-checked. Returns (response, final address)."""
+    for _ in range(8):
+        if not host_allowed(url):
+            raise Failed("The address leads to a host that is not allowed.")
+        try:
+            return OPENER.open(urllib.request.Request(url, headers=headers or {}), timeout=timeout), url
+        except urllib.error.HTTPError as e:
+            where = e.headers.get("Location") if e.headers else None
+            code = e.code
+            e.close()
+            if code in (301, 302, 303, 307, 308) and where:
+                url = urllib.parse.urljoin(url, where)
+                continue
+            if code in (401, 403):
+                raise Expired("The address has expired.")
+            raise Failed("HTTP error %s" % code)
+    raise Failed("Too many redirects.")
+
+
+class Progress:
+    def __init__(self, job, size):
+        self.job, self.size, self.done = job, size, 0
+        self.lock, self.last, self.started = threading.Lock(), 0.0, time.time()
+
+    def add(self, n):
+        with self.lock:
+            self.done += n
+
+    def write(self, state="running", error=None, force=False):
+        now = time.time()
+        if not force and now - self.last < 1.0:
+            return
+        self.last = now
+        data = {"dest": self.job["dest"], "state": state, "done": min(self.done, self.size), "size": self.size,
+                "pid": os.getpid(), "updated": now, "error": error,
+                "speed": round(self.done / max(1.0, now - self.started))}
+        try:
+            data["created"] = __import__("psutil").Process().create_time()
+        except Exception:
+            data["created"] = None
+        tmp = self.job["state"] + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, self.job["state"])
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            data = f.read(8 * 1024 * 1024)
+            if not data:
+                return h.hexdigest()
+            h.update(data)
+
+
+def load_map(mapf, size, count):
+    head = ("RULZ1 %d %d\n" % (size, CHUNK)).encode("ascii")
+    try:
+        with open(mapf, "rb") as f:
+            raw = f.read()
+        if raw.startswith(head) and len(raw) == len(head) + count:
+            return head, bytearray(raw[len(head):])
+    except OSError:
+        pass
+    return head, bytearray(b"0" * count)
+
+
+def ranged(job, url, part, mapf, size, progress):
+    count = max(1, ceil_div(size, CHUNK))
+    head, marks = load_map(mapf, size, count)
+    if not os.path.isfile(part) or os.path.getsize(part) != size:
+        marks = bytearray(b"0" * count)
+        with open(part, "wb") as f:
+            f.truncate(size)
+    with open(mapf, "wb") as f:
+        f.write(head + bytes(marks))
+    todo = [i for i in range(count) if marks[i:i + 1] != b"1"]
+    progress.add(sum(min(size, (i + 1) * CHUNK) - i * CHUNK for i in range(count) if marks[i:i + 1] == b"1"))
+    fd = os.open(part, os.O_RDWR | getattr(os, "O_BINARY", 0))
+    mfd = os.open(mapf, os.O_RDWR | getattr(os, "O_BINARY", 0))
+    lock, stop, errors = threading.Lock(), threading.Event(), []
+
+    def write_at(offset, data):
+        if hasattr(os, "pwrite"):
+            os.pwrite(fd, data, offset)
+        else:
+            with lock:
+                os.lseek(fd, offset, os.SEEK_SET)
+                os.write(fd, data)
+
+    def worker():
+        while not stop.is_set():
+            with lock:
+                if not todo:
+                    return
+                i = todo.pop(0)
+            a, b = i * CHUNK, min(size, (i + 1) * CHUNK) - 1
+            for attempt in range(TRIES):
+                got = 0
+                try:
+                    resp, _ = open_url(url, {"Range": "bytes=%d-%d" % (a, b)})
+                    with resp:
+                        if getattr(resp, "status", 200) != 206:
+                            raise Failed("The server ignored the range.")
+                        got_range = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", resp.headers.get("Content-Range") or "")
+                        if not got_range or tuple(int(x) for x in got_range.groups()) != (a, b, size):
+                            raise Failed("The server answered another range than asked.")
+                        while not stop.is_set():
+                            data = resp.read(1024 * 1024)
+                            if not data:
+                                break
+                            write_at(a + got, data)
+                            got += len(data)
+                            progress.add(len(data))
+                            progress.write()
+                    if stop.is_set():
+                        return
+                    if got != b - a + 1:
+                        raise Failed("Short range.")
+                    with lock:
+                        os.lseek(mfd, len(head) + i, os.SEEK_SET)
+                        os.write(mfd, b"1")
+                    break
+                except Expired as e:
+                    errors.append(e)
+                    stop.set()
+                    return
+                except Exception as e:
+                    progress.add(-got)
+                    if attempt == TRIES - 1:
+                        errors.append(e)
+                        stop.set()
+                        return
+                    SLEEP(min(30, 2 ** attempt))
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(min(CONNECTIONS, max(1, len(todo))))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    os.close(fd)
+    os.close(mfd)
+    if errors:
+        raise errors[0]
+
+
+def ceil_div(a, b):
+    return -(-a // b)
+
+
+def single(url, part, size, progress):
+    resp, _ = open_url(url)
+    with resp, open(part, "wb") as f:
+        while True:
+            data = resp.read(1024 * 1024)
+            if not data:
+                break
+            f.write(data)
+            progress.add(len(data))
+            progress.write()
+
+
+def run(job):
+    """Download job["dest"]; returns the final state name. The state file says how it went."""
+    size, dest = int(job["size"]), job["dest"]
+    part, mapf = dest + ".fpart", dest + ".fmap"
+    progress = Progress(job, size)
+    try:
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        progress.write("running", force=True)
+        url = job["url"]
+        if size == 0:
+            open(part, "wb").close()
+        else:
+            resp, final = open_url(url, {"Range": "bytes=0-0"})
+            with resp:
+                status = getattr(resp, "status", 200)
+                total = (resp.headers.get("Content-Range") or "").rpartition("/")[2]
+                length = resp.headers.get("Content-Length")
+            if status == 206 and total.isdigit():
+                if int(total) != size:
+                    raise Failed("The file there is %s bytes, not %d." % (total, size))
+                ranged(job, final, part, mapf, size, progress)
+            else:
+                if length and length.isdigit() and int(length) != size:
+                    raise Failed("The file there is %s bytes, not %d." % (length, size))
+                single(final, part, size, progress)  # the server ignores ranges: one stream, from the start
+        if os.path.getsize(part) != size:
+            raise Failed("The download is %d bytes, not %d." % (os.path.getsize(part), size))
+        progress.write("running", force=True)
+        if sha256_file(part) != job["sha256"].lower():
+            for p in (part, mapf):
+                if os.path.exists(p):
+                    os.remove(p)
+            raise Failed("The checksum differs.")
+        os.replace(part, dest)
+        if os.path.exists(mapf):
+            os.remove(mapf)
+        rec = job["record"]
+        os.makedirs(os.path.dirname(rec), exist_ok=True)
+        with open(rec + ".tmp", "w", encoding="utf-8") as f:
+            json.dump({"path": job["rel"], "size": size, "sha256": job["sha256"].lower(), "tree": False,
+                       "at": round(time.time())}, f)
+        os.replace(rec + ".tmp", rec)
+        progress.done = size
+        progress.write("done", force=True)
+        return "done"
+    except Expired:
+        progress.write("expired", "The address has expired.", force=True)
+        return "expired"
+    except Exception as e:
+        progress.write("failed", scrub(e) or type(e).__name__, force=True)
+        return "failed"
+
+
+def main():
+    for name in ("SIGHUP", "SIGPIPE"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), signal.SIG_IGN)
+    job = json.loads(sys.stdin.readline())
+    return 0 if run(job) == "done" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+def embedded(program: str, name: str) -> types.ModuleType:
+    """An embedded program's functions, loaded here (the agent is piped, so its programs are not files)."""
+    module = types.ModuleType(name)
+    exec(compile(program, f"<{name}>", "exec"), module.__dict__)  # noqa: S102  (our own constant)
+    return module
+
+
+def pid_running(pid, created=None) -> bool:
+    try:
+        return live_process(pid, created) is not None
+    except ImportError:  # no psutil: the pid alone
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except (OSError, TypeError, ValueError):
+            return False
+
+
+def fetch_paths(rel: str) -> tuple[Path, Path]:
+    key = hashlib.sha1(rel.encode("utf-8")).hexdigest()[:16]
+    return FETCH_DIR / f"{key}.json", FETCH_DIR / f"{key}.lock"
+
+
+def fetch_status(rel: str, size=None) -> dict:
+    """{"dest", "state": none | starting | running | done | failed | expired | interrupted, "done", "size", "error"}."""
+    rec = sent_record(rel)
+    if rec and not rec.get("tree") and Path(rel).is_file() and Path(rel).stat().st_size == rec.get("size"):
+        return {"dest": rel, "state": "done", "done": rec["size"], "size": rec["size"]}
+    state_path, _ = fetch_paths(rel)
+    data = read_json(state_path)
+    if not isinstance(data, dict):
+        return {"dest": rel, "state": "none", "done": 0, "size": size}
+    state = data.get("state")
+    if state in ("starting", "running"):
+        alive = data.get("pid") is not None and pid_running(data["pid"], data.get("created"))
+        if not alive and (data.get("pid") is not None or time.time() - (data.get("updated") or 0) > 30):
+            state = "interrupted"
+    out = {"dest": rel, "state": state, "done": data.get("done") or 0, "size": data.get("size") or size}
+    for key in ("error", "speed"):
+        if data.get(key) is not None:
+            out[key] = data[key]
+    return out
+
+
+def cmd_file_fetch(args) -> int:
+    """Start (or find already going) a detached download of a signed address into models/sent. The address, size and
+    checksum come in the sent config (stdin of this program); the child gets them through a pipe. Answers with
+    fetch-state's shape; "done" at once when the file is already here."""
+    rel = args.path
+    sent_path(rel)
+    try:
+        job = json.loads(base64.b64decode(SENT_CONFIG).decode("utf-8")) if SENT_CONFIG else None
+        url, size, sha = str(job["url"]), int(job["size"]), str(job["sha256"]).lower()
+    except (ValueError, KeyError, TypeError, UnicodeError) as e:
+        raise Refused(f"file-fetch needs {{url, size, sha256}} in the sent config ({type(e).__name__}).") from e
+    if size < 0 or not re.fullmatch(r"[0-9a-f]{64}", sha):
+        raise Refused("file-fetch needs a size and a 64 digit sha256.")
+    fetcher = embedded(FETCH_PROGRAM, "rulz_fetch")
+    if not fetcher.host_allowed(url):
+        raise Refused("That address is not on an allowed host (huggingface.co, *.huggingface.co, *.hf.co).")
+    if sent_complete(rel, size):
+        show(fetch_status(rel, size))
+        return 0
+    state_path, lock_path = fetch_paths(rel)
+    lock = hold_lock(lock_path)
+    if lock is None:
+        show(fetch_status(rel, size))
+        return 0
+    with lock:
+        now = fetch_status(rel, size)
+        if now["state"] in ("starting", "running"):
+            show(now)
+            return 0
+        write_json(state_path, {"dest": rel, "state": "starting", "done": 0, "size": size, "pid": None,
+                                "updated": time.time()})
+        child = {"url": url, "size": size, "sha256": sha, "dest": rel, "rel": rel, "state": str(state_path),
+                 "record": str(sent_record_path(rel))}
+        flags = {"start_new_session": True} if sys.platform != "win32" else {
+            "creationflags": getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+        proc = subprocess.Popen([sys.executable, "-c", FETCH_PROGRAM], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, close_fds=True, **flags)
+        proc.stdin.write((json.dumps(child) + "\n").encode("utf-8"))
+        proc.stdin.close()
+    time.sleep(0.5)
+    show(fetch_status(rel, size))
+    return 0
+
+
+def cmd_fetch_state(args) -> int:
+    sent_path(args.path)
+    show(fetch_status(args.path))
+    return 0
+
+
+# ---------------------------------------------------------------- watchdog
+
+WATCH_PROGRAM = r'''#!/usr/bin/env python3
+"""RulZ AI Trainer's idle watchdog for a rented vast.ai instance. Written by rulz_agent.py (watchdog arm); do not edit.
+It only ever stops its own instance: after N idle minutes it asks vast.ai with the container's own API key. Idle means
+no run, no waiting queue entry, no LoRA test and nothing arriving (a growing file below models/sent or
+datasets/.rulz_incoming, a running file-fetch, provisioning). Before any run was seen it also fires, unless the PC's
+manager touched output/_watchdog/alive in the last 10 minutes. The program reads nothing of the trainer's code."""
+import contextlib
+import json
+import os
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+POLL = 30.0
+RETRY_FIRED = 600.0  # a stop vast.ai accepted but that did not happen is asked again this often
+RETRY_AFTER = 300.0  # a stop that failed is asked again this often while the instance is still idle
+ALIVE_FRESH = 600.0
+ARRIVE_WINDOW = 180.0
+REBOOT_SLACK = 5.0
+TESTS_FINAL = ("refused", "done", "stopped", "failed")
+VAST_API = "https://console.vast.ai/api/v0"
+ENV_FILE = Path("/etc/environment")
+FIRST_PROCESS_ENV = Path("/proc/1/environ")
+OWNED = ("pid", "created", "idle_since", "seen_running", "fired", "fired_at", "fired_boot", "booted", "rebooted",
+         "spent", "last", "next_try", "seen_at")  # what this program writes; the rest is the agent's
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name("%s.%d.%d.tmp" % (path.name, os.getpid(), threading.get_ident()))
+    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def locked(folder):
+    """An exclusive OS lock on <folder>/lock (where fcntl exists) around a read-modify-write of state.json: the agent
+    (arm, disarm) and this program both take it."""
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    Path(folder).mkdir(parents=True, exist_ok=True)
+    with open(Path(folder) / "lock", "a+b") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def booted():
+    """When this container started, as the agent's booted(): its first process's start time."""
+    try:
+        import psutil
+
+        return round(psutil.Process(1).create_time(), 1)
+    except Exception:
+        pass
+    try:
+        fields = Path("/proc/1/stat").read_text().rsplit(")", 1)[1].split()
+        start = int(fields[19]) / os.sysconf("SC_CLK_TCK")
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime"):
+                return round(int(line.split()[1]) + start, 1)
+    except Exception:
+        pass
+    return None
+
+
+def pid_alive(pid, created=None):
+    try:
+        import psutil
+    except ImportError:
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except (OSError, TypeError, ValueError):
+            return False
+    try:
+        proc = psutil.Process(int(pid))
+        if created is not None and abs(proc.create_time() - float(created)) > 1.0:
+            return False
+        return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+    except (TypeError, ValueError, psutil.Error):
+        return False
+
+
+def newest_mtime(folder, fresh_after=None):
+    """The newest change time (the later of mtime and ctime: tar restores old mtimes) of anything below folder,
+    directories included. The whole folder is scanned, or until something newer than fresh_after is found."""
+    newest = None
+    for dirpath, dirs, names in os.walk(folder):
+        for name in list(dirs) + list(names) + [""]:
+            try:
+                st = os.stat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            m = max(st.st_mtime, st.st_ctime)
+            newest = m if newest is None else max(newest, m)
+            if fresh_after is not None and m >= fresh_after:
+                return newest
+    return newest
+
+
+def tests_running(tests):
+    try:
+        folders = [d for d in Path(tests).iterdir() if d.is_dir() and not d.is_symlink()]
+    except OSError:
+        return False
+    for d in folders:
+        status = read_json(d / "status.json", {}) or {}
+        if status.get("state") in TESTS_FINAL:
+            continue
+        pid = status.get("pid")
+        try:
+            young = time.time() - d.stat().st_mtime <= 120
+        except OSError:
+            continue
+        if (pid is None and young) or (pid is not None and pid_alive(pid, status.get("pid_created"))):
+            return True
+    return False
+
+
+def fetching(folder, now):
+    try:
+        files = list(Path(folder).glob("*.json"))
+    except OSError:
+        return False
+    for f in files:
+        data = read_json(f, {}) or {}
+        if data.get("state") in ("starting", "running"):
+            if data.get("pid") is not None and pid_alive(data["pid"], data.get("created")):
+                return True
+            if data.get("pid") is None and now - (data.get("updated") or 0) < 60:
+                return True
+    return False
+
+
+VIEWERS = ("tail", "less", "more", "cat", "grep", "egrep", "vi", "vim", "nano", "head", "watch", "journalctl")
+PROVISION_WORDS = ("provision.sh", "provisioner", "install.sh", "download_models.sh")
+PROVISION_MAX_AGE = 7200.0  # a process older than this is not a provisioning that is still going
+
+
+def provisioning_process(cmdline, name, age):
+    """Is this process a setup step still going: younger than 2 hours, not a log viewer (tail -F provisioning.log runs
+    for ever), and naming provision.sh, provisioner, install.sh, download_models.sh or `pip install` as a word of its
+    arguments?"""
+    args = [str(a) for a in (cmdline or [])]
+    if not args or age >= PROVISION_MAX_AGE:
+        return False
+    if os.path.basename(str(name or args[0])) in VIEWERS or os.path.basename(args[0]) in VIEWERS:
+        return False
+    words = [os.path.basename(a) for a in args[1:]]
+    if any(w in PROVISION_WORDS for w in words):
+        return True
+    pip = any(w in ("pip", "pip3") for w in [os.path.basename(args[0])] + words) or ("-m" in args and "pip" in args)
+    return "install" in args[1:] and pip
+
+
+def provisioning(root, now):
+    models = Path(root) / "models"
+    log = models / "bucket_download.log"
+    try:
+        if log.is_file() and not (models / "bucket" / ".download_complete").is_file() \
+                and now - log.stat().st_mtime < ARRIVE_WINDOW:
+            return True
+    except OSError:
+        pass
+    try:
+        import psutil
+
+        for proc in psutil.process_iter(["cmdline", "name", "create_time"]):
+            info = proc.info
+            if provisioning_process(info.get("cmdline"), info.get("name"), now - (info.get("create_time") or now)):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def observe(root, now=None):
+    """What the machine shows now: the inputs of decide()."""
+    now = time.time() if now is None else now
+    root = Path(root)
+    out = root / "output"
+    job = read_json(root / ".webui_job.json", {}) or {}
+    running = job.get("pid") is not None and pid_alive(job["pid"], job.get("create_time"))
+    queue = read_json(out / "_queue.json", {}) or {}
+    arriving = False
+    for folder in (root / "models" / "sent", root / "datasets" / ".rulz_incoming"):
+        newest = newest_mtime(folder, now - ARRIVE_WINDOW) if folder.is_dir() else None
+        if newest is not None and now - newest < ARRIVE_WINDOW:
+            arriving = True
+    arriving = arriving or fetching(out / "_fetch", now) or provisioning(root, now)
+    try:
+        alive = (out / "_watchdog" / "alive").stat().st_mtime
+    except OSError:
+        alive = None
+    return {"running": bool(running), "waiting": len(queue.get("waiting") or []), "paused": bool(queue.get("paused")),
+            "tests": tests_running(out / "_tests"), "arriving": bool(arriving), "alive": alive, "booted": booted()}
+
+
+def decide(now, st, obs):
+    """(new state, action): action is "stop" or None. Pure: state and observations in, state out."""
+    st = dict(st)
+    limit = max(1.0, float(st.get("minutes") or 60)) * 60
+    boot, was = obs.get("booted"), st.get("booted")
+    if boot is not None:
+        if was is not None and abs(boot - was) > REBOOT_SLACK:  # the container restarted: a run that was going ended
+            st.update(rebooted=True, idle_since=None)
+        if was is None or abs(boot - was) > REBOOT_SLACK:
+            st["booted"] = boot
+    if st.get("fired"):
+        fired_boot = st.get("fired_boot")
+        if boot is not None and fired_boot is not None and abs(boot - fired_boot) > REBOOT_SLACK:
+            st["spent"] = True  # a restart after the stop: nothing more until re-armed
+            return st, None
+        if st.get("spent") or st.get("fired_at") is None:
+            return st, None
+        # vast.ai took the request but the instance did not stop: ask again every RETRY_FIRED while still idle
+        waits = obs.get("waiting", 0) > 0 and not (obs.get("paused") and st.get("rebooted"))
+        if obs.get("running") or obs.get("tests") or obs.get("arriving") or waits:
+            st["fired_at"] = now
+            return st, None
+        return (st, "stop") if now - st["fired_at"] >= RETRY_FIRED else (st, None)
+    if obs.get("running"):
+        st.update(seen_running=True, rebooted=False, idle_since=None, next_try=None)
+        return st, None
+    waits = obs.get("waiting", 0) > 0 and not (obs.get("paused") and st.get("rebooted"))
+    busy = bool(obs.get("tests") or obs.get("arriving") or waits)
+    if not st.get("seen_running") and not busy and obs.get("alive") is not None and now - obs["alive"] < ALIVE_FRESH:
+        busy = True  # a manager that looks in is still working on it
+    if busy:
+        st.update(idle_since=None, next_try=None)
+        return st, None
+    if st.get("idle_since") is None:
+        st["idle_since"] = now
+        return st, None
+    if now - st["idle_since"] >= limit and (st.get("next_try") is None or now >= st["next_try"]):
+        return st, "stop"
+    return st, None
+
+
+def container_env():
+    """The container's variables: /etc/environment, the first process's environment, then this process's own."""
+    values = {}
+    try:
+        for line in ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+            name, sep, value = line.strip().removeprefix("export ").partition("=")
+            if sep and name and not name.startswith("#"):
+                values[name.strip()] = value.strip().strip("'\"")
+    except OSError:
+        pass
+    try:
+        raw = FIRST_PROCESS_ENV.read_bytes()
+    except OSError:
+        raw = b""
+    for item in raw.split(b"\0"):
+        name, sep, value = item.decode("utf-8", "replace").partition("=")
+        if sep and name:
+            values[name] = value
+    values.update(os.environ)
+    return values
+
+
+def stop_instance(env=None, opener=urllib.request.urlopen):
+    """(ok, message): PUT {"state": "stopped"} to this instance with CONTAINER_API_KEY. The key goes in a header only
+    and no message carries it or an address."""
+    env = container_env() if env is None else env
+    label = env.get("VAST_CONTAINERLABEL") or ""
+    ident = str(env.get("CONTAINER_ID") or label.removeprefix("C."))
+    key = env.get("CONTAINER_API_KEY")
+    if not ident.isdigit() or not key:
+        return False, "No CONTAINER_ID or CONTAINER_API_KEY here."
+    request = urllib.request.Request(
+        "%s/instances/%s/" % (VAST_API, ident), data=json.dumps({"state": "stopped"}).encode("utf-8"), method="PUT",
+        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json", "Accept": "application/json"})
+    try:
+        with opener(request, timeout=30) as response:
+            body = response.read().decode("utf-8", errors="replace")
+        try:
+            answer = json.loads(body)
+        except ValueError:
+            answer = {}
+        if isinstance(answer, dict) and answer.get("success") is False:
+            return False, "vast.ai refused the stop."
+        return True, "Stop sent to vast.ai."
+    except urllib.error.HTTPError as e:
+        return False, "vast.ai answered HTTP %s." % e.code
+    except Exception as e:
+        return False, "The stop request failed (%s)." % type(e).__name__
+
+
+def merge_owned(path, new):
+    cur = read_json(path, {}) or {}
+    for k in OWNED:
+        if k in new:
+            cur[k] = new[k]
+    write_json(path, cur)
+
+
+def save_owned(path, new):
+    with locked(Path(path).parent):
+        merge_owned(path, new)
+
+
+def step(root, now, obs, stop=stop_instance):
+    """One look. Marks "fired" before the stop is sent; a failed request un-fires and tries again in RETRY_AFTER."""
+    path = Path(root) / "output" / "_watchdog" / "state.json"
+    with locked(path.parent):  # a disarm wins: armed is read again here, under the lock, before anything is marked
+        st = read_json(path, {}) or {}
+        if not st.get("armed"):
+            return "disarmed"
+        new, action = decide(now, st, obs)
+        if action != "stop":
+            merge_owned(path, new)
+            return None
+        new.update(fired=True, fired_at=now, fired_boot=obs.get("booted"), next_try=None)
+        merge_owned(path, new)
+    ok, message = stop()
+    new["last"] = message
+    if not ok:
+        new.update(fired=False, fired_boot=None, next_try=now + RETRY_AFTER)
+    save_owned(path, new)
+    return "stopped" if ok else "failed"
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    root = Path(argv[argv.index("--root") + 1]) if "--root" in argv else Path.cwd()
+    supervised = "--supervised" in argv
+    os.chdir(root)
+    path = root / "output" / "_watchdog" / "state.json"
+    created = None
+    try:
+        import psutil
+
+        created = psutil.Process().create_time()
+    except Exception:
+        pass
+    save_owned(path, {"pid": os.getpid(), "created": created, "idle_since": None, "seen_at": time.time()})
+    while True:
+        st = read_json(path, {}) or {}
+        if not st.get("armed"):
+            if not supervised:
+                return 0
+        else:
+            try:
+                step(root, time.time(), observe(root))
+            except Exception as e:  # a bad look must not end the watch
+                save_owned(path, {"last": "Look failed (%s)." % type(e).__name__})
+        time.sleep(POLL)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+URLOPEN = urllib.request.urlopen  # tests replace it
+
+
+def own_instance(env: dict) -> tuple[str, str]:
+    label = env.get("VAST_CONTAINERLABEL") or ""
+    ident = str(env.get("CONTAINER_ID") or label.removeprefix("C."))
+    return (ident if ident.isdigit() else ""), env.get("CONTAINER_API_KEY") or ""
+
+
+def key_check(env: dict | None = None, opener=None) -> tuple[bool, str]:
+    """Read this instance with its own API key: (can_stop, reason). The key only goes in a header; the reason never
+    carries it or an address."""
+    env = container_env() if env is None else env
+    ident, key = own_instance(env)
+    if not ident:
+        return False, "This is not a vast.ai instance (no CONTAINER_ID)."
+    if not key:
+        return False, "This instance has no CONTAINER_API_KEY."
+    request = urllib.request.Request(f"{VAST_API}/instances/{ident}/", method="GET",
+                                     headers={"Authorization": f"Bearer {key}", "Accept": "application/json"})
+    try:
+        with (opener or URLOPEN)(request, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        return False, f"vast.ai answered HTTP {e.code} to the key."
+    except Exception as e:  # noqa: BLE001
+        return False, f"vast.ai could not be asked ({type(e).__name__})."
+    if isinstance(data, dict) and data.get("success") is False:
+        return False, "vast.ai refused the key."
+    return True, ""
+
+
+_WATCH_MODULE = None
+
+
+def embedded_watch() -> types.ModuleType:
+    global _WATCH_MODULE
+    if _WATCH_MODULE is None:
+        _WATCH_MODULE = embedded(WATCH_PROGRAM, "rulz_watch")
+    return _WATCH_MODULE
+
+
+def watch_process_alive(st: dict) -> bool:
+    return st.get("pid") is not None and pid_running(st["pid"], st.get("created"))
+
+
+def autostop_block() -> dict:
+    data = read_json(AUTOSTOP_FILE)
+    return {"armed": bool(isinstance(data, dict) and data.get("armed"))}
+
+
+def watchdog_block(now: float | None = None) -> dict:
+    """The snapshot's watchdog: {armed (set and its process alive, not fired), idle_since, minutes, fired, ...}."""
+    now = time.time() if now is None else now
+    st = read_json(WATCH_STATE)
+    st = st if isinstance(st, dict) else {}
+    alive = watch_process_alive(st)
+    try:
+        age = round(now - WATCH_ALIVE.stat().st_mtime, 1)
+    except OSError:
+        age = None
+    block = {"armed": bool(st.get("armed")) and alive and not st.get("fired"), "idle_since": st.get("idle_since"),
+             "minutes": st.get("minutes"), "fired": bool(st.get("fired")), "alive": alive,
+             "supervised": bool(st.get("supervised")), "seen_running": bool(st.get("seen_running")),
+             "rebooted": bool(st.get("rebooted")), "can_stop": st.get("can_stop"), "last": st.get("last"),
+             "alive_age": age, "autostop_armed": autostop_block()["armed"]}
+    if st.get("idle_since") is not None:
+        block["idle_seconds"] = round(max(0.0, now - st["idle_since"]), 1)
+    return block
+
+
+def watch_conf_text(python: str, root: Path) -> str:
+    return (f"[program:{WATCH_PROGRAM_NAME}]\n"
+            f"command={python} {(root / WATCH_FILE).as_posix()} --root {root.as_posix()} --supervised\n"
+            f"directory={root.as_posix()}\nautostart=true\nautorestart=true\nstartsecs=3\n"
+            "stdout_logfile=/dev/null\nredirect_stderr=true\n")
+
+
+def start_watch_process(root: Path) -> None:
+    """The detached program, for an instance without supervisor."""
+    flags = {"start_new_session": True} if sys.platform != "win32" else {
+        "creationflags": getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    subprocess.Popen([sys.executable, str((root / WATCH_FILE).resolve()), "--root", str(root.resolve())],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=str(root),
+                     close_fds=True, **flags)
+
+
+def ctl_run(ctl: list[str], *words: str) -> bool:
+    try:
+        return subprocess.run([*ctl, *words], capture_output=True, stdin=subprocess.DEVNULL, timeout=60).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def update_watch_state(**fields) -> dict:
+    """state.json changed under the lock the watchdog takes too (output/_watchdog/lock)."""
+    with embedded_watch().locked(WATCH_DIR):
+        st = read_json(WATCH_STATE)
+        st = st if isinstance(st, dict) else {}
+        st.update(fields)
+        write_json(WATCH_STATE, st)
+    return st
+
+
+def watchdog_arm(minutes: int) -> dict:
+    if not 10 <= minutes <= 1440:
+        raise Refused("--idle-minutes must be between 10 and 1440.")
+    ok, reason = key_check()
+    if not ok:  # nothing to arm that could stop anything; a watchdog already there is left as it is
+        return dict(watchdog_block(), can_stop=False, reason=reason)
+    root = Path.cwd()
+    text = WATCH_PROGRAM
+    WATCH_DIR.mkdir(parents=True, exist_ok=True)
+    changed = read_text(WATCH_FILE) != text
+    if changed:
+        tmp = WATCH_FILE.with_name(WATCH_FILE.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8", newline="\n")
+        tmp.replace(WATCH_FILE)
+    ctl = supervisorctl()
+    update_watch_state(armed=True, minutes=minutes, armed_at=round(time.time(), 1), fired=False, fired_at=None,
+                       fired_boot=None, spent=False, idle_since=None, seen_running=False, rebooted=False,
+                       next_try=None, booted=booted(), can_stop=True, supervised=ctl is not None, last="")
+    alive = watch_process_alive(read_json(WATCH_STATE) or {})
+    if ctl is not None:
+        conf = watch_conf_text(sys.executable, root)
+        conf_changed = read_text(WATCH_CONF) != conf
+        if conf_changed:
+            WATCH_CONF.write_text(conf, encoding="utf-8", newline="\n")
+        if conf_changed or not alive:
+            ctl_run(ctl, "reread")
+            ctl_run(ctl, "update")
+        if alive and (changed or conf_changed):
+            ctl_run(ctl, "restart", WATCH_PROGRAM_NAME)
+        elif not alive:
+            ctl_run(ctl, "start", WATCH_PROGRAM_NAME)
+    elif not alive:
+        start_watch_process(root)
+    deadline = time.time() + WATCH_START_WAIT
+    while time.time() < deadline and not watch_process_alive(read_json(WATCH_STATE) or {}):
+        time.sleep(0.3)
+    if ctl is not None and not watch_process_alive(read_json(WATCH_STATE) or {}):
+        update_watch_state(supervised=False)  # supervisor did not start it: the detached one
+        start_watch_process(root)
+        time.sleep(1.0)
+    return dict(watchdog_block(), can_stop=True)
+
+
+def watchdog_disarm() -> dict:
+    st = update_watch_state(armed=False, idle_since=None)
+    ctl = supervisorctl()
+    if ctl is not None and WATCH_CONF.exists():
+        ctl_run(ctl, "stop", WATCH_PROGRAM_NAME)
+        try:
+            WATCH_CONF.unlink()
+        except OSError:
+            pass
+        ctl_run(ctl, "reread")
+        ctl_run(ctl, "update")
+    if st.get("pid") is not None:
+        try:
+            proc = live_process(st["pid"], st.get("created"))
+            if proc is not None:
+                proc.terminate()
+        except ImportError:
+            pass
+    return watchdog_block()
+
+
+def cmd_watchdog(args) -> int:
+    """arm --idle-minutes N | disarm | status | alive. Answers with the snapshot's watchdog block (arm adds can_stop and,
+    when the key can't stop this instance, reason)."""
+    if args.action == "arm":
+        show(watchdog_arm(args.idle_minutes))
+    elif args.action == "disarm":
+        show(watchdog_disarm())
+    elif args.action == "alive":
+        WATCH_DIR.mkdir(parents=True, exist_ok=True)
+        WATCH_ALIVE.touch()
+        os.utime(WATCH_ALIVE, None)
+        show({"alive": True, "time": time.time()})
+    else:
+        show(watchdog_block())
+    return 0
+
+
+def tests_running_count() -> int:
+    try:
+        return len(running_tests())
+    except (Refused, OSError):
+        return 0
+
+
+def tree_listing(d: Path) -> list[dict]:
+    """Every file below a job folder except state_* folders, remote_render/, hidden files and folders, *.part files."""
+    out = []
+    for folder, dirs, names in os.walk(d):
+        top = Path(folder) == d
+        dirs[:] = sorted(x for x in dirs if not x.startswith(".") and not x.startswith("state_")
+                         and not (top and x == "remote_render"))
+        for name in sorted(names):
+            p = Path(folder) / name
+            if name.startswith(".") or name.endswith(".part") or p.is_symlink():
+                continue
+            st = p.stat()
+            out.append({"path": p.relative_to(d.parent).as_posix(), "size": st.st_size, "mtime": int(st.st_mtime)})
+    return out
+
+
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="rulz_agent", description="RulZ AI Trainer's runs on this machine")
     sub = ap.add_subparsers(dest="command", required=True)
@@ -1112,7 +2281,8 @@ def parser() -> argparse.ArgumentParser:
         return p
 
     command("status", cmd_status)
-    command("jobs", cmd_jobs)
+    p = command("jobs", cmd_jobs)
+    p.add_argument("--all", action="store_true", help="every folder of output/ that can be a job, with its state")
     p = command("job", cmd_job, True)
     p.add_argument("--full", action="store_true", help="status.json with its per-step series")
     p.add_argument("--files", type=int, default=60, help="how many of the folder's file names to list")
@@ -1132,7 +2302,7 @@ def parser() -> argparse.ArgumentParser:
     command("poll", cmd_poll, True)
     p = command("files", cmd_files, True)
     p.add_argument("--tests", metavar="TEST_ID")
-    p.add_argument("--what", action="append", choices=("logs", "probes", "samples", "maps", "loras", "best", "all"))
+    p.add_argument("--what", action="append", choices=("logs", "probes", "samples", "maps", "loras", "best", "all", "tree"))
     p.add_argument("--step", type=int, help="only this step's images and LoRA")
     command("test-start", cmd_test_start)
     p = command("test-status", cmd_test_status)
@@ -1163,6 +2333,22 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="even while a run goes")
     p.add_argument("--reinstall", action="store_true", help="run install.sh even when the requirements are the same")
     command("webui", cmd_webui)
+    p = command("file-state", cmd_file_state)
+    p.add_argument("path", help="posix path below models/sent/<12 hex>/")
+    p.add_argument("--size", type=int, help="the file's final size: a longer .part is cut back to nothing")
+    p.add_argument("--tree", action="store_true", help="a folder; its file list comes in the sent config")
+    p = command("file-done", cmd_file_done)
+    p.add_argument("path")
+    p.add_argument("--size", type=int)
+    p.add_argument("--sha256")
+    p.add_argument("--tree", action="store_true", help="a folder; its file list comes in the sent config")
+    p = command("file-fetch", cmd_file_fetch)
+    p.add_argument("path", help="where the file goes; {url, size, sha256} come in the sent config")
+    p = command("fetch-state", cmd_fetch_state)
+    p.add_argument("path")
+    p = command("watchdog", cmd_watchdog)
+    p.add_argument("action", choices=("arm", "disarm", "status", "alive"))
+    p.add_argument("--idle-minutes", type=int, default=60, help="arm: idle minutes before the stop (10..1440)")
     return ap
 
 
