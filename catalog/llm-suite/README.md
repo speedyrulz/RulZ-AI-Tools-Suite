@@ -29,7 +29,7 @@ Discover/downloads, RAG and a CLI are planned.
   extra arguments; per-model saved defaults; memory estimate with a fits/partial/likely-OOM verdict; load progress;
   live server log; several models loaded at once.
   - **Settings per mode** (0.33.0): each model can have its own load settings, sampling and system prompt for Chat,
-    Reverse engineering, Adventure and Writing (**My Models**, pick a model, **Settings for**). Anything a mode leaves
+    Coding (0.35.0, used by RulZ Coding Agent), Reverse engineering, Adventure and Writing (**My Models**, pick a model, **Settings for**). Anything a mode leaves
     out stays as it is without it. The load dialog has **Load for** and, for a mode, its **Own sampling** (0.34.1).
     **API server sampling** is only for other programs and is set for all modes. When a model is loaded with other settings than the
     mode wants, a bar offers to reload it; it never reloads by itself. Existing chats, sessions and Writing projects keep
@@ -101,6 +101,14 @@ Discover/downloads, RAG and a CLI are planned.
   the memory estimate. A chat-completions request may also carry llama.cpp's own `lora` field (`[{ "id", "scale" }]`,
   ids in load order) to set adapter strengths for that request. `POST /v1/models/{id}/unload` unloads every running instance of a model (replying with how many it
   `unloaded`), so a client can free the memory when it is done with a model.
+  Settings per mode for other apps (0.35.0, Coding and Reverse engineering only): `GET /v1/models/{id}/modes` returns
+  each mode's sampling, system prompt and whether the loaded model matches its load settings;
+  `GET` / `POST /v1/models/{id}/modes/{coding|re}/load-config` reads and changes a mode's load settings (a reload only
+  with `"reload": true`); `POST /v1/models/{id}/reload` with `{ "mode": "coding" }` loads the model again with them. A
+  reload is refused while anything uses the model and for a model on a rental, and web pages can't use these routes. A
+  request with `X-RulZ-Mode: coding` (or `re`) loads a model that isn't loaded with that mode's settings, and one with
+  `X-RulZ-Rental: deny` is refused instead of being answered on a rented computer. Replies name the model that answered
+  (`X-RulZ-Model`) and say when it ran on a rental (`X-RulZ-Rental: 1`).
   Default port 1234 (pick another if LM Studio is running).
 - **Writing mode** (`Ctrl+7`) — write a novel with a local model. A project is a plain folder of Markdown files
   (default `Documents\RulZ Novels`, set in **Settings → Writing**), so Obsidian, VS Code or a sync client can open it

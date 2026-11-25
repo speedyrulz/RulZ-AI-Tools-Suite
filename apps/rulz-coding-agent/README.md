@@ -80,6 +80,18 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
   [REA](https://www.npmjs.com/package/rea-agents) for reverse engineering, work here too with nothing to set up
   twice. Settings lists them and can start them; otherwise they start the first time the agent needs one. Ask for
   them by name ("use REA to study the app in C:\Apps\Viewer").
+- **PDFs** (0.23.0): attach up to 10 PDFs (50 MB each) to a message with the paperclip or by dropping them on the message box; the
+  agent reads them with its `read_pdf` tool, a few pages at a time, and can search them. It also reads PDFs that are in
+  the project. Text only: scanned pages have none. Attached PDFs are copied to the app's data folder and go when their
+  message is deleted. Practice tasks don't get the tool.
+- **Settings per mode** (0.23.0, RulZ LLM Suite 0.35.0): coding tasks use the model's **Coding** settings from RulZ LLM
+  Suite, and reverse-engineering, practice and batch tasks its **Reverse engineering** settings: sampling, system prompt
+  and load settings. Coding sampling set in this app's Model settings wins over the Suite's; for reverse engineering the
+  Suite's is used as it is. When the loaded model has other load settings, a bar offers to reload it (**Keep as is**
+  hides it); nothing reloads by itself. **Settings for** in Model settings edits each mode's load settings.
+- **Models on a rented computer** (vast.ai, from RulZ LLM Suite) are marked **on a rental** and only used when you choose
+  one; every other request says it must not be answered there. Your messages, attached PDFs, the files the agent reads
+  and what its tools return go to that computer. A batch run there asks first, for every run.
 - **Settings → Record tasks for reverse-engineering training** (off by default): RulZ LLM Suite records each task as
   a reverse-engineering session, exactly as the model saw it. The sessions show on the Suite's Reverse Engineering
   page, labelled RulZ Coding Agent, where you grade them and export the good ones as `train.jsonl` for fine-tuning.
@@ -89,7 +101,8 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
   Engineering page offers, run by the agent in the open project. **Start a task** analyses a program or folder with
   the Suite's question templates (Overview, License check, Network, …) or **clones** it: specific pieces (file format,
   protocol, algorithm, …) or the whole program, as new code in the language you pick, written into the project.
-  **Practice** lists the training kit's tasks with how often each was tried and solved; **Start** has the Suite copy
+  **Practice** lists the training kit's tasks with how often the model you use tried, solved and failed each (all models together
+  before RulZ LLM Suite 0.34.0); **Start** has the Suite copy
   the task's program into a fresh work folder, and when the agent finishes, its `ANSWER:` line is checked and the
   result shows in the chat. **Done** lists every RE session the Suite knows (its own chats and other apps' tasks) with
   its grade. With **Record for training** on (the default), these tasks are recorded in the Suite even when the

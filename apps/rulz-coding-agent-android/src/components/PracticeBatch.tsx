@@ -11,8 +11,12 @@ import {
 import type { BatchItem, BatchItemStatus, BatchOptions, BatchRun, BatchState, RePracticeTaskStats } from '@shared/types'
 import { toast } from 'sonner'
 import { errorMessage, invoke, on } from '../lib/api'
+import { RENTAL_NOTE } from '@shared/modes'
 import { cn, formatDuration, relativeTime } from '../lib/format'
+import { batchRentalGate } from '../lib/modeLogic'
+import { activeModelId, useApp } from '../stores/app'
 import { useWorkspace } from '../stores/workspace'
+import { modelLabel, RentalBadge } from './common'
 import { Badge, Button, Input, Spinner, Switch } from './ui'
 
 const BATCH_OPTS_KEY = 'rulz.practiceBatchOptions'
@@ -130,6 +134,12 @@ export function BatchRunBox({
   const [label, setLabel] = useState('')
   const [starting, setStarting] = useState(false)
   const [stoppingMode, setStoppingMode] = useState<'after' | 'now' | null>(null)
+  const modelId = useApp((s) => activeModelId(s.settings, s.connection))
+  const rental = useApp((s) => s.connection.models.find((m) => m.id === modelId)?.rental)
+  /** The yes to run on a rented computer: asked for every run, never remembered, and gone when the model changes. */
+  const [rentalYes, setRentalYes] = useState(false)
+  useEffect(() => setRentalYes(false), [modelId])
+  const gate = batchRentalGate(rental, rentalYes)
 
   const options = useMemo(() => cleanBatchOptions({ ...opts, family }), [opts, family])
   const solvedIds = useMemo(() => new Set(tasks.filter((t) => t.solved > 0).map((t) => t.id)), [tasks])
@@ -190,12 +200,13 @@ export function BatchRunBox({
   }
 
   const startBatch = async (): Promise<void> => {
-    if (!project || !planned.length) return
+    if (!project || !planned.length || !gate.canStart) return
     setStarting(true)
     try {
-      const next = await invoke('batch:start', project.path, label.trim(), options, record)
+      const next = await invoke('batch:start', project.path, label.trim(), options, record, gate.rentalOk)
       onStateChange(next)
       setLabel('')
+      setRentalYes(false)
     } catch (e) {
       toast.error(friendlyReError(e))
     } finally {
@@ -261,13 +272,26 @@ export function BatchRunBox({
         placeholder="Label, e.g. base or lora-v2 (optional)"
         onChange={(e) => setLabel(e.target.value)}
       />
+      {gate.needsYes && (
+        <div className="space-y-2 rounded-xl border border-warn/40 bg-warn/10 p-3 text-[13px]">
+          <RentalBadge model={{ rental }} />
+          <p>
+            {modelLabel(modelId)} runs on a rented computer. {RENTAL_NOTE.replace('This model runs on a rented computer. ', '')} A batch run sends all of that
+            for every task, without you watching.
+          </p>
+          <label className="flex min-h-11 items-center gap-3 text-[14px]">
+            <Switch checked={rentalYes} onCheckedChange={setRentalYes} label="Yes, run this batch on the rented computer" />
+            <span className="min-w-0">Yes, run this batch on the rented computer</span>
+          </label>
+        </div>
+      )}
       <div className="flex items-center justify-between gap-3">
         <span className="text-[13px] text-faint tabular-nums">
           {planned.length === 0
             ? '0 tasks'
             : `${taskCount} task${taskCount === 1 ? '' : 's'}${options.attempts > 1 ? ` × ${options.attempts} tries (${planned.length})` : ''}${family ? ` · only ${family}` : ''}`}
         </span>
-        <Button variant="primary" disabled={!project || !planned.length || busy || starting} onClick={() => void startBatch()}>
+        <Button variant="primary" disabled={!project || !planned.length || busy || starting || !gate.canStart} onClick={() => void startBatch()}>
           {starting ? <Spinner /> : <Play size={15} />} Start batch run
         </Button>
       </div>
@@ -328,6 +352,7 @@ function RunCard({ run, active, onStateChange }: { run: BatchRun; active: boolea
           ) : (
             <Badge tone="neutral">done</Badge>
           )}
+          {run.rentalOk && <Badge>rental</Badge>}
           <span className="shrink-0 text-[14px] tabular-nums">
             <span className="font-semibold">{pct(s)}</span>{' '}
             <span className="text-muted">
@@ -348,6 +373,7 @@ function RunCard({ run, active, onStateChange }: { run: BatchRun; active: boolea
       </button>
       {open && (
         <div className="space-y-3 border-t border-border bg-panel-2/30 px-3.5 py-3">
+          {run.stopNote && <p className="rounded-lg border border-border bg-panel p-2.5 text-[13px]">{run.stopNote}</p>}
           {s.families.length > 0 && (
             <div className="flex flex-wrap gap-1.5 text-[12px]">
               {s.families.map((f) => (

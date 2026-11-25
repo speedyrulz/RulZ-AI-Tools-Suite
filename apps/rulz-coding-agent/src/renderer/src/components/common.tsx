@@ -1,12 +1,19 @@
 import { Check } from 'lucide-react'
 import { APPROVAL_LEVELS } from '@shared/defaults'
+import { RENTAL_NOTE } from '@shared/modes'
 import type { ApprovalLevel, ModelInfo } from '@shared/types'
 import { cn, formatTokens } from '../lib/format'
-import { Select } from './ui'
+import { Badge, Select } from './ui'
 
 /** Readable model name: no folders, no ".gguf". */
 export function modelLabel(id: string): string {
   return (id.split(/[\\/]/).pop() ?? id).replace(/\.gguf$/i, '')
+}
+
+/** "on a rental", with its name and whether it is reconnecting, for a model that runs on a rented computer. */
+export function rentalText(m: Pick<ModelInfo, 'rental'>): string {
+  if (!m.rental) return ''
+  return `on a rental${m.rental.label ? `: ${m.rental.label}` : ''}${m.rental.reconnecting ? ', reconnecting' : ''}`
 }
 
 export function ModelSelect({ models, value, onChange }: { models: ModelInfo[]; value: string; onChange: (id: string) => void }) {
@@ -17,10 +24,27 @@ export function ModelSelect({ models, value, onChange }: { models: ModelInfo[]; 
       {sorted.map((m) => (
         <option key={m.id} value={m.id}>
           {modelLabel(m.id)}
-          {m.loaded ? `  (ready${m.loadedContext ? `, ${formatTokens(m.loadedContext)} context` : ''})` : ''}
+          {m.rental
+            ? `  (${rentalText(m)}${m.loadedContext ? `, ${formatTokens(m.loadedContext)} context` : ''})`
+            : m.loaded
+              ? `  (ready${m.loadedContext ? `, ${formatTokens(m.loadedContext)} context` : ''})`
+              : ''}
         </option>
       ))}
     </Select>
+  )
+}
+
+/** The warning under a rental's model: what leaves this computer. */
+export function RentalNote({ model }: { model: Pick<ModelInfo, 'rental'> | undefined }) {
+  if (!model?.rental) return null
+  return (
+    <div className="rounded-lg border border-warn/40 bg-warn/10 p-3 text-[13px]">
+      <div className="mb-1 flex items-center gap-2">
+        <Badge tone="warn">{rentalText(model)}</Badge>
+      </div>
+      {RENTAL_NOTE} It is never picked for you: only when you choose it.
+    </div>
   )
 }
 

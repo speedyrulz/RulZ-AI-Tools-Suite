@@ -1,8 +1,12 @@
 import type { TimelineItem } from '@shared/types'
-import { ArrowLeft, ArrowUp, Binary, Brain, Check, ChevronDown, ChevronRight, EllipsisVertical, SlidersHorizontal, History, LoaderCircle, NotebookPen, Package, Play, Settings, Square, Undo2 } from 'lucide-react'
+import { ArrowLeft, ArrowUp, Binary, Brain, Check, ChevronDown, ChevronRight, EllipsisVertical, Paperclip, Server, SlidersHorizontal, History, LoaderCircle, NotebookPen, Package, Play, Settings, Square, Undo2 } from 'lucide-react'
 import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { splitThink, thinkingOpen } from '@shared/think'
-import { modelLabel } from '../components/common'
+import { modelLabel, RentalBadge, RentalGoneNote } from '../components/common'
+import { PdfChips, SentPdfChip } from '../components/PdfChips'
+import { ReloadBar } from '../components/ReloadBar'
+import { sourceOf, usePdf, usePdfScope } from '../stores/pdf'
+import { toast } from 'sonner'
 import { LogoMark } from '../components/Logo'
 import { Markdown } from '../components/Markdown'
 import { HistorySheet, NotesSheet } from '../components/ProjectSheets'
@@ -11,7 +15,7 @@ import { RunView } from '../components/RunView'
 import { DraftReadout, FileCount, FileList, PlanList, StepList, TaskPicker } from '../components/TaskViews'
 import { Button, IconButton, Sheet, Textarea, TopBar } from '../components/ui'
 import { cn, formatTokens } from '../lib/format'
-import { activeModelId, useApp } from '../stores/app'
+import { activeModelId, chosenRentalGone, useApp } from '../stores/app'
 import { useUi, type Tab } from '../stores/ui'
 import { undoableTask, useWorkspace } from '../stores/workspace'
 
@@ -103,7 +107,13 @@ function ModelSheet({ open, onOpenChange, current }: { open: boolean; onOpenChan
             <Check size={18} className={m.id === current ? 'text-accent' : 'invisible'} />
             <span className="min-w-0">
               <span className="block truncate">{modelLabel(m.id)}</span>
-              {m.loaded && <span className="block text-[12px] text-ok">Ready{m.loadedContext ? `, ${formatTokens(m.loadedContext)} context` : ''}</span>}
+              {m.rental ? (
+                <span className="mt-0.5 flex max-w-full">
+                  <RentalBadge model={m} />
+                </span>
+              ) : (
+                m.loaded && <span className="block text-[12px] text-ok">Ready{m.loadedContext ? `, ${formatTokens(m.loadedContext)} context` : ''}</span>
+              )}
             </span>
           </button>
         ))}
@@ -132,8 +142,11 @@ function ModelLine() {
   const context = useWorkspace((s) => s.context)
   const id = activeModelId(settings, connection)
   const model = connection.models.find((m) => m.id === id)
+  const gone = chosenRentalGone(settings, connection)
   let dot = <span className="size-1.5 shrink-0 rounded-full bg-faint/60" />
   if (connection.status !== 'connected') dot = <span className="size-1.5 shrink-0 rounded-full bg-danger" />
+  else if (gone) dot = <span className="size-1.5 shrink-0 rounded-full bg-danger" />
+  else if (model?.rental) dot = <Server size={11} className="shrink-0 text-muted" aria-hidden />
   else if (activity === 'loading') dot = <LoaderCircle size={11} className="shrink-0 animate-spin text-accent" />
   else if (model?.loaded) dot = <span className="size-1.5 shrink-0 rounded-full bg-ok" />
   const pct = context?.size ? Math.round(Math.min(1, context.used / context.size) * 100) : null
@@ -142,6 +155,7 @@ function ModelLine() {
       <button aria-label="Change the AI model" className="flex max-w-full min-w-0 items-center gap-1.5 text-left text-[12px] text-faint" onClick={() => setOpen(true)}>
         {dot}
         <span className="truncate">{id ? modelLabel(id) : 'No model'}</span>
+        {gone ? <span className="shrink-0">· not on a rental now</span> : model?.rental && <span className="shrink-0">· {model.rental.reconnecting ? 'rental reconnecting' : 'on a rental'}</span>}
         <ChevronDown size={12} className="shrink-0" />
         {pct !== null && (
           <span className={cn('shrink-0', pct >= 85 ? 'text-danger' : pct >= 60 && 'text-warn')}>
@@ -346,7 +360,18 @@ const ChatItem = memo(function ChatItem({ item, streaming, thinking }: { item: T
   if (item.kind === 'user') {
     return (
       <div className="flex justify-end">
-        <div className="max-w-[88%] rounded-2xl rounded-br-md bg-accent-soft px-3.5 py-2.5 text-[15px] whitespace-pre-wrap">{item.text}</div>
+        <div className="flex max-w-[88%] min-w-0 flex-col items-end gap-1.5">
+          {!!item.attachments?.length && (
+            <div className="flex max-w-full flex-col items-end gap-1.5">
+              {item.attachments.map((p) => (
+                <SentPdfChip key={p.id} pdf={p} />
+              ))}
+            </div>
+          )}
+          {(item.text.trim() || !item.attachments?.length) && (
+            <div className="rounded-2xl rounded-br-md bg-accent-soft px-3.5 py-2.5 text-[15px] whitespace-pre-wrap">{item.text}</div>
+          )}
+        </div>
       </div>
     )
   }
@@ -413,7 +438,8 @@ function ThinkingBox({ text, live }: { text: string; live: boolean }) {
 function EmptyState() {
   const project = useWorkspace((s) => s.project)!
   const connected = useApp((s) => s.connection.status === 'connected')
-  const re = useReOverview(connected)
+  const modelId = useApp((s) => activeModelId(s.settings, s.connection))
+  const re = useReOverview(connected, modelId)
   const [reOpen, setReOpen] = useState<ReTab | null>(null)
   const done = re.data?.sessions.length ?? 0
   const solved = re.data?.sessions.filter((s) => s.outcome === 'solved').length ?? 0
@@ -509,10 +535,20 @@ function Composer() {
   const send = useWorkspace((s) => s.send)
   const stop = useWorkspace((s) => s.stop)
   const llmReady = useApp((s) => s.connection.status === 'connected')
+  // A chosen model that was on a rental and is gone: nothing starts, and no other model takes its place.
+  const rentalGone = useApp((s) => chosenRentalGone(s.settings, s.connection) !== null)
   const [text, setText] = useState('')
   const ref = useRef<HTMLTextAreaElement>(null)
+  const fileRef = useRef<HTMLInputElement>(null)
   const answering = prompt?.kind === 'question'
-  const canSend = llmReady && !!text.trim() && (!running || answering)
+  usePdfScope()
+  const pdfChips = usePdf((s) => s.chips)
+  const pdfOlder = usePdf((s) => s.older)
+  const pdfBlocked = pdfChips.some((c) => c.state !== 'ready')
+  const pdfIds = pdfChips.flatMap((c) => (c.state === 'ready' && c.attachment ? [c.attachment.id] : []))
+  // No attaching while a task runs or a question is open: PDFs only go with the message that starts a task.
+  const canAttach = !pdfOlder && !running && !prompt
+  const canSend = llmReady && (answering ? !!text.trim() : (!!text.trim() || pdfIds.length > 0) && !pdfBlocked) && (!running || answering) && (answering || !rentalGone)
 
   useEffect(() => {
     const fill = (e: Event): void => {
@@ -533,12 +569,45 @@ function Composer() {
   const submit = async (): Promise<void> => {
     if (!canSend) return
     const sent = text
-    if (await send(sent, answering ? prompt.id : undefined)) setText((current) => current === sent ? '' : current)
+    const ids = answering ? [] : usePdf.getState().ids()
+    if (!answering && usePdf.getState().blocked()) return
+    if (await send(sent, answering ? prompt.id : undefined, ids)) {
+      setText((current) => current === sent ? '' : current)
+      // The chips go only after the task started.
+      if (ids.length) usePdf.getState().clearSent(ids)
+    }
+  }
+
+  const pick = (files: FileList | null): void => {
+    if (!files?.length) return
+    const problems = usePdf.getState().add([...files].map(sourceOf))
+    for (const p of problems) toast.error(p)
   }
 
   return (
     <div className="pb-safe shrink-0 border-t border-border bg-panel px-3 pt-2.5">
+      <ReloadBar mode="coding" className="mb-2.5" />
+      <RentalGoneNote className="mb-2.5" />
+      <PdfChips />
       <div className="flex items-end gap-2 pb-2.5">
+        {!pdfOlder && (
+          <>
+            <input
+              ref={fileRef}
+              type="file"
+              accept="application/pdf"
+              multiple
+              hidden
+              onChange={(e) => {
+                pick(e.target.files)
+                e.target.value = ''
+              }}
+            />
+            <IconButton label="Attach PDF" disabled={!canAttach} onClick={() => fileRef.current?.click()}>
+              <Paperclip size={20} />
+            </IconButton>
+          </>
+        )}
         <textarea
           ref={ref}
           value={text}

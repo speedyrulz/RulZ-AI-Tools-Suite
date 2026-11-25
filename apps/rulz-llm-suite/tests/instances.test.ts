@@ -73,6 +73,23 @@ describe('InstanceManager.load', () => {
     expect(mgr.list()).toEqual([])
   })
 
+  it('asks a careful load again when its turn comes, before anything is unloaded', async () => {
+    const events: string[] = []
+    const mgr = manager(events)
+    const a = mgr.load('a', null)
+    a.catch(() => undefined)
+    await vi.waitFor(() => expect(events).toEqual(['spawn a']))
+    let why: string | null = null
+    const refused = mgr.load('a', { ...DEFAULT_LOAD_CONFIG, contextLength: 1234 }, undefined, () => why)
+    why = 'The model is in use.'
+    await expect(refused).rejects.toThrow('The model is in use.')
+    expect(events).toEqual(['spawn a'])
+    why = null
+    mgr.load('a', { ...DEFAULT_LOAD_CONFIG, contextLength: 1234 }, undefined, () => why).catch(() => undefined)
+    await vi.waitFor(() => expect(events).toEqual(['spawn a', 'kill a', 'spawn a']))
+    await mgr.unloadAll()
+  })
+
   it('a failed start does not block the next load', async () => {
     const events: string[] = []
     const mgr = manager(events, { getModel: (id) => (id === 'missing' ? undefined : { ...model, id, name: id }) })

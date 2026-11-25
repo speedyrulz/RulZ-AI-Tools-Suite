@@ -66,7 +66,12 @@ export function storeAdapter(store: NovelStore): WritingStore {
   }
 }
 
-const modelOf = (i: LoadedInstance): WritingModel => ({ modelId: i.modelId, instanceId: i.instanceId, contextLength: i.contextLength })
+const modelOf = (i: LoadedInstance): WritingModel => ({
+  modelId: i.modelId,
+  instanceId: i.instanceId,
+  contextLength: i.contextLength,
+  ...(i.host ? { rental: { label: i.host.label, reconnecting: !!i.reconnecting } } : {})
+})
 
 /**
  * The model catalog (the library, plus the models on rentals) and instance manager as the Writing page's
@@ -74,7 +79,7 @@ const modelOf = (i: LoadedInstance): WritingModel => ({ modelId: i.modelId, inst
  */
 export function modelsAdapter(library: { list(): ModelEntry[] }, instances: InstanceManager): WritingModels {
   return {
-    list: () => library.list().map((m) => ({ id: m.id, name: m.name })),
+    list: () => library.list().map((m) => ({ id: m.id, name: m.name, ...(m.remote ? { remote: true } : {}) })),
     ready: (modelId) => {
       if (modelId) {
         const i = instances.readyFor(modelId)

@@ -1,13 +1,17 @@
 import { Folder, Play, RefreshCw } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { familyCounts, nextPracticeTask } from '@shared/batch'
+import { practiceScope, triesText } from '@shared/modes'
 import type { BatchState, ReKind, ReOutcome, ReOverview, ReStartRequest } from '@shared/types'
 import { toast } from 'sonner'
 import { invoke } from '../lib/api'
 import { cn, relativeTime } from '../lib/format'
+import { activeModelId, useApp } from '../stores/app'
 import { useWorkspace } from '../stores/workspace'
+import { modelLabel } from './common'
 import { FolderPicker } from './FolderPicker'
 import { BatchRunBox, BatchScoreboard, friendlyReError, useBatchState } from './PracticeBatch'
+import { ReloadBar } from './ReloadBar'
 import { Badge, Button, Field, Input, Select, Sheet, Spinner, Switch, Textarea } from './ui'
 
 const OUTCOME_TONE: Record<ReOutcome, 'neutral' | 'ok' | 'warn' | 'danger'> = { unrated: 'neutral', solved: 'ok', partial: 'warn', failed: 'danger' }
@@ -16,21 +20,29 @@ const KIND_LABEL: Record<ReKind, string> = { analyse: 'Analyse', practice: 'Prac
 /** A computer running an older RulZ Coding Agent doesn't know the RE or batch requests. */
 const friendly = friendlyReError
 
-/** RulZ LLM Suite's RE overview, through the computer. */
-export function useReOverview(open: boolean): { data: ReOverview | null; error: string | null; loading: boolean; reload: () => void } {
+/**
+ * RulZ LLM Suite's RE overview, through the computer, for the model in use (the practice counts are
+ * that model's; an older computer or RulZ LLM Suite ignores the model and counts all models together).
+ * Asked again when the model changes; an answer for a model picked before is dropped.
+ */
+export function useReOverview(open: boolean, model?: string): { data: ReOverview | null; error: string | null; loading: boolean; reload: () => void } {
   const [data, setData] = useState<ReOverview | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  /** The newest question. */
+  const latest = useRef(0)
   const reload = useCallback(() => {
+    const mine = ++latest.current
     setLoading(true)
-    invoke('re:overview')
+    invoke('re:overview', model || undefined)
       .then((d) => {
+        if (mine !== latest.current) return
         setData(d)
         setError(null)
       })
-      .catch((e) => setError(friendly(e)))
-      .finally(() => setLoading(false))
-  }, [])
+      .catch((e) => mine === latest.current && setError(friendly(e)))
+      .finally(() => mine === latest.current && setLoading(false))
+  }, [model])
   useEffect(() => {
     if (open) reload()
   }, [open, reload])
@@ -43,7 +55,8 @@ export type ReTab = 'start' | 'practice' | 'sessions'
 export function ReSheet({ open, onOpenChange, initialTab = 'start' }: { open: boolean; onOpenChange: (open: boolean) => void; initialTab?: ReTab }) {
   const project = useWorkspace((s) => s.project)
   const running = useWorkspace((s) => s.running)
-  const { data, error, loading, reload } = useReOverview(open)
+  const modelId = useApp((s) => activeModelId(s.settings, s.connection))
+  const { data, error, loading, reload } = useReOverview(open, modelId)
   const { state: batch, supported: batchSupported, setState: setBatch } = useBatchState(open, reload)
   const batchActive = Boolean(batch?.activeId)
   const busy = running || batchActive
@@ -98,6 +111,8 @@ export function ReSheet({ open, onOpenChange, initialTab = 'start' }: { open: bo
         </button>
       </div>
       <div className="px-4 pb-4">
+        {/* The next task here is a reverse-engineering one, so the Reverse engineering settings are what it should run with. */}
+        {open && <ReloadBar mode="re" busy={batchActive} className="mb-3" />}
         {batchActive ? (
           <div className="mb-3 text-[13px] text-warn">A batch run is going; stop it before starting another task.</div>
         ) : (
@@ -338,6 +353,8 @@ function PracticeList({
         <div className="text-[14px] text-muted">No practice tasks in {data.practice.kitDir}.</div>
       ) : (
         <>
+          {/* Which model the counts are for: one model with a RulZ LLM Suite that counts per model, else all of them together. */}
+          <div className="text-[13px] font-medium text-muted">{practiceScope(data.practice, modelLabel)}</div>
           <div className="grid grid-cols-2 gap-2">
             {familyTiles.map((c) => (
               <button
@@ -351,7 +368,7 @@ function PracticeList({
               >
                 <div className="truncate text-[14px] font-medium">{c.family}</div>
                 <div className="text-[12px] text-faint tabular-nums">
-                  {c.solved}/{c.total} solved · {c.tried} tried
+                  {c.solved}/{c.total} solved · {c.tried} tried{c.failed !== undefined && <> · {c.failed} failed</>}
                 </div>
               </button>
             ))}
@@ -404,7 +421,7 @@ function PracticeList({
                   <div className="mt-0.5 flex flex-wrap gap-1">
                     <Badge>{t.family}</Badge>
                     <Badge>{t.tier}</Badge>
-                    {t.solved > 0 ? <Badge tone="ok">solved {t.solved}/{t.attempts}</Badge> : t.attempts > 0 ? <Badge tone="danger">0/{t.attempts}</Badge> : null}
+                    {t.solved > 0 ? <Badge tone="ok">{triesText(t)}</Badge> : t.attempts > 0 ? <Badge tone="danger">{triesText(t)}</Badge> : null}
                   </div>
                 </div>
                 <Button disabled={busy} onClick={() => onStart(t.id)}>

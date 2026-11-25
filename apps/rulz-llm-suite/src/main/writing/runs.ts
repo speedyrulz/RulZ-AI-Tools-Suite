@@ -54,7 +54,7 @@ import {
   type StateCardItem
 } from '@shared/novelRun'
 import type { ChatRequest, StreamEvent, WireMessage } from '@shared/types'
-import type { WritingAlt, WritingJob, WritingJobStatus, WritingResult, WritingRunRequest, WritingStateItem } from '@shared/phone'
+import type { PhoneModel, WritingAlt, WritingJob, WritingJobStatus, WritingResult, WritingRunRequest, WritingStateItem } from '@shared/phone'
 import type { ModelGateLike } from '../modelGate'
 
 // ---------------------------------------------------------------------------------------------
@@ -84,11 +84,13 @@ export interface WritingModel {
   modelId: string
   instanceId: string
   contextLength: number | null
+  /** The rental it runs on; absent = this PC. */
+  rental?: { label: string; reconnecting: boolean }
 }
 
 export interface WritingModels {
   /** The model library. */
-  list(): { id: string; name: string }[]
+  list(): { id: string; name: string; remote?: boolean }[]
   /** The ready instance of a model; with null, any ready instance (the desktop's "active model"). */
   ready(modelId: string | null): WritingModel | undefined
   /** Loads the model as the desktop does (instances:ensure) and resolves when it is ready. */
@@ -306,8 +308,17 @@ export class WritingRuns {
     return res
   }
 
-  models(): { id: string; name: string; loaded: boolean }[] {
-    return this.deps.models.list().map((m) => ({ id: m.id, name: m.name, loaded: !!this.deps.models.ready(m.id) }))
+  models(): PhoneModel[] {
+    return this.deps.models.list().map((m) => {
+      const ready = this.deps.models.ready(m.id)
+      // A rental's model: label null = it is not loaded on a rental now.
+      return {
+        id: m.id,
+        name: m.name,
+        loaded: !!ready,
+        ...(m.remote ? { rental: { label: ready?.rental?.label ?? null, reconnecting: !!ready?.rental?.reconnecting } } : {})
+      }
+    })
   }
 
   // -------------------------------------------------------------------------------------------

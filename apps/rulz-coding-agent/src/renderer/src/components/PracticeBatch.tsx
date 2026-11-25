@@ -3,9 +3,12 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import type { BatchItem, BatchItemStatus, BatchOptions, BatchRun, BatchState, ReOverview } from '@shared/types'
 import { DEFAULT_BATCH_OPTIONS, cleanBatchOptions, familyCounts, nextPracticeTask, planBatch, summarize } from '@shared/batch'
+import { RENTAL_NOTE, practiceScope } from '@shared/modes'
 import { errorMessage, invoke, on } from '../lib/api'
 import { cn, formatDuration, relativeTime } from '../lib/format'
+import { activeModelId, useApp } from '../stores/app'
 import { useWorkspace } from '../stores/workspace'
+import { modelLabel, rentalText } from './common'
 import { Badge, Button, Field, IconButton, Input, NumberInput, ProgressBar, Select, Switch } from './ui'
 
 const OPTIONS_KEY = 'rulz-coding-agent.batchOptions'
@@ -98,6 +101,10 @@ export function PracticePanel({
       <KitFolder practice={data.practice} locked={!!active} onReload={onReload} />
       {tasks.length > 0 && (
         <>
+          {/* Which model the counts are for: one model with a RulZ LLM Suite that counts per model, else all of them together. */}
+          <div className="text-[12px] font-medium text-muted" data-testid="practice-scope">
+            {practiceScope(data.practice, modelLabel)}
+          </div>
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
             {tiles.map((t) => (
               <button
@@ -110,7 +117,7 @@ export function PracticePanel({
               >
                 <div className={cn('truncate text-[13px] font-medium', family === t.family && 'text-accent')}>{t.family}</div>
                 <div className="text-[11.5px] tabular-nums text-muted">
-                  {t.solved}/{t.total} solved · {t.tried} tried
+                  {t.solved}/{t.total} solved · {t.tried} tried{t.failed !== undefined && <> · {t.failed} failed</>}
                 </div>
               </button>
             ))}
@@ -211,9 +218,14 @@ function BatchBox({
   onState: (s: BatchState) => void
 }) {
   const project = useWorkspace((s) => s.project)
+  const modelId = useApp((s) => activeModelId(s.settings, s.connection))
+  const rental = useApp((s) => s.connection.models.find((m) => m.id === modelId)?.rental)
   const [options, setOptions] = useState<BatchOptions>(() => ({ ...loadOptions(), family }))
   const [label, setLabel] = useState('')
   const [starting, setStarting] = useState(false)
+  /** The yes to send a run to a rented computer: asked for every run, never remembered. */
+  const [rentalYes, setRentalYes] = useState(false)
+  useEffect(() => setRentalYes(false), [modelId])
   // A tile click picks the family for the run too.
   useEffect(() => setOptions((o) => ({ ...o, family })), [family])
   const patch = (p: Partial<BatchOptions>): void => {
@@ -235,7 +247,7 @@ function BatchBox({
     if (!project) return
     setStarting(true)
     try {
-      onState(await invoke('batch:start', project.path, label.trim(), cleanBatchOptions(options), record))
+      onState(await invoke('batch:start', project.path, label.trim(), cleanBatchOptions(options), record, !!rental && rentalYes))
     } catch (e) {
       toast.error(errorMessage(e))
     } finally {
@@ -288,11 +300,21 @@ function BatchBox({
           <Switch checked={options.onlyUnsolved} onCheckedChange={(v) => patch({ onlyUnsolved: v })} />
         </Field>
       </div>
+      {rental && (
+        <div className="space-y-1.5 rounded-lg border border-warn/40 bg-warn/10 p-3 text-[13px]">
+          <div>
+            <Badge tone="warn">{rentalText({ rental })}</Badge> {modelLabel(modelId)} runs on a rented computer. {RENTAL_NOTE.replace('This model runs on a rented computer. ', '')}
+          </div>
+          <label className="flex items-center gap-2">
+            <Switch checked={rentalYes} onCheckedChange={setRentalYes} label="Yes, run this batch on the rented computer" /> Yes, run this batch on the rented computer
+          </label>
+        </div>
+      )}
       <div className="flex items-center gap-3">
         <span className="text-[11.5px] text-faint">Tools that ask for approval are approved automatically in batch runs.</span>
         <div className="flex-1" />
         <span className="text-[13px] tabular-nums text-muted">{planned} {planned === 1 ? 'task' : 'tasks'}</span>
-        <Button variant="primary" disabled={!planned || busy || starting || !project} onClick={() => void startRun()}>
+        <Button variant="primary" disabled={!planned || busy || starting || !project || (!!rental && !rentalYes)} onClick={() => void startRun()}>
           {starting ? <LoaderCircle size={14} className="animate-spin" /> : <Play size={14} />} Start batch run
         </Button>
       </div>
@@ -386,6 +408,7 @@ function Scoreboard({ state, onState }: { state: BatchState; onState: (s: BatchS
                     <div className="flex items-center gap-2 text-[13px]">
                       <span className="truncate font-medium">{run.label || 'Unlabelled'}</span>
                       <Badge tone={run.status === 'running' ? 'accent' : run.status === 'done' ? 'ok' : 'neutral'}>{run.status}</Badge>
+                      {run.rentalOk && <Badge tone="warn">rental</Badge>}
                     </div>
                     <div className="truncate text-[11.5px] text-muted">
                       {run.modelName} · {relativeTime(run.createdAt)} · {s.tasksSolved}/{s.tasksScored} tasks solved
@@ -429,6 +452,7 @@ function RunDetail({ run }: { run: BatchRun }) {
   const counts = (Object.entries(s.counts) as [BatchItemStatus, number][]).filter(([, n]) => n > 0)
   return (
     <div className="space-y-3 border-t border-border bg-panel px-3 py-3">
+      {run.stopNote && <div className="rounded-lg border border-warn/40 bg-warn/10 p-2.5 text-[12.5px]">{run.stopNote}</div>}
       <div className="flex flex-wrap gap-1.5">
         {counts.map(([status, n]) => (
           <Badge key={status} tone={STATUS_TONE[status]}>

@@ -21,6 +21,10 @@ export interface MockRequest {
   path: string
   /** The RE session header RulZ LLM Suite records requests by, if sent. */
   reSession?: string
+  /** The X-RulZ-Mode header, if sent. */
+  mode?: string
+  /** The X-RulZ-Rental header, if sent. */
+  rental?: string
   body: {
     model?: string
     stream?: boolean
@@ -34,7 +38,15 @@ export interface MockOptions {
   /** Pretend to be LM Studio (no RulZ fields, no /health app name). */
   lmStudio?: boolean
   apiKey?: string
-  models?: { id: string; state?: 'loaded' | 'not-loaded'; loaded_context_length?: number }[]
+  models?: {
+    id: string
+    state?: 'loaded' | 'not-loaded'
+    loaded_context_length?: number
+    /** A model on a rental, as LLM Suite 0.35 reports it. */
+    rental?: { label: string | null; reconnecting: boolean }
+    /** Overrides the path (LLM Suite 0.29 to 0.34 marked a rental by a `vast/` path). */
+    path?: string
+  }[]
   template?: string
   nCtx?: number
   turns?: MockTurn[] | ((req: MockRequest, index: number) => MockTurn)
@@ -49,6 +61,18 @@ export interface MockOptions {
   }
   /** Answer GET/POST /v1/models/{id}/load-config like newer RulZ LLM Suite versions. */
   loadConfig?: boolean
+  /**
+   * LLM Suite 0.35: GET /v1/models/{id}/modes, POST .../reload and .../modes/{mode}/load-config. A body
+   * (in LLM Suite's snake_case) is what the modes route answers; without this option every one of them is a 404, like
+   * an older LLM Suite. As a function it can answer a status instead.
+   */
+  modes?: Record<string, unknown> | ((model: string) => { status: number; body: unknown })
+  /** Answer POST .../reload with this 409 sentence (a reload that is refused). */
+  reloadRefusal?: string
+  /** Answer a mode's load-config POST with `reload_blocked: <this>` (settings saved, reload refused). */
+  reloadBlocked?: string
+  /** GET /v1/re/overview?model=: answer per model (`practice.model` set, `failed` counted). Without it the query is ignored, like an older LLM Suite. */
+  practicePerModel?: boolean
 }
 
 export const QWEN_CODER_TEMPLATE =
@@ -90,6 +114,14 @@ export async function startMockRulz(opts: MockOptions = {}) {
     { index: 1, name: 'RTX 3090', memUsedMiB: 512, memTotalMiB: 24576 }
   ]
   const loadConfigPosts: unknown[] = []
+  /** POST .../modes/{mode}/load-config bodies. */
+  const modeLoadConfigPosts: { mode: string; model: string; body: Record<string, unknown> }[] = []
+  /** Every request that names a model and is not the model list: its path, method and the mode and rental headers. */
+  const headerLog: { path: string; method: string; model: string; mode?: string; rental?: string }[] = []
+  /** POST .../reload bodies. */
+  const reloads: { model: string; body: Record<string, unknown> }[] = []
+  /** The ?model= of each GET /v1/re/overview ('' when none). */
+  const overviewQueries: string[] = []
   /** POST /v1/re/kit bodies. */
   const kits: { kitDir?: string }[] = []
   /** POST /v1/re/sessions/{id} bodies, as newer RulZ LLM Suite versions take them. */
@@ -116,11 +148,74 @@ export async function startMockRulz(opts: MockOptions = {}) {
         data: models.map((m) =>
           opts.lmStudio
             ? { id: m.id, object: 'model', owned_by: 'organization_owner' }
-            : { id: m.id, object: 'model', owned_by: 'rulz', path: `C:\\models\\${m.id}.gguf`, arch: 'qwen3moe', state: m.state ?? 'not-loaded', loaded_context_length: m.loaded_context_length, max_context_length: 262144 }
+            : {
+                id: m.id,
+                object: 'model',
+                owned_by: 'rulz',
+                path: m.path ?? `C:\\models\\${m.id}.gguf`,
+                arch: 'qwen3moe',
+                state: m.state ?? 'not-loaded',
+                loaded_context_length: m.loaded_context_length,
+                max_context_length: 262144,
+                ...(m.rental ? { rental: m.rental } : {})
+              }
         )
       })
     }
-    if (opts.loadConfig && url.pathname.startsWith('/v1/models/') && url.pathname.endsWith('/load-config')) {
+    // Like LLM Suite 0.35: a request with X-RulZ-Rental: deny gets a 409 instead of an answer from a rental's model.
+    const named = url.pathname === '/props' ? url.searchParams.get('model') : null
+    const refuseRental = (model: string | null | undefined): boolean => {
+      const m = models.find((x) => x.id === model)
+      if (!m || !(m.rental || /^vast\//i.test(m.path ?? '')) || req.headers['x-rulz-rental'] !== 'deny') return false
+      json(409, { error: { message: `${m.id} runs on a rented computer, and this request does not allow rentals. Turn that on in RulZ Coding Agent, or choose a model on this computer.` } })
+      return true
+    }
+    const modeLog = (path: string, model: string): void => {
+      const mode = req.headers['x-rulz-mode']
+      const rental = req.headers['x-rulz-rental']
+      headerLog.push({ path, method: req.method ?? 'GET', model, ...(typeof mode === 'string' ? { mode } : {}), ...(typeof rental === 'string' ? { rental } : {}) })
+    }
+    const modelRoute = /^\/v1\/models\/([^/]+)\/(modes|reload)$/.exec(url.pathname)
+    if (modelRoute && opts.modes !== undefined && !opts.lmStudio) {
+      const model = decodeURIComponent(modelRoute[1])
+      modeLog(url.pathname, model)
+      if (modelRoute[2] === 'modes' && req.method === 'GET') {
+        const r = typeof opts.modes === 'function' ? opts.modes(model) : { status: 200, body: opts.modes }
+        return json(r.status, r.body)
+      }
+      if (modelRoute[2] === 'reload' && req.method === 'POST') {
+        reloads.push({ model, body: JSON.parse(await readBody(req)) as Record<string, unknown> })
+        if (opts.reloadRefusal) return json(409, { error: { message: opts.reloadRefusal } })
+        const r = typeof opts.modes === 'function' ? opts.modes(model) : { status: 200, body: opts.modes }
+        return json(r.status, r.body)
+      }
+    }
+    const modeConfig = /^\/v1\/models\/([^/]+)\/modes\/(coding|re)\/load-config$/.exec(url.pathname)
+    if (modeConfig && opts.modes !== undefined && opts.loadConfig && !opts.lmStudio) {
+      const model = decodeURIComponent(modeConfig[1])
+      const mode = modeConfig[2]
+      let blocked: string | undefined
+      if (req.method === 'POST') {
+        const body = JSON.parse(await readBody(req)) as Record<string, unknown>
+        if (!body.dry_run) {
+          modeLoadConfigPosts.push({ mode, model, body })
+          blocked = opts.reloadBlocked
+        }
+      }
+      return json(200, {
+        config: loadConfig,
+        custom: true,
+        max_context_length: 262144,
+        state: 'ready',
+        loaded_context_length: loadConfig.contextLength,
+        gpus,
+        mode,
+        mode_own: modeLoadConfigPosts.some((p) => p.mode === mode && p.body.config !== null),
+        ...(blocked ? { reload_blocked: blocked } : {})
+      })
+    }
+    // (An LLM Suite older than 0.35 has no per-mode path: it falls through to the 404 below.)
+    if (opts.loadConfig && url.pathname.startsWith('/v1/models/') && url.pathname.endsWith('/load-config') && !url.pathname.includes('/modes/')) {
       let config = loadConfig
       if (req.method === 'POST') {
         const body = JSON.parse(await readBody(req)) as { config: object; dry_run?: boolean }
@@ -147,13 +242,19 @@ export async function startMockRulz(opts: MockOptions = {}) {
       })
     }
     if (url.pathname === '/v1/re/overview' && !opts.lmStudio) {
+      const asked = url.searchParams.get('model') ?? ''
+      overviewQueries.push(asked)
+      const perModel = opts.practicePerModel && asked
+      // Per model, `xor-1` counts as solved for the model that is asked about (and failed once for any other).
+      const stats = (id: string): { attempts: number; solved: number; failed?: number } =>
+        perModel ? (id === 'xor-1' ? { attempts: 2, solved: 1, failed: 1 } : { attempts: 0, solved: 0, failed: 0 }) : { attempts: 0, solved: 0 }
       return json(200, {
         object: 're.overview',
         recording: true,
         sessions: [],
-        practice: { kitDir: 'k', tasks: [
-          { id: 'xor-1', family: 'xor', tier: 't1', binary: 'xor.exe', prompt: 'Key of {exe}?', attempts: 0, solved: 0 },
-          { id: 'xor-2', family: 'xor', tier: 't1', binary: 'xor.exe', prompt: 'Key of {exe}?', attempts: 0, solved: 0 }
+        practice: { kitDir: 'k', ...(perModel ? { model: asked } : {}), tasks: [
+          { id: 'xor-1', family: 'xor', tier: 't1', binary: 'xor.exe', prompt: 'Key of {exe}?', ...stats('xor-1') },
+          { id: 'xor-2', family: 'xor', tier: 't1', binary: 'xor.exe', prompt: 'Key of {exe}?', ...stats('xor-2') }
         ] },
         goals: [{ label: 'Overview', text: 'Analyze {target}.' }],
         clonePieces: [],
@@ -182,13 +283,25 @@ export async function startMockRulz(opts: MockOptions = {}) {
       return json(200, { id, object: 're.session', recording: true, outcome: 'unrated', ...body })
     }
     if (url.pathname === '/props') {
+      modeLog('/props', named ?? '')
+      if (refuseRental(named)) return
       return json(200, { chat_template: opts.template ?? QWEN_CODER_TEMPLATE, default_generation_settings: { n_ctx: opts.nCtx ?? 65536 } })
     }
     if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
       const body = JSON.parse(await readBody(req)) as MockRequest['body']
       const reSession = req.headers['x-rulz-re-session']
-      const record: MockRequest = { path: url.pathname, body, ...(typeof reSession === 'string' ? { reSession } : {}) }
+      const mode = req.headers['x-rulz-mode']
+      const rental = req.headers['x-rulz-rental']
+      const record: MockRequest = {
+        path: url.pathname,
+        body,
+        ...(typeof reSession === 'string' ? { reSession } : {}),
+        ...(typeof mode === 'string' ? { mode } : {}),
+        ...(typeof rental === 'string' ? { rental } : {})
+      }
       requests.push(record)
+      modeLog(url.pathname, body.model ?? '')
+      if (refuseRental(body.model)) return
       // Like llama.cpp: earlier tool calls' arguments must parse as JSON, or the request fails.
       for (const m of body.messages ?? []) {
         for (const c of m.tool_calls ?? []) {
@@ -233,6 +346,10 @@ export async function startMockRulz(opts: MockOptions = {}) {
     url: `http://127.0.0.1:${port}`,
     requests,
     loadConfigPosts,
+    modeLoadConfigPosts,
+    headerLog,
+    reloads,
+    overviewQueries,
     reSessions,
     kits,
     close: () => new Promise<void>((r) => server.close(() => r()))

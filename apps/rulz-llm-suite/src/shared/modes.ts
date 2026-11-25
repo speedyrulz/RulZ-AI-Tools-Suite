@@ -1,4 +1,4 @@
-// Per-model defaults for each mode of the app (Chat, Reverse engineering, Adventure, Writing): load settings, sampling
+// Per-model defaults for each mode of the app (Chat, Reverse engineering, Adventure, Writing, Coding): load settings, sampling
 // and system prompt. Anything a mode does not set falls back to the model's default load settings and to the sampling
 // and prompt that mode always had.
 import { DEFAULT_SAMPLING } from './defaults'
@@ -6,15 +6,17 @@ import { FICTION_SAMPLING } from './novelPrompts'
 import { reSampling } from './re'
 import type { LoadConfig, ModelSampling, SamplingParams } from './types'
 
-export type AppMode = 'chat' | 're' | 'adventure' | 'writing'
+export type AppMode = 'chat' | 're' | 'adventure' | 'writing' | 'coding'
 
-export const APP_MODES: AppMode[] = ['chat', 're', 'adventure', 'writing']
+export const APP_MODES: AppMode[] = ['chat', 're', 'adventure', 'writing', 'coding']
 
 export const MODE_LABELS: Record<AppMode, string> = {
   chat: 'Chat',
   re: 'Reverse engineering',
   adventure: 'Adventure',
-  writing: 'Writing'
+  writing: 'Writing',
+  // No page of its own: RulZ Coding Agent uses it for its normal tasks.
+  coding: 'Coding'
 }
 
 /** What one model uses in one mode. null (or an empty prompt) = the fallback. */
@@ -51,6 +53,7 @@ export function modeLoad(base: LoadConfig, modes: ModelModeDefaults | undefined,
 export function builtInSampling(mode: AppMode, appDefault: SamplingParams): SamplingParams {
   switch (mode) {
     case 'chat':
+    case 'coding':
       return appDefault
     case 're':
       return reSampling(appDefault)

@@ -17,8 +17,8 @@ import type { AppSettings, RemoteClient } from '@shared/types'
 export const REMOTE_PATH = '/rulz'
 
 /** Requests that only make sense on this computer (dialogs, its own browser and Explorer, phone access itself). */
-const COMPUTER_ONLY = new Set(['dialog:pickFolder', 'dialog:pickFile', 'shell:showItem', 'shell:openUrl'])
-const isComputerOnly = (channel: string): boolean => COMPUTER_ONLY.has(channel) || channel.startsWith('remote:')
+const COMPUTER_ONLY = new Set(['dialog:pickFolder', 'dialog:pickFile', 'dialog:pickPdfs', 'shell:showItem', 'shell:openUrl', 'pdf:attachPath'])
+export const isComputerOnly = (channel: string): boolean => COMPUTER_ONLY.has(channel) || channel.startsWith('remote:')
 
 /** Events the phone doesn't get. */
 const NOT_SENT = new Set<EventChannel>(['remote:changed'])
@@ -45,7 +45,10 @@ export function originAllowed(origin: string | undefined): boolean {
 }
 
 export interface RemoteHost {
-  invoke(channel: string, args: unknown[]): Promise<unknown>
+  /** `caller` is the id of the phone connection that asked (uploads belong to it). */
+  invoke(channel: string, args: unknown[], caller?: string): Promise<unknown>
+  /** A phone connection ended: whatever it had under way (uploads) is dropped. */
+  disconnected?(caller: string): void
   subscribe(listener: (channel: EventChannel, payload: unknown) => void): () => void
   version: string
   /** This computer's name, shown on the phone. */
@@ -244,6 +247,7 @@ export class RemoteServer {
       ws.on('pong', () => (conn.alive = true))
       ws.on('message', (d) => void this.request(conn, parse(d)))
       ws.on('close', () => {
+        this.host.disconnected?.(conn.info.id)
         if (this.conns.delete(conn.info.id)) this.onClientsChanged(this.clients())
       })
       ws.send(JSON.stringify({ t: 'welcome', protocol: REMOTE_PROTOCOL, version: this.host.version, name: this.host.name }))
@@ -259,7 +263,7 @@ export class RemoteServer {
     let reply: object
     try {
       if (isComputerOnly(channel)) throw new Error('That can only be done on the computer.')
-      const value = await this.host.invoke(channel, channel === 'settings:update' ? [settingsPatchFromPhone(args[0])] : args)
+      const value = await this.host.invoke(channel, channel === 'settings:update' ? [settingsPatchFromPhone(args[0])] : args, conn.info.id)
       const isSettings = channel === 'settings:get' || channel === 'settings:update'
       reply = { t: 'result', id, ok: true, value: isSettings && value ? settingsForPhone(value as AppSettings) : value }
     } catch (e) {

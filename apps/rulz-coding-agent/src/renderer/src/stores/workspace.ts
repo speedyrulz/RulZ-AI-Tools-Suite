@@ -43,8 +43,9 @@ interface WorkspaceState {
   /**
    * Starts a task, or answers my question when `promptId` (the question shown when the owner
    * pressed Send) is given. False when it didn't go through, so the typed text can stay.
+   * `attachments` (ids of attached PDFs) go only with a message that starts a task; the text may then be empty.
    */
-  send: (text: string, promptId?: string) => Promise<boolean>
+  send: (text: string, promptId?: string, attachments?: string[]) => Promise<boolean>
   stop: () => void
   /** A note for the running task: before its next step, or at once (cutting the model's reply short) with `interrupt`. */
   addNote: (text: string, interrupt: boolean) => Promise<boolean>
@@ -307,11 +308,12 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       }
     },
 
-    send: async (text, promptId) => {
+    send: async (text, promptId, attachments) => {
       const project = get().project
-      if (!project || !text.trim()) return false
+      if (!project || (!text.trim() && !(attachments?.length && promptId === undefined))) return false
       const prompt = get().prompt
       if (promptId !== undefined || prompt?.kind === 'question') {
+        if (!text.trim()) return false
         // Only the question the owner was answering: it may have been answered on the phone, and
         // another one may be waiting now.
         if (!prompt || prompt.kind !== 'question' || prompt.id !== promptId) {
@@ -322,7 +324,8 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         return true
       }
       try {
-        await invoke('task:start', project.path, text)
+        if (attachments?.length) await invoke('task:start', project.path, text, attachments)
+        else await invoke('task:start', project.path, text)
         return true
       } catch (e) {
         toast.error(errorMessage(e))

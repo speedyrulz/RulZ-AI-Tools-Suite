@@ -1,7 +1,9 @@
 import { ArrowLeft } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
 import type { Theme } from '@shared/types'
-import { Button, Field, IconButton, Input, Select, Switch, TopBar } from '../components/ui'
+import type { PhoneModel } from '@shared/phone'
+import { ModelPicker } from '../components/ModelPicker'
+import { Button, Field, IconButton, Input, Switch, TopBar } from '../components/ui'
 import { cn, relativeTime } from '../lib/format'
 import { isNative } from '../lib/native'
 import { link } from '../lib/remote'
@@ -33,7 +35,7 @@ function Section({ title, hint, children }: { title: string; hint?: string; chil
 function ProjectModel() {
   const project = useProject((s) => s.state?.project)
   const setModel = useProject((s) => s.setModel)
-  const [models, setModels] = useState<{ id: string; name: string; loaded: boolean }[] | null>(null)
+  const [models, setModels] = useState<PhoneModel[] | null>(null)
   const [error, setError] = useState('')
   useEffect(() => {
     if (!project) return
@@ -53,16 +55,7 @@ function ProjectModel() {
   const sorted = [...models].sort((a, b) => Number(b.loaded) - Number(a.loaded) || a.name.localeCompare(b.name))
   return (
     <Field label={`Model for “${project.title}”`} hint="Models marked “ready” start right away. The others are loaded by the computer first.">
-      <Select value={project.modelId ?? ''} onChange={(e) => void setModel(e.target.value || null)}>
-        <option value="">The model that is active on the computer</option>
-        {project.modelId && !models.some((m) => m.id === project.modelId) && <option value={project.modelId}>{project.modelId}</option>}
-        {sorted.map((m) => (
-          <option key={m.id} value={m.id}>
-            {m.name}
-            {m.loaded ? ' (ready)' : ''}
-          </option>
-        ))}
-      </Select>
+      <ModelPicker models={sorted} value={project.modelId} onChange={(id) => void setModel(id)} placeholder="The model that is active on the computer" />
     </Field>
   )
 }

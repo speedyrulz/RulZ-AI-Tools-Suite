@@ -96,6 +96,31 @@ export class SettingsStore {
     })
   }
 
+  /**
+   * Sets or removes only the load settings of one mode of one model; its sampling and prompt stay as they are, read inside
+   * the queue so a save that is still running is not undone. The API-server sampling in a mode's load is not the mode's to
+   * set: an entry that has one keeps it, a new one gets the model's default load settings'. null removes the mode's own
+   * load, and an entry left with nothing is dropped. A function gets the load the mode has when the save's turn comes.
+   */
+  async setModeLoad(modelId: string, mode: AppMode, load: LoadConfig | null | ((current: LoadConfig) => LoadConfig)): Promise<void> {
+    if (!APP_MODES.includes(mode)) throw new Error(`Unknown mode: ${String(mode)}`)
+    await this.changeModes((all) => {
+      const wanted = typeof load === 'function' ? load(modeLoad(this.getModelDefaults(modelId).config, all.get(modelId), mode)) : load
+      const parsed = wanted ? parseLoadConfig(wanted) : null
+      const existing = all.get(modelId)?.[mode]
+      const next: ModeDefaults = {
+        load: parsed ? { ...parsed, sampling: existing?.load?.sampling ?? this.getModelDefaults(modelId).config.sampling } : null,
+        sampling: existing?.sampling ?? null,
+        systemPrompt: existing?.systemPrompt ?? ''
+      }
+      const modes: ModelModeDefaults = { ...all.get(modelId) }
+      if (modeDefaultsEmpty(next)) delete modes[mode]
+      else modes[mode] = next
+      if (Object.keys(modes).length) all.set(modelId, modes)
+      else all.delete(modelId)
+    })
+  }
+
   /** Changes to the modes file go one after another: each starts from what the one before it saved, so none is lost. */
   private changeModes(change: (all: Map<string, ModelModeDefaults>) => void): Promise<void> {
     const run = this.modeChain.then(async () => {

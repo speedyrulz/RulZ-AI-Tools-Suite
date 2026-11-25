@@ -2,6 +2,8 @@ import { ArrowLeft, Backpack, Map, Settings, Share2, Square } from 'lucide-react
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { pathTo, type AdventureNode, type AdventureSetup } from '@shared/adventure'
+import { ModeLine } from '../components/ModeLine'
+import type { PhoneModel } from '@shared/phone'
 import { EditPassageSheet } from '../components/adventure/EditPassageSheet'
 import { MapSheet, PassageMenuSheet, SettingsSheet, StateSheet } from '../components/adventure/PlaySheets'
 import { ActionBox, ChoiceList, JobStatus, PassageCard } from '../components/adventure/Reading'
@@ -18,11 +20,11 @@ export function AdventurePlay() {
   const [sheet, setSheet] = useState<'state' | 'map' | 'settings' | 'edit' | 'choice' | null>(null)
   const [choiceId, setChoiceId] = useState('')
   const [setup, setSetup] = useState<AdventureSetup | null>(null)
-  const [models, setModels] = useState<{ id: string, name: string, loaded: boolean }[]>([])
+  const [models, setModels] = useState<PhoneModel[]>([])
   const [editNode, setEditNode] = useState<AdventureNode | null>(null)
 
   useEffect(() => {
-    void link.invoke('adventure:models').then(setModels).catch((e) => toast.error(adventureError(e)))
+    void link.invoke('writing:models').then(setModels).catch((e) => toast.error(adventureError(e)))
   }, [])
 
   if (!adv) {
@@ -81,6 +83,7 @@ export function AdventurePlay() {
         <IconButton label="Export" onClick={() => void exportStory()}><Share2 size={19} /></IconButton>
         {active && <IconButton label="Stop" onClick={stop}><Square size={19} /></IconButton>}
       </TopBar>
+      <ModeLine mode="adventure" modelId={adv.setup.modelId} />
       <div className="px-safe pb-safe min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-lg space-y-4 px-4 py-4">
           {otherNode && (

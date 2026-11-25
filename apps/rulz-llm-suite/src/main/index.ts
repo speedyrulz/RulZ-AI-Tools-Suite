@@ -22,6 +22,7 @@ import { AdapterConverter } from './models/convert'
 import { createModelCatalog } from './models/catalog'
 import { ModelLibrary } from './models/library'
 import { ApiServer } from './server/apiServer'
+import { resolveModel } from './server/helpers'
 import { parseLoadConfig } from './settings/schema'
 import { SettingsStore } from './settings/store'
 import { FILE_TOOLS_SERVER } from './files/fileTools'
@@ -45,6 +46,7 @@ import { createPhoneService, type PhoneService } from './phone/host'
 import { settingsForRenderer, settingsPatchFromRenderer } from './phone/settings'
 import { ChatEventTap, chatAdapter, chatBusyReason, modelsAdapter, storeAdapter } from './writing/adapters'
 import { WritingEvents, writingHandlers } from './writing/ipc'
+import { PhoneModes } from './writing/modeInfo'
 import { WritingRuns } from './writing/runs'
 import { PHONE_WRITING_CHANNELS } from '@shared/phone'
 import { PHONE_ADVENTURE_CHANNELS } from '@shared/adventure'
@@ -322,6 +324,14 @@ async function main(): Promise<void> {
     gpus: () => hardware.snapshot().gpus,
     onStatus: (s) => broadcast('server:changed', s),
     onRequest: (e) => broadcast('server:request', e),
+    // Per-mode settings and reloads for other apps (docs/app-modes-design.md); reloadBlock and modelGate are set up below.
+    modes: {
+      get: (id) => settings.modeDefaults(id),
+      setLoad: (id, mode, load) => settings.setModeLoad(id, mode, load),
+      changed: sendModeDefaults,
+      reloadBlock: (instanceId, holding) => reloadBlock(instanceId, holding),
+      takeGate: (holder) => modelGate.take(holder)
+    },
     re: {
       enabled: () => settings.get().re.recordApi,
       record: (id, round) => {
@@ -339,15 +349,29 @@ async function main(): Promise<void> {
         broadcast('re:changed', undefined)
         return s
       },
-      overview: async () => {
+      overview: async (model) => {
         const chats = []
-        const reSummaries = (await conversations.list()).filter((s) => s.reOutcome).slice(0, MAX_OVERVIEW_SESSIONS)
+        const summaries = await conversations.list()
+        const reSummaries = summaries.filter((s) => s.reOutcome).slice(0, MAX_OVERVIEW_SESSIONS)
         for (const s of reSummaries) {
           const c = await conversations.get(s.id).catch(() => null)
-          if (c?.re) chats.push({ id: c.id, title: c.title, updatedAt: c.updatedAt, re: c.re })
+          if (c?.re) chats.push({ id: c.id, title: c.title, updatedAt: c.updatedAt, re: c.re, modelId: s.modelId })
         }
         const re = settings.get().re
-        return buildOverview({ chats, traces: await traces.list(), practice: await listPractice(re.kitDir), recording: re.recordApi })
+        const library = catalog.list()
+        // The model asked for may be a public id: its library entry gives the name the practice results are matched by;
+        // a text that names no model is matched as it is.
+        const asked = model ? (resolveModel(library, model)?.id ?? model) : undefined
+        return buildOverview({
+          chats,
+          traces: await traces.list(),
+          practice: await listPractice(re.kitDir),
+          recording: re.recordApi,
+          model: asked,
+          summaries,
+          runs: await batches.list(),
+          models: library.map((m) => ({ id: m.id, name: m.name }))
+        })
       },
       preparePractice: async (taskId) => {
         const { target, prompt, task } = await preparePractice(settings.get().re.kitDir, practiceRoot, taskId)
@@ -777,14 +801,37 @@ async function main(): Promise<void> {
   // Writing runs: AI actions started from the phone, run here (docs/phone-access-design.md, "Writing runs").
   const writingEvents = new WritingEvents()
   const chatReason = chatBusyReason(chat, () => bench.isRunning(), modelGate)
+  const chatReasonPastGate = chatBusyReason(chat, () => bench.isRunning())
   // A batch run on rentals alone leaves this PC's model free.
-  const busyReason = (): string | null =>
-    pool.busy && pool.activeInstances.some((id) => !instances.get(id)?.host) ? 'A practice batch run is using the model on the computer.' : chatReason()
+  const busyReason = (pastGate = false): string | null =>
+    pool.busy && pool.activeInstances.some((id) => !instances.get(id)?.host)
+      ? 'A practice batch run is using the model on the computer.'
+      : pastGate
+        ? chatReasonPastGate()
+        : chatReason()
+  // Why a loaded model cannot be reloaded now: the model gate, a chat, a benchmark or a practice batch (busyReason), and
+  // anything still using this instance. The API's reload and the phone's reload both ask it, then hold the gate until
+  // the load has ended. `holding`: the reload that holds the gate itself asks again, so the gate is no reason then.
+  const reloadBlock = (instanceId: string, holding?: string): string | null => {
+    const inst = instances.get(instanceId)
+    if (!inst || inst.status === 'stopping') return 'The model is not loaded.'
+    if (inst.status === 'loading') return 'The model is still loading.'
+    const why = busyReason(holding !== undefined && modelGate.heldBy() === holding)
+    if (why) return why
+    if (pool.busy && pool.activeInstances.includes(instanceId)) return 'A practice batch run is using the model.'
+    if (instances.usersOf(instanceId) > 0) return 'The model is in use.'
+    // With "unload the previous model" on, the reload takes every other model on this PC down with it.
+    if (settings.get().unloadPreviousOnLoad && instances.list().some((i) => !i.host && instances.usersOf(i.instanceId) > 0)) {
+      return 'Another model on this PC is in use, and loading a model unloads it.'
+    }
+    return null
+  }
+  const writingModels = modelsAdapter(catalog, instances)
   const writingRuns = new WritingRuns({
     store: storeAdapter(novel),
     chat: chatAdapter(chat, chatTap, 'phone'),
-    models: modelsAdapter(catalog, instances),
-    busyReason,
+    models: writingModels,
+    busyReason: () => busyReason(),
     gate: modelGate,
     // A phone may use a project's jobs while it holds the project open (a reconnected phone has a new id).
     holds: (owner, folder) => novel.ownersOf(folder).includes(owner),
@@ -792,7 +839,17 @@ async function main(): Promise<void> {
     emit: writingEvents.emit
   })
   writingEvents.subscribe((job) => phone.emit('writing:job', job))
-  const writing = writingHandlers(writingRuns)
+  const phoneModes = new PhoneModes({
+    getEntry: (id) => catalog.get(id),
+    newestReady: () => writingModels.ready(null)?.modelId ?? null,
+    readyFor: (id) => instances.readyFor(id),
+    modeDefaults: (id) => settings.modeDefaults(id),
+    loadDefaults: (id) => settings.getModelDefaults(id).config,
+    reloadBlock,
+    leased: (id) => apiServer.leasedUntil(id) !== null,
+    reload: (model, mode, also) => apiServer.requestModeReload(model, mode, also)
+  })
+  const writing = writingHandlers(writingRuns, phoneModes)
   for (const channel of PHONE_WRITING_CHANNELS) {
     // runAs: a state patch from Apply is announced as the phone's change, so the window hears about it.
     phone.handlers.register(channel, ((owner: string, ...args: unknown[]) => runAs(owner, () => writing[channel](owner, ...args))) as never)

@@ -410,6 +410,6 @@ describe('SettingsStore mode defaults', () => {
   })
 
   it('knows every mode', () => {
-    expect(APP_MODES).toEqual(['chat', 're', 'adventure', 'writing'])
+    expect(APP_MODES).toEqual(['chat', 're', 'adventure', 'writing', 'coding'])
   })
 })

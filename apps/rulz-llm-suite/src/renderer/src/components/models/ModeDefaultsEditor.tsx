@@ -48,7 +48,8 @@ const WHEN: Record<AppMode, string> = {
   chat: 'Used for new chats; existing ones keep their settings.',
   re: 'Used for new sessions; existing ones keep their settings.',
   adventure: 'Used from the next passage. A temperature set on the adventure wins.',
-  writing: 'New projects start with this sampling; the prompt is used for every request.'
+  writing: 'New projects start with this sampling; the prompt is used for every request.',
+  coding: "RulZ Coding Agent uses this for its normal tasks; the values set in that app win over this sampling."
 }
 
 /**
@@ -193,7 +194,13 @@ function Editor({ modelId, model, remote, rentalId, scope, onScope, allView }: P
           <section className="space-y-2" aria-label="System prompt">
             <Field
               label="System prompt"
-              hint={mode === 'chat' ? "Used for new chats with this model. Empty = the app's default system prompt." : 'Added after the built-in prompt. Empty = nothing is added.'}
+              hint={
+                mode === 'chat'
+                  ? "Used for new chats with this model. Empty = the app's default system prompt."
+                  : mode === 'coding'
+                    ? "Added after RulZ Coding Agent's built-in prompt. Empty = nothing is added."
+                    : 'Added after the built-in prompt. Empty = nothing is added.'
+              }
             >
               <Textarea
                 rows={5}

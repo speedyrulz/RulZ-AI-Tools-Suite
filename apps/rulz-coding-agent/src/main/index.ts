@@ -3,6 +3,7 @@ import { hostname } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { app, BrowserWindow, dialog, nativeTheme, shell } from 'electron'
 import { CANDIDATE_URLS } from '@shared/defaults'
+import { chooseModel } from '@shared/modes'
 import type { ConnectionInfo, FolderListing, ModelActivity, ProjectInfo, ProjectState, Theme, ToolServersInfo } from '@shared/types'
 import { ToolServers } from './mcp/toolServers'
 import { FIX_RUN_SHOWN, fixRunTask, SHARE_SHOWN, SHARE_TASK, systemPrompt } from './agent/prompt'
@@ -10,13 +11,17 @@ import { childPids } from './agent/childPids'
 import { ProjectSession } from './agent/session'
 import { BatchRunner, BatchStore } from './agent/batch'
 import { practiceTask, reTask } from './agent/reTasks'
-import { broadcast, handle, invokeHandler, onBroadcast } from './ipc'
+import { AttachmentStore } from './agent/attachments'
+import { pdfHandlers, startArguments } from './agent/pdfHandlers'
+import { PdfWorkerReader, pdfCmapDir } from './pdf/reader'
+import { broadcast, currentCaller, handle, invokeHandler, onBroadcast } from './ipc'
 import { checkPageInWindow } from './project/pageWindow'
 import { AppRunner } from './project/runApp'
 import { CopySnapshots, GitSnapshots, gitInstalled, type Snapshotter } from './project/snapshots'
 import { ProjectStore } from './project/store'
 import { PhoneAccess } from './remote/access'
 import { findServer, normalizeUrl, RulzClient } from './rulz/client'
+import { modelAdmin } from './rulz/modelAdmin'
 import { SettingsStore } from './settings'
 
 const isDev = !app.isPackaged && !!process.env.ELECTRON_RENDERER_URL
@@ -119,6 +124,13 @@ async function main(): Promise<void> {
   const settings = new SettingsStore(userData)
   await settings.init()
   const store = new ProjectStore(userData)
+  // PDFs are read in worker threads (out/main/pdfWorker.js, next to index.js), never in this process. The attached
+  // ones are kept under the app's data folder, per project.
+  const pdfReader = new PdfWorkerReader({
+    workerPath: join(__dirname, 'pdfWorker.js'),
+    cmapDir: () => pdfCmapDir(app.isPackaged, process.resourcesPath, __dirname)
+  })
+  const attachments = new AttachmentStore(userData, pdfReader)
   const hasGit = await gitInstalled()
   // Shells left running by a crash are stopped now. Not waited for: finding them after a crash
   // can take PowerShell a few seconds, and shells started meanwhile are recorded all the same.
@@ -137,6 +149,12 @@ async function main(): Promise<void> {
     const changed = JSON.stringify(next) !== JSON.stringify(connection)
     connection = next
     if (changed) broadcast('server:changed', connection)
+    // The chosen model turns out to be a rental's (chosen before this was kept track of): remembered, so that another
+    // model is never used in its place once it is gone.
+    const chosen = settings.get().model
+    if (chosen && !settings.get().modelRental && next.models.some((m) => m.id === chosen && m.rental)) {
+      void settings.update({ modelRental: true }).catch(() => undefined)
+    }
     if (next.status === 'connected' && next.url !== settings.get().lastServerUrl) void settings.update({ lastServerUrl: next.url })
   }
   let connecting: Promise<ConnectionInfo> | null = null
@@ -204,7 +222,12 @@ async function main(): Promise<void> {
     client,
     store: new BatchStore(join(userData, 'batch-runs.json')),
     session: () => session,
-    modelName: () => settings.get().model || connection.models.find((m) => m.loaded)?.id || '',
+    // Never a rental's model unless the owner chose it (and then only with the run's yes).
+    modelName: () => {
+      const c = chooseModel(settings.get().model, settings.get().modelRental, connection.models)
+      return c.ok ? c.model : settings.get().model
+    },
+    model: () => chooseModel(settings.get().model, settings.get().modelRental, connection.models),
     broadcast: (state) => broadcast('batch:changed', state)
   })
 
@@ -234,6 +257,8 @@ async function main(): Promise<void> {
     if (session?.isRunning) throw new Error('A task is still running. Press Stop first.')
     // Let go of the project before the awaits below, so nothing (a batch run, a task) can start in it meanwhile.
     const closing = { session, runner }
+    // Uploads under way for this project are cancelled (a phone's half-sent PDF).
+    if (session) void attachments.dropProject(session.root).catch(() => undefined)
     session = null
     runner = null
     current = null
@@ -264,8 +289,11 @@ async function main(): Promise<void> {
       snapshotter,
       trash,
       checkPage: checkPageInWindow,
-      toolServers
+      toolServers,
+      pdf: { reader: pdfReader, attachments }
     })
+    // PDFs no message uses (never sent, or older than a day) and half-sent uploads are cleared away.
+    void session.sweepPdfs()
     runner = new AppRunner(abs, (e) => broadcast('run:event', e), async (file) => {
       const err = await shell.openPath(file)
       if (err) throw new Error(err)
@@ -287,9 +315,13 @@ async function main(): Promise<void> {
     await toolServers.start()
     return toolsInfo()
   })
-  handle('settings:update', async (patch) => {
+  handle('settings:update', async (rawPatch) => {
     const before = settings.get()
-    const next = await settings.update(patch)
+    // Whether the chosen model is a rental's is worked out here, from the model list, never taken from the caller.
+    const { modelRental: _ignored, ...patch } = rawPatch
+    const next = await settings.update(
+      patch.model !== undefined ? { ...patch, modelRental: !!connection.models.find((m) => m.id === patch.model)?.rental } : patch
+    )
     if (next.theme !== before.theme) mainWindow?.setBackgroundColor(windowBackground(next.theme))
     if (next.serverUrl !== before.serverUrl || next.apiKey !== before.apiKey) void connect()
     if (next.model !== before.model) client.reset()
@@ -303,6 +335,14 @@ async function main(): Promise<void> {
     const r = await dialog.showOpenDialog(mainWindow!, { title, defaultPath, properties: ['openFile'] })
     return r.canceled ? null : (r.filePaths[0] ?? null)
   })
+  handle('dialog:pickPdfs', async ({ title } = {}) => {
+    const r = await dialog.showOpenDialog(mainWindow!, {
+      title: typeof title === 'string' ? title.slice(0, 200) : 'Attach PDFs',
+      filters: [{ name: 'PDF files', extensions: ['pdf'] }],
+      properties: ['openFile', 'multiSelections']
+    })
+    return r.canceled ? [] : r.filePaths
+  })
   handle('shell:showItem', (path) => shell.showItemInFolder(path))
   handle('shell:openUrl', async (url) => {
     if (!/^https?:\/\//i.test(url)) throw new Error('Only web addresses can be opened.')
@@ -314,7 +354,14 @@ async function main(): Promise<void> {
   const testHost = process.env.RULZ_AGENT_REMOTE_HOST
   const phone = new PhoneAccess({
     settings,
-    host: { invoke: invokeHandler, subscribe: onBroadcast, version: app.getVersion(), name: hostname() },
+    host: {
+      invoke: invokeHandler,
+      // A phone that goes away takes its half-sent PDF uploads with it.
+      disconnected: (caller) => void attachments.cancelOwner(caller).catch(() => undefined),
+      subscribe: onBroadcast,
+      version: app.getVersion(),
+      name: hostname()
+    },
     emit: (status) => broadcast('remote:changed', status),
     ...(testHost ? { addresses: () => [testHost], dnsName: async () => undefined } : {})
   })
@@ -325,16 +372,20 @@ async function main(): Promise<void> {
 
   handle('server:connect', () => connect())
   handle('server:status', () => connection)
-  handle('models:loadSettings', (model) => client.loadSettings(model))
-  handle('models:previewLoadSettings', (model, config) => client.previewLoadSettings(model, config))
-  handle('models:setLoadSettings', async (model, config) => {
-    // Restarting the model would cut off the answer it is writing.
-    batch.assertIdle()
-    if (session?.isRunning) throw new Error('A task is running. Wait for it to finish or press Stop, then change the load settings.')
-    const info = await client.setLoadSettings(model, config)
-    void refreshModels()
-    return info
+  const admin = modelAdmin({
+    client,
+    models: () => connection.models,
+    assertIdle: (what) => {
+      batch.assertIdle()
+      if (session?.isRunning) throw new Error(`A task is running. Wait for it to finish or press Stop, then ${what}.`)
+    },
+    refreshModels: () => void refreshModels()
   })
+  handle('models:loadSettings', (model, mode) => admin.loadSettings(model, mode))
+  handle('models:previewLoadSettings', (model, config, mode) => admin.previewLoadSettings(model, config, mode))
+  handle('models:setLoadSettings', (model, config, mode) => admin.setLoadSettings(model, config, mode))
+  handle('models:modes', (model) => admin.modes(model))
+  handle('models:reloadMode', (model, mode) => admin.reloadMode(model, mode))
 
   handle('projects:recent', () => store.recent())
   handle('projects:current', () => currentState())
@@ -356,19 +407,30 @@ async function main(): Promise<void> {
     projectChanged()
   })
 
-  handle('task:start', (path, text) => {
+  handle('task:start', async (path, text, ids) => {
     batch.assertIdle()
-    return requireSession(path).start(text)
+    const s = requireSession(path)
+    // Checked before anything starts: a message with a PDF that is not known here does not start at all.
+    const args = await startArguments(s, text, ids)
+    batch.assertIdle()
+    if (s !== session) throw new Error('That project is not open.')
+    s.start(args.text, { attachments: args.attachments })
   })
+  const pdf = pdfHandlers({ store: attachments, session: requireSession, caller: currentCaller })
+  handle('pdf:attachPath', (path, file) => pdf.attachPath(path, file))
+  handle('pdf:uploadBegin', (path, name, bytes) => pdf.uploadBegin(path, name, bytes))
+  handle('pdf:uploadChunk', (uploadId, index, base64) => pdf.uploadChunk(uploadId, index, base64))
+  handle('pdf:uploadEnd', (uploadId) => pdf.uploadEnd(uploadId))
+  handle('pdf:remove', (path, id) => pdf.remove(path, id))
   handle('task:stop', (path) => requireSession(path).stop())
-  handle('re:overview', () => client.reOverview())
+  handle('re:overview', (model) => client.reOverview(typeof model === 'string' && model ? model : undefined))
   handle('re:setKit', (kitDir) => {
     // A run's tasks were planned from the kit it started with.
     batch.assertIdle()
     return client.setReKit(kitDir)
   })
   handle('batch:state', () => batch.state())
-  handle('batch:start', (path, label, options, record) => batch.start(path, label, options, record))
+  handle('batch:start', (path, label, options, record, rentalOk) => batch.start(path, label, options, record, typeof rentalOk === 'boolean' ? rentalOk : undefined))
   handle('batch:stop', (mode) => batch.stop(mode))
   handle('batch:delete', (id) => batch.delete(id))
   handle('re:start', async (path, req) => {
@@ -488,7 +550,7 @@ async function main(): Promise<void> {
       while (s.isRunning && Date.now() < deadline - 500) await new Promise((r) => setTimeout(r, 50))
       await s.close()
     }
-    const work = Promise.allSettled([runner?.stop(), closeSession(), toolServers.dispose(), phone.dispose(), batch.idle().then(() => batch.flush())])
+    const work = Promise.allSettled([runner?.stop(), closeSession(), toolServers.dispose(), phone.dispose(), attachments.cancelAll(), batch.idle().then(() => batch.flush())])
     let timer: NodeJS.Timeout | undefined
     await Promise.race([work, new Promise((r) => (timer = setTimeout(r, Math.max(0, deadline - Date.now()))))])
     clearTimeout(timer)

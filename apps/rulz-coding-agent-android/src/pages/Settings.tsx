@@ -2,7 +2,7 @@ import { ArrowLeft, ChevronDown, FolderOpen } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
 import { MAX_INSTRUCTION_CHARS } from '@shared/defaults'
 import type { Theme, ToolServersInfo } from '@shared/types'
-import { ApprovalChooser, ModelSelect } from '../components/common'
+import { ApprovalChooser, ModelSelect, RentalGoneNote } from '../components/common'
 import { FolderPicker } from '../components/FolderPicker'
 import { ModelSettings } from '../components/ModelSettings'
 import { Button, Field, IconButton, Input, Switch, Textarea, TopBar } from '../components/ui'
@@ -176,6 +176,7 @@ export function Settings() {
               {connection.models.length ? (
                 <>
                   <ModelSelect models={connection.models} value={modelId} onChange={(model) => void update({ model })} />
+                  <RentalGoneNote />
                   {modelId && (
                     <>
                       <button className="flex items-center gap-1 py-1 text-[14px] text-muted" onClick={() => setModelSettingsOpen(!modelSettingsOpen)}>

@@ -41,7 +41,7 @@ interface WorkspaceState {
   create: (name: string, parentDir: string | null) => Promise<boolean>
   /** Closes the project on the computer too. */
   close: () => Promise<void>
-  send: (text: string, promptId?: string) => Promise<boolean>
+  send: (text: string, promptId?: string, attachments?: string[]) => Promise<boolean>
   stop: () => void
   answer: (promptId: string, answer: PromptAnswer) => Promise<boolean>
   undo: (taskId?: string) => Promise<void>
@@ -252,13 +252,14 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       }
     },
 
-    send: async (text, promptId) => {
+    send: async (text, promptId, attachments) => {
       const project = get().project
-      if (!project || !text.trim()) return false
+      // The text may be empty when PDFs are attached.
+      if (!project || (!text.trim() && !attachments?.length)) return false
       if (promptId) return get().answer(promptId, { kind: 'question', text: text.trim() })
       if (get().prompt) return false
       try {
-        await invoke('task:start', project.path, text)
+        await invoke('task:start', project.path, text, attachments?.length ? attachments : undefined)
         return true
       } catch (e) {
         toast.error(errorMessage(e))

@@ -1,6 +1,8 @@
 // Single source of truth for IPC channels between the renderer and the main process.
+import type { PdfAttachment } from './pdf'
 import type {
   AgentEvent,
+  AgentMode,
   AppSettings,
   BatchOptions,
   BatchState,
@@ -10,6 +12,7 @@ import type {
   LoadSettings,
   ModelActivity,
   ModelLoadInfo,
+  ModelModes,
   ProjectInfo,
   ProjectState,
   PromptAnswer,
@@ -42,6 +45,8 @@ export interface IpcInvoke {
   'tools:start': () => ToolServersInfo
   'dialog:pickFolder': (opts: { title?: string; defaultPath?: string }) => string | null
   'dialog:pickFile': (opts: { title?: string; defaultPath?: string }) => string | null
+  /** The computer's file chooser for PDFs (several at once); this computer only. */
+  'dialog:pickPdfs': (opts: { title?: string }) => string[]
   'shell:showItem': (path: string) => void
   'shell:openUrl': (url: string) => void
   /** Subfolders of a folder (the drives when `path` is empty), for choosing a folder from the phone. */
@@ -57,12 +62,20 @@ export interface IpcInvoke {
   /** Finds RulZ LLM Suite (current address, then 1234 / 1235) and lists its models. */
   'server:connect': () => ConnectionInfo
   'server:status': () => ConnectionInfo
-  /** A model's load settings (context length, GPU layers…) in RulZ LLM Suite. */
-  'models:loadSettings': (model: string) => ModelLoadInfo
+  /** A model's load settings (context length, GPU layers…) in RulZ LLM Suite; with `mode`, the ones that mode loads with (needs 0.35). */
+  'models:loadSettings': (model: string, mode?: AgentMode) => ModelLoadInfo
   /** RulZ LLM Suite's memory estimate for changed settings, without saving them. */
-  'models:previewLoadSettings': (model: string, config: Partial<LoadSettings>) => ModelLoadInfo
-  /** Changes them; a loaded model restarts in RulZ LLM Suite to use them. */
-  'models:setLoadSettings': (model: string, config: Partial<LoadSettings>) => ModelLoadInfo
+  'models:previewLoadSettings': (model: string, config: Partial<LoadSettings>, mode?: AgentMode) => ModelLoadInfo
+  /**
+   * Changes them; a loaded model restarts in RulZ LLM Suite to use them. With `mode` they are that mode's
+   * own settings and `null` removes them. Refused for a rental's model and while a task or batch run goes.
+   * `reloadBlocked` in the answer says why a reload LLM Suite refused did not happen (the settings are saved).
+   */
+  'models:setLoadSettings': (model: string, config: Partial<LoadSettings> | null, mode?: AgentMode) => ModelLoadInfo
+  /** A model's settings per mode (sampling, prompt, whether it runs with the mode's load settings); null = a RulZ LLM Suite older than 0.35. */
+  'models:modes': (model: string) => ModelModes | null
+  /** Loads the model again with a mode's load settings (never automatic). Refused while a task or batch run goes, and for a rental's model. */
+  'models:reloadMode': (model: string, mode: AgentMode) => ModelModes
 
   'projects:recent': () => ProjectInfo[]
   /** The project open right now, if any (the phone picks up where the computer is). */
@@ -72,7 +85,19 @@ export interface IpcInvoke {
   'projects:forget': (path: string) => ProjectInfo[]
   'projects:close': () => void
 
-  'task:start': (projectPath: string, text: string) => void
+  /**
+   * Starts a task. `attachments` are the ids of PDFs attached to the open project (pdf:attachPath or pdf:upload*),
+   * at most 10; the text may be empty when there are some. Attachments only go with the message that starts a task.
+   */
+  'task:start': (projectPath: string, text: string, attachments?: string[]) => void
+  /** Attaches a PDF from a path on this computer (this computer only); the open project only. */
+  'pdf:attachPath': (projectPath: string, path: string) => PdfAttachment
+  /** Starts an upload of a PDF (the phone, or a dropped file without a path): 512 KB chunks in order, base64, at most one per connection. */
+  'pdf:uploadBegin': (projectPath: string, name: string, bytes: number) => { uploadId: string; chunkBytes: number }
+  'pdf:uploadChunk': (uploadId: string, index: number, base64: string) => void
+  'pdf:uploadEnd': (uploadId: string) => PdfAttachment
+  /** Removes an attachment that was not sent yet; one a message uses is refused. */
+  'pdf:remove': (projectPath: string, id: string) => void
   'task:stop': (projectPath: string) => void
   'task:answer': (projectPath: string, promptId: string, answer: PromptAnswer) => void
   /** A note for the running task, added before its next step; `interrupt` also cuts the model's current reply short. */
@@ -92,7 +117,8 @@ export interface IpcInvoke {
   'files:diff': (projectPath: string, taskId: string, path: string) => FileDiff
 
   /** RulZ LLM Suite's RE sessions, practice tasks and templates (needs RulZ LLM Suite 0.15.0). */
-  're:overview': () => ReOverview
+  /** With `model`, the practice counts are for that model (`practice.model` is then set); an older RulZ LLM Suite counts all models together. */
+  're:overview': (model?: string) => ReOverview
   /** Starts a reverse-engineering task (analyse, practice or clone) in the open project. */
   're:start': (projectPath: string, req: ReStartRequest) => void
   /** Changes RulZ LLM Suite's practice kit folder (needs RulZ LLM Suite 0.27.0) and returns the kit's tasks. */
@@ -100,8 +126,11 @@ export interface IpcInvoke {
 
   /** Practice batch runs: the saved runs and the one going now. */
   'batch:state': () => BatchState
-  /** Starts a batch run of practice tasks in the open project. Tools are approved automatically in its tasks. */
-  'batch:start': (projectPath: string, label: string, options: BatchOptions, record: boolean) => BatchState
+  /**
+   * Starts a batch run of practice tasks in the open project. Tools are approved automatically in its tasks.
+   * `rentalOk`: the owner's yes to use a model on a rented computer; the main process refuses a rental's model without it.
+   */
+  'batch:start': (projectPath: string, label: string, options: BatchOptions, record: boolean, rentalOk?: boolean) => BatchState
   /** 'after' finishes the task in progress, then stops; 'now' stops that task too. */
   'batch:stop': (mode: 'after' | 'now') => BatchState
   /** Removes a saved run from the scoreboard (not the running one). */
@@ -144,4 +173,6 @@ export interface RulzApi {
     ...args: Parameters<IpcInvoke[K]>
   ): Promise<Awaited<ReturnType<IpcInvoke[K]>>>
   on<K extends EventChannel>(channel: K, listener: (payload: IpcEvents[K]) => void): () => void
+  /** The path of a file dropped on the window ('' when it has none); only this computer's window has it. */
+  pathForFile(file: File): string
 }

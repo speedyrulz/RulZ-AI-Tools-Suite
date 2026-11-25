@@ -9,8 +9,10 @@ import type {
   ContextUsage,
   DistributiveOmit,
   FileDiff,
+  AgentMode,
   ModelActivity,
   ModelInfo,
+  ModelModes,
   PendingPrompt,
   ProjectState,
   PromptAnswer,
@@ -21,10 +23,12 @@ import type {
   WireMessage,
   WireToolCall
 } from '@shared/types'
-import { DEFAULT_MAX_OUTPUT_TOKENS, MAX_INSTRUCTION_CHARS, samplingRequest, skipsThinking } from '@shared/defaults'
+import { DEFAULT_MAX_OUTPUT_TOKENS, MAX_INSTRUCTION_CHARS } from '@shared/defaults'
 import { dropExchange, dropReply, forModel, requestItem, whyNotDelete, whyNotRedo } from '@shared/history'
+import { chooseModel, describeModeUse, modeHeaders, modeOfTask, modePrompt, requestSkipsThinking, taskSamplingFields, withApiOverride } from '@shared/modes'
 import { splitThink } from '@shared/think'
-import { friendlyServerError, pickDefaultModel, RE_SESSION_HEADER, ServerError, type RulzClient, type TurnResult } from '../rulz/client'
+import { attachedLabel, MAX_PDFS_PER_MESSAGE, PDF_ID, type PdfAttachment } from '@shared/pdf'
+import { friendlyServerError, RE_SESSION_HEADER, ServerError, type RulzClient, type TurnResult } from '../rulz/client'
 import { addDraft } from '../rulz/draft'
 import type { Snapshot, Snapshotter } from '../project/snapshots'
 import type { ProjectData, ProjectStore } from '../project/store'
@@ -53,7 +57,9 @@ import { dropPlanNotes, parsePlan, PLAN_TOOL, planInHistory, planNote, planResul
 import { checkSyntax } from './syntaxCheck'
 import { backgroundNote, HOW_TO_RUN_TASK, lastBackgroundNoteIn, NO_BACKGROUND_NOTE, parseRunLine, parseShareLine, systemPrompt } from './prompt'
 import { approvalKey, classifyCommand, classifyStartCommand, needsApproval, type ActionKind } from './safety'
-import { describeStep, EXTRA_TOOL_DEFS, EXTRA_TOOL_NAMES, parseToolArgs, serverLabel, TOOL_DEFS, TOOL_NAMES } from './tools'
+import { attachmentBlock, pdfsForPrompt } from './pdfNotes'
+import { runReadPdf, type PdfTools } from './readPdf'
+import { describeStep, EXTRA_TOOL_DEFS, EXTRA_TOOL_NAMES, parseToolArgs, PDF_TOOL, PDF_TOOL_DEF, serverLabel, TOOL_DEFS, TOOL_NAMES } from './tools'
 import { toolSummary } from '../mcp/config'
 import type { ToolInfo, ToolServers } from '../mcp/toolServers'
 
@@ -96,7 +102,15 @@ export interface SessionDeps {
   toolServers?: Pick<ToolServers, 'configured' | 'start' | 'status' | 'find' | 'search' | 'instructions' | 'call'>
   /** Checks a file the agent has just written for syntax errors; the real check unless a test replaces it. */
   checkSyntax?: typeof checkSyntax
+  /** Reads PDFs (read_pdf) and keeps the ones attached to messages; without it there is no read_pdf and no attaching. */
+  pdf?: PdfTools
 }
+
+/** Attached PDFs nobody uses any more are swept when a project opens, once they are this old. */
+const PDF_SWEEP_AGE_MS = 24 * 60 * 60 * 1000
+
+/** read_pdf and the other tools of the lists the model sees: with the PDF tool only when it is offered. */
+const TOOLS_WITH_PDF = [...TOOL_DEFS, PDF_TOOL_DEF]
 
 /** What ask_user gets back in a batch task. */
 const UNATTENDED_ANSWER = 'Nobody is watching: this task runs unattended as part of a batch run. Decide this yourself and carry on.'
@@ -105,7 +119,28 @@ const UNATTENDED_ANSWER = 'Nobody is watching: this task runs unattended as part
 class StopTask extends Error {}
 
 /** An error whose message is already written for the owner. */
-class FriendlyError extends Error {}
+class FriendlyError extends Error {
+  /** The model could not be used at all (gone, or only rentals): a batch run stops instead of failing every task. */
+  constructor(
+    message: string,
+    readonly rental = false
+  ) {
+    super(message)
+  }
+}
+
+/** What a task knows about LLM Suite's modes: read once before its first request and kept, so the prompt stays stable. */
+interface TaskMode {
+  mode: AgentMode
+  /** null: an older LLM Suite (or the read failed): everything as before. */
+  modes: ModelModes | null
+  /** Sent with every request of the task (chat turns, summaries, /props). */
+  headers: Record<string, string>
+}
+
+/** A refusal or failure the server worded for the owner: a rental that said no or lost its connection. */
+const isRentalTrouble = (e: unknown): boolean =>
+  e instanceof ServerError && (e.status === 409 || (e.status >= 500 && /connection to the rental/i.test(e.message)))
 
 function cleanContent(text: string): string {
   return splitThink(text).answer
@@ -114,6 +149,12 @@ function cleanContent(text: string): string {
 function stepDetail(name: string, args: Record<string, unknown>): string | undefined {
   // Tool-server tools: the full name and arguments.
   if (name.includes('__')) return `${name} ${JSON.stringify(args)}`.slice(0, 400)
+  if (name === PDF_TOOL && typeof args.path === 'string') {
+    const bits = [args.path.slice(0, 200)]
+    if (args.pages !== undefined && args.pages !== null && args.pages !== '') bits.push(`pages ${String(args.pages).slice(0, 40)}`)
+    if (typeof args.query === 'string' && args.query.trim()) bits.push(`for "${args.query.trim().slice(0, 80)}"`)
+    return bits.join(' ')
+  }
   if (typeof args.command === 'string') return args.command
   if (typeof args.page === 'string') return args.page
   if (typeof args.path === 'string') return args.path
@@ -153,6 +194,14 @@ export class ProjectSession {
   private current: TaskRecord | null = null
   /** True while a batch run's task runs: nobody is watching, so nothing may wait for a person (see ask). */
   private unattended = false
+  /** Batch task started with the owner's yes to use a rental's model. */
+  private rentalOk = false
+  /** The running task's mode settings (see TaskMode); null between tasks. */
+  private taskMode: TaskMode | null = null
+  /** Set when the server refused the last task's requests for a rental (a batch run stops on it). */
+  private refusal: string | null = null
+  /** The project's attached PDFs for the running task's system prompt: read once at the start and kept, so the prompt stays stable. */
+  private taskPdfs: PdfAttachment[] = []
 
   constructor(
     public data: ProjectData,
@@ -165,6 +214,11 @@ export class ProjectSession {
 
   get isRunning(): boolean {
     return this.running
+  }
+
+  /** Why the last task's requests were refused or cut off for a rental, in the server's words (null when they were not). */
+  get modelRefusal(): string | null {
+    return this.refusal
   }
 
   state(name: string, lastOpened: number): ProjectState {
@@ -259,24 +313,112 @@ export class ProjectSession {
   }
 
   /** `shown` is what the conversation shows when the model gets a longer text (e.g. "Fix this"). */
-  start(text: string, opts: { howToRun?: boolean; share?: boolean; shown?: string; re?: ReTaskInfo; batch?: boolean } = {}): void {
+  start(
+    text: string,
+    opts: { howToRun?: boolean; share?: boolean; shown?: string; re?: ReTaskInfo; batch?: boolean; rentalOk?: boolean; attachments?: PdfAttachment[] } = {}
+  ): void {
     const trimmed = text.trim()
-    if (!trimmed) return
+    // PDFs are only ever attached to the message that starts a task (a note sent while a task runs has none).
+    const pdfs = opts.attachments?.length ? opts.attachments : []
+    if (!trimmed && !pdfs.length) return
     if (this.running) throw new Error('A task is already running. Wait for it to finish or press Stop.')
     if (this.busy) throw new Error(`Wait for ${this.busy} to finish first.`)
-    const visible = opts.shown?.trim() || trimmed
+    if (pdfs.some((p) => this.removingPdfs.has(p.id))) throw new Error('One of the attached PDFs is being removed. Attach it again.')
+    const visible = opts.shown?.trim() || trimmed || attachedLabel(pdfs.length)
     const title = visible.split('\n')[0].slice(0, 80) + (visible.split('\n')[0].length > 80 ? '…' : '')
     const task: TaskRecord = { id: randomUUID(), title: opts.howToRun ? 'Finding out how to run the app' : title, startedAt: Date.now(), outcome: 'running', steps: [], files: [] }
-    if (opts.howToRun || opts.share || visible !== trimmed) task.request = { text: trimmed, howToRun: opts.howToRun, share: opts.share }
+    if (opts.howToRun || opts.share || visible !== trimmed || pdfs.length) {
+      task.request = { text: trimmed, howToRun: opts.howToRun, share: opts.share, ...(pdfs.length ? { attachments: pdfs.map((p) => p.id) } : {}) }
+    }
     if (opts.re) task.re = { ...opts.re, practice: opts.re.practice && { taskId: opts.re.practice.taskId, family: opts.re.practice.family, tier: opts.re.practice.tier } }
-    const item: TimelineItem = { id: randomUUID(), kind: 'user', text: opts.howToRun ? 'How do I run this app?' : visible, taskId: task.id }
+    const item: TimelineItem = {
+      id: randomUUID(),
+      kind: 'user',
+      text: opts.howToRun ? 'How do I run this app?' : visible,
+      taskId: task.id,
+      ...(pdfs.length ? { attachments: pdfs.map((p) => ({ ...p })) } : {})
+    }
     this.data.tasks.push(task)
     this.data.timeline.push(item)
     this.running = true
     this.unattended = opts.batch === true
+    this.rentalOk = opts.batch === true && opts.rentalOk === true
+    this.refusal = null
+    this.taskMode = null
     this.abort = new AbortController()
     this.emit({ type: 'task-start', task, item })
-    void this.run(task, trimmed, opts.howToRun ?? false, opts.share ?? false)
+    void this.run(task, trimmed, opts.howToRun ?? false, opts.share ?? false, pdfs)
+  }
+
+  // ---------- attached PDFs ----------
+
+  /**
+   * The attachments a message asks for, checked: a list of ids (at most 10), each one an attachment of this project.
+   * Duplicates are dropped. Throws a sentence for the owner when anything is wrong.
+   */
+  async attachmentsFor(ids: unknown): Promise<PdfAttachment[]> {
+    if (ids === undefined || ids === null) return []
+    if (!Array.isArray(ids) || ids.some((id) => typeof id !== 'string')) throw new Error('The attached PDFs must be sent as a list of ids.')
+    const unique = [...new Set(ids as string[])]
+    if (!unique.length) return []
+    const store = this.deps.pdf?.attachments
+    if (!store) throw new Error('Attaching PDFs is not available here.')
+    if (unique.length > MAX_PDFS_PER_MESSAGE) throw new Error(`At most ${MAX_PDFS_PER_MESSAGE} PDFs can be attached to one message.`)
+    if (unique.some((id) => !PDF_ID.test(id))) throw new Error('One of the attached PDFs is not known here. Attach it again.')
+    const known = new Map((await store.list(this.root)).map((a) => [a.id, a]))
+    const out: PdfAttachment[] = []
+    for (const id of unique) {
+      const a = known.get(id)
+      if (!a) throw new Error('One of the attached PDFs is not known here (it may have been removed). Attach it again.')
+      out.push(a)
+    }
+    return out
+  }
+
+  /** Every attachment id a message of this project uses. */
+  private usedPdfIds(): Set<string> {
+    const ids = new Set<string>()
+    for (const i of this.data.timeline) if (i.kind === 'user') for (const a of i.attachments ?? []) ids.add(a.id)
+    return ids
+  }
+
+  /** Attachments being removed right now: a message that would use one does not start. */
+  private removingPdfs = new Set<string>()
+
+  /** Removes an attachment that was never sent. One a message uses is refused. */
+  async removePdf(id: unknown): Promise<void> {
+    if (typeof id !== 'string' || !PDF_ID.test(id)) throw new Error('That PDF is not known here.')
+    if (this.usedPdfIds().has(id)) throw new Error('That PDF belongs to a message. Delete the message to remove it.')
+    if (this.removingPdfs.has(id)) throw new Error('That PDF is being removed.')
+    this.removingPdfs.add(id)
+    try {
+      await this.deps.pdf?.attachments.remove(this.root, id)
+    } finally {
+      this.removingPdfs.delete(id)
+    }
+  }
+
+  /** The PDFs of a task's request message. */
+  private pdfsOfTask(taskId: string): PdfAttachment[] {
+    return this.data.timeline.flatMap((i) => (i.kind === 'user' && i.taskId === taskId ? (i.attachments ?? []) : []))
+  }
+
+  /** Removes these PDFs from disk, except any that a remaining message still uses. */
+  private async releasePdfs(list: PdfAttachment[]): Promise<void> {
+    const store = this.deps.pdf?.attachments
+    if (!store || !list.length) return
+    const used = this.usedPdfIds()
+    for (const a of new Set(list.map((p) => p.id))) if (!used.has(a)) await store.remove(this.root, a).catch(() => undefined)
+  }
+
+  /** Clears out what no message uses and is older than a day, and half-uploaded files; run when the project opens. */
+  async sweepPdfs(): Promise<void> {
+    await this.deps.pdf?.attachments.sweep(this.root, this.usedPdfIds(), PDF_SWEEP_AGE_MS).catch(() => undefined)
+  }
+
+  /** True while the PDF tool is offered: PDF reading is set up and this is not a practice task. */
+  private pdfOffered(): boolean {
+    return !!this.deps.pdf && !this.current?.re?.practice
   }
 
   stop(): void {
@@ -362,9 +504,15 @@ export class ProjectSession {
       const why = whyNotDelete(this.data.timeline, this.data.tasks, itemId, this.running)
       if (why) throw new Error(why)
       const item = this.data.timeline.find((i) => i.id === itemId)!
+      let gone: PdfAttachment[] = []
       if (item.kind === 'assistant') dropReply(this.data, itemId)
-      else if (item.kind === 'user') this.forgetExchange(item.taskId, item.text)
+      else if (item.kind === 'user') {
+        gone = this.pdfsOfTask(item.taskId)
+        this.forgetExchange(item.taskId, item.text)
+      }
       await this.saveNow()
+      // The request's PDFs go with it, unless another message still uses one.
+      await this.releasePdfs(gone)
     })
   }
 
@@ -373,7 +521,7 @@ export class ProjectSession {
    * then its exchange is replaced by the new run (History keeps the first try, marked undone).
    */
   async redo(taskId: string, text?: string): Promise<void> {
-    const { task, item } = await this.exclusive('the redo', async () => {
+    const { task, item, pdfs } = await this.exclusive('the redo', async () => {
       const item = requestItem(this.data.timeline, taskId)
       const why = whyNotRedo(this.data.timeline, this.data.tasks, item?.id ?? '', this.running)
       if (why || !item) throw new Error(why ?? 'Only a request can be run again.')
@@ -384,14 +532,18 @@ export class ProjectSession {
         // The exchange goes too, so the model has nothing left to be told about.
         this.data.notes.pop()
       }
+      // The request's PDFs are kept: the new run of it uses them again.
+      const pdfs = [...this.pdfsOfTask(task.id)]
       this.forgetExchange(task.id, item.text)
       if (changed) this.notice(`Put back the files “${task.title}” changed, then ran your request again.`, 'info')
-      return { task, item }
+      return { task, item, pdfs }
     })
     const edited = text?.trim()
-    if (edited && edited !== item.text) this.start(edited)
-    else if (task.request) this.start(task.request.text, { howToRun: task.request.howToRun, share: task.request.share, shown: item.text, re: task.re })
-    else this.start(item.text)
+    const attachments = pdfs.length ? pdfs : undefined
+    if (edited && edited !== item.text) this.start(edited, { attachments })
+    else if (task.request) {
+      this.start(task.request.text, { howToRun: task.request.howToRun, share: task.request.share, shown: item.text, re: task.re, attachments })
+    } else this.start(item.text, { attachments })
   }
 
   private forgetExchange(taskId: string, text: string): void {
@@ -426,10 +578,12 @@ export class ProjectSession {
 
   // ---------- the task ----------
 
-  private async run(task: TaskRecord, text: string, howToRun: boolean, share: boolean): Promise<void> {
+  private async run(task: TaskRecord, text: string, howToRun: boolean, share: boolean, pdfs: PdfAttachment[] = []): Promise<void> {
     const signal = this.abort!.signal
     this.allowed = new Set()
     this.current = task
+    // The list of attached PDFs in the system prompt is read here, once: it does not change while the task runs.
+    this.taskPdfs = this.pdfOffered() ? pdfsForPrompt(this.data.timeline.filter((i): i is Extract<TimelineItem, { kind: 'user' }> => i.kind === 'user')) : []
     let snap: Snapshotter | null = null
     try {
       this.setStatus({ phase: 'working', text: 'Saving a restore point…' })
@@ -441,7 +595,10 @@ export class ProjectSession {
       }
       if (signal.aborted) throw new StopTask()
 
-      const model = this.resolveModel()
+      const choice = this.resolveModel()
+      const model = choice.model
+      // Read before the first request and kept for the whole task, so the system prompt stays stable.
+      this.taskMode = await this.readModes(task, model, choice.rental, signal)
       const nCtx = await this.prepareModel(model, signal)
       this.nCtx = nCtx
       this.extraServers = (await this.deps.toolServers?.configured().catch(() => [])) ?? []
@@ -451,7 +608,10 @@ export class ProjectSession {
       this.lastBackgroundNote = lastBackgroundNoteIn(this.data.messages)
 
       const notes = this.data.notes.splice(0)
-      const body = howToRun ? HOW_TO_RUN_TASK : text
+      const typed = howToRun ? HOW_TO_RUN_TASK : text
+      // The model's copy of a message with PDFs starts with a note naming them; the conversation shows only what was typed.
+      const block = pdfs.length ? attachmentBlock(pdfs) : ''
+      const body = block ? `${block}\n\n${typed || 'The owner sent these PDFs without a message.'}` : typed
       const content = notes.length ? `${notes.map((n) => `[Note: ${n}]`).join('\n')}\n\n${body}` : body
       this.taskStart = this.data.messages.length
       this.data.messages.push({ role: 'user', content, task: task.id })
@@ -484,9 +644,14 @@ export class ProjectSession {
         )
       } else {
         task.outcome = 'error'
-        this.notice(e instanceof FriendlyError ? e.message : friendlyServerError(e), 'error', task.id)
+        const message = e instanceof FriendlyError ? e.message : friendlyServerError(e)
+        if (isRentalTrouble(e) || (e instanceof FriendlyError && e.rental)) this.refusal = message
+        this.notice(message, 'error', task.id)
       }
     } finally {
+      this.taskMode = null
+      this.taskPdfs = []
+      this.rentalOk = false
       this.closeOpenCalls()
       // A checklist note was for this task only.
       dropPlanNotes(this.data.messages)
@@ -527,13 +692,39 @@ export class ProjectSession {
     }
   }
 
-  private resolveModel(): string {
-    const chosen = this.deps.settings().model
-    const models = this.deps.models()
-    if (chosen && (!models.length || models.some((m) => m.id === chosen))) return chosen
-    const pick = pickDefaultModel(models)
-    if (!pick) throw new FriendlyError('RulZ LLM Suite has no models yet. Add one on its My Models page, then try again.')
-    return pick
+  /** The model for this task: the chosen one, or the default pick (never a rental's). Says so when a rental's model is gone. */
+  private resolveModel(): { model: string; rental: boolean } {
+    const s = this.deps.settings()
+    const choice = chooseModel(s.model, s.modelRental, this.deps.models())
+    if (!choice.ok) throw new FriendlyError(choice.reason, true)
+    return choice
+  }
+
+  /**
+   * Reads LLM Suite's settings for the model in this task's mode, once. A 404 is an older LLM Suite:
+   * everything as before, silently. Any other failure: as before too, with a notice in the conversation.
+   * Also decides the headers every request of the task carries.
+   */
+  private async readModes(task: TaskRecord, model: string, rentalChosen: boolean, signal: AbortSignal): Promise<TaskMode> {
+    const mode = modeOfTask(task)
+    // A rental's model is used only when the owner chose it (or, in a batch run, said yes to it).
+    const headers = modeHeaders(mode, this.unattended ? this.rentalOk : rentalChosen)
+    let modes: ModelModes | null = null
+    try {
+      modes = await this.deps.client.modelModes(model, signal, headers)
+    } catch (e) {
+      if (signal.aborted) throw e
+      if (isRentalTrouble(e)) throw e
+      this.notice(`I couldn't read RulZ LLM Suite's settings for this model, so I'm using this app's own. (${friendlyServerError(e)})`, 'warn', task.id)
+    }
+    const line = describeModeUse(mode, modes, this.deps.settings().modelSampling[model])
+    if (line) this.notice(line, 'info', task.id)
+    return { mode, modes, headers }
+  }
+
+  /** Headers for a request of the running task: the mode, and a refusal of rentals unless allowed. Without a task, the strictest. */
+  private requestHeaders(): Record<string, string> {
+    return this.taskMode?.headers ?? modeHeaders('coding', false)
   }
 
   /** After "Share my app": points the owner at the packaged file the agent named, if it is really there. */
@@ -559,12 +750,12 @@ export class ProjectSession {
     }
     let nCtx: number | undefined
     try {
-      nCtx = (await this.deps.client.modelProps(model, signal)).nCtx
+      nCtx = (await this.deps.client.modelProps(model, signal, this.requestHeaders())).nCtx
     } catch (e) {
       if (signal.aborted) throw e
       const status = (e as { status?: number }).status
-      // A 503 means loading failed; other errors only cost us the extra details.
-      if (status === 503) throw e
+      // A 503 means loading failed, a 409 that a rental said no; other errors only cost us the extra details.
+      if (status === 503 || isRentalTrouble(e)) throw e
     }
     this.deps.activity('working')
     this.deps.refreshModels()
@@ -577,7 +768,7 @@ export class ProjectSession {
     if (fresh?.loadedContext && nCtx !== undefined && fresh.loadedContext !== nCtx) {
       this.deps.client.forgetProps(model)
       // Fetched again: the chat template in them decides the tool-argument fix for this task.
-      await this.deps.client.modelProps(model, signal).catch(() => undefined)
+      await this.deps.client.modelProps(model, signal, this.requestHeaders()).catch(() => undefined)
     }
     const size = fresh?.loadedContext ?? nCtx ?? info?.loadedContext ?? DEFAULT_CTX
     if (size <= SMALL_CONTEXT && !this.warnedSmallContext) {
@@ -827,10 +1018,13 @@ export class ProjectSession {
         date: new Date().toDateString(),
         summary: this.data.summary,
         memory: this.data.memory,
+        pdfs: this.taskPdfs,
         instructions: this.deps.settings().instructions,
         extraTools: this.extraServers.length
           ? { servers: this.extraServers.map(serverLabel), advice: this.deps.toolServers?.instructions().map((i) => ({ ...i, server: serverLabel(i.server) })) ?? [] }
-          : undefined
+          : undefined,
+        // Part of the system string, so the context budget below counts it.
+        suitePrompt: this.taskMode ? (modePrompt(this.taskMode.mode, this.taskMode.modes) ?? undefined) : undefined
       })
       this.noteBackground()
       const fit = fitMessages(this.data.messages, budget, estimateTokens(system) + estimateTokens(JSON.stringify(this.toolDefs())))
@@ -873,14 +1067,16 @@ export class ProjectSession {
           { role: 'user', content: earlier + transcript(part, maxChars) }
         ],
         1500,
-        signal
+        signal,
+        this.requestHeaders()
       )
       // Checked without the thinking: a reply that was all <think> (cut off while thinking) would
       // otherwise replace the summary, and everything folded into it, with nothing.
       summary = cleanContent(reply).trim()
       if (!summary) throw new Error('empty summary')
     } catch (e) {
-      if (signal.aborted) throw e
+      // A rental that said no (or lost its connection) is not a reason to make do with a mechanical summary.
+      if (signal.aborted || isRentalTrouble(e)) throw e
       summary = `${this.data.summary ? `${this.data.summary}\n` : ''}${mechanicalSummary(part)}`
     }
     this.data.summary = summary
@@ -922,8 +1118,15 @@ export class ProjectSession {
     signal: AbortSignal
   ): Promise<TurnResult & { cut?: { thinking: string }; itemId?: string }> {
     const own = this.deps.settings().modelSampling[model]
+    // The sampling of this task: the recommended values, LLM Suite's mode settings and the owner's own, merged on request fields.
+    const mode = this.taskMode?.mode ?? modeOfTask(task)
+    const modes = this.taskMode?.modes ?? null
+    const sampling = taskSamplingFields(model, own, mode, modes)
     // With thinking skipped no thoughts will stream, so don't promise them.
-    this.setStatus({ phase: 'thinking', text: skipsThinking(own) ? 'Working… (thinking is off in Model settings)' : 'Thinking…' })
+    this.setStatus({
+      phase: 'thinking',
+      text: requestSkipsThinking(withApiOverride(sampling, modes)) ? 'Working… (thinking is off in the model settings)' : 'Thinking…'
+    })
     this.deps.activity('working')
     let item: Extract<TimelineItem, { kind: 'assistant' }> | null = null
     const tools = this.toolDefs()
@@ -932,12 +1135,12 @@ export class ProjectSession {
     // buildRequest already tidied up when the reply had too little room; if nothing more could go, ask
     // for what is left rather than more than the context holds.
     const maxTokens = Math.max(Math.min(LAST_RESORT_REPLY_TOKENS, cap), Math.min(cap, nCtx - Math.ceil(estimated * this.scale) - 256))
-    const sampling = samplingRequest(model, own)
-    const reHeaders = this.reRecording(task)
+    const reHeaders = { ...this.reRecording(task), ...this.requestHeaders() }
     let result: TurnResult & { cut?: { thinking: string } }
     const turnSignal = this.notes.beginTurn(signal)
     try {
-      result = await this.deps.client.streamTurn({ model, messages, tools, max_tokens: maxTokens, ...sampling }, turnSignal, {
+      // The sampling goes first: nothing in it can replace the model, the messages, the tools or the reply length.
+      result = await this.deps.client.streamTurn({ ...sampling, model, messages, tools, max_tokens: maxTokens }, turnSignal, {
         onProgress: (done, total) => {
           if (total > 4000) this.setStatus({ phase: 'thinking', text: `Reading the project notes… ${Math.round((done / total) * 100)}%` })
         },
@@ -1017,12 +1220,23 @@ export class ProjectSession {
 
   /** The tools offered in this request: the built-in ones, plus find/load and loaded tool-server tools when there are tool servers. */
   private toolDefs(): unknown[] {
-    if (!this.extraServers.length) return TOOL_DEFS
+    // read_pdf is read-only like read_file, so it needs no approval; practice tasks never get it.
+    const builtIn = this.pdfOffered() ? TOOLS_WITH_PDF : TOOL_DEFS
+    if (!this.extraServers.length) return builtIn
     const loaded = [...this.loaded.values()].map((t) => ({
       type: 'function' as const,
       function: { name: t.qualifiedName, description: t.description ?? `${t.name} (from ${t.server})`, parameters: t.inputSchema }
     }))
-    return [...TOOL_DEFS, ...EXTRA_TOOL_DEFS, ...loaded]
+    return [...builtIn, ...EXTRA_TOOL_DEFS, ...loaded]
+  }
+
+  /** "Reading <file name>" for an attached PDF (by its file name), null for a path in the project or an id that is not known. */
+  private async pdfTitle(args: Record<string, unknown>): Promise<string | null> {
+    const m = typeof args.path === 'string' ? /^attachment:([0-9a-f]{16})$/.exec(args.path.trim()) : null
+    const found = m ? await this.deps.pdf?.attachments.resolve(this.root, m[1]).catch(() => null) : null
+    if (!found) return null
+    const query = typeof args.query === 'string' ? args.query.trim().slice(0, 40) : ''
+    return query ? `Searching ${found.name} for "${query}"` : `Reading ${found.name}`
   }
 
   /** A tool-server tool by name, starting the servers first if needed (the model may call one it remembers). */
@@ -1089,7 +1303,9 @@ export class ProjectSession {
     const name = call.function.name
     const parsed = parseToolArgs(call.function.arguments)
     const args = 'args' in parsed ? parsed.args : {}
-    const title = describeStep(name, args)
+    let title = describeStep(name, args)
+    // An attached PDF is named by its file name in the steps.
+    if (name === PDF_TOOL && this.pdfOffered()) title = (await this.pdfTitle(args)) ?? title
     // The checklist has its own place in the side panel, so updating it isn't listed as a step.
     if (name === PLAN_TOOL) {
       return { result: 'error' in parsed ? { text: parsed.error, isError: true } : this.setPlan(task, args), title, quiet: true }
@@ -1119,9 +1335,14 @@ export class ProjectSession {
           }
           return undefined
         })
+    // Not offered (no PDF reader here, or a practice task): refused even when the model calls it anyway.
+    if (name === PDF_TOOL && !this.pdfOffered()) {
+      return finish({ text: this.deps.pdf ? 'read_pdf is not available in this task.' : 'PDF reading is not available here.', isError: true })
+    }
     if (!known && !extra) {
       const more = this.extraServers.length ? ' Tools from the tool servers are found with find_tools and loaded with load_tools.' : ''
-      return finish({ text: `There is no tool named "${name}". The tools are: ${[...TOOL_NAMES].join(', ')}.${more}`, isError: true })
+      const names = [...TOOL_NAMES].filter((n) => n !== PDF_TOOL || this.pdfOffered())
+      return finish({ text: `There is no tool named "${name}". The tools are: ${names.join(', ')}.${more}`, isError: true })
     }
 
     try {
@@ -1199,7 +1420,9 @@ export class ProjectSession {
       case 'search_text':
         return files.searchText(root, args)
       case 'read_file':
-        return files.readFile(root, args)
+        return files.readFile(root, args, { pdfHint: this.pdfOffered() })
+      case PDF_TOOL:
+        return runReadPdf(root, args, this.deps.pdf, signal)
 
       case 'write_file':
       case 'edit_file': {

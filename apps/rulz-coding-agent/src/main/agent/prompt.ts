@@ -1,4 +1,6 @@
 // The system prompt: the single most important piece of text in the app.
+import type { PdfAttachment } from '@shared/pdf'
+import { pdfSection } from './pdfNotes'
 
 export interface PromptInfo {
   projectPath: string
@@ -12,6 +14,10 @@ export interface PromptInfo {
   instructions?: string
   /** Tool servers set up in RulZ LLM Suite, and the advice they give for using their tools. */
   extraTools?: { servers: string[]; advice: { server: string; text: string }[] }
+  /** The project's attached PDFs (the newest 20), fixed for the whole task; in the stable part, before the summary. */
+  pdfs?: PdfAttachment[]
+  /** The system prompt RulZ LLM Suite has for the model in this task's mode; goes at the very end. */
+  suitePrompt?: { label: string; text: string }
 }
 
 export function systemPrompt(info: PromptInfo): string {
@@ -81,8 +87,15 @@ export function systemPrompt(info: PromptInfo): string {
       `## The owner's notes for this project\nThe owner wrote these in "Things to always remember". Follow them in everything you do, unless the owner asks for something different in this task:\n${info.memory.trim()}`
     )
   }
+  const pdfs = info.pdfs?.length ? pdfSection(info.pdfs) : ''
+  if (pdfs) parts.push(pdfs)
   // Last, as it changes most often of these: only when the notes are tidied up.
   if (info.summary?.trim()) parts.push(`## Earlier work in this project (summary)\n${info.summary.trim()}`)
+  if (info.suitePrompt?.text.trim()) {
+    parts.push(
+      `## Extra instructions from RulZ LLM Suite (${info.suitePrompt.label} settings)\nThe owner set these up in RulZ LLM Suite for this model. Follow them together with the rules above (the "Honesty and safety" rules always come first):\n${info.suitePrompt.text.trim()}`
+    )
+  }
   return parts.join('\n\n')
 }
 

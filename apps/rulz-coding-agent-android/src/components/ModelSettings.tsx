@@ -1,11 +1,15 @@
 // The phone's version of the computer's Settings > Model settings: the same settings, laid out for a narrow screen.
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { DEFAULT_MAX_OUTPUT_TOKENS, KV_CACHE_TYPES, REASONING_EFFORTS, recommendedSampling } from '@shared/defaults'
+import { MODE_LABEL } from '@shared/modes'
 import { parseTensorSplit, rebalanceSplit, toPercents } from '@shared/split'
-import type { KvCacheType, LoadEstimate, LoadSettings, ModelLoadInfo, ReasoningEffort, SamplingSettings } from '@shared/types'
-import { invoke } from '../lib/api'
+import type { AgentMode, KvCacheType, LoadEstimate, LoadSettings, ModelLoadInfo, ModelModes, ReasoningEffort, SamplingSettings } from '@shared/types'
+import { errorMessage, invoke } from '../lib/api'
 import { cn, formatBytes, formatTokens } from '../lib/format'
+import { openingSettingsFor } from '../lib/modeLogic'
 import { useApp } from '../stores/app'
+import { useModelModes, useModes } from '../stores/modes'
+import { RentalNote } from './common'
 import { Badge, Button, Field, Input, Select, Switch } from './ui'
 
 /** Number box that allows an empty value (mapped to null). */
@@ -63,12 +67,27 @@ const SAMPLING_FIELDS: { key: NumericKey; label: string; hint: string; min: numb
 
 const EMPTY_SAMPLING: Record<string, SamplingSettings> = {}
 
-/** How the model writes: the owner's values over the recommended ones, saved per model on the computer. */
-function Sampling({ model }: { model: string }) {
+/** The request field LLM Suite uses for each of this form's numbers. */
+const REQUEST_FIELD: Partial<Record<NumericKey, string>> = { temperature: 'temperature', topP: 'top_p', topK: 'top_k', repeatPenalty: 'repeat_penalty' }
+
+/** What stays when the values overridden here are cleared: the longest answer is this app's own setting. */
+const onlyLength = (own: SamplingSettings): SamplingSettings => (own.maxOutputTokens === undefined ? {} : { maxOutputTokens: own.maxOutputTokens })
+
+/** How the model writes: the owner's values over LLM Suite's Coding values over the recommended ones, saved per model on the computer. */
+function Sampling({ model, modes }: { model: string; modes: ModelModes | null | undefined }) {
   const all = useApp((s) => s.settings?.modelSampling ?? EMPTY_SAMPLING)
   const update = useApp((s) => s.updateSettings)
   const own = all[model] ?? {}
+  const suite = modes?.modes.coding.sampling ?? null
+  const suiteRe = modes?.modes.re.sampling ?? null
   const rec: SamplingSettings = { maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS, ...recommendedSampling(model) }
+  /** LLM Suite's Coding value for a field, when it has one: it shows grey, and a value set here overrides it. */
+  const suiteValue = (key: NumericKey): number | undefined => {
+    const field = REQUEST_FIELD[key]
+    const v = field && suite ? suite[field] : undefined
+    return typeof v === 'number' ? v : undefined
+  }
+  const overridden = SAMPLING_FIELDS.filter((f) => own[f.key] !== undefined && suiteValue(f.key) !== undefined)
 
   const set = <K extends keyof SamplingSettings>(key: K, v: SamplingSettings[K] | undefined): void => {
     const next: SamplingSettings = { ...own }
@@ -83,12 +102,18 @@ function Sampling({ model }: { model: string }) {
 
   return (
     <div className="space-y-1">
+      {suite && (
+        <p className="pb-1 text-[12px] text-faint">
+          RulZ LLM Suite has Coding sampling for this model: its values show in grey, and a value you set here overrides it
+          {overridden.length > 0 && <> ({overridden.map((f) => `${f.label.split(' (')[0]}: ${suiteValue(f.key)} there`).join(', ')})</>}.
+        </p>
+      )}
       {SAMPLING_FIELDS.map((f) => (
         <Field key={f.key} label={f.label} hint={f.hint} inline>
           <NumberBox
             label={f.label}
             value={own[f.key] ?? null}
-            placeholder={rec[f.key] !== undefined ? String(rec[f.key]) : 'Default'}
+            placeholder={suiteValue(f.key) !== undefined ? String(suiteValue(f.key)) : rec[f.key] !== undefined ? String(rec[f.key]) : 'Default'}
             min={f.min}
             max={f.max}
             step={f.step}
@@ -155,10 +180,36 @@ function Sampling({ model }: { model: string }) {
         )}
       </div>
 
-      {Object.keys(own).length > 0 && (
-        <Button size="sm" variant="ghost" onClick={() => void update({ modelSampling: Object.fromEntries(Object.entries(all).filter(([k]) => k !== model)) })}>
-          Back to recommended
-        </Button>
+      {Object.keys(own).length > 0 &&
+        (suite ? (
+          // One button clears what is overridden here; the longest answer stays this app's.
+          Object.keys(onlyLength(own)).length < Object.keys(own).length && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                const keep = onlyLength(own)
+                const rest = Object.fromEntries(Object.entries(all).filter(([k]) => k !== model))
+                void update({ modelSampling: Object.keys(keep).length ? { ...rest, [model]: keep } : rest })
+              }}
+            >
+              Use LLM Suite&apos;s Coding values
+            </Button>
+          )
+        ) : (
+          <Button size="sm" variant="ghost" onClick={() => void update({ modelSampling: Object.fromEntries(Object.entries(all).filter(([k]) => k !== model)) })}>
+            Back to recommended
+          </Button>
+        ))}
+      {suiteRe && (
+        <p className="pt-1 text-[12px] text-faint">
+          Reverse-engineering tasks use LLM Suite&apos;s Reverse engineering sampling as it is (
+          {Object.entries(suiteRe)
+            .slice(0, 6)
+            .map(([k, v]) => `${k.replaceAll('_', ' ')} ${typeof v === 'object' ? '…' : String(v)}`)
+            .join(', ')}
+          ), not the values above.
+        </p>
       )}
     </div>
   )
@@ -179,7 +230,7 @@ const VERDICT = {
 } as const
 
 /** RulZ LLM Suite's estimate for the settings being edited (asked again shortly after each change). */
-function useEstimate(model: string, info: ModelLoadInfo | null, draft: LoadSettings | null): LoadEstimate | undefined {
+function useEstimate(model: string, info: ModelLoadInfo | null, draft: LoadSettings | null, mode?: AgentMode): LoadEstimate | undefined {
   const [preview, setPreview] = useState<LoadEstimate | undefined>()
   const patch = info && draft ? changes(draft, info.config) : {}
   const key = JSON.stringify(patch)
@@ -188,7 +239,7 @@ function useEstimate(model: string, info: ModelLoadInfo | null, draft: LoadSetti
     if (!info?.estimate || key === '{}') return
     let cancelled = false
     const t = setTimeout(() => {
-      invoke('models:previewLoadSettings', model, patch).then(
+      invoke('models:previewLoadSettings', model, patch, mode).then(
         (i) => !cancelled && setPreview(i.estimate),
         () => undefined
       )
@@ -197,7 +248,7 @@ function useEstimate(model: string, info: ModelLoadInfo | null, draft: LoadSetti
       cancelled = true
       clearTimeout(t)
     }
-  }, [model, info, key])
+  }, [model, info, key, mode])
   return key === '{}' ? info?.estimate : preview
 }
 
@@ -322,25 +373,33 @@ function DraftTuning({ draft, change, builtIn }: { draft: LoadSettings; change: 
 }
 
 /** How RulZ LLM Suite loads the model. Saving restarts a loaded model, so changes wait for the button. */
-function Loading({ model }: { model: string }) {
+function Loading({ model, mode, readOnly }: { model: string; mode?: AgentMode; readOnly?: boolean }) {
   const [info, setInfo] = useState<ModelLoadInfo | null>(null)
   const [draft, setDraft] = useState<LoadSettings | null>(null)
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
   const [saving, setSaving] = useState(false)
-  const estimate = useEstimate(model, info, draft)
+  const estimate = useEstimate(model, info, draft, mode)
 
   useEffect(() => {
     setInfo(null)
     setDraft(null)
     setError('')
-    invoke('models:loadSettings', model).then(
+    setNotice('')
+    // A slow answer for the model (or mode) picked before must not fill in, and then save, this one's settings.
+    let current = true
+    invoke('models:loadSettings', model, mode).then(
       (i) => {
+        if (!current) return
         setInfo(i)
         setDraft(i.config)
       },
-      (e: Error) => setError(/Unknown request/i.test(e.message) ? 'Update RulZ Coding Agent on the computer (0.8.0 or later) to change load settings from the phone.' : e.message)
+      (e: Error) => current && setError(/Unknown request/i.test(e.message) ? 'Update RulZ Coding Agent on the computer (0.8.0 or later) to change load settings from the phone.' : e.message)
     )
-  }, [model])
+    return () => {
+      current = false
+    }
+  }, [model, mode])
 
   if (error && !draft) return <p className="text-[14px] text-warn">{error}</p>
   if (!info || !draft) return <p className="text-[14px] text-faint">Loading…</p>
@@ -359,22 +418,27 @@ function Loading({ model }: { model: string }) {
   const canTuneDraft = draft.draftSampling !== undefined && hasAnyDraft && draft.useDraft
   const builtInDraft = pickedDraft ? pickedDraft.builtIn : !draft.draftFile && !!info.defaultDraft?.builtIn
 
-  const save = async (): Promise<void> => {
+  /** Saves (a loaded model restarts), or with `null` removes the mode's own settings. A reload LLM Suite refuses still saves: it says why. */
+  const save = async (config: Partial<LoadSettings> | null): Promise<void> => {
     setSaving(true)
     setError('')
+    setNotice('')
     try {
-      const next = await invoke('models:setLoadSettings', model, patch)
+      const next = await invoke('models:setLoadSettings', model, config, mode)
       setInfo(next)
       setDraft(next.config)
+      if (next.reloadBlocked) setNotice(`Saved, but the model was not reloaded: ${next.reloadBlocked}`)
+      void useModes.getState().refresh(model, true)
     } catch (e) {
-      setError((e as Error).message)
+      setError(errorMessage(e))
     } finally {
       setSaving(false)
     }
   }
 
   return (
-    <div className="space-y-1">
+    // A disabled fieldset greys out and blocks every control inside it (a rental's settings are read-only).
+    <fieldset disabled={readOnly} className="m-0 min-w-0 space-y-1 border-0 p-0">
       <Field label="Context length" hint={`Tokens I keep in mind${info.maxContext ? `; up to ${formatTokens(info.maxContext)}` : ''}. Empty = as much as fits.`} inline>
         <NumberBox label="Context length" value={draft.contextLength} placeholder="Fit" min={512} max={info.maxContext} step={1024} onChange={(v) => change({ contextLength: v === null ? null : Math.round(v) })} />
       </Field>
@@ -452,7 +516,7 @@ function Loading({ model }: { model: string }) {
 
       <div className="space-y-2 pt-3">
         <div className="flex gap-2">
-          <Button variant="primary" className="flex-1" disabled={saving || !dirty} onClick={() => void save()}>
+          <Button variant="primary" className="flex-1" disabled={saving || !dirty} onClick={() => void save(patch)}>
             {saving ? 'Saving…' : loaded ? 'Save and restart model' : 'Save'}
           </Button>
           {dirty && !saving && (
@@ -463,27 +527,66 @@ function Loading({ model }: { model: string }) {
         </div>
         <p className="text-[12px] text-faint">
           {loaded ? `Loaded${info.loadedContext ? ` with ${formatTokens(info.loadedContext)} context` : ''}` : 'Not loaded; used the next time it loads'}
-          {!info.custom && ' · using RulZ LLM Suite defaults'}
+          {!mode && !info.custom && ' · using RulZ LLM Suite defaults'}
+          {mode && ` · ${MODE_LABEL[mode]} ${info.modeOwn ? 'has load settings of its own' : 'uses the settings of all modes'}`}
         </p>
+        {mode && info.modeOwn && (
+          <div className="space-y-1">
+            <Button variant="ghost" disabled={saving} onClick={() => void save(null)}>
+              Use the settings of all modes
+            </Button>
+            <p className="text-[12px] text-faint">Removes {MODE_LABEL[mode]}&apos;s own load settings.</p>
+          </div>
+        )}
       </div>
+      {notice && <p className="text-[14px] text-warn">{notice}</p>}
       {error && <p className="text-[14px] text-danger">{error}</p>}
-    </div>
+    </fieldset>
   )
 }
 
 /** Generation and load settings for one model, under the model picker in Settings. */
 export function ModelSettings({ model }: { model: string }) {
+  const rental = useApp((s) => s.connection.models.find((m) => m.id === model))
+  const { modes } = useModelModes()
+  // "Settings for" exists only with a computer and a RulZ LLM Suite that have modes. It opens on Coding when
+  // the model has load settings of its own for it, so an edit always changes what is used.
+  const [mode, setMode] = useState<AgentMode | 'all'>('all')
+  const opened = useRef('')
+  useEffect(() => {
+    if (!modes || opened.current === model) return
+    opened.current = model
+    setMode(openingSettingsFor(modes))
+  }, [model, modes])
+  const shownMode: AgentMode | undefined = modes && mode !== 'all' ? mode : undefined
+
   return (
     <div className="mt-3 space-y-5 rounded-xl border border-border bg-panel-2/50 p-3.5">
+      <RentalNote model={rental} />
       <div>
         <div className="text-[12px] font-medium tracking-wide text-muted uppercase">How it writes</div>
         <p className="mb-2 text-[12px] text-faint">Saved for this model. Empty boxes use the value in grey.</p>
-        <Sampling model={model} />
+        <Sampling model={model} modes={modes} />
       </div>
       <div>
         <div className="text-[12px] font-medium tracking-wide text-muted uppercase">How it loads</div>
-        <p className="mb-2 text-[12px] text-faint">Saved in RulZ LLM Suite on the computer.</p>
-        <Loading model={model} />
+        <p className="mb-2 text-[12px] text-faint">
+          {rental?.rental
+            ? 'Read-only: this model runs on a rented computer, so it is loaded and changed on RulZ LLM Suite’s vast.ai page, not from here.'
+            : 'Saved in RulZ LLM Suite on the computer.'}
+        </p>
+        {modes && (
+          <div className="mb-3">
+            <Field label="Settings for">
+              <Select aria-label="Settings for" value={mode} onChange={(e) => setMode(e.target.value as AgentMode | 'all')}>
+                <option value="all">All modes</option>
+                <option value="coding">{MODE_LABEL.coding}</option>
+                <option value="re">{MODE_LABEL.re}</option>
+              </Select>
+            </Field>
+          </div>
+        )}
+        <Loading model={model} mode={shownMode} readOnly={!!rental?.rental} />
       </div>
     </div>
   )

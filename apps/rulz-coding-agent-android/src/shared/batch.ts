@@ -70,13 +70,15 @@ export function nextPracticeTask(tasks: RePracticeTaskStats[]): RePracticeTaskSt
 }
 
 /** Per family: tasks, tasks tried at least once, tasks solved at least once (the family tiles). */
-export function familyCounts(tasks: RePracticeTaskStats[]): { family: string; total: number; tried: number; solved: number }[] {
-  const out = new Map<string, { total: number; tried: number; solved: number }>()
+export function familyCounts(tasks: RePracticeTaskStats[]): { family: string; total: number; tried: number; solved: number; failed?: number }[] {
+  const out = new Map<string, { total: number; tried: number; solved: number; failed?: number }>()
   for (const t of tasks) {
     const f = out.get(t.family) ?? { total: 0, tried: 0, solved: 0 }
     f.total++
     if (t.attempts > 0) f.tried++
     if (t.solved > 0) f.solved++
+    // Failed tries, when LLM Suite sends them (0.35).
+    if (typeof t.failed === 'number') f.failed = (f.failed ?? 0) + t.failed
     out.set(t.family, f)
   }
   return [...out.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([family, c]) => ({ family, ...c }))

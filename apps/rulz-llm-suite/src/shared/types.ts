@@ -305,6 +305,8 @@ export interface ReSessionSummary {
   goal: string
   outcome: ReOutcome
   practice?: { taskId: string; family: string; tier: string; answer?: string; expected?: string }
+  /** Keys (see modelKey) of the models that answered; empty when not known. */
+  models: string[]
   /** Recorded model responses and tool rounds (0 when nothing was recorded). */
   responses: number
   toolRounds: number
@@ -315,6 +317,8 @@ export interface ReSessionSummary {
 export interface RePracticeTaskStats extends RePracticeTask {
   attempts: number
   solved: number
+  /** Only in an overview asked for one model. */
+  failed?: number
 }
 
 /** Everything other apps need to show and start RE tasks (GET /v1/re/overview). */
@@ -324,7 +328,8 @@ export interface ReOverview {
   recording: boolean
   /** Newest first. */
   sessions: ReSessionSummary[]
-  practice: { kitDir: string; error?: string; tasks: RePracticeTaskStats[] }
+  /** `model`: the model key the counts are for (see modelKey); present only when the overview was asked for one model. */
+  practice: { kitDir: string; error?: string; model?: string; tasks: RePracticeTaskStats[] }
   /** Prompt templates; {target} is replaced by the target path. */
   goals: { label: string; text: string }[]
   clonePieces: { label: string; text: string }[]

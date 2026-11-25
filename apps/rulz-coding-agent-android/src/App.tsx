@@ -14,10 +14,18 @@ import { Workspace } from './pages/Workspace'
 import { useAlerts } from './stores/alerts'
 import { isDarkTheme, useApp } from './stores/app'
 import { useLink } from './stores/link'
+import { useModes } from './stores/modes'
 import { useUi } from './stores/ui'
 import { useWorkspace } from './stores/workspace'
 
 let started = false
+
+/** Asks again for the modes of the model in use (a reconnect, or the app back in the front): the model may have been reloaded meanwhile. */
+function refreshModes(reconnected: boolean): void {
+  const modes = useModes.getState()
+  modes.forComputer(useLink.getState().currentId)
+  void (reconnected ? modes.reconnected() : modes.refreshWanted())
+}
 
 /** Wires up the connection and the phone's buttons once. */
 function start(askToPair: (c: Omit<Computer, 'id'>) => void): void {
@@ -32,13 +40,14 @@ function start(askToPair: (c: Omit<Computer, 'id'>) => void): void {
     if (s.kind !== 'connected') return
     void useApp.getState().resync()
     void useWorkspace.getState().resync()
+    refreshModes(true)
   })
   let active = true
   const updateBackoff = (): void => { link.backgroundIdle = !active && !useWorkspace.getState().running }
   useWorkspace.subscribe(updateBackoff)
   if (isNative) void CapacitorApp.addListener('appStateChange', ({ isActive }) => { active = isActive; updateBackoff() })
   else document.addEventListener('visibilitychange', () => { active = document.visibilityState === 'visible'; updateBackoff() })
-  onResume(() => { active = true; updateBackoff(); void link.check() })
+  onResume(() => { active = true; updateBackoff(); void link.check(); refreshModes(false) })
   onPairingLink((url) => {
     // A tapped notification (rulzagent://open/project): go to the project; a pending approval shows itself.
     if (/^rulzagent:\/\/open\b/i.test(url)) {

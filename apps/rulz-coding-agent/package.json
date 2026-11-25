@@ -1,7 +1,7 @@
 {
   "name": "rulz-coding-agent",
   "productName": "RulZ Coding Agent",
-  "version": "0.22.0",
+  "version": "0.23.0",
   "description": "Describe an app in plain English and let a local AI model served by RulZ LLM Suite build it.",
   "main": "./out/main/index.js",
   "author": "RulZ",
@@ -49,6 +49,7 @@
     "electron": "44.9.3",
     "electron-builder": "26.0.12",
     "electron-vite": "5.0.0",
+    "pdfjs-dist": "6.5.438",
     "playwright-core": "1.64.1",
     "tailwindcss": "4.1.14",
     "typescript": "5.9.3",

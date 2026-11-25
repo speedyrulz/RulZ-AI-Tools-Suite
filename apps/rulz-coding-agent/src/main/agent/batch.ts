@@ -5,6 +5,7 @@
 import { randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 import { cleanBatchOptions, planBatch, settleRun } from '@shared/batch'
+import { RENTAL_NEEDS_YES, RENTAL_OLD_APP, type ModelChoice } from '@shared/modes'
 import type { AgentEvent, BatchItem, BatchOptions, BatchRun, BatchState, ReOverview, TaskRecord } from '@shared/types'
 import { readJson, writeJsonAtomic } from '../util/jsonFile'
 import type { ReSessionInfo } from '../rulz/client'
@@ -81,7 +82,8 @@ export class BatchStore {
 
 export interface BatchDeps {
   client: {
-    reOverview(): Promise<ReOverview>
+    /** `model`: the practice counts are for that model (LLM Suite 0.35). */
+    reOverview(model?: string): Promise<ReOverview>
     preparePractice(taskId: string): Promise<{ target: string; prompt: string; family: string; tier: string }>
     describeReSession(id: string, info: ReSessionInfo): Promise<boolean>
   }
@@ -90,6 +92,11 @@ export interface BatchDeps {
   session: () => ProjectSession | null
   /** The model the agent uses now. */
   modelName: () => string
+  /**
+   * The model the agent would use now and whether it runs on a rental, or why there is none (never a
+   * rental's unless chosen). Without it, `modelName` is taken as a local model.
+   */
+  model?: () => ModelChoice
   broadcast: (state: BatchState) => void
   /** Milliseconds in a "minute per task"; tests make it small. */
   msPerMinute?: number
@@ -111,8 +118,14 @@ export class BatchRunner {
   private inTask = false
   private timedOut = false
   private loop: Promise<void> = Promise.resolve()
+  /** Set when a task ended because the model could not be used (a rental said no, was lost or is gone): the run stops with this. */
+  private halt: string | null = null
 
   constructor(private readonly deps: BatchDeps) {}
+
+  private choice(): ModelChoice {
+    return this.deps.model?.() ?? { ok: true, model: this.deps.modelName(), rental: false }
+  }
 
   private now = (): number => (this.deps.now ?? Date.now)()
 
@@ -155,14 +168,22 @@ export class BatchRunner {
     if (e.type === 'task-end') this.waiter?.(e.task)
   }
 
-  async start(projectPath: string, label: string, options: BatchOptions, record: boolean): Promise<BatchState> {
+  /**
+   * `rentalOk`: the owner said yes to a rental's model (messages, files and tool results go to that
+   * computer). Left out by an older phone app, which can't ask: that is refused with its own sentence.
+   */
+  async start(projectPath: string, label: string, options: BatchOptions, record: boolean, rentalOk?: boolean): Promise<BatchState> {
     await this.deps.store.load()
     if (this.activeId) throw new Error('A batch run is already going.')
     const session = this.deps.session()
     if (!session || resolve(session.root).toLowerCase() !== resolve(projectPath).toLowerCase()) throw new Error('That project is not open.')
     if (session.isRunning) throw new Error('A task is already running. Wait for it to finish or press Stop.')
     const opts = cleanBatchOptions(options)
-    const overview = await this.deps.client.reOverview()
+    const chosen = this.choice()
+    if (!chosen.ok) throw new Error(chosen.reason)
+    if (chosen.rental && rentalOk !== true) throw new Error(rentalOk === undefined ? RENTAL_OLD_APP : RENTAL_NEEDS_YES)
+    // The practice counts (and "only unsolved") are those of the model the run uses.
+    const overview = await this.deps.client.reOverview(chosen.model)
     const tasks = overview.practice.tasks
     const items = planBatch(tasks, opts, new Set(tasks.filter((t) => t.solved > 0).map((t) => t.id)))
     if (!items.length) throw new Error('No tasks match.')
@@ -175,14 +196,16 @@ export class BatchRunner {
       createdAt: this.now(),
       status: 'running',
       projectPath: session.root,
-      modelName: this.deps.modelName(),
+      modelName: chosen.model,
       kitDir: overview.practice.kitDir,
       record,
       options: opts,
-      items
+      items,
+      ...(rentalOk === true ? { rentalOk: true } : {})
     }
     this.activeId = run.id
     this.stopping = null
+    this.halt = null
     void this.save(run)
     const state = this.changed()
     this.loop = this.runLoop(run.id)
@@ -221,7 +244,18 @@ export class BatchRunner {
     return this.patchRun((r) => ({ ...r, items: r.items.map((it, i) => (i === index ? { ...it, ...patch } : it)) }))
   }
 
+  /** Why the next task must not start: the model is gone, or became a rental's in a run that was not given the yes. */
+  private modelProblem(run: BatchRun): string | null {
+    const c = this.choice()
+    if (!c.ok) return c.reason
+    if (c.rental && !run.rentalOk) {
+      return `The model in use, ${c.model}, is now on a rented computer, and this run was not started with the yes for that. The run was stopped. Choose a model on this computer, or start a new run and say yes.`
+    }
+    return null
+  }
+
   private async runLoop(id: string): Promise<void> {
+    let stopNote: string | undefined
     try {
       for (;;) {
         if (this.stopping) break
@@ -229,7 +263,18 @@ export class BatchRunner {
         if (!run) break
         const index = run.items.findIndex((i) => i.status === 'pending')
         if (index < 0) break
+        // Checked before each task: the owner may have switched models in the meantime.
+        const problem = this.modelProblem(run)
+        if (problem) {
+          stopNote = problem
+          break
+        }
+        this.halt = null
         await this.runItem(index)
+        if (this.halt) {
+          stopNote = this.halt
+          break
+        }
       }
     } catch (e) {
       // Not expected (runItem catches its own failures); the run ends stopped, with what it has.
@@ -240,7 +285,7 @@ export class BatchRunner {
       this.patchRun((r) => {
         // A task cut off above has not been tried.
         const items = r.items.map((i): BatchItem => (i.status === 'running' ? { ...i, status: 'pending', startedAt: undefined } : i))
-        return { ...r, items, status: items.some((i) => i.status === 'pending') ? 'stopped' : 'done', finishedAt: this.now() }
+        return { ...r, items, status: items.some((i) => i.status === 'pending') ? 'stopped' : 'done', finishedAt: this.now(), ...(stopNote ? { stopNote } : {}) }
       })
       this.activeId = null
       this.stopping = null
@@ -275,7 +320,7 @@ export class BatchRunner {
     const ended = new Promise<TaskRecord>((resolveEnd) => (this.waiter = resolveEnd))
     let timer: NodeJS.Timeout | undefined
     try {
-      session.start(started.text, { shown: started.shown, re: started.info, batch: true })
+      session.start(started.text, { shown: started.shown, re: started.info, batch: true, rentalOk: run.rentalOk === true })
     } catch (e) {
       this.waiter = null
       return fail(errorText(e))
@@ -334,6 +379,8 @@ export class BatchRunner {
       this.patchItem(index, { status, ...common })
       return
     }
+    // A rental that refused, was lost or is gone fails every task after this one the same way: stop the run instead.
+    if (task.outcome === 'error' && session.modelRefusal) this.halt = session.modelRefusal
     this.patchItem(index, { status: 'error', ...common, error: lastProblem(session, task) })
   }
 }

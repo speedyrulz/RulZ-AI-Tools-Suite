@@ -167,8 +167,8 @@ export class InstanceManager {
    * Loads a model. A remote model is loaded on `host`; without one, an instance of it that already exists is
    * reloaded on its own host, and when there is none the call fails (this never starts or rents anything).
    */
-  load(modelId: string, config: LoadConfig | null, host?: RemoteHost): Promise<LoadedInstance> {
-    return this.queueLoad(modelId, config, false, host).then((r) => r.instance)
+  load(modelId: string, config: LoadConfig | null, host?: RemoteHost, refuse?: () => string | null): Promise<LoadedInstance> {
+    return this.queueLoad(modelId, config, false, host, undefined, refuse).then((r) => r.instance)
   }
 
   /**
@@ -203,7 +203,8 @@ export class InstanceManager {
     config: LoadConfig | null,
     reuseAny: boolean,
     host?: RemoteHost,
-    mode?: AppMode
+    mode?: AppMode,
+    refuse?: () => string | null
   ): Promise<{ instance: LoadedInstance; started: boolean }> {
     let target: RemoteHost | undefined
     try {
@@ -214,7 +215,7 @@ export class InstanceManager {
     const key = hostKey(target)
     const entry = { modelId, host: target }
     this.pending.push(entry)
-    const started = (this.loadQueues.get(key) ?? Promise.resolve()).then(() => this.startLoad(modelId, config, reuseAny, target, mode))
+    const started = (this.loadQueues.get(key) ?? Promise.resolve()).then(() => this.startLoad(modelId, config, reuseAny, target, mode, refuse))
     // The queue only waits for the start; a failed start must not block the next load.
     this.loadQueues.set(key, started.catch(() => undefined))
     const done = (): void => {
@@ -255,6 +256,11 @@ export class InstanceManager {
     }
   }
 
+  /** How many requests or chats use an instance right now (acquire without release); 0 when it is gone. */
+  usersOf(instanceId: string): number {
+    return this.running.get(instanceId)?.users ?? 0
+  }
+
   /** When a ready instance was last used; null while it is in use, loading or gone. */
   idleSince(instanceId: string): number | null {
     const run = this.running.get(instanceId)
@@ -275,7 +281,8 @@ export class InstanceManager {
     config: LoadConfig | null,
     reuseAny: boolean,
     host: RemoteHost | undefined,
-    mode?: AppMode
+    mode?: AppMode,
+    refuse?: () => string | null
   ): Promise<{ ready: Promise<LoadedInstance>; started: boolean }> {
     this.checkDisposed()
     const found = this.deps.getModel(modelId)
@@ -289,8 +296,13 @@ export class InstanceManager {
 
     const existing = [...this.running.values()].find((r) => r.info.modelId === modelId && hostKey(r.host) === key && r.info.status !== 'stopping')
     if (existing && (reuseAny || sameConfig(existing.info.config, cfg))) return { ready: existing.ready, started: false }
+    // Asked in the same step as the first unload, so nothing can start using a model in between; what has to go then goes
+    // at once, not one after another.
+    const why = refuse?.()
+    if (why) throw new Error(why)
+    if (refuse && this.deps.unloadPreviousOnLoad()) await this.unloadWhere((r) => hostKey(r.host) === key)
     // Quitting during any of these waits must not leave a llama-server running after the app is gone.
-    if (existing) await this.unload(existing.info.instanceId)
+    else if (existing) await this.unload(existing.info.instanceId)
     this.checkDisposed()
     // Only the previous models of the same host go: a rental's model never makes room on this PC, nor the reverse.
     if (this.deps.unloadPreviousOnLoad()) await this.unloadWhere((r) => hostKey(r.host) === key)
