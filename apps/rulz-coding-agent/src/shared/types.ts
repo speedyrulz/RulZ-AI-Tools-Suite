@@ -1,4 +1,5 @@
 // Types shared by the main process and the renderer.
+import type { PdfAttachment } from './pdf'
 
 export type Theme = 'dark' | 'light' | 'system'
 
@@ -37,6 +38,11 @@ export interface AppSettings {
    * Engineering page, where it is graded and exported for fine-tuning).
    */
   reRecording: boolean
+  /**
+   * The chosen model was on a rental (a rented computer) when it was chosen. Set by the main process
+   * only; it lets the app say so when that model is gone, instead of quietly using another one.
+   */
+  modelRental: boolean
 }
 
 /** How the model writes its answers. Missing = the recommended value for that model. */
@@ -70,6 +76,14 @@ export interface ModelInfo {
   maxContext?: number
   arch?: string
   quantization?: string
+  /** Set while the model is loaded on a rental (a rented computer): what is sent to it leaves this PC. */
+  rental?: ModelRental
+}
+
+/** A model loaded on a rented computer (from RulZ LLM Suite's `rental`, or a `vast/` path before 0.35). */
+export interface ModelRental {
+  label: string | null
+  reconnecting: boolean
 }
 
 export type ConnectionStatus =
@@ -166,6 +180,40 @@ export interface ModelLoadInfo {
   moeLayers?: number | null
   gpus: GpuInfo[]
   estimate?: LoadEstimate
+  /** Set when the answer is for one mode's load settings (RulZ LLM Suite 0.35). */
+  mode?: AgentMode
+  /** True when that mode has load settings of its own. */
+  modeOwn?: boolean
+  /** Settings were saved, but the model could not be reloaded now; this says why. */
+  reloadBlocked?: string
+}
+
+// ---------- Modes (RulZ LLM Suite 0.35) ----------
+
+/** The mode a task runs in: `re` for reverse-engineering tasks (also practice and batch), `coding` for the rest. */
+export type AgentMode = 'coding' | 're'
+
+/** One mode's settings for a model, as LLM Suite reports them (GET /v1/models/{id}/modes). */
+export interface ModeSettings {
+  ownLoad: boolean
+  /** Request fields (temperature, top_k…) for /v1/chat/completions; null = the mode has no sampling of its own. */
+  sampling: Record<string, unknown> | null
+  /** The thinking fields of that sampling; null when sampling is null. */
+  thinking: Record<string, unknown> | null
+  /** Added to the agent's system prompt; '' = none. */
+  systemPrompt: string
+  /** Whether the running (or loading) settings are the ones this mode loads with; null = not loaded. */
+  matches: boolean | null
+}
+
+export interface ModelModes {
+  id: string
+  state: 'not-loaded' | 'loading' | 'ready'
+  /** Changes with every load; null when not loaded. */
+  instance: string | null
+  /** The all-modes API server sampling when its override is on: it replaces these fields in every request. */
+  apiOverride: Record<string, unknown> | null
+  modes: Record<AgentMode, ModeSettings>
 }
 
 /** What the model is doing right now, for the top bar. */
@@ -205,7 +253,16 @@ export interface ChangedFile {
 }
 
 export type TimelineItem =
-  | { id: string; kind: 'user'; text: string; taskId: string; /** Sent while the task ran; `cut` when it cut the model's reply short. */ note?: 'queued' | 'cut' }
+  | {
+      id: string
+      kind: 'user'
+      text: string
+      taskId: string
+      /** Sent while the task ran; `cut` when it cut the model's reply short. */
+      note?: 'queued' | 'cut'
+      /** PDFs attached to this request (older app versions and the older phone app ignore the field). */
+      attachments?: PdfAttachment[]
+    }
   | { id: string; kind: 'assistant'; text: string; taskId: string; /** The model's thinking before this reply, when it sent any. */ reasoning?: string }
   | {
       id: string
@@ -261,7 +318,7 @@ export interface TaskRecord {
   snapshot?: { kind: 'git'; commit: string } | { kind: 'copy'; dir: string }
   undone?: boolean
   /** What the model was asked when it differs from the shown request (a button's task), for running it again. */
-  request?: { text: string; howToRun?: boolean; share?: boolean }
+  request?: { text: string; howToRun?: boolean; share?: boolean; attachments?: string[] }
   /** Set for a reverse-engineering task (from the RE panel). */
   re?: ReTaskInfo
   steps: Step[]
@@ -490,6 +547,8 @@ export interface ReSessionSummary {
   responses: number
   toolRounds: number
   updatedAt: number
+  /** The models the session ran with (keys); sent by RulZ LLM Suite 0.35. */
+  models?: string[]
 }
 
 export interface RePracticeTaskStats {
@@ -501,13 +560,16 @@ export interface RePracticeTaskStats {
   prompt: string
   attempts: number
   solved: number
+  /** Tries graded as failed; sent by RulZ LLM Suite 0.35. */
+  failed?: number
 }
 
 /** RulZ LLM Suite's RE sessions, practice tasks and prompt templates (GET /v1/re/overview). */
 export interface ReOverview {
   recording: boolean
   sessions: ReSessionSummary[]
-  practice: { kitDir: string; error?: string; tasks: RePracticeTaskStats[] }
+  /** `model` is there when the counts are for that one model (RulZ LLM Suite 0.35 with `?model=`); without it they cover all models. */
+  practice: { kitDir: string; error?: string; model?: string; tasks: RePracticeTaskStats[] }
   /** {target} is replaced by the target path. */
   goals: { label: string; text: string }[]
   clonePieces: { label: string; text: string }[]
@@ -599,6 +661,10 @@ export interface BatchRun {
   record: boolean
   options: BatchOptions
   items: BatchItem[]
+  /** The run was started with the owner's yes to use a model on a rented computer. */
+  rentalOk?: boolean
+  /** Why the run stopped by itself, when it did (the model became a rental's, a rental failed…). */
+  stopNote?: string
 }
 
 export interface BatchState {

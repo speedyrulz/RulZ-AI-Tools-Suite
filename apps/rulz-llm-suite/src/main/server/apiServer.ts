@@ -4,8 +4,9 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http'
 import { isAbsolute } from 'node:path'
 import type { AdapterEntry, ApiReSession, ReOverview, RePracticeInfo, ApiRequestLog, ApiServerSettings, ApiServerStatus, GpuStat, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@shared/types'
 import { fileName } from '@shared/draft'
+import { modeLoad, modePromptExtra, reloadFor, type AppMode, type ModelModeDefaults } from '@shared/modes'
 import { API_RE_ID, RE_OUTCOMES, RE_SESSION_HEADER } from '@shared/re'
-import type { RecordedRound } from '../chat/service'
+import { samplingRequestFields, type RecordedRound } from '../chat/service'
 import type { InstanceManager } from '../engine/instances'
 import {
   adapterChoiceList,
@@ -22,6 +23,7 @@ import {
   publicModelId,
   remoteLoadView,
   resolveModel,
+  type RemoteLoadPatch,
   SAMPLING_PATHS,
   UsageReader
 } from './helpers'
@@ -68,6 +70,39 @@ const RE_PRACTICE_PREFIX = '/v1/re/practice/'
 /** POST /v1/re/kit saves the shared RE training kit folder. */
 const RE_KIT = '/v1/re/kit'
 const PRACTICE_ID = /^[\w-]{1,80}$/
+/** The modes other apps may ask about and load with (header X-RulZ-Mode, the mode routes). */
+const API_MODES = ['coding', 're'] as const
+type ApiMode = (typeof API_MODES)[number]
+const isApiMode = (m: unknown): m is ApiMode => typeof m === 'string' && (API_MODES as readonly string[]).includes(m)
+/** A request with X-RulZ-Mode leaves a lease on its model until this long after its end (see leasedUntil). */
+const LEASE_MS = 2 * 60_000
+/** Paths whose request loads a model that is not loaded with the settings of the X-RulZ-Mode header. */
+const MODE_LOAD_PATHS = new Set(['/v1/chat/completions', '/props'])
+
+/** The new routes under /v1/models/{id}/: modes, reload and modes/{mode}/load-config. */
+type ModeRoute =
+  | { kind: 'modes'; id: string }
+  | { kind: 'reload'; id: string }
+  | { kind: 'loadConfig'; id: string; mode: string }
+
+function parseModeRoute(method: string, path: string): ModeRoute | null {
+  const prefix = '/v1/models/'
+  if (!path.startsWith(prefix)) return null
+  const rest = path.slice(prefix.length)
+  if (method === 'GET' && rest.length > '/modes'.length && rest.endsWith('/modes')) return { kind: 'modes', id: rest.slice(0, -'/modes'.length) }
+  if (method === 'POST' && rest.length > '/reload'.length && rest.endsWith('/reload')) return { kind: 'reload', id: rest.slice(0, -'/reload'.length) }
+  if (method === 'GET' || method === 'POST') {
+    const m = /^(.+)\/modes\/([^/]+)\/load-config$/.exec(rest)
+    if (m) return { kind: 'loadConfig', id: m[1], mode: m[2] }
+  }
+  return null
+}
+
+/** What asking for a mode reload came to. 'matches' also covers a model that is not loaded: nothing happens then. */
+export type ModeReloadResult = { status: 'not-loaded' } | { status: 'matches' } | { status: 'started' } | { status: 'blocked'; why: string }
+
+/** A response header value that Node accepts: plain ASCII as it is, anything else percent-encoded. */
+const headerSafe = (v: string): string => (/^[\x20-\x7e]*$/.test(v) ? v : encodeURIComponent(v))
 
 export interface ApiServerDeps {
   instances: InstanceManager
@@ -82,13 +117,32 @@ export interface ApiServerDeps {
   gpus: () => GpuStat[]
   onStatus: (s: ApiServerStatus) => void
   onRequest: (entry: ApiRequestLog) => void
+  /** Clock for leases; tests. */
+  now?: () => number
+  /**
+   * Per-mode settings and what a reload needs (docs/app-modes-design.md). Without it the mode routes answer 404 and the
+   * X-RulZ-Mode header only leaves a lease.
+   */
+  modes?: {
+    /** One model's settings per mode. */
+    get: (modelId: string) => ModelModeDefaults
+    /** Saves or removes (null) one mode's load settings only; its sampling and prompt stay. */
+    setLoad: (modelId: string, mode: AppMode, load: LoadConfig | null | ((current: LoadConfig) => LoadConfig)) => Promise<void>
+    /** Tells the window the mode settings changed. */
+    changed?: () => void
+    /** Why the instance cannot be reloaded right now, or null. `holding`: the gate's holder that asks, for which the gate is no reason. */
+    reloadBlock?: (instanceId: string, holding?: string) => string | null
+    /** Takes the model gate; the release function, or the sentence saying who holds it. */
+    takeGate?: (holder: string) => (() => void) | string
+  }
   /** RE sessions other apps run through the server (ids as the app sent them). */
   re?: {
     enabled: () => boolean
     record: (id: string, round: RecordedRound) => void
     session: (id: string) => Promise<ApiReSession | null>
     update: (id: string, patch: Partial<ApiReSession>) => Promise<ApiReSession>
-    overview: () => Promise<ReOverview>
+    /** `model`: count practice for that model only (a library id, or the text the client sent). */
+    overview: (model?: string) => Promise<ReOverview>
     preparePractice: (taskId: string) => Promise<{ target: string; prompt: string; family: string; tier: string }>
     gradePractice: (taskId: string, target: string, text: string) => Promise<{ answer: string | null; passed: boolean; expected: string }>
     /** Saves the kit folder and returns that kit's practice list (error set when the kit has no tasks). */
@@ -109,6 +163,8 @@ export class ApiServer {
   private jit = new Map<string, number>()
   private idleTimer: NodeJS.Timeout | null = null
   private loading = new Map<string, Promise<LoadedInstance>>()
+  /** Model id → until when a request with X-RulZ-Mode keeps its model leased. */
+  private leases = new Map<string, number>()
 
   constructor(private readonly deps: ApiServerDeps) {}
 
@@ -249,6 +305,15 @@ export class ApiServer {
       return fail(403, 'Reverse-engineering calls cannot come from a web page.', 'permission_error')
     }
 
+    // The mode routes carry system prompts and change load settings: only other apps may call them, never a web page
+    // (CORS may be on), and a POST must be JSON, which a plain form cannot send.
+    const modeRoute = this.deps.modes ? parseModeRoute(method, path) : null
+    // A page that points its own name at this computer (DNS rebinding) sends no Origin with a GET; its Host gives it away.
+    if (modeRoute && (req.headers.origin !== undefined || !ownHost(req.headers.host))) return fail(403, 'Mode calls cannot come from a web page.', 'permission_error')
+    if (modeRoute && method === 'POST' && !/^application\/json\b/i.test(String(req.headers['content-type'] ?? ''))) {
+      return fail(415, 'Send the request as application/json.', 'invalid_request_error')
+    }
+
     // Watched from the start, so a client that leaves while its model loads is noticed too.
     let clientGone = false
     let onClientGone: (() => void) | null = null
@@ -268,6 +333,65 @@ export class ApiServer {
         res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(this.listModels()))
         return finish(200)
       }
+      if (modeRoute) {
+        const modes = this.deps.modes!
+        const rawMode = modeRoute.kind === 'loadConfig' ? decodeURIComponent(modeRoute.mode) : null
+        if (rawMode !== null && !isApiMode(rawMode)) return fail(404, 'Unknown mode: only coding and re are available.', 'not_found_error')
+        const model = resolveModel(this.deps.getModels(), decodeURIComponent(modeRoute.id))
+        if (!model || (model.remote && !this.deps.instances.readyFor(model.id))) return fail(404, 'Model not found.', 'not_found_error')
+        if (modeRoute.kind === 'modes') {
+          res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(this.modesBody(model)))
+          return finish(200)
+        }
+        if (modeRoute.kind === 'reload') {
+          const json = await jsonBody()
+          if (!json) return
+          if (!isApiMode(json.mode)) return fail(400, 'mode must be "coding" or "re".', 'invalid_request_error')
+          if (model.remote) return fail(409, remoteRefusal(model, 'reload it'), 'invalid_request_error')
+          const r = this.requestModeReload(model, json.mode)
+          if (r.status === 'blocked') return fail(409, r.why, 'invalid_request_error')
+          res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(this.modesBody(model, r.status === 'started')))
+          return finish(200)
+        }
+        // GET or POST /v1/models/{id}/modes/{mode}/load-config
+        const mode = rawMode as ApiMode
+        // Changing the settings could reload the model, and the API never loads a rental's model.
+        if (model.remote && method === 'POST') return fail(409, remoteRefusal(model, 'change its load settings'), 'invalid_request_error')
+        let preview: LoadConfig | undefined
+        let blocked: string | undefined
+        if (method === 'POST') {
+          const json = await jsonBody()
+          if (!json) return
+          const base = this.deps.getLoadDefaults(model.id).config
+          let write: LoadConfig | null | ((current: LoadConfig) => LoadConfig) = null
+          if (json.config === null) {
+            // {"config": null} removes the mode's own load settings.
+            if (json.dry_run === true) preview = base
+          } else {
+            const rawConfig = json.adapters !== undefined ? { ...((json.config as object | undefined) ?? {}), adapters: json.adapters } : (json.config ?? {})
+            if (rawConfig && typeof rawConfig === 'object' && (rawConfig as { sampling?: unknown }).sampling !== undefined) {
+              return fail(400, 'Invalid load setting sampling: the API server sampling belongs to all modes, set it on /load-config', 'invalid_request_error')
+            }
+            const checked = this.checkLoadPatch(rawConfig, model)
+            if (!checked.ok) return fail(400, checked.error, 'invalid_request_error')
+            // Merged when its turn to be saved comes, so a change saved just before is not undone.
+            write = (current) => applyRemoteLoadPatch(current, checked.patch)
+            if (json.dry_run === true) preview = write(modeLoad(base, modes.get(model.id), mode))
+          }
+          if (json.dry_run !== true) {
+            await modes.setLoad(model.id, mode, write)
+            modes.changed?.()
+            // A reload is only started when asked for; one that is refused leaves the saved settings in place.
+            if (json.reload === true) {
+              const r = this.requestModeReload(model, mode)
+              if (r.status === 'blocked') blocked = r.why
+            }
+          }
+        }
+        const entry = this.loadConfigEntry(model, preview, mode) as Record<string, unknown>
+        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(blocked ? { ...entry, reload_blocked: blocked } : entry))
+        return finish(200)
+      }
       if (path.startsWith('/v1/models/') && path.endsWith(LOAD_CONFIG_SUFFIX) && (method === 'GET' || method === 'POST')) {
         const model = resolveModel(this.deps.getModels(), decodeURIComponent(path.slice('/v1/models/'.length, -LOAD_CONFIG_SUFFIX.length)))
         if (!model || (model.remote && !this.deps.instances.readyFor(model.id))) return fail(404, 'Model not found.', 'not_found_error')
@@ -279,20 +403,9 @@ export class ApiServer {
           if (!json) return
           // `adapters` may sit beside `config` as well as in it.
           const raw = json.adapters !== undefined ? { ...((json.config as object | undefined) ?? {}), adapters: json.adapters } : (json.config ?? {})
-          const parsed = parseRemoteLoadPatch(raw)
-          if (!parsed.ok) return fail(400, `Invalid load setting ${parsed.error}`, 'invalid_request_error')
-          const patch = { ...parsed.patch }
-          if (patch.draftFile !== undefined) {
-            const draftFile = draftFileFromRemote(patch.draftFile, model, this.deps.getModels())
-            if (draftFile === undefined) return fail(400, 'Invalid load setting draftFile: not one of draft_choices', 'invalid_request_error')
-            patch.draftFile = draftFile
-          }
-          if (patch.adapters !== undefined) {
-            const checked = adaptersFromRemote(patch.adapters, model, this.deps.getAdapters?.() ?? [])
-            if (!checked.ok) return fail(400, checked.error, 'invalid_request_error')
-            patch.adapters = checked.adapters
-          }
-          const merged = applyRemoteLoadPatch(this.deps.getLoadDefaults(model.id).config, patch)
+          const checked = this.checkLoadPatch(raw, model)
+          if (!checked.ok) return fail(400, checked.error, 'invalid_request_error')
+          const merged = applyRemoteLoadPatch(this.deps.getLoadDefaults(model.id).config, checked.patch)
           // dry_run only estimates memory for the changed settings, so a form can show it while editing.
           if (json.dry_run === true) preview = merged
           else {
@@ -313,7 +426,9 @@ export class ApiServer {
       }
       if (path === RE_OVERVIEW && method === 'GET') {
         if (!this.deps.re) return fail(404, `Unknown endpoint: ${method} ${path}`, 'not_found_error')
-        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(await this.deps.re.overview()))
+        // ?model={id}: the practice counts are that model's only (see buildOverview).
+        const model = url.searchParams.get('model')?.trim().slice(0, 1024)
+        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(await this.deps.re.overview(model || undefined)))
         return finish(200)
       }
       if (path === RE_KIT && method === 'POST') {
@@ -429,13 +544,19 @@ export class ApiServer {
       if (picked.fallback) entry.requestedModel = requestedModel
       entry.stream = stream
 
+      // X-RulZ-Mode: a model that is not loaded is loaded with that mode's settings; a loaded one is used as it is.
+      const modeHeader = headerValue(req, 'x-rulz-mode')
+      const requestMode = isApiMode(modeHeader) ? modeHeader : undefined
+      // Sent more than once, the values arrive as one list: a single deny in it counts.
+      const denyRental = (headerValue(req, 'x-rulz-rental') ?? '').toLowerCase().split(',').some((v) => v.trim() === 'deny')
+
       let inst = this.deps.instances.readyFor(model.id)
       if (!inst && model.remote) return fail(409, remoteRefusal(model, 'load it'), 'invalid_request_error')
       if (!inst) {
         entry.phase = 'loading'
         this.record(entry)
         try {
-          inst = await this.ensureLoaded(model.id)
+          inst = await this.ensureLoaded(model.id, requestMode && MODE_LOAD_PATHS.has(path) ? requestMode : undefined)
         } catch (err) {
           if (clientGone) return
           return fail(503, `Could not load ${model.name}: ${(err as Error).message}`, 'server_error')
@@ -445,6 +566,13 @@ export class ApiServer {
         entry.phase = 'running'
       }
       if (clientGone) return
+      // Checked on the instance that answers, right before the request goes to it: the one a load just made, or one that
+      // replaced the one found above, can be a rental's too (the fallback for unknown names may pick a rental's model).
+      const answering = inst.instanceId
+      inst = this.deps.instances.list().find((i) => i.instanceId === answering) ?? inst
+      if (denyRental && inst.host) {
+        return fail(409, `${model.name} runs on the rental ${inst.host.label}, and this request says it must not use a rental.`, 'invalid_request_error')
+      }
 
       if (json && inst.config.sampling.override && SAMPLING_PATHS.has(path)) {
         json = overrideSampling(json, inst.config.sampling)
@@ -475,11 +603,14 @@ export class ApiServer {
       // Held for the whole request, however long the stream runs, so idle-unload can't stop the model under it.
       const release = this.deps.instances.acquire(inst.instanceId, 'api', 'api request')
       if (this.jit.has(inst.instanceId)) this.jit.set(inst.instanceId, Date.now())
+      // Another app's task is between two requests most of the time: the lease keeps its model from being reloaded then.
+      if (requestMode) this.lease(inst.modelId)
       this.emit()
       try {
-        await this.proxy(req, res, inst, path + url.search, body, entry, finish, (abort) => (onClientGone = abort), capture)
+        await this.proxy(req, res, inst, path + url.search, body, entry, finish, (abort) => (onClientGone = abort), capture, entry.model ?? inst.modelName)
       } finally {
         release()
+        if (requestMode) this.lease(inst.modelId)
         this.touch(inst.instanceId)
       }
     } catch (err) {
@@ -504,7 +635,9 @@ export class ApiServer {
     /** Registers what to do if the client disconnects mid-request. */
     onClientGone: (abort: () => void) => void,
     /** Receives the reply of a successful chat completion (RE recording). */
-    capture?: (reply: RecordedRound['response']) => void
+    capture?: (reply: RecordedRound['response']) => void,
+    /** The public id of the model that answers, sent back as X-RulZ-Model. */
+    publicId?: string
   ): Promise<void> {
     return new Promise((resolve) => {
       const headers: Record<string, string> = { host: `127.0.0.1:${inst.port}` }
@@ -520,6 +653,9 @@ export class ApiServer {
           for (const [k, v] of Object.entries(ures.headers)) {
             if (v !== undefined && !['connection', 'keep-alive', 'transfer-encoding', 'access-control-allow-origin'].includes(k)) out[k] = v
           }
+          // Which model answered, and whether that is a rented computer (the caller may not want its text to go there).
+          if (publicId) out['x-rulz-model'] = headerSafe(publicId)
+          if (inst.host) out['x-rulz-rental'] = '1'
           res.writeHead(ures.statusCode ?? 502, out)
           // What the model server sent decides how usage is read: an error to a streamed request is plain JSON.
           const sse = /text\/event-stream/i.test(String(ures.headers['content-type'] ?? ''))
@@ -583,11 +719,11 @@ export class ApiServer {
    * used as it is, whatever its settings, and stays the user's: only a load started here is
    * unloaded again when idle.
    */
-  private ensureLoaded(modelId: string): Promise<LoadedInstance> {
+  private ensureLoaded(modelId: string, mode?: AppMode): Promise<LoadedInstance> {
     let p = this.loading.get(modelId)
     if (!p) {
       p = this.deps.instances
-        .ensure(modelId)
+        .ensure(modelId, mode)
         .then(({ instance, started }) => {
           if (started) {
             this.jit.set(instance.instanceId, Date.now())
@@ -618,6 +754,67 @@ export class ApiServer {
       .finally(() => this.loading.delete(modelId))
     p.catch(() => undefined)
     this.loading.set(modelId, p)
+  }
+
+  /** Leaves (or extends) the lease of a model: until LEASE_MS after now. */
+  private lease(modelId: string): void {
+    this.leases.set(modelId, (this.deps.now?.() ?? Date.now()) + LEASE_MS)
+  }
+
+  /** Until when a model is leased by a request that named a mode (see LEASE_MS); null when it is not. */
+  leasedUntil(modelId: string): number | null {
+    const until = this.leases.get(modelId)
+    if (until === undefined) return null
+    if (until <= (this.deps.now?.() ?? Date.now())) {
+      this.leases.delete(modelId)
+      return null
+    }
+    return until
+  }
+
+  /**
+   * Loads a loaded model again with the settings a mode has for it, when it runs with others (the reload bar's rule:
+   * reloadFor). Refused while it loads, while something uses it or the app is busy (reloadBlock), and for a rental's
+   * model. The model gate is held until the load has ended, and a model this server loaded stays one it may unload when
+   * idle. `also` is a caller's own reason to refuse (the phone looks at leases), asked after the app's.
+   */
+  requestModeReload(model: ModelEntry, mode: AppMode, also?: () => string | null): ModeReloadResult {
+    const modes = this.deps.modes
+    const all = this.deps.instances.list().filter((i) => i.modelId === model.id && i.status !== 'stopping')
+    if (!modes || !all.length) return { status: 'not-loaded' }
+    if (model.remote) return { status: 'blocked', why: remoteRefusal(model, 'reload it') }
+    const inst = all.find((i) => i.status === 'ready') ?? all[0]
+    if (inst.status === 'loading' || this.loading.has(model.id)) return { status: 'blocked', why: `${model.name} is still loading.` }
+    const wanted = reloadFor(inst.config, this.deps.getLoadDefaults(model.id).config, modes.get(model.id), mode)
+    if (!wanted) return { status: 'matches' }
+    const why = modes.reloadBlock?.(inst.instanceId) ?? also?.() ?? null
+    if (why) return { status: 'blocked', why }
+    const holder = `reload:${model.id}`
+    const gate = modes.takeGate?.(holder)
+    if (typeof gate === 'string') return { status: 'blocked', why: gate }
+    // The gate stays taken until the load has ended or failed.
+    const wasJit = this.jit.delete(inst.instanceId)
+    let p: Promise<LoadedInstance>
+    try {
+      // Asked again when the load's turn comes: a load queued before it can leave time for a request to start.
+      p = this.deps.instances.load(model.id, wanted, undefined, () => modes.reloadBlock?.(inst.instanceId, holder) ?? also?.() ?? null)
+    } catch (err) {
+      gate?.()
+      return { status: 'blocked', why: err instanceof Error ? err.message : String(err) }
+    }
+    p = p
+      .then((i) => {
+        if (wasJit) this.jit.set(i.instanceId, this.deps.now?.() ?? Date.now())
+        this.emit()
+        return i
+      })
+      .finally(() => {
+        gate?.()
+        this.loading.delete(model.id)
+      })
+    p.catch(() => undefined)
+    this.loading.set(model.id, p)
+    return { status: 'started' }
   }
 
   private touch(instanceId: string): void {
@@ -689,17 +886,68 @@ export class ApiServer {
       quantization: m.info?.quantization,
       max_context_length: m.info?.contextLength,
       state: inst ? 'loaded' : 'not-loaded',
-      loaded_context_length: inst?.contextLength ?? undefined
+      loaded_context_length: inst?.contextLength ?? undefined,
+      // Only while it is loaded on a rental: where its text goes.
+      ...(inst?.host ? { rental: { label: inst.host.label, reconnecting: !!inst.reconnecting } } : {})
     }
   }
 
-  private loadConfigEntry(m: ModelEntry, preview?: LoadConfig): unknown {
+  /** A client's load-config patch, checked: unlike saved settings, bad values are refused. Errors are the 400 message. */
+  private checkLoadPatch(raw: unknown, model: ModelEntry): { ok: true; patch: RemoteLoadPatch } | { ok: false; error: string } {
+    const parsed = parseRemoteLoadPatch(raw)
+    if (!parsed.ok) return { ok: false, error: `Invalid load setting ${parsed.error}` }
+    const patch = { ...parsed.patch }
+    if (patch.draftFile !== undefined) {
+      const draftFile = draftFileFromRemote(patch.draftFile, model, this.deps.getModels())
+      if (draftFile === undefined) return { ok: false, error: 'Invalid load setting draftFile: not one of draft_choices' }
+      patch.draftFile = draftFile
+    }
+    if (patch.adapters !== undefined) {
+      const checked = adaptersFromRemote(patch.adapters, model, this.deps.getAdapters?.() ?? [])
+      if (!checked.ok) return { ok: false, error: checked.error }
+      patch.adapters = checked.adapters
+    }
+    return { ok: true, patch }
+  }
+
+  /** The body of GET /v1/models/{id}/modes. `reloading`: a reload was just started, whose new instance does not exist yet. */
+  private modesBody(m: ModelEntry, reloading = false): unknown {
+    const all = this.deps.modes?.get(m.id) ?? {}
+    const base = this.deps.getLoadDefaults(m.id).config
+    const list = this.deps.instances.list().filter((i) => i.modelId === m.id && i.status !== 'stopping')
+    const ready = this.deps.instances.readyFor(m.id)
+    const inst = reloading ? undefined : (ready ?? list.find((i) => i.status === 'loading'))
+    const sampling = (inst?.config ?? base).sampling
+    const entryOf = (mode: ApiMode): unknown => {
+      const own = all[mode]
+      const fields = own?.sampling ? samplingRequestFields(own.sampling) : null
+      return {
+        own_load: !!own?.load,
+        sampling: fields?.sampling ?? null,
+        thinking: fields?.thinking ?? null,
+        system_prompt: modePromptExtra(all, mode),
+        matches: inst ? reloadFor(inst.config, base, all, mode) === null : null
+      }
+    }
+    return {
+      object: 'model.modes',
+      id: publicModelId(m, this.deps.getModels()),
+      state: reloading ? 'loading' : ready ? 'ready' : inst ? 'loading' : 'not-loaded',
+      instance: inst?.instanceId ?? null,
+      api_override: sampling.override ? overrideSampling({}, sampling) : null,
+      modes: Object.fromEntries(API_MODES.map((mode) => [mode, entryOf(mode)]))
+    }
+  }
+
+  private loadConfigEntry(m: ModelEntry, preview?: LoadConfig, mode?: ApiMode): unknown {
     const saved = this.deps.getLoadDefaults(m.id)
-    const config = preview ?? saved.config
+    const modes = mode ? this.deps.modes?.get(m.id) : undefined
+    const config = preview ?? (mode ? modeLoad(saved.config, modes, mode) : saved.config)
     const inst = this.deps.instances.list().find((i) => i.modelId === m.id && i.status !== 'stopping')
     return {
       id: publicModelId(m, this.deps.getModels()),
       object: 'model.load_config',
+      ...(mode ? { mode, mode_own: !!modes?.[mode]?.load } : {}),
       config: remoteLoadView(config, m),
       custom: saved.custom,
       dry_run: preview ? true : undefined,
@@ -734,6 +982,19 @@ export class ApiServer {
   private emit(): void {
     this.deps.onStatus(this.getStatus())
   }
+}
+
+/** A request header's value when it is a single string, trimmed. */
+function headerValue(req: IncomingMessage, name: string): string | undefined {
+  const v = req.headers[name]
+  return typeof v === 'string' ? v.trim() : undefined
+}
+
+/** A Host that means this computer or a local network name, not a name on the internet a web page could point here. */
+export function ownHost(host: string | undefined): boolean {
+  const name = (host ?? '').trim().toLowerCase().replace(/:\d+$/, '').replace(/\.$/, '')
+  if (!name || name.startsWith('[') || !name.includes('.')) return true
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(name) || /\.(local|localhost|lan|home|internal|ts\.net)$/.test(name)
 }
 
 /** Why the API server won't load, unload or change a model that runs on a rented vast.ai instance. */

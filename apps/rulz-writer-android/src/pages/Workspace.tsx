@@ -1,5 +1,6 @@
 import { ArrowLeft, BookMarked, ListTree, MessagesSquare, PenLine, ScanSearch, Settings as SettingsIcon, SquareStack } from 'lucide-react'
 import { useEffect } from 'react'
+import { ModeLine } from '../components/ModeLine'
 import { BibleTab } from '../components/BibleTab'
 import { CheckTab } from '../components/CheckTab'
 import { ConflictSheet, SaveBadge } from '../components/EditorParts'
@@ -112,6 +113,7 @@ export function Workspace() {
           <SettingsIcon size={20} />
         </IconButton>
       </TopBar>
+      <ModeLine mode="writing" modelId={state.project.modelId} />
       <div className="px-safe min-h-0 flex-1">
         {tab === 'write' && <WriteTab />}
         {tab === 'bible' && <BibleTab />}

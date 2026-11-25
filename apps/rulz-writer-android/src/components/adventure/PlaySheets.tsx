@@ -1,4 +1,5 @@
 import { childrenOf, newestLeaf, siblingsOf, type Adventure, type AdventureNode, type AdventureSetup } from '@shared/adventure'
+import type { PhoneModel } from '@shared/phone'
 import { Button, Sheet } from '../ui'
 import { SetupFields } from '../../pages/Adventures'
 
@@ -109,7 +110,7 @@ export function MapSheet({ open, adventure, path, onClose, onMove }: {
 export function SettingsSheet({ setup, setSetup, models, onClose, onSave }: {
   setup: AdventureSetup
   setSetup: (setup: AdventureSetup) => void
-  models: { id: string, name: string, loaded: boolean }[]
+  models: PhoneModel[]
   onClose: () => void
   onSave: () => void
 }) {

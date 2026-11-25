@@ -10,7 +10,8 @@ export const FALLBACK: Record<AppMode, string> = {
   chat: 'Uses the new-chat sampling in Settings.',
   re: 'Uses the built-in values for tool use.',
   adventure: "Uses the app's built-in sampling.",
-  writing: 'Uses the fiction sampling new projects start with.'
+  writing: 'Uses the fiction sampling new projects start with.',
+  coding: "Uses RulZ Coding Agent's own recommended values. Its own settings win where it has them."
 }
 
 const LEFTOVER_LABELS: Record<(typeof SHARED_SAMPLING_KEYS)[number], string> = {
@@ -64,13 +65,15 @@ export function OwnSampling({
 }) {
   const [varietyOpen, setVarietyOpen] = useState(false)
   const honoursLimits = mode === 'chat' || mode === 're'
+  // Coding takes the thinking fields, but the Coding Agent keeps its own reply length and seed.
+  const honoursThinking = honoursLimits || mode === 'coding'
   const editSampling = <K extends keyof SamplingParams>(key: K, value: SamplingParams[K]): void => {
     if (sampling) onChange({ on, sampling: { ...sampling, [key]: value } })
   }
 
   return (
     <section className="space-y-3" aria-label="Own sampling">
-      <Field inline label="Own sampling" hint={`Only for ${MODE_LABELS[mode]}`}>
+      <Field inline label="Own sampling" hint={mode === 'coding' ? "What RulZ Coding Agent's normal tasks use; its own values win there" : `Only for ${MODE_LABELS[mode]}`}>
         <Switch
           checked={on}
           onCheckedChange={(next) => onChange({ on: next, sampling: next ? (sampling ?? (appSampling ? structuredClone(adoptSampling(mode, appSampling, {})) : null)) : sampling })}
@@ -90,7 +93,7 @@ export function OwnSampling({
             Repetition and variety
           </button>
           {varietyOpen && <VarietyFields sampling={sampling} onChange={editSampling} />}
-          {honoursLimits && <ThinkingFields sampling={sampling} onChange={editSampling} />}
+          {honoursThinking && <ThinkingFields sampling={sampling} onChange={editSampling} />}
         </div>
       ) : (
         <>

@@ -56,6 +56,11 @@ choose a path or type an action, and use the map to return to earlier passages. 
   end or remove facts by hand.
 - **Check**: the consistency check of the scene; tap **Show in the text** to select the passage, or dismiss a finding.
 - **Interview**: talk to a character; **Add to voice notes** adds a line to the character's Voice section.
+- **The model's settings** (0.3.0, RulZ LLM Suite 0.35.0): a line under the title names the model that writes and which
+  of its Writing (or Adventure) settings apply. When it runs with other load settings, **Reload** loads it again with
+  them; **Keep as is** hides the bar. Nothing reloads by itself, and the settings are changed on the computer.
+- **Models on a rented computer** (vast.ai) are marked **Rental**; your text is sent there when you choose one. They are
+  loaded on the computer only.
 - **Settings**: the model of the open project; notifications when a job finishes while the app is in the background,
   **Stay connected in the background** (Android shows a small ongoing notification for it); this phone's look and name;
   switch or forget computers.

@@ -681,7 +681,7 @@ describe('phone handlers', () => {
     const t = setup()
     const runs = new WritingRuns({ store: t.store, chat: t.chat, models: t.models, emit: events.emit, newId: () => 'j1', holds: (o, folder) => o === 'phone:1' && folder === FOLDER })
     const h = writingHandlers(runs)
-    expect(Object.keys(h).sort()).toEqual(['writing:abort', 'writing:applyState', 'writing:dismiss', 'writing:job', 'writing:jobs', 'writing:models', 'writing:run'])
+    expect(Object.keys(h).sort()).toEqual(['writing:abort', 'writing:applyState', 'writing:dismiss', 'writing:job', 'writing:jobs', 'writing:mode', 'writing:models', 'writing:reloadMode', 'writing:run'])
     const job = (await h['writing:run']('phone:1', request())) as WritingJob
     expect(job.id).toBe('j1')
     await finished(runs, 'j1')

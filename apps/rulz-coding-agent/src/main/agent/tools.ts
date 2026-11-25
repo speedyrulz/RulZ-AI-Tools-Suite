@@ -154,7 +154,22 @@ export const TOOL_DEFS = [
   )
 ]
 
-export const TOOL_NAMES = new Set(TOOL_DEFS.map((t) => t.function.name))
+/** Reads a PDF in the project, or one the owner attached. Offered when PDF reading is set up, never in practice tasks. */
+export const PDF_TOOL = 'read_pdf'
+export const PDF_TOOL_DEF = tool(
+  PDF_TOOL,
+  'Read the text of a PDF (text only, no OCR). Pages come as "--- Page N ---"; long PDFs are read in parts, and the result says what to ask for next. ' +
+    'Use query to find which pages mention something.',
+  {
+    path: { type: 'string', description: 'PDF path inside the project, e.g. "docs/manual.pdf", or "attachment:<id>" for a PDF the owner attached (the ids are listed in your instructions and in the message).' },
+    pages: { type: 'string', description: 'Pages to read or search: "3", "2-5" or "1,4-6". Default: from page 1.' },
+    query: { type: 'string', description: 'Plain text to search for (not case-sensitive). Returns page numbers with short snippets instead of pages.' },
+    offset: { type: 'integer', description: 'For a very long page: the character of the first page to continue from, as the previous result says.' }
+  },
+  ['path']
+)
+
+export const TOOL_NAMES = new Set([...TOOL_DEFS.map((t) => t.function.name), PDF_TOOL])
 
 /**
  * Offered only when tool servers are set up in RulZ LLM Suite: the model finds and loads their
@@ -182,7 +197,7 @@ export const EXTRA_TOOL_DEFS = [
 
 export const EXTRA_TOOL_NAMES = new Set(EXTRA_TOOL_DEFS.map((t) => t.function.name))
 
-const INTEGER_ARGS = new Set(['depth', 'start_line', 'end_line', 'timeout_seconds', 'wait_seconds'])
+const INTEGER_ARGS = new Set(['depth', 'start_line', 'end_line', 'timeout_seconds', 'wait_seconds', 'offset'])
 
 /**
  * Parses tool-call arguments. Accepts strict JSON, then Python-style dicts; coerces numbers given
@@ -287,6 +302,10 @@ export function describeStep(name: string, args: Record<string, unknown>): strin
       return `Searching for "${String(args.query ?? '').slice(0, 40)}"`
     case 'read_file':
       return `Reading ${base(args.path)}`
+    case 'read_pdf': {
+      const what = typeof args.path === 'string' && args.path.startsWith('attachment:') ? 'an attached PDF' : base(args.path)
+      return typeof args.query === 'string' && args.query.trim() ? `Searching ${what} for "${args.query.trim().slice(0, 40)}"` : `Reading ${what}`
+    }
     case 'write_file':
       return `Writing ${base(args.path)}`
     case 'edit_file':

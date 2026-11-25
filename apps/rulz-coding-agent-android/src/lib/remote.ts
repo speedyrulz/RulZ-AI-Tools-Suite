@@ -102,6 +102,11 @@ export class RemoteLink implements RulzApi {
     return () => set.delete(l)
   }
 
+  /** Only the computer's own window knows a dropped file's path; a phone file has none (it is uploaded instead). */
+  pathForFile(): string {
+    return ''
+  }
+
   onState(listener: (s: LinkState) => void): () => void {
     this.stateListeners.add(listener)
     return () => this.stateListeners.delete(listener)

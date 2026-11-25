@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { BrowserWindow, ipcMain } from 'electron'
 import type { EventChannel, InvokeChannel, IpcEvents, IpcInvoke } from '@shared/ipc'
 
@@ -16,11 +17,17 @@ export function handle<K extends InvokeChannel>(channel: K, fn: Handler<K>): voi
   ipcMain.handle(channel, (_event, ...args) => fn(...(args as Parameters<IpcInvoke[K]>)))
 }
 
-/** Calls a handler for the phone app. */
-export async function invokeHandler(channel: string, args: unknown[]): Promise<unknown> {
+/** Who is calling a handler: this computer's window, or one phone connection (its id). */
+const callers = new AsyncLocalStorage<string>()
+export const WINDOW_CALLER = 'window'
+/** The caller of the handler running now ('window' for this computer's window). Read it before the handler's first await. */
+export const currentCaller = (): string => callers.getStore() ?? WINDOW_CALLER
+
+/** Calls a handler for the phone app; `caller` is the phone connection's id. */
+export async function invokeHandler(channel: string, args: unknown[], caller?: string): Promise<unknown> {
   const fn = handlers.get(channel as InvokeChannel)
   if (!fn) throw new Error(`Unknown request "${channel}".`)
-  return fn(...args)
+  return caller === undefined ? fn(...args) : callers.run(caller, () => fn(...args))
 }
 
 /** Hears every broadcast (the phone app's connection uses it). */

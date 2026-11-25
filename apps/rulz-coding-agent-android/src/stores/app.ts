@@ -1,8 +1,10 @@
 import { create } from 'zustand'
 import { toast } from 'sonner'
 import type { AppInfo } from '@shared/ipc'
+import { chooseModel } from '@shared/modes'
 import type { AppSettings, ConnectionInfo, ModelActivity, Theme } from '@shared/types'
 import { errorMessage, invoke, on } from '../lib/api'
+import { chosenRentalGone } from '../lib/modeLogic'
 import { loadPref, savePref } from '../lib/native'
 
 interface AppState {
@@ -88,11 +90,15 @@ media.addEventListener('change', () => {
   if (useApp.getState().theme === 'system') applyTheme('system')
 })
 
-/** The model the agent will use: the chosen one, or the server's best guess (same rule as the computer). */
+/**
+ * The model the agent will use: the chosen one, or the server's best guess (never a rental's; same rule
+ * as the computer). A chosen model that was on a rental and is gone stays shown as chosen: the app says
+ * so and does not use another one (see `chosenRentalGone`).
+ */
 export function activeModelId(settings: AppSettings | null, connection: ConnectionInfo): string {
   const chosen = settings?.model ?? ''
-  if (chosen && (!connection.models.length || connection.models.some((m) => m.id === chosen))) return chosen
-  const coder = (id: string): boolean => /qwen3[-_.]?coder/i.test(id)
-  const m = connection.models
-  return (m.find((x) => x.loaded && coder(x.id)) ?? m.find((x) => x.loaded) ?? m.find((x) => coder(x.id)) ?? m[0])?.id ?? ''
+  const c = chooseModel(chosen, settings?.modelRental === true, connection.models)
+  return c.ok ? c.model : chosen
 }
+
+export { chosenRentalGone }

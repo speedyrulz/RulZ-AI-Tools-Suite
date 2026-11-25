@@ -94,7 +94,7 @@ export function startLoad(base: LoadConfig, modes: ModelModeDefaults | undefined
 
 /** The Select value of a scope and back. */
 export const scopeValue = (s: PickerScope): string => s ?? 'all'
-export const scopeFromValue = (v: string): PickerScope => (v === 'chat' || v === 're' || v === 'adventure' || v === 'writing' ? v : null)
+export const scopeFromValue = (v: string): PickerScope => (APP_MODES as string[]).includes(v) ? (v as AppMode) : null
 
 /** The load settings the picker shows for a scope: that mode's own, else the model's default ones. */
 export function scopeLoad(base: LoadConfig, modes: ModelModeDefaults | undefined, scope: PickerScope): LoadConfig {

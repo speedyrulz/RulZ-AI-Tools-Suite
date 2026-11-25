@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { toast } from 'sonner'
 import type { AppInfo } from '@shared/ipc'
+import { chooseModel } from '@shared/modes'
 import type { AppSettings, ConnectionInfo, ModelActivity } from '@shared/types'
 import { errorMessage, invoke, on } from '../lib/api'
 
@@ -78,11 +79,22 @@ media.addEventListener('change', () => {
   if (theme === 'system') applyTheme(theme)
 })
 
-/** The model the agent will use: the chosen one, or the server's best guess. */
+/**
+ * The model the agent will use: the chosen one, or the server's best guess (never a rental's). A
+ * chosen model that was on a rental and is gone stays shown as chosen: the app says so and does not
+ * use another one (see `chosenRentalGone`).
+ */
 export function activeModelId(settings: AppSettings | null, connection: ConnectionInfo): string {
   const chosen = settings?.model ?? ''
-  if (chosen && (!connection.models.length || connection.models.some((m) => m.id === chosen))) return chosen
-  const coder = (id: string): boolean => /qwen3[-_.]?coder/i.test(id)
-  const m = connection.models
-  return (m.find((x) => x.loaded && coder(x.id)) ?? m.find((x) => x.loaded) ?? m.find((x) => coder(x.id)) ?? m[0])?.id ?? ''
+  const c = chooseModel(chosen, settings?.modelRental ?? false, connection.models)
+  return c.ok ? c.model : chosen
+}
+
+/** The sentence for a chosen model that ran on a rental and is not in the list now, or that runs on one the owner has not chosen it for; else null. */
+export function chosenRentalGone(settings: AppSettings | null, connection: ConnectionInfo): string | null {
+  if (connection.status !== 'connected' || !settings?.model) return null
+  const c = chooseModel(settings.model, settings.modelRental, connection.models)
+  if (c.ok) return null
+  const listed = connection.models.find((m) => m.id === settings.model)
+  return listed ? (listed.rental ? c.reason : null) : settings.modelRental ? c.reason : null
 }

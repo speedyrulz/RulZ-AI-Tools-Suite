@@ -1,25 +1,30 @@
-import { ArrowLeft, ArrowUp, Binary, Brain, Check, ChevronDown, ChevronRight, Clock, Copy, CornerDownRight, FolderOpen, SlidersHorizontal, History, LoaderCircle, MessageSquarePlus, NotebookPen, Package, Pencil, Play, RotateCcw, Settings, Square, Trash2, Undo2, X } from 'lucide-react'
+import { ArrowLeft, ArrowUp, Binary, Brain, Check, ChevronDown, ChevronRight, Clock, Copy, CornerDownRight, FolderOpen, SlidersHorizontal, History, LoaderCircle, MessageSquarePlus, NotebookPen, Package, Paperclip, Pencil, Play, RotateCcw, Settings, Square, Trash2, Undo2, X } from 'lucide-react'
 import { toast } from 'sonner'
-import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { memo, useEffect, useLayoutEffect, useRef, useState, type DragEvent } from 'react'
 import { ApprovalDialog } from '../components/ApprovalDialog'
 import { ContextMeter } from '../components/ContextMeter'
 import { DraftMeter } from '../components/DraftMeter'
 import { HistoryDialog } from '../components/HistoryDialog'
 import { NotesDialog } from '../components/NotesDialog'
+import { PdfChip } from '../components/PdfChips'
 import { ReDialog, useReOverview } from '../components/ReDialog'
 import { LogoMark } from '../components/Logo'
 import { Markdown } from '../components/Markdown'
 import { ConnectionHelp } from '../components/NotConnected'
 import { RunPanel } from '../components/RunPanel'
 import { SidePanel } from '../components/SidePanel'
-import { modelLabel } from '../components/common'
+import { modelLabel, rentalText } from '../components/common'
+import { ReloadBar } from '../components/ReloadBar'
 import { Button, Dialog, DropdownMenu, IconButton, Kbd, Textarea, Tooltip } from '../components/ui'
-import { invoke } from '../lib/api'
+import { errorMessage, invoke } from '../lib/api'
 import { cn } from '../lib/format'
-import { activeModelId, useApp } from '../stores/app'
+import { activeModelId, chosenRentalGone, useApp } from '../stores/app'
+import { chipsOf, useAttachments } from '../stores/attachments'
 import { undoableTask, useWorkspace } from '../stores/workspace'
 import { ThemeToggle } from './Home'
 import { whyNotDelete, whyNotRedo } from '@shared/history'
+import { RENTAL_NOTE } from '@shared/modes'
+import { attachedLabel, MAX_PDFS_PER_MESSAGE } from '@shared/pdf'
 import type { TimelineItem } from '@shared/types'
 import { splitThink, thinkingOpen } from '@shared/think'
 
@@ -219,11 +224,18 @@ function ModelChip() {
   const model = connection.models.find((m) => m.id === id)
   const connected = connection.status === 'connected'
 
+  const gone = chosenRentalGone(settings, connection)
   let dot = <span className="size-2 shrink-0 rounded-full bg-faint/60" />
   let status = 'Loads when you start'
   if (!connected) {
     dot = <span className="size-2 shrink-0 rounded-full bg-danger" />
     status = 'Not connected'
+  } else if (gone) {
+    dot = <span className="size-2 shrink-0 rounded-full bg-danger" />
+    status = model ? 'Choose it again' : 'Not on a rental now'
+  } else if (model?.rental) {
+    dot = <span className="size-2 shrink-0 rounded-full bg-warn" />
+    status = model.rental.reconnecting ? 'Rental reconnecting…' : 'Ready on a rental'
   } else if (activity === 'loading') {
     dot = <LoaderCircle size={13} className="shrink-0 animate-spin text-accent" />
     status = 'Loading…'
@@ -239,6 +251,7 @@ function ModelChip() {
       trigger={
         <button
           aria-label="Change the AI model"
+          title={gone ?? (model?.rental ? RENTAL_NOTE : undefined)}
           className="ml-2 flex h-9 max-w-[340px] min-w-0 items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 text-left transition-colors hover:border-accent/60"
         >
           {dot}
@@ -250,7 +263,7 @@ function ModelChip() {
       items={[
         // Switching mid-task would change models between steps, so it waits for the task to end.
         ...sorted.map((m) => ({
-          label: `${modelLabel(m.id)}${m.loaded ? '  (ready)' : ''}`,
+          label: `${modelLabel(m.id)}${m.rental ? `  (${rentalText(m)})` : m.loaded ? '  (ready)' : ''}`,
           icon: <Check size={13} className={m.id === id ? 'text-accent' : 'invisible'} />,
           disabled: running,
           onSelect: () => void update({ model: m.id })
@@ -303,6 +316,13 @@ function Conversation() {
                     {item.note === 'cut' ? 'Note: stopped my reply to add this' : 'Note added while I was working'}
                   </span>
                 )}
+                {item.attachments?.length ? (
+                  <div className="flex max-w-[85%] flex-wrap justify-end gap-1.5">
+                    {item.attachments.map((a) => (
+                      <PdfChip key={a.id} name={a.name} pages={a.pages} />
+                    ))}
+                  </div>
+                ) : null}
                 <div className="max-w-[85%] rounded-2xl rounded-br-md bg-accent-soft px-4 py-2.5 text-[14px] whitespace-pre-wrap">{item.text}</div>
                 <MessageActions item={item} copyText={item.text} onEdit={() => setEditing(item.id)} />
               </div>
@@ -458,7 +478,9 @@ function MessageActions({ item, copyText, onEdit }: { item: TimelineItem; copyTe
 
 /** Edits the latest request in place; "Run again" undoes its file changes first, then runs the new text. */
 function EditRequest({ item, onClose }: { item: Extract<TimelineItem, { kind: 'user' }>; onClose: () => void }) {
-  const [text, setText] = useState(item.text)
+  const pdfCount = item.attachments?.length ?? 0
+  // A message of PDFs only shows a label as its text; editing starts from an empty box.
+  const [text, setText] = useState(pdfCount && item.text === attachedLabel(pdfCount) ? '' : item.text)
   const ref = useRef<HTMLTextAreaElement>(null)
   const redo = useWorkspace((s) => s.redo)
   const running = useWorkspace((s) => s.running)
@@ -471,7 +493,7 @@ function EditRequest({ item, onClose }: { item: Extract<TimelineItem, { kind: 'u
     el.setSelectionRange(el.value.length, el.value.length)
   }, [])
   const submit = (): void => {
-    if (!text.trim() || running) return
+    if ((!text.trim() && !pdfCount) || running) return
     onClose()
     void redo(item.taskId, text)
   }
@@ -496,7 +518,7 @@ function EditRequest({ item, onClose }: { item: Extract<TimelineItem, { kind: 'u
           <Button size="sm" onClick={onClose}>
             Cancel
           </Button>
-          <Button size="sm" variant="primary" disabled={!text.trim() || running} onClick={submit}>
+          <Button size="sm" variant="primary" disabled={(!text.trim() && !pdfCount) || running} onClick={submit}>
             <RotateCcw size={13} /> Run again
           </Button>
         </div>
@@ -540,7 +562,8 @@ function ThinkingBlock({ text, live }: { text: string; live: boolean }) {
 function EmptyState() {
   const project = useWorkspace((s) => s.project)!
   const connected = useApp((s) => s.connection.status === 'connected')
-  const re = useReOverview(connected)
+  const modelId = useApp((s) => activeModelId(s.settings, s.connection))
+  const re = useReOverview(connected, modelId)
   const [reOpen, setReOpen] = useState<null | 'start' | 'practice' | 'sessions'>(null)
   const done = re.data?.sessions.length ?? 0
   const solved = re.data?.sessions.filter((s) => s.outcome === 'solved').length ?? 0
@@ -651,7 +674,15 @@ function Composer() {
   const cancelNote = useWorkspace((s) => s.cancelNote)
   const interrupt = useWorkspace((s) => s.interrupt)
   const connected = useApp((s) => s.connection.status === 'connected')
+  const projectPath = useWorkspace((s) => s.project?.path)
+  const chips = useAttachments((s) => chipsOf(s, projectPath))
+  const attachFiles = useAttachments((s) => s.attachFiles)
+  const attachPaths = useAttachments((s) => s.attachPaths)
+  const removeChip = useAttachments((s) => s.remove)
+  const clearSent = useAttachments((s) => s.clearSent)
   const [text, setText] = useState('')
+  const [dragging, setDragging] = useState(false)
+  const dragDepth = useRef(0)
   const ref = useRef<HTMLTextAreaElement>(null)
   const answering = prompt?.kind === 'question'
   const questionId = answering ? prompt.id : undefined
@@ -661,7 +692,13 @@ function Composer() {
   const sending = useRef(false)
   /** While a task runs, what's typed is a note for it (unless it is answering my question). */
   const noting = running && !answering
-  const canSend = connected && !!text.trim()
+  /** PDFs go only with the message that starts a task, not with a note or an answer. */
+  const canAttach = connected && !!projectPath && !running && !answering
+  const ready = chips.filter((c) => c.id)
+  const reading = chips.some((c) => c.busy)
+  const starting = !noting && !answering
+  // The text may be empty when PDFs go along; a PDF still being read waits.
+  const canSend = connected && (!!text.trim() || (starting && ready.length > 0)) && !(starting && reading)
 
   useEffect(() => {
     const fill = (e: Event): void => {
@@ -687,20 +724,47 @@ function Composer() {
     const sent = text
     // The box is emptied only once it went through (a task can't start while another one runs).
     sending.current = true
+    const sentIds = starting ? ready.map((c) => c.id!) : []
     let ok = false
     try {
-      ok = noting ? await addNote(sent, now) : await send(sent, questionId)
+      ok = noting ? await addNote(sent, now) : await send(sent, questionId, sentIds)
     } finally {
       sending.current = false
     }
     if (ok) {
       setText((current) => (current === sent ? '' : current))
       draftFor.current = undefined
+      // The chips go only once the start went through; after a failed start they stay.
+      if (sentIds.length && projectPath) clearSent(projectPath, sentIds)
     }
+  }
+
+  const pickPdfs = async (): Promise<void> => {
+    if (!canAttach || !projectPath) return
+    try {
+      const paths = await invoke('dialog:pickPdfs', { title: 'Attach PDFs' })
+      if (paths.length) attachPaths(projectPath, paths)
+    } catch (e) {
+      toast.error(errorMessage(e))
+    }
+  }
+
+  const onDrop = (e: DragEvent): void => {
+    e.preventDefault()
+    dragDepth.current = 0
+    setDragging(false)
+    const files = [...e.dataTransfer.files]
+    if (!files.length) return
+    if (!canAttach || !projectPath) {
+      toast.error(running ? 'PDFs can be attached when you start a task, not while one is running.' : 'PDFs can’t be attached right now.')
+      return
+    }
+    attachFiles(projectPath, files)
   }
 
   return (
     <div className="mx-auto w-full max-w-3xl px-6 pt-3 pb-5">
+      <ReloadBar mode="coding" className="mb-2" />
       {running && notes.length > 0 && (
         <div className="mb-2 flex flex-col gap-1.5">
           {notes.map((n) => (
@@ -718,7 +782,34 @@ function Composer() {
           ))}
         </div>
       )}
-      <div className={cn('rounded-xl border bg-panel p-2 transition-colors focus-within:border-accent', answering ? 'border-accent/60' : 'border-border')}>
+      <div
+        className={cn(
+          'rounded-xl border bg-panel p-2 transition-colors focus-within:border-accent',
+          answering ? 'border-accent/60' : 'border-border',
+          dragging && 'border-accent ring-1 ring-accent/40'
+        )}
+        onDragEnter={(e) => {
+          if (!e.dataTransfer.types.includes('Files')) return
+          e.preventDefault()
+          dragDepth.current++
+          setDragging(true)
+        }}
+        onDragOver={(e) => {
+          if (e.dataTransfer.types.includes('Files')) e.preventDefault()
+        }}
+        onDragLeave={() => {
+          dragDepth.current = Math.max(0, dragDepth.current - 1)
+          if (!dragDepth.current) setDragging(false)
+        }}
+        onDrop={onDrop}
+      >
+        {chips.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 px-1 pt-0.5 pb-1.5" aria-label="Attached PDFs">
+            {chips.map((c) => (
+              <PdfChip key={c.key} name={c.name} pages={c.pages} busy={c.busy} onRemove={() => void removeChip(projectPath!, c.key)} />
+            ))}
+          </div>
+        )}
         <textarea
           ref={ref}
           value={text}
@@ -738,17 +829,22 @@ function Composer() {
           aria-label="What should I build or change?"
         />
         <div className="flex items-center justify-between gap-2 px-1">
-          <span className="text-[11px] text-faint">
-            {noting ? (
-              <>
-                <Kbd>Enter</Kbd> add note · <Kbd>Ctrl+Enter</Kbd> send now · <Kbd>Esc</Kbd> to stop
-              </>
-            ) : (
-              <>
-                <Kbd>Enter</Kbd> to send · <Kbd>Shift+Enter</Kbd> new line{running && <> · <Kbd>Esc</Kbd> to stop</>}
-              </>
-            )}
-          </span>
+          <div className="flex min-w-0 items-center gap-1">
+            <IconButton size="sm" label="Attach PDFs" disabled={!canAttach || chips.length >= MAX_PDFS_PER_MESSAGE} onClick={() => void pickPdfs()}>
+              <Paperclip size={16} />
+            </IconButton>
+            <span className="min-w-0 truncate text-[11px] text-faint">
+              {noting ? (
+                <>
+                  <Kbd>Enter</Kbd> add note · <Kbd>Ctrl+Enter</Kbd> send now · <Kbd>Esc</Kbd> to stop
+                </>
+              ) : (
+                <>
+                  <Kbd>Enter</Kbd> to send · <Kbd>Shift+Enter</Kbd> new line{running && <> · <Kbd>Esc</Kbd> to stop</>}
+                </>
+              )}
+            </span>
+          </div>
           <div className="flex items-center gap-3">
             <DraftMeter />
             <ContextMeter />

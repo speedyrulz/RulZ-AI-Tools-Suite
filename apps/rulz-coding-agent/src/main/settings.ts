@@ -41,7 +41,8 @@ const schema = z.object({
   remotePort: z.number().int().min(1024).max(65535).catch(D.remotePort),
   remoteToken: z.string().catch(D.remoteToken),
   keepThinkingOpen: z.boolean().catch(D.keepThinkingOpen),
-  reRecording: z.boolean().catch(D.reRecording)
+  reRecording: z.boolean().catch(D.reRecording),
+  modelRental: z.boolean().catch(D.modelRental)
 })
 
 export function parseSettings(raw: unknown): AppSettings {

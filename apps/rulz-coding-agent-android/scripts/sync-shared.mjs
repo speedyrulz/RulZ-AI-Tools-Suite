@@ -11,7 +11,7 @@ if (!existsSync(from)) {
 }
 const to = join(import.meta.dirname, '..', 'src', 'shared')
 mkdirSync(to, { recursive: true })
-for (const file of ['ipc.ts', 'types.ts', 'defaults.ts', 'diff.ts', 'runOutput.ts', 'split.ts', 'think.ts']) {
+for (const file of ['ipc.ts', 'types.ts', 'batch.ts', 'defaults.ts', 'modes.ts', 'pdf.ts', 'diff.ts', 'runOutput.ts', 'split.ts', 'think.ts']) {
   copyFileSync(join(from, file), join(to, file))
   console.log(`copied ${file}`)
 }

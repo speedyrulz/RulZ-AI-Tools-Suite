@@ -1,5 +1,6 @@
 // Talks to RulZ LLM Suite's local API server (OpenAI-compatible endpoints).
-import type { ConnectionInfo, LoadSettings, ModelInfo, ModelLoadInfo, ReKind, ReOutcome, ReOverview, WireMessage, WireToolCall } from '@shared/types'
+import { parseModelModes, pickDefaultModel as pickDefault, rentalOf } from '@shared/modes'
+import type { AgentMode, ConnectionInfo, LoadSettings, ModelInfo, ModelLoadInfo, ModelModes, ReKind, ReOutcome, ReOverview, WireMessage, WireToolCall } from '@shared/types'
 import { noDraftMsPerToken } from './draft'
 import { errorFromBody, type GenTimings, interpretChunk, SseParser, ToolCallAccumulator } from './sse'
 import { jsonifyToolCallArgs, templateStringifiesArgs, validToolCallArgs } from './toolArgs'
@@ -48,6 +49,7 @@ export function parseModels(json: unknown): { isRulz: boolean; models: ModelInfo
     quantization?: string
     max_context_length?: number
     loaded_context_length?: number
+    rental?: unknown
   }
   const raw = data as Raw[]
   const isRulz = raw.length === 0 ? false : raw.some((m) => m.owned_by === 'rulz' || (m.path !== undefined && m.state !== undefined))
@@ -59,7 +61,8 @@ export function parseModels(json: unknown): { isRulz: boolean; models: ModelInfo
       loadedContext: m.loaded_context_length,
       maxContext: m.max_context_length,
       arch: m.arch,
-      quantization: m.quantization
+      quantization: m.quantization,
+      ...(rentalOf(m) ? { rental: rentalOf(m) } : {})
     }))
   return { isRulz, models }
 }
@@ -102,17 +105,8 @@ export async function findServer(candidates: string[], apiKey: string): Promise<
   return { status: 'not-found', url: '', models: [] }
 }
 
-/** The model to use when none is chosen: a loaded coder model, then any loaded one, then a coder model. */
-export function pickDefaultModel(models: ModelInfo[]): string {
-  const coder = (m: ModelInfo): boolean => /qwen3[-_.]?coder/i.test(m.id)
-  return (
-    models.find((m) => m.loaded && coder(m)) ??
-    models.find((m) => m.loaded) ??
-    models.find(coder) ??
-    models.find((m) => /coder|code/i.test(m.id)) ??
-    models[0]
-  )?.id ?? ''
-}
+/** The model to use when none is chosen: a loaded coder model, then any loaded one, then a coder model. Never a rental's. */
+export const pickDefaultModel = pickDefault
 
 export interface ModelProps {
   chatTemplate?: string
@@ -190,11 +184,11 @@ export class RulzClient {
   }
 
   /** Chat template and context length. Asking for an unloaded model makes RulZ load it. */
-  async modelProps(model: string, signal?: AbortSignal): Promise<ModelProps> {
+  async modelProps(model: string, signal?: AbortSignal, extra: Record<string, string> = {}): Promise<ModelProps> {
     const cached = this.props.get(model)
     if (cached) return cached
     const { url, apiKey } = this.config()
-    const res = await fetch(`${url}/props?model=${encodeURIComponent(model)}`, { headers: headers(apiKey), signal })
+    const res = await fetch(`${url}/props?model=${encodeURIComponent(model)}`, { headers: { ...headers(apiKey), ...extra }, signal })
     if (!res.ok) throw new ServerError(errorFromBody(res.status, await res.text()), res.status)
     const j = (await res.json()) as { chat_template?: string; default_generation_settings?: { n_ctx?: number }; n_ctx?: number }
     const props = { chatTemplate: j.chat_template, nCtx: j.default_generation_settings?.n_ctx ?? j.n_ctx }
@@ -269,32 +263,69 @@ export class RulzClient {
     return { content, toolCalls: calls.result(), finishReason, usage, gen }
   }
 
-  /** The model's load settings in RulZ LLM Suite. */
-  async loadSettings(model: string): Promise<ModelLoadInfo> {
-    return this.loadConfigRequest(model, 'GET')
+  /** The model's load settings in RulZ LLM Suite; with `mode`, the ones that mode loads with (0.35). */
+  async loadSettings(model: string, mode?: AgentMode): Promise<ModelLoadInfo> {
+    return this.loadConfigRequest(model, 'GET', undefined, mode)
   }
 
   /** The memory estimate for changed load settings, without saving them. */
-  async previewLoadSettings(model: string, config: Partial<LoadSettings>): Promise<ModelLoadInfo> {
-    return this.loadConfigRequest(model, 'POST', { config, dry_run: true })
+  async previewLoadSettings(model: string, config: Partial<LoadSettings>, mode?: AgentMode): Promise<ModelLoadInfo> {
+    return this.loadConfigRequest(model, 'POST', { config, dry_run: true }, mode)
   }
 
-  /** Saves new load settings in RulZ LLM Suite; a loaded model restarts with them. */
-  async setLoadSettings(model: string, config: Partial<LoadSettings>): Promise<ModelLoadInfo> {
-    const info = await this.loadConfigRequest(model, 'POST', { config, reload: true })
+  /**
+   * Saves new load settings in RulZ LLM Suite; a loaded model restarts with them. With `mode` they are
+   * that mode's own settings, and `null` removes them (the mode then uses the settings of all modes).
+   * A reload LLM Suite refuses still saves the settings: the answer says why in `reloadBlocked`.
+   */
+  async setLoadSettings(model: string, config: Partial<LoadSettings> | null, mode?: AgentMode): Promise<ModelLoadInfo> {
+    if (config === null && !mode) throw new Error('Pick a mode to remove its own load settings.')
+    const info = await this.loadConfigRequest(model, 'POST', { config, reload: true }, mode)
     this.props.delete(model)
     return info
   }
 
-  private async loadConfigRequest(model: string, method: 'GET' | 'POST', body?: unknown): Promise<ModelLoadInfo> {
+  /** The settings of a model for each mode (GET /v1/models/{id}/modes); null from a RulZ LLM Suite older than 0.35. */
+  async modelModes(model: string, signal?: AbortSignal, extra: Record<string, string> = {}): Promise<ModelModes | null> {
     const { url, apiKey } = this.config()
-    const res = await fetch(`${url}/v1/models/${encodeURIComponent(model)}/load-config`, {
+    const res = await fetch(`${url}/v1/models/${encodeURIComponent(model)}/modes`, {
+      headers: { ...headers(apiKey), ...extra },
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000)
+    })
+    const text = await res.text()
+    if (res.status === 404) return null
+    if (!res.ok) throw new ServerError(errorFromBody(res.status, text), res.status)
+    return parseModelModes(JSON.parse(text))
+  }
+
+  /** Loads the model again with a mode's load settings (POST /v1/models/{id}/reload). Refusals come back as ServerError with LLM Suite's sentence. */
+  async reloadMode(model: string, mode: AgentMode): Promise<ModelModes> {
+    const { url, apiKey } = this.config()
+    const res = await fetch(`${url}/v1/models/${encodeURIComponent(model)}/reload`, {
+      method: 'POST',
+      headers: headers(apiKey, true),
+      body: JSON.stringify({ mode }),
+      signal: AbortSignal.timeout(30_000)
+    })
+    const text = await res.text()
+    if (res.status === 404) throw new ServerError('This version of RulZ LLM Suite cannot reload a model from here. Update RulZ LLM Suite, or reload it on its Models page.', 404)
+    if (!res.ok) throw new ServerError(errorFromBody(res.status, text), res.status)
+    this.props.delete(model)
+    return parseModelModes(JSON.parse(text))
+  }
+
+  private async loadConfigRequest(model: string, method: 'GET' | 'POST', body?: unknown, mode?: AgentMode): Promise<ModelLoadInfo> {
+    const { url, apiKey } = this.config()
+    const res = await fetch(`${url}/v1/models/${encodeURIComponent(model)}${mode ? `/modes/${encodeURIComponent(mode)}` : ''}/load-config`, {
       method,
       headers: headers(apiKey, !!body),
       body: body ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(10_000)
     })
     const text = await res.text()
+    if (res.status === 404 && mode && /Unknown endpoint/i.test(text)) {
+      throw new ServerError('This version of RulZ LLM Suite has no load settings per mode. Update RulZ LLM Suite, or change them on its Models page.', 404)
+    }
     if (res.status === 404 && /Unknown endpoint/i.test(text)) {
       throw new ServerError('This version of RulZ LLM Suite cannot change load settings from here. Update RulZ LLM Suite, or change them on its Models page.', 404)
     }
@@ -335,9 +366,9 @@ export class RulzClient {
     return (await res.json()) as T
   }
 
-  /** RE sessions, practice tasks and prompt templates from RulZ LLM Suite. */
-  reOverview(): Promise<ReOverview> {
-    return this.reJson<ReOverview>('/v1/re/overview')
+  /** RE sessions, practice tasks and prompt templates from RulZ LLM Suite. With `model` the practice counts are for that model (0.35). */
+  reOverview(model?: string): Promise<ReOverview> {
+    return this.reJson<ReOverview>(`/v1/re/overview${model ? `?model=${encodeURIComponent(model)}` : ''}`)
   }
 
   /** Changes RulZ LLM Suite's practice kit folder (one folder for both apps) and returns the kit's tasks. */
@@ -366,11 +397,11 @@ export class RulzClient {
   }
 
   /** Non-streamed completion without tools (used for summaries). */
-  async complete(model: string, messages: WireMessage[], maxTokens: number, signal?: AbortSignal): Promise<string> {
+  async complete(model: string, messages: WireMessage[], maxTokens: number, signal?: AbortSignal, extra: Record<string, string> = {}): Promise<string> {
     const { url, apiKey } = this.config()
     const res = await fetch(`${url}/v1/chat/completions`, {
       method: 'POST',
-      headers: headers(apiKey, true),
+      headers: { ...headers(apiKey, true), ...extra },
       body: JSON.stringify({ model, messages, max_tokens: maxTokens, stream: false, temperature: 0.3 }),
       signal
     })
@@ -394,6 +425,9 @@ export function parseLoadInfo(json: unknown): ModelLoadInfo {
     gpus?: ModelLoadInfo['gpus']
     moe_layers?: number | null
     estimate?: ModelLoadInfo['estimate'] | null
+    mode?: unknown
+    mode_own?: unknown
+    reload_blocked?: unknown
   }
   if (!j?.config || typeof j.config !== 'object') throw new Error('RulZ LLM Suite sent load settings I could not read.')
   return {
@@ -411,7 +445,9 @@ export function parseLoadInfo(json: unknown): ModelLoadInfo {
       : undefined,
     moeLayers: typeof j.moe_layers === 'number' && j.moe_layers > 0 ? j.moe_layers : j.moe_layers === undefined ? undefined : null,
     gpus: Array.isArray(j.gpus) ? j.gpus : [],
-    estimate: j.estimate ?? undefined
+    estimate: j.estimate ?? undefined,
+    ...(j.mode === 'coding' || j.mode === 're' ? { mode: j.mode, modeOwn: j.mode_own === true } : {}),
+    ...(typeof j.reload_blocked === 'string' && j.reload_blocked ? { reloadBlocked: j.reload_blocked.slice(0, 500) } : {})
   }
 }
 
@@ -443,6 +479,8 @@ export function friendlyServerError(e: unknown): string {
     return 'I lost the connection to RulZ LLM Suite. Check that it is open and its server is started (Developer page), then try again.'
   }
   if (err instanceof ServerError) {
+    // A rental refused (409), or lost its connection: LLM Suite's own sentence says what to do.
+    if (err.status === 409 || (err.status >= 500 && /connection to the rental/i.test(err.message))) return err.message
     if (err.status === 503) return `The model could not be loaded: ${err.message}`
     if (err.status === 401) return 'RulZ LLM Suite rejected the API key. Check it in Settings.'
     if (err.status === 404) return `RulZ LLM Suite doesn't know that model any more. Pick another one in Settings. (${err.message})`

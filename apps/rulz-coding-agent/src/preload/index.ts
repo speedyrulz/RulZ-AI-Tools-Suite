@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type { RulzApi } from '@shared/ipc'
 
 const api: RulzApi = {
@@ -9,6 +9,13 @@ const api: RulzApi = {
     ipcRenderer.on(channel, wrapped)
     return () => {
       ipcRenderer.removeListener(channel, wrapped)
+    }
+  },
+  pathForFile: (file) => {
+    try {
+      return webUtils.getPathForFile(file)
+    } catch {
+      return ''
     }
   }
 }

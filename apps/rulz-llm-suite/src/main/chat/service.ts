@@ -118,18 +118,9 @@ export function avoidWordsBias(words: string[], strength: number): [string, numb
   return out
 }
 
-export function buildRequestBody(
-  alias: string,
-  messages: WireMessage[],
-  s: SamplingParams,
-  disableThinking = false,
-  lora: { id: number; scale: number }[] | null = null
-): Record<string, unknown> {
-  const body: Record<string, unknown> = {
-    model: alias,
-    messages,
-    stream: true,
-    return_progress: true,
+/** The first sampler fields of every request (always sent). */
+function baseSamplerFields(s: SamplingParams): Record<string, unknown> {
+  return {
     temperature: s.temperature,
     top_k: s.topK,
     top_p: s.topP,
@@ -138,12 +129,11 @@ export function buildRequestBody(
     presence_penalty: s.presencePenalty,
     frequency_penalty: s.frequencyPenalty
   }
-  // Adapter strengths for this request only; llama-server runs the adapters it leaves out at 0.
-  if (lora) body.lora = lora
-  if (s.maxTokens !== null) body.max_tokens = s.maxTokens
-  if (s.stop.length) body.stop = s.stop
-  if (s.seed !== null) body.seed = s.seed
-  // Fiction samplers: only sent when on, so requests of people who never touch them stay as they were.
+}
+
+/** Fiction samplers and avoided words: only sent when on, so requests of people who never touch them stay as they were. */
+function extraSamplerFields(s: SamplingParams): Record<string, unknown> {
+  const body: Record<string, unknown> = {}
   if (s.dryMultiplier > 0) {
     body.dry_multiplier = s.dryMultiplier
     body.dry_base = s.dryBase
@@ -159,6 +149,12 @@ export function buildRequestBody(
   }
   const bias = avoidWordsBias(s.avoidWords, s.avoidStrength)
   if (bias.length) body.logit_bias = bias
+  return body
+}
+
+/** The thinking fields of a request: whether thinking is on, and how much of it. */
+function thinkingFields(s: SamplingParams, disableThinking: boolean): Record<string, unknown> {
+  const body: Record<string, unknown> = {}
   const thinking = disableThinking ? 'off' : s.thinking
   if (thinking !== 'auto') body.chat_template_kwargs = { enable_thinking: thinking === 'on' }
   if (thinking !== 'off') {
@@ -166,6 +162,38 @@ export function buildRequestBody(
     if (s.thinkingBudget !== null) body.thinking_budget_tokens = s.thinkingBudget
     if (s.thinkingBudget !== null && s.thinkingBudgetMessage.trim()) body.reasoning_budget_message = s.thinkingBudgetMessage
   }
+  return body
+}
+
+/**
+ * The request fields a sampling gives, apart from what belongs to one request or one chat (the model, messages,
+ * streaming, JSON schema, reply length, stop words, seed, adapter strengths). The chat request is built from these, and
+ * the API server shows them for a mode's own sampling, so the two cannot drift.
+ */
+export function samplingRequestFields(s: SamplingParams, disableThinking = false): { sampling: Record<string, unknown>; thinking: Record<string, unknown> } {
+  return { sampling: { ...baseSamplerFields(s), ...extraSamplerFields(s) }, thinking: thinkingFields(s, disableThinking) }
+}
+
+export function buildRequestBody(
+  alias: string,
+  messages: WireMessage[],
+  s: SamplingParams,
+  disableThinking = false,
+  lora: { id: number; scale: number }[] | null = null
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    model: alias,
+    messages,
+    stream: true,
+    return_progress: true,
+    ...baseSamplerFields(s)
+  }
+  // Adapter strengths for this request only; llama-server runs the adapters it leaves out at 0.
+  if (lora) body.lora = lora
+  if (s.maxTokens !== null) body.max_tokens = s.maxTokens
+  if (s.stop.length) body.stop = s.stop
+  if (s.seed !== null) body.seed = s.seed
+  Object.assign(body, extraSamplerFields(s), thinkingFields(s, disableThinking))
   if (s.jsonSchema.trim()) {
     body.response_format = { type: 'json_schema', json_schema: { name: 'output', schema: JSON.parse(s.jsonSchema) } }
   }

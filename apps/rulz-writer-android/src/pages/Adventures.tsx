@@ -2,6 +2,8 @@ import { ArrowLeft, MoreVertical, Plus } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import type { AdventureSetup, AdventureStarter } from '@shared/adventure'
+import type { PhoneModel } from '@shared/phone'
+import { ModelPicker } from '../components/ModelPicker'
 import type { NovelProjectSummary } from '@shared/novel'
 import { Badge, Button, Field, IconButton, Input, Select, Sheet, Switch, Textarea, TopBar } from '../components/ui'
 import { relativeTime } from '../lib/format'
@@ -13,7 +15,7 @@ export const initialSetup: AdventureSetup = {
   title: '', genre: '', premise: '', character: '', tone: '', length: 'medium', choiceCount: 3,
   modelId: null, temperature: null
 }
-type Model = { id: string, name: string, loaded: boolean }
+type Model = PhoneModel
 
 export function SetupFields({ setup, setSetup, models, full = false }: {
   setup: AdventureSetup
@@ -65,10 +67,7 @@ export function SetupFields({ setup, setSetup, models, full = false }: {
         </Select>
       </Field>
       <Field label="Model">
-        <Select aria-label="Model" value={setup.modelId ?? ''} onChange={(e) => change({ modelId: e.target.value || null })}>
-          <option value="">Loaded model</option>
-          {models.map((model) => <option key={model.id} value={model.id}>{model.name}{model.loaded ? ' (loaded)' : ''}</option>)}
-        </Select>
+        <ModelPicker models={models} value={setup.modelId} onChange={(modelId) => change({ modelId })} placeholder="Loaded model" />
       </Field>
       <Field label="Temperature" hint="Leave empty for the default.">
         <Input
@@ -159,7 +158,7 @@ export function AdventureNew() {
   const [busy, setBusy] = useState(false)
   useEffect(() => {
     void Promise.all([
-      link.invoke('adventure:starters'), link.invoke('adventure:models'), link.invoke('novel:listProjects')
+      link.invoke('adventure:starters'), link.invoke('writing:models'), link.invoke('novel:listProjects')
     ]).then(([ideas, availableModels, availableProjects]) => {
       setStarters(ideas)
       setModels(availableModels)

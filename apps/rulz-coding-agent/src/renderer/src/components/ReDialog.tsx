@@ -1,31 +1,41 @@
 import { LoaderCircle, Play, RefreshCw } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
+import { triesText } from '@shared/modes'
 import type { ReKind, ReOutcome, ReOverview, ReStartRequest } from '@shared/types'
 import { errorMessage, invoke } from '../lib/api'
 import { cn, relativeTime } from '../lib/format'
+import { activeModelId, useApp } from '../stores/app'
 import { useWorkspace } from '../stores/workspace'
 import { PracticePanel } from './PracticeBatch'
+import { ReloadBar } from './ReloadBar'
 import { Badge, Button, Dialog, Field, Input, Select, Switch, Textarea } from './ui'
 
 export const OUTCOME_TONE: Record<ReOutcome, 'neutral' | 'ok' | 'warn' | 'danger'> = { unrated: 'neutral', solved: 'ok', partial: 'warn', failed: 'danger' }
 export const KIND_LABEL: Record<ReKind, string> = { analyse: 'Analyse', practice: 'Practice', 'clone-pieces': 'Clone pieces', 'clone-full': 'Full clone' }
 
-/** RulZ LLM Suite's RE overview, loaded when asked for. */
-export function useReOverview(open: boolean): { data: ReOverview | null; error: string | null; loading: boolean; reload: () => void } {
+/**
+ * RulZ LLM Suite's RE overview, loaded when asked for, for the model in use (the practice counts are
+ * that model's; an older RulZ LLM Suite counts all models together). Asked again when the model changes.
+ */
+export function useReOverview(open: boolean, model?: string): { data: ReOverview | null; error: string | null; loading: boolean; reload: () => void } {
   const [data, setData] = useState<ReOverview | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  /** The newest question: an answer for a model picked before must not replace the current one's. */
+  const latest = useRef(0)
   const reload = useCallback(() => {
+    const mine = ++latest.current
     setLoading(true)
-    invoke('re:overview')
+    invoke('re:overview', model || undefined)
       .then((d) => {
+        if (mine !== latest.current) return
         setData(d)
         setError(null)
       })
-      .catch((e) => setError(errorMessage(e)))
-      .finally(() => setLoading(false))
-  }, [])
+      .catch((e) => mine === latest.current && setError(errorMessage(e)))
+      .finally(() => mine === latest.current && setLoading(false))
+  }, [model])
   useEffect(() => {
     if (open) reload()
   }, [open, reload])
@@ -38,7 +48,8 @@ type Tab = 'start' | 'practice' | 'sessions'
 export function ReDialog({ open, onOpenChange, initialTab = 'start' }: { open: boolean; onOpenChange: (open: boolean) => void; initialTab?: Tab }) {
   const project = useWorkspace((s) => s.project)
   const running = useWorkspace((s) => s.running)
-  const { data, error, loading, reload } = useReOverview(open)
+  const modelId = useApp((s) => activeModelId(s.settings, s.connection))
+  const { data, error, loading, reload } = useReOverview(open, modelId)
   const [tab, setTab] = useState<Tab>(initialTab)
   const [record, setRecord] = useState(true)
   useEffect(() => {
@@ -85,6 +96,8 @@ export function ReDialog({ open, onOpenChange, initialTab = 'start' }: { open: b
         </button>
       </div>
       <div className="min-h-[320px] overflow-y-auto px-5 py-4">
+        {/* The next task here is a reverse-engineering one, so the Reverse engineering settings are what it should run with. */}
+        {open && <ReloadBar mode="re" className="mb-4" />}
         {error ? (
           <div className="rounded-lg border border-warn/40 bg-warn/10 p-3 text-sm">{error}</div>
         ) : !data ? (
@@ -291,7 +304,7 @@ function PracticeList({
                 <span className="font-mono">{t.id}</span>
                 <Badge>{t.family}</Badge>
                 <Badge>{t.tier}</Badge>
-                {t.solved > 0 ? <Badge tone="ok">solved {t.solved}/{t.attempts}</Badge> : t.attempts > 0 ? <Badge tone="danger">0/{t.attempts}</Badge> : null}
+                {t.solved > 0 ? <Badge tone="ok">{triesText(t)}</Badge> : t.attempts > 0 ? <Badge tone="danger">{triesText(t)}</Badge> : null}
               </div>
               <div className="truncate text-[11.5px] text-muted" title={t.prompt}>
                 {t.prompt.replaceAll('{exe}', t.binary)}

@@ -44,6 +44,7 @@ export class ModelGate implements ModelGateLike {
   }
 
   private sentence(): string {
+    if (this.holder?.startsWith('reload:')) return 'LLM Suite is loading a model.'
     return `LLM Suite is already writing ${describe(this.holder ?? '')} on the computer.`
   }
 }

@@ -32,7 +32,13 @@ const shared = { '@shared': resolve(__dirname, 'src/shared') }
 
 export default defineConfig({
   main: {
-    resolve: { alias: shared }
+    resolve: { alias: shared },
+    build: {
+      rollupOptions: {
+        // The PDF worker thread is a main-process file of its own (out/main/pdfWorker.js), so it also works from inside app.asar.
+        input: { index: resolve(__dirname, 'src/main/index.ts'), pdfWorker: resolve(__dirname, 'src/main/pdf/worker.ts') }
+      }
+    }
   },
   preload: {
     resolve: { alias: shared }

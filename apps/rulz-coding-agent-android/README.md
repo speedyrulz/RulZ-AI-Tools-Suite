@@ -80,6 +80,13 @@ by itself, since every try counts towards the computer's limit; **Try again** on
   settings); notifications; this phone's look and name; switch or forget computers. The RulZ LLM Suite address and
   API key, phone access itself and recording tasks for reverse-engineering training can only be changed on the
   computer.
+- **PDFs** (0.10.0): the paperclip next to the arrow attaches up to 10 PDFs (50 MB each) from the phone to the next
+  task. They are sent to the computer in pieces, with progress, cancel and **Try again**.
+- **Settings per mode** (0.10.0): Model settings shows the Coding and Reverse engineering settings from RulZ LLM Suite,
+  with **Settings for** to change each one's load settings, and a bar offers to reload a model that runs with others.
+- **Models on a rented computer** are marked **On a rental** and only used when you choose one. A batch run there needs
+  its switch on, for every run. Practice counts are those of the model in use.
+- These need RulZ Coding Agent 0.23.0 and RulZ LLM Suite 0.35.0 on the computer; with older ones they stay hidden.
 - **Only on the computer**: adding a note while a task runs, and the Copy, Edit, Run again and Delete buttons on
   messages.
 

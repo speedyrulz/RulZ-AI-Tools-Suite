@@ -281,13 +281,15 @@ export async function searchText(
 
 export async function readFile(
   root: string,
-  args: { path?: unknown; start_line?: unknown; end_line?: unknown }
+  args: { path?: unknown; start_line?: unknown; end_line?: unknown },
+  opts: { /** read_pdf is offered: a PDF is pointed at it instead of failing as "not a text file". */ pdfHint?: boolean } = {}
 ): Promise<ToolOutcome> {
   let target
   try {
     target = await resolveInProject(root, args.path)
     const st = await fs.stat(target.abs)
     if (st.isDirectory()) return fail(`"${target.rel}" is a folder. Use list_files to see what is in it.`)
+    if (opts.pdfHint && /\.pdf$/i.test(target.rel)) return fail(`"${target.rel}" is a PDF, which read_file can't show. Use read_pdf with the path "${target.rel}" to read its text.`)
     if (st.size > MAX_READ_BYTES) return fail(`"${target.rel}" is too large to read (${formatSize(st.size)}).`)
     const buf = await fs.readFile(target.abs)
     if (looksBinary(buf)) return fail(`"${target.rel}" is not a text file (${formatSize(st.size)}), so it can't be read as text.`)

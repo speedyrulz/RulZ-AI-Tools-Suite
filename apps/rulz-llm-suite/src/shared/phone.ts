@@ -186,8 +186,39 @@ export interface WritingIpcInvoke {
   /** Applies chosen items of a 'state' job to state.json; refused when the scene's disk text no longer hashes to the
    *  job's textHash. Returns the result of novel:statePatch. */
   'writing:applyState': (jobId: string, itemKeys: string[]) => import('./novel').NovelStatePatchResult
-  /** The model library, for the project's model picker (the project's modelId is set with novel:projectPatch). */
-  'writing:models': () => { id: string; name: string; loaded: boolean }[]
+  /** The model library, for the project's model picker (the project's modelId is set with novel:projectPatch). A model on a
+   *  rental has `rental` (label null = it is not loaded on one now). */
+  'writing:models': () => PhoneModel[]
+  /** What applies to a mode with a model: its own settings, and whether the loaded model runs with others. modelId null =
+   *  the model a job with no model of its own would use (the newest loaded one). */
+  'writing:mode': (mode: PhoneMode, modelId: string | null) => PhoneModeInfo
+  /** Loads the model again with the mode's load settings; refused for a rental, while the computer is busy or while
+   *  RulZ Coding Agent uses the model. Returns the mode's info as it is right after the start. */
+  'writing:reloadMode': (mode: PhoneMode, modelId: string) => PhoneModeInfo
+}
+
+export interface PhoneModel {
+  id: string
+  name: string
+  loaded: boolean
+  rental?: { label: string | null; reconnecting: boolean }
+}
+
+export type PhoneMode = 'writing' | 'adventure'
+export const PHONE_MODES: readonly PhoneMode[] = ['writing', 'adventure']
+
+export interface PhoneModeInfo {
+  mode: PhoneMode
+  /** The model that would write: the given one, else the newest loaded one; null when there is none. */
+  modelId: string | null
+  name: string
+  loaded: boolean
+  rental?: { label: string | null; reconnecting: boolean }
+  ownLoad: boolean
+  ownSampling: boolean
+  hasPrompt: boolean
+  /** Set when it runs with other settings than the mode's. `blocked`: why it can't be reloaded from here right now. */
+  reload: { label: string; blocked: string | null } | null
 }
 
 export interface WritingIpcEvents {
@@ -231,7 +262,9 @@ export const PHONE_WRITING_CHANNELS = [
   'writing:abort',
   'writing:dismiss',
   'writing:applyState',
-  'writing:models'
+  'writing:models',
+  'writing:mode',
+  'writing:reloadMode'
 ] as const satisfies readonly (keyof WritingIpcInvoke)[]
 
 // Adventure mode (src/shared/adventure.ts): PHONE_ADVENTURE_CHANNELS leaves out the desktop-only deletes and the save
