@@ -44,3 +44,17 @@ def test_run_strip_cannot_widen_the_header():
     # screen and the logo row, centred in it, slid off to the right (seen at 412 px)
     rule = re.search(r"^\.rz-run \{([^}]*)\}", webui.THEME_CSS, re.M).group(1)
     assert "max-width: 100%" in rule and "min-width: 0" in rule
+
+
+def test_a_tooltips_target_names_its_element_in_every_nicegui():
+    """inline_descriptions finds the setting a tooltip belongs to: NiceGUI 3 names it "#c5", NiceGUI 4 "#ng-5", and for
+    an input or a dropdown the control inside it, '[for="ng-5"]' (every dropdown kept a floating help text over its
+    options)."""
+    for target, want in (("#c5", "c5"), ("#ng-5", "ng-5"), ('[for="ng-5"]', "ng-5"), ("[for='ng-12']", "ng-12")):
+        found = webui.TIP_TARGET.search(target)
+        assert found is not None and found.group(1) == want
+
+
+def test_help_text_hides_while_a_dropdown_is_open():
+    assert 'body:has(.q-menu[role="listbox"], .q-menu [role="listbox"]) .q-tooltip { visibility: hidden !important; }' \
+        in webui.THEME_CSS

@@ -1335,3 +1335,113 @@ def test_a_job_name_that_is_not_a_folder_name_is_not_a_run(world):
         m.jobs[bad] = dict(m.jobs["a"], job=bad, run_id=f"r-{bad}")
     world.tick()
     assert [r["job"] for r in world.fleet.runs()] == ["a"]
+
+
+# ---------------------------------------------------------------- what rulz_send.py needs of the fleet
+
+
+def test_an_entry_can_be_given_its_id_and_the_send_it_belongs_to(world):
+    entries = world.fleet.enqueue("x", {"steps": 5}, instance=1, entry_id="send-1", send="send-1")
+    assert entries[0]["id"] == "send-1" and entries[0]["send"] == "send-1" and entries[0]["push"] == []
+    assert world.fleet.queue_view()["waiting"][0]["send"] == "send-1"
+    plain = world.fleet.plan("y", {"steps": 5})[0]
+    assert "send" not in plain and len(plain["id"]) == 10  # the default id and no send field
+    with pytest.raises(Refused, match="Already queued"):  # the same id twice, even for another job name
+        world.fleet.enqueue("z", {"steps": 5}, entry_id="send-1")
+    with pytest.raises(Refused, match="Not an entry id"):
+        world.fleet.plan("w", {"steps": 5}, entry_id="../x")
+    with pytest.raises(Refused, match="Not an entry id"):
+        world.fleet.plan("w", {"race": True, "race_configs": [{"name": "a"}, {"name": "b"}], "steps": 5},
+                         entry_id="one", split=2)
+
+
+def test_the_entry_id_and_the_send_reach_the_run_record(world):
+    world.fleet.enqueue("x", {"steps": 5}, instance=1, entry_id="send-1", send="send-1")
+    world.tick()
+    world.tick()
+    rec = world.fleet.runs(instance=1)[0]
+    assert rec["entry"] == "send-1" and rec["send"] == "send-1" and rec["job"] == "x"
+
+
+def test_a_reserved_instance_takes_only_the_entry_of_its_send(world):
+    world.fleet.set_instance(1, reserved="mine")
+    world.fleet.set_instance(2, reserved="other")
+    world.fleet.enqueue("loose", {"steps": 5})
+    world.fleet.enqueue("pinned", {"steps": 5}, instance=1, send="other", entry_id="e-other")
+    world.tick()
+    assert world.starts(1) == [] and world.starts(2) == []  # neither entry belongs to the send that holds an instance
+    world.fleet.enqueue("mine", {"steps": 5}, instance=1, send="mine", entry_id="e-mine")
+    world.tick()
+    assert world.starts(1) == ["mine"] and world.starts(2) == []
+    world.fleet.set_instance(2, reserved=None)  # the hold is gone: the queue uses it again
+    world.machines["1"].finish()
+    world.tick()
+    world.tick()
+    assert world.starts(2) == ["loose"]
+
+
+def test_discovery_leaves_out_an_instance_of_a_send_that_has_not_reached_it(tmp_path):
+    raw = [{"id": 3, "actual_status": "running", "label": "rulz-trainer-abc", "gpu_name": "x",
+            "extra_env": [["RULZ_REPO", "x"]]}]
+    fleet = Fleet(home=tmp_path / "fleet", list_instances=lambda: raw)
+    fleet.discover()
+    assert "3" in fleet.read()["instances"]  # nothing holds it back: it is taken in
+    fleet2 = Fleet(home=tmp_path / "fleet2", list_instances=lambda: raw)
+    sends = tmp_path / "sends.json"
+    sends.write_text(json.dumps({"sends": [{"id": "s1", "label": "rulz-trainer-abc", "joined": None}]}))
+    fleet2.discover()
+    assert fleet2.read()["instances"] == {}
+    sends.write_text(json.dumps({"sends": [{"id": "s1", "label": "rulz-trainer-abc", "joined": 5.0}]}))
+    fleet2.discover()
+    assert "3" in fleet2.read()["instances"]  # the send reached it: no longer held back
+
+
+def test_discovery_leaves_out_an_open_rent_and_a_rental_the_send_does_not_name_yet(tmp_path):
+    raw = [{"id": 3, "actual_status": "running", "label": "rulz-trainer-abc", "extra_env": [["RULZ_REPO", "x"]]}]
+    fleet = Fleet(home=tmp_path / "fleet", list_instances=lambda: raw)
+    (tmp_path / "rentals.json").write_text(json.dumps({"rentals": [], "intents": [
+        {"label": "rulz-trainer-abc", "send": "s1", "state": "checking"}]}))
+    fleet.discover()
+    assert fleet.read()["instances"] == {}
+    # adopted: a rental of a send that is on record and has not joined
+    (tmp_path / "rentals.json").write_text(json.dumps({"rentals": [
+        {"id": 3, "label": "rulz-trainer-abc", "send": "s1"}], "intents": []}))
+    (tmp_path / "sends.json").write_text(json.dumps({"sends": [{"id": "s1", "label": "", "joined": None}]}))
+    fleet.discover()
+    assert fleet.read()["instances"] == {}
+    (tmp_path / "sends.json").write_text(json.dumps({"sends": []}))  # the send is gone: nothing holds it back
+    fleet.discover()
+    assert "3" in fleet.read()["instances"]
+
+
+def test_discovery_asks_an_overriding_predicate_too(tmp_path):
+    raw = [{"id": 3, "actual_status": "running", "label": "a", "extra_env": [["RULZ_REPO", "x"]]},
+           {"id": 4, "actual_status": "running", "label": "b", "extra_env": [["RULZ_REPO", "x"]]}]
+    fleet = Fleet(home=tmp_path / "fleet", list_instances=lambda: raw, skip_discovery=lambda row: row["label"] == "a")
+    fleet.discover()
+    assert sorted(fleet.read()["instances"]) == ["4"]
+
+
+def test_the_tree_of_a_run_can_be_downloaded_by_name_but_is_no_download_rule(world):
+    assert "tree" not in fleet_module.DOWNLOAD_KINDS and "tree" in fleet_module.MANUAL_KINDS
+    machine = world.machines["1"]
+    machine.run("a")
+    world.tick()
+    machine.finish()
+    world.tick()
+    key = world.fleet.find_run("a")["key"]
+    before = list(world.fleet.load_run(key).get("downloaded") or [])
+    result = world.fleet.pull_now(key, ["tree"])
+    assert "error" not in result and world.fetched[-1][1] == ["a/tree.bin"]
+    assert world.fleet.load_run(key)["downloaded"] == before  # not one of the kinds the run list shows
+    with pytest.raises(Refused, match="Pick what"):
+        world.fleet.pull_now(key, ["tree", "logs"])
+    with pytest.raises(Refused, match="Not a download rule"):
+        world.fleet.set_download({"tree": "end"})
+
+
+def test_the_send_event_kinds_are_known():
+    for kind in ("send_failed", "send_started", "send_alert", "instance_stopped_after_run",
+                 "instance_destroyed_after_run"):
+        assert kind in fleet_module.EVENT_KINDS
+    assert "send_failed" in fleet_module.WAIT_KINDS and "send_started" not in fleet_module.WAIT_KINDS

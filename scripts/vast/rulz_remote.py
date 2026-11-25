@@ -64,13 +64,15 @@ def pulls_root() -> Path:
 REMOTE_DIR = "/workspace/RulzTrainer"
 PYTHON = '"$(test -x /venv/main/bin/python && echo /venv/main/bin/python || echo python3)"'
 AGENT_COMMANDS = {"status", "jobs", "job", "log", "probes", "config", "start", "stop", "queue", "snapshot",
-                  "record", "update", "webui", "test-status", "test-stop"}  # rulz_agent.py's
+                  "record", "update", "webui", "test-status", "test-stop", "file-state", "file-done", "file-fetch",
+                  "fetch-state", "watchdog"}  # rulz_agent.py's
 CONFIG_SLOT = b'SENT_CONFIG = ""'  # the line of rulz_agent.py that takes a local config
 SSH_FAILED = 255  # ssh's own exit status: it could not connect, or the connection dropped
 TIMED_OUT = 124  # the exit status Remote.run reports for a call that got no answer in its timeout (as timeout(1))
 SHORT_CALL_TIMEOUT = 120  # seconds for a snapshot, status or stop: ssh alive but hung must not wait for ever
 SHORT_COMMANDS = {"status", "jobs", "job", "log", "probes", "config", "stop", "queue", "snapshot", "record", "webui",
-                  "files", "poll", "test-status", "test-stop"}  # agent commands that only read or touch a file
+                  "files", "poll", "test-status", "test-stop", "file-state", "file-fetch", "fetch-state",
+                  "watchdog"}  # agent commands that only read or touch a file (file-done hashes: no limit)
 SYNC_PATHS = ("rulztrainer", "webui.py", "scripts", "requirements.txt")  # what a run needs of the code
 VASTAI_TIMEOUT = 120  # seconds for one vastai CLI call: a hung API request must not hold up every look after it
 UPLOAD_MARK = ".rulz_upload"  # in a dataset sent by rulz_fleet.py: dataset_digest() of what was sent
@@ -99,9 +101,35 @@ def vastai(*args: str) -> str:
     return done.stdout
 
 
+def _rest_instances() -> list[dict] | None:
+    """The account's instances through vast.ai's REST list (every page), in the CLI's shape, when an API key is
+    there; None when there is no key or the list could not be read, so that the CLI is tried. rulz_market is
+    imported here, not at the top: it must stay free of any import of this module's callers."""
+    here = str(HERE)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    try:
+        import rulz_market
+        if not rulz_market.api_key():
+            return None
+        return rulz_market.remote_instances()
+    except Exception:  # noqa: BLE001  (no key, no network, an unreadable page: the CLI is the way back)
+        return None
+
+
 def list_instances() -> list[dict]:
-    data = json.loads(vastai("show", "instances", "--raw"))
-    return data.get("instances", []) if isinstance(data, dict) else data
+    """Every instance of the account: the REST list when an API key is there, else `vastai show instances`."""
+    listed = _rest_instances()
+    if listed is not None:
+        return listed
+    try:
+        data = json.loads(vastai("show", "instances", "--raw"))
+    except ValueError:
+        raise Unreachable("vastai sent an instance list this tool could not read.") from None
+    rows = data.get("instances") if isinstance(data, dict) else data
+    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+        raise Unreachable("vastai sent an instance list this tool could not read.")
+    return rows
 
 
 def is_rulztrainer(inst: dict) -> bool:
@@ -480,13 +508,45 @@ def _pipe_gone(e: OSError) -> bool:
         getattr(e, "filename", None) is None and e.errno in (errno.EPIPE, errno.EINVAL))
 
 
+class CountingWriter:
+    """A file object that tells progress(bytes, 0) of what goes through it (tarfile writes into it). The calls are
+    gathered: at most one per `every` seconds (the bytes in between added up), and finish() makes the last one, so a
+    caller that writes a file or the screen on each call is not asked 0.7 million times a second."""
+
+    def __init__(self, stream, progress, every: float = 2.0, clock=time.monotonic):
+        self.stream, self.progress, self.every, self.clock = stream, progress, every, clock
+        self.pending, self.last = 0, clock()
+
+    def write(self, data):
+        self.stream.write(data)
+        self.pending += len(data)
+        if self.clock() - self.last >= self.every:
+            self.finish()
+        return len(data)
+
+    def finish(self):
+        if self.pending:
+            count, self.pending = self.pending, 0
+            self.progress(count, 0)
+        self.last = self.clock()
+
+    def flush(self):
+        self.stream.flush()
+
+    def close(self):
+        self.finish()
+        self.stream.close()
+
+
 def send(remote: Remote, items: list[tuple[Path, str]], target: str, hidden: bool = True, *, staged: bool = False,
-         marks: dict[str, str] | None = None) -> None:
+         marks: dict[str, str] | None = None, progress=None) -> None:
     """Stream local paths, each with its name in the archive, into a folder on the instance; hidden=False leaves
     out hidden files and folders below each item. staged=True unpacks into a hidden folder beside them first and
     moves each item into place only once all of it is there, so a dropped connection leaves no half copy under the
     item's name for the next look to take as sent (stage folders left by a dropped copy go after 6 hours); marks
-    puts a small UPLOAD_MARK file holding the given text into each named item.
+    puts a small UPLOAD_MARK file holding the given text into each named item. progress(bytes, files) is called as
+    extract's is: with the bytes just written into the stream (tar headers and padding included, so the sum is a little
+    over the files' sizes) and, after each item, (0, 1).
 
     A file here that can't be read (moved, locked, shrunk while it was read) stops the copy with SystemExit: it used
     to be taken for the far end going away, which left ssh waiting for the rest of the archive."""
@@ -511,10 +571,13 @@ def send(remote: Remote, items: list[tuple[Path, str]], target: str, hidden: boo
         shell = f"mkdir -p {quoted} && tar -xf - -C {quoted}"
     proc = subprocess.Popen(remote.command(shell), stdin=subprocess.PIPE)
     keep = tar_info_for_instance if hidden else without_hidden
+    counter = CountingWriter(proc.stdin, progress) if progress else None
     try:
-        with tarfile.open(fileobj=proc.stdin, mode="w|") as tar:
+        with tarfile.open(fileobj=counter or proc.stdin, mode="w|") as tar:
             for path, name in items:
                 tar.add(path, arcname=name, filter=keep)
+                if progress:
+                    progress(0, 1)
                 mark = (marks or {}).get(name)
                 if mark is not None:
                     data = mark.encode("utf-8")
@@ -527,6 +590,8 @@ def send(remote: Remote, items: list[tuple[Path, str]], target: str, hidden: boo
             proc.wait()
             raise SystemExit(f"Could not read {getattr(e, 'filename', None) or 'a file'} here: {e}") from e
     finally:
+        if counter is not None:
+            counter.finish()
         try:
             proc.stdin.close()
         except OSError:
