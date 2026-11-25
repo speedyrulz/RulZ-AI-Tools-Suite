@@ -288,3 +288,21 @@ included (drawn inactive, because no window is activated). The Export window is 
 real position, with a drawn shadow. The harness process is DPI-unaware, so the images are 1600x1000 at 100% on a
 scaled screen. Nothing is saved or exported. `-Readme` writes the README set as PNGs, and the last command saves
 them as the README's JPEGs. The gallery's `03-export` is the README's `03-export-dark`.
+
+## comfyui-launcher (PySide6)
+
+```bat
+python -B capture_comfyui_launcher.py --out R:\out\comfyui-launcher --readme R:\out-readme\comfyui-launcher
+```
+
+Any Python with PySide6 will do (the app needs nothing else). The script runs the app from
+`apps/RulZ-ComfyUI-Launcher` with `APPDATA` pointing at a temporary folder, so nothing of yours is read or
+written: each picture gets its own config file there with three demo configurations ("Main", "Second" and
+"CPU test") and `Settings.theme` set to `dark` or `light`. No `wsl.exe` or `nvidia-smi` is started: the GPU
+monitor, the port watcher, the distro list and the option catalog request are replaced with stand-ins that
+report three made-up cards (RTX 5090, 4090, 4060 Ti) and one distro, and no server is started. The Log page is
+fed with made-up text. The main window and the Preferences dialog are grabbed with `QWidget.grab()` at 100%
+(1280x860 for the window; `--size` changes it). It writes `01-settings.png`, `02-log.png` and `03-preferences.png`
+in the dark theme and `04-settings-light.png`, `05-log-light.png` and `06-preferences-light.png` in the light
+theme, to `--out` (the catalog set) and, if given, `--readme` (the same files for the app's `docs` folder). Look
+at every image, then copy the ones you keep into `catalog/comfyui-launcher/screenshots/` with `finalize.py`.

@@ -11,7 +11,8 @@ export const CATEGORIES: { name: string; blurb: string }[] = [
   { name: 'AI Training', blurb: 'Prepare datasets, train LoRAs and manage your models' },
   { name: 'Images', blurb: 'Collect, sort, compare and lay out pictures' },
   { name: 'Video', blurb: 'Cut and repair clips' },
-  { name: 'LLM', blurb: 'Run local language models and build apps with them' }
+  { name: 'LLM', blurb: 'Run local language models and build apps with them' },
+  { name: 'ComfyUI', blurb: 'Start and manage your ComfyUI servers' }
 ]
 
 export const CATALOG: CatalogApp[] = [
@@ -453,6 +454,31 @@ export const CATALOG: CatalogApp[] = [
       'Sending to vast.ai needs ssh (built into Windows 10 and 11) and your ssh key in your vast.ai account.'
     ],
     highlights: ['Repos and buckets in one table', 'Move, copy, rename in one commit', 'Send to vast.ai', 'Bucket sync']
+  },
+  {
+    id: 'comfyui-launcher',
+    name: 'RulZ ComfyUI Launcher',
+    tagline: 'Starts and manages ComfyUI servers that run inside WSL',
+    description:
+      'Save a configuration for each way you run ComfyUI: the WSL distro, the ComfyUI folder, the GPU, the port ' +
+      'and the launch arguments. Start and stop several servers from one window, watch each one’s log and GPU ' +
+      'memory, and open ComfyUI in your browser when it is ready. A configuration can open the RulZFlow page ' +
+      'instead of ComfyUI’s own, if the server has the RulZFlow extension.',
+    category: 'ComfyUI',
+    repo: SUITE_REPO,
+    path: 'apps/RulZ-ComfyUI-Launcher',
+    tagPrefix: 'comfyui-launcher-v',
+    branch: 'main',
+    install: { kind: 'zip', asset: '^RulZ-ComfyUI-Launcher-v[\\d.]+-win64\\.zip$' },
+    launch: { target: 'RulZ ComfyUI Launcher.exe' },
+    requirements: [{ id: 'nvidia', optional: true, note: 'Only to pick a GPU for a server and to show its memory' }],
+    folderName: 'RulZ ComfyUI Launcher',
+    notes: [
+      'Needs Windows 10 or 11 with WSL 2 and a distro that already has ComfyUI installed. The launcher does not install either.',
+      'Configurations and settings are kept in %APPDATA%\\RulZ ComfyUI Launcher, separate from the program.',
+      'Closing the launcher stops the servers it started, unless you turned on close to tray.'
+    ],
+    highlights: ['Several servers at once', 'Per-server GPU and arguments', 'Live log and GPU memory', 'RulZFlow page option']
   }
 ]
 

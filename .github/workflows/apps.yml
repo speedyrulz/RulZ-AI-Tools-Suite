@@ -27,6 +27,7 @@ on:
       - 'image-grid-v*'
       - 'hf-manager-v*'
       - 'trainer-optimizer-v*'
+      - 'comfyui-launcher-v*'
       - 'coding-agent-android-v*'
       - 'writer-android-v*'
   pull_request:
@@ -59,6 +60,7 @@ jobs:
             [rulz-image-crawler]=rulz-image-crawler [image-preparer]=RulZ-Image-Preparer
             [image-grid]=RulZ-Image-Grid [hf-manager]=RulZ-Huggingface-Manager
             [trainer-optimizer]=RulZ-AI-Trainer-Optimizer
+            [comfyui-launcher]=RulZ-ComfyUI-Launcher
             [coding-agent-android]=rulz-coding-agent-android
             [writer-android]=rulz-writer-android
           )
@@ -117,6 +119,7 @@ jobs:
             'image-grid'         = @{ dir = 'RulZ-Image-Grid'; name = 'RulZ Image Grid'; kind = 'dotnet' }
             'hf-manager'         = @{ dir = 'RulZ-Huggingface-Manager'; name = 'RulZ Huggingface Manager'; kind = 'source' }
             'trainer-optimizer'  = @{ dir = 'RulZ-AI-Trainer-Optimizer'; name = 'RulZ AI Trainer Optimizer'; kind = 'source' }
+            'comfyui-launcher'   = @{ dir = 'RulZ-ComfyUI-Launcher'; name = 'RulZ ComfyUI Launcher'; kind = 'python' }
             'coding-agent-android' = @{ dir = 'rulz-coding-agent-android'; name = 'RulZ Coding Agent for Android'; kind = 'android' }
             'writer-android'     = @{ dir = 'rulz-writer-android'; name = 'RulZ Writer for Android'; kind = 'android' }
           }
@@ -137,6 +140,7 @@ jobs:
             'rulz-image-crawler' { (Select-String -Path "$env:DIR/crawler_app/__init__.py" -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
             'hf-manager'       { (Select-String -Path "$env:DIR/rulz_hf_manager/__init__.py" -Pattern "__version__\s*=\s*'([^']+)'").Matches[0].Groups[1].Value }
             'trainer-optimizer' { (Select-String -Path "$env:DIR/rulz_optimizer/__init__.py" -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
+            'comfyui-launcher' { (Select-String -Path "$env:DIR/rulz_comfy_launcher/__init__.py" -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
             { $_ -in 'llm-suite', 'coding-agent', 'coding-agent-android', 'writer-android' } { (Get-Content "$env:DIR/package.json" -Raw | ConvertFrom-Json).version }
             default { '' }   # source apps are released from the branch; the tag is the version
           }
@@ -281,6 +285,18 @@ jobs:
           New-Item -ItemType Directory -Force ../../out | Out-Null
           Push-Location dist
           7z a -tzip -mx=9 "../../../out/RulZ-Image-Organizer-v$env:VERSION-win64.zip" "RulZ Image Organizer"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Pop-Location
+      # ComfyUI Launcher's build.ps1 runs its tests first (always on in GitHub Actions); they use offscreen Qt and
+      # start no WSL, ComfyUI or GPU work.
+      - if: env.APP == 'comfyui-launcher'
+        working-directory: ${{ env.DIR }}
+        run: |
+          ./build.ps1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force ../../out | Out-Null
+          Push-Location dist
+          7z a -tzip -mx=9 "../../../out/RulZ-ComfyUI-Launcher-v$env:VERSION-win64.zip" "RulZ ComfyUI Launcher"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           Pop-Location
       - if: env.APP == 'clip-extractor'
