@@ -53,7 +53,7 @@ export interface BatchStartRequest {
   label: string
   kitDir: string
   modelId: string
-  /** Tasks an earlier session solved (for `onlyUnsolved`). */
+  /** Tasks the model solved before (for `onlyUnsolved`). */
   solved: string[]
   target: BatchTarget
 }

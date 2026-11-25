@@ -220,6 +220,49 @@ describe('recording and exporting', () => {
     expect(kept).toEqual(['b', 'c'])
   })
 
+  it('leaves out sessions of models that are not selected, before the per-task limit', async () => {
+    const data = join(dir, 'data')
+    const store = new TraceStore(data)
+    const go: WireMessage[] = [{ role: 'user', content: 'go' }]
+    const by = (model: string, id: string): RecordedRound => ({ ...round(id, go, { content: 'ANSWER: x' }), model })
+    await store.record('a', by('A', 'r1'))
+    await store.record('b', by('B', 'r1'))
+    await store.record('both', by('A', 'r1'))
+    // Another start of the app: the first model must still be known.
+    await new TraceStore(data).record('both', by('B', 'r2'))
+    expect((await store.info('a'))?.models).toEqual(['A'])
+    expect((await store.info('both'))?.models).toEqual(['A', 'B'])
+
+    // Recorded before the models were kept: the latest one is known, also when the session goes on.
+    await mkdir(join(data, 'old'), { recursive: true })
+    await writeFile(join(data, 'old', 'request.json'), JSON.stringify({ requestId: 'r0', at: 1, model: 'B', messages: go, tools: [], trimmedEver: false }))
+    await writeFile(join(data, 'old', 'responses.jsonl'), JSON.stringify({ requestId: 'r0', at: 1, content: 'x', reasoning: '', toolCalls: [] }) + '\n')
+    expect((await store.info('old'))?.models).toEqual(['B'])
+    await store.record('old', by('A', 'r1'))
+    expect((await store.info('old'))?.models).toEqual(['B', 'A'])
+
+    const practice = { taskId: 't1', family: 'keygen', tier: 'easy' }
+    const sessions = ['a', 'b', 'both', 'old'].map((id) => conv(id, { practice }))
+    const run = async (maxPerTask: number, skipModels?: string[]) => {
+      const outDir = join(dir, 'out')
+      const r = await exportDataset(store, sessions, { outDir, outcomes: ['solved'], skipTrimmed: true, maxPerTask, skipModels })
+      const lines = (await readFile(join(outDir, 'train.jsonl'), 'utf8')).split('\n').filter(Boolean).map((l) => JSON.parse(l))
+      return { r, lines, ids: lines.map((l) => l.meta.conversation), manifest: JSON.parse(await readFile(join(outDir, 'manifest.json'), 'utf8')) }
+    }
+    const all = await run(0)
+    expect(all.ids).toEqual(['a', 'b', 'both', 'old'])
+    expect(all.lines[2].meta).toMatchObject({ model: 'B', models: ['A', 'B'] })
+    expect(all.lines[0].meta).not.toHaveProperty('models')
+    expect(all.manifest.models).toEqual({ A: 2, B: 2 })
+
+    // 'a' comes first, but must not use up the task's one place.
+    const onlyB = await run(1, ['A'])
+    expect(onlyB.ids).toEqual(['b'])
+    expect(onlyB.r.dropped).toEqual({ 'model not selected': 3 })
+    expect(onlyB.manifest).toMatchObject({ skipModels: ['A'], models: { B: 1 } })
+    expect((await run(0, ['A', 'B'])).ids).toEqual([])
+  })
+
   it('rejects conversation ids that could leave the data folder', () => {
     const store = new TraceStore(join(dir, 'data'))
     expect(() => store.record('../x', round('r', [], {}))).toThrow()

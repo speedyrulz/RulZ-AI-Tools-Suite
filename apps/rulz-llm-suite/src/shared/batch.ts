@@ -63,7 +63,7 @@ export interface BatchItem {
 export interface BatchOptions {
   /** Only this task family; '' = every family. */
   family: string
-  /** Leave out tasks an earlier session already solved. */
+  /** Leave out tasks the run's model already solved. */
   onlyUnsolved: boolean
   /** At most this many tasks, spread over the families; 0 = all. */
   maxTasks: number

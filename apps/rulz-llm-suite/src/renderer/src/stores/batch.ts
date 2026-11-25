@@ -11,7 +11,7 @@ import { useApp } from './app'
 import { useChat } from './chat'
 import { WBENCH_BUSY, wbenchRunning } from '../lib/wbenchFlag'
 import { useModels } from './models'
-import { practiceRecords, solvedTasks, useReTraces } from './reTraces'
+import { practiceOf, solvedTasks, useReTraces } from './reTraces'
 
 interface BatchState {
   loaded: boolean
@@ -85,9 +85,12 @@ export const useBatch = create<BatchState>((set, get) => {
       const wanted = settings.re.modelId
       const modelId = wanted && models.models.some((m) => m.id === wanted) ? wanted : models.activeModelId
       if (!modelId) return void toast.error('Load a model first, or choose one under New session.')
-      const solved = [...solvedTasks(practiceRecords(useChat.getState().summaries, useReTraces.getState().traces))]
       set({ starting: true, stopping: null })
       try {
+        // Earlier runs hold results whose chats are gone.
+        await get().init()
+        const sources = { summaries: useChat.getState().summaries, traces: useReTraces.getState().traces, runs: get().runs, models: models.models }
+        const solved = [...solvedTasks(practiceOf(modelId, sources))]
         const run = await invoke('re:batchStart', { tasks, options: cleanBatchOptions(options), label, kitDir, modelId, solved, target })
         set((s) => ({ runs: upsert(s.runs, run), activeId: run.id }))
       } catch (e) {
