@@ -138,7 +138,8 @@ fence (`remote: true`): private REA, allowed roots. Before start the window says
 
 - Page **OpenRouter** (Ctrl+0): key card, spending card (today, limit, per model, last days), privacy switch, "Your
   models", and a browser with search, filters (free, images, tools) and prices per million tokens.
-- Picker: an OpenRouter badge and prices; one click connects. No load form, reload bar or estimate.
+- Picker: an OpenRouter badge and prices; one click connects. No load form, reload bar or estimate. One mode's own
+  sampling can be edited there (0.36.1); it is saved when you connect.
 - Every place that shows a rental host shows "OpenRouter" for cloud. Composer line: text goes to OpenRouter.
 - Unsupported samplers are greyed with "Not supported by this model". Stats line shows the cost. Top bar chip: spent today.
 

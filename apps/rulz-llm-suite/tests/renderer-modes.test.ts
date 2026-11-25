@@ -7,12 +7,14 @@ import { RE_SYSTEM_PROMPT, reSampling } from '@shared/re'
 import type { AppSettings, Conversation, LoadConfig, ModelEntry } from '@shared/types'
 import {
   chatDefaultsFor,
+  cloudPickerMode,
   deepEqual,
   followChatDefaults,
   isFollowable,
   modesFor,
   pickerScope,
   reloadOffer,
+  samplingSave,
   scopeFromValue,
   scopeLoad,
   scopeValue,
@@ -239,6 +241,27 @@ describe('what the picker saves for a mode in one call', () => {
   it('is null when nothing is left', () => {
     expect(withModeSaves(own({ sampling: mine }), baseS, { sampling: null })).toBeNull()
     expect(withModeSaves(undefined, baseS, {})).toBeNull()
+  })
+})
+
+describe("the picker's OpenRouter panel", () => {
+  const mine = { ...DEFAULT_SAMPLING, temperature: 0.3 }
+
+  it('starts with the mode of the page, and with Chat where the page has none', () => {
+    expect(cloudPickerMode('chat', false)).toBe('chat')
+    expect(cloudPickerMode('chat', true)).toBe('re')
+    expect(cloudPickerMode('writing', false)).toBe('writing')
+    expect(cloudPickerMode('openrouter', false)).toBe('chat')
+    expect(cloudPickerMode('models', true)).toBe('chat')
+  })
+
+  it('saves the sampling and keeps the prompt, and nothing is left when it is all off', () => {
+    expect(samplingSave(undefined, { on: true, sampling: mine })).toEqual({ load: null, sampling: { ...mine, jsonSchema: '' }, systemPrompt: '' })
+    const existing = own({ sampling: mine, systemPrompt: 'hi' })
+    expect(samplingSave(existing, { on: true, sampling: { ...mine, temperature: 1 } })).toEqual({ ...existing, sampling: { ...mine, jsonSchema: '', temperature: 1 } })
+    expect(samplingSave(existing, { on: false, sampling: mine })).toEqual({ ...existing, sampling: null })
+    expect(samplingSave(own({ sampling: mine }), { on: false, sampling: mine })).toBeNull()
+    expect(samplingSave(undefined, { on: true, sampling: null })).toBeNull()
   })
 })
 

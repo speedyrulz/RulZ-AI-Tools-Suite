@@ -135,6 +135,13 @@ export function withModeSaves(
   return modeDefaultsEmpty(next) ? null : next
 }
 
+/** The mode the picker's OpenRouter panel starts with. It has no "all modes": such a model has no load settings. */
+export const cloudPickerMode = (page: string, chatIsRe: boolean): AppMode => pickerScope(page, chatIsRe) ?? 'chat'
+
+/** What the OpenRouter panel saves for a mode: its own sampling on or off, the rest kept. null = the entry is gone. */
+export const samplingSave = (existing: ModeDefaults | undefined, edit: { on: boolean; sampling: SamplingParams | null }): ModeDefaults | null =>
+  withModeSaves(existing, undefined, { sampling: edit.on ? edit.sampling : null })
+
 /** The reload bar's offer: the settings to reload with, or null. A dismissed instance + mode gets none. */
 export function reloadOffer(
   running: LoadConfig | null | undefined,
