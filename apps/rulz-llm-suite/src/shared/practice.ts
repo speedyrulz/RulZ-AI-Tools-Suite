@@ -1,6 +1,7 @@
 // Practice results per model: which RE practice tasks a model has tried and solved. Shared by the window and the
 // API server (GET /v1/re/overview?model=), so both count the same way. Models are told apart by name (modelKey).
 import { isScored, type BatchRun } from './batch'
+import { isCloudModelId } from './cloud'
 import type { ReTraceInfo } from './types'
 
 /** One practice session: which task, how it was graded, and by which models (see modelKey; empty = not known). */
@@ -20,9 +21,11 @@ export interface PracticeSources {
 
 /**
  * The same key for a model on this PC and its copy on a rental, and after its file moved to another folder: models
- * are told apart by name. Takes a name, a library id (a path) or a remote id.
+ * are told apart by name. Takes a name, a library id (a path) or a remote id. An OpenRouter model is recorded under its
+ * whole id (openrouter/<slug>): it is never the same as a model on this PC of that name.
  */
 export function modelKey(nameOrId: string): string {
+  if (isCloudModelId(nameOrId)) return nameOrId.toLowerCase()
   return (nameOrId.split(/[\\/]/).at(-1) ?? '')
     .toLowerCase()
     .replace(/\.gguf$/, '')
@@ -32,6 +35,7 @@ export function modelKey(nameOrId: string): string {
 
 /** The key of a model id, by its name in the library when it is still there. */
 export function keyOfModel(modelId: string, models: PracticeSources['models']): string {
+  if (isCloudModelId(modelId)) return modelKey(modelId)
   return modelKey(models.find((m) => m.id === modelId)?.name ?? modelId)
 }
 

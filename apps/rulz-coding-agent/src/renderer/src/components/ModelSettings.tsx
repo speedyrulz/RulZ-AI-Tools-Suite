@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { DEFAULT_MAX_OUTPUT_TOKENS, KV_CACHE_TYPES, REASONING_EFFORTS, recommendedSampling } from '@shared/defaults'
-import { MODE_LABEL } from '@shared/modes'
+import { CLOUD_CONTEXT_NOTE, MODE_LABEL } from '@shared/modes'
 import { parseTensorSplit, rebalanceSplit, toPercents } from '@shared/split'
 import type { AgentMode, KvCacheType, LoadEstimate, LoadSettings, ModelLoadInfo, ModelModes, ReasoningEffort, SamplingSettings } from '@shared/types'
 import { errorMessage, invoke } from '../lib/api'
@@ -592,11 +592,13 @@ export function ModelSettings({ model }: { model: string }) {
           )}
         </div>
         <p className="mb-2 text-[11px] text-faint">
-          {rental?.rental
-            ? 'Read-only: this model runs on a rented computer, so it is loaded and changed on RulZ LLM Suite’s vast.ai page, not from here.'
-            : 'Saved in RulZ LLM Suite, so its Models page uses them too.'}
+          {rental?.cloud
+            ? CLOUD_CONTEXT_NOTE
+            : rental?.rental
+              ? 'Read-only: this model runs on a rented computer, so it is loaded and changed on RulZ LLM Suite’s vast.ai page, not from here.'
+              : 'Saved in RulZ LLM Suite, so its Models page uses them too.'}
         </p>
-        <Loading model={model} mode={shownMode} readOnly={!!rental?.rental} />
+        {!rental?.cloud && <Loading model={model} mode={shownMode} readOnly={!!rental?.rental} />}
       </div>
     </div>
   )

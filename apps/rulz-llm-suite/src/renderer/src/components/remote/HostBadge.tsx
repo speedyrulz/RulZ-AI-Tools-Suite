@@ -1,6 +1,29 @@
-import { Cloud, LoaderCircle } from 'lucide-react'
+import { Cloud, Globe, LoaderCircle } from 'lucide-react'
 import type { RemoteHost } from '@shared/remote'
 import { Badge, Tooltip } from '../ui'
+
+/** A connected OpenRouter model: the text goes to OpenRouter. `compact`: an icon only, for the top bar's small chips. */
+export function CloudBadge({ compact }: { compact?: boolean }) {
+  const text = 'Runs at OpenRouter. Your messages go there.'
+  if (compact) {
+    return (
+      <Tooltip content={text}>
+        <span className="shrink-0 text-muted" role="img" aria-label={text}>
+          <Globe size={12} />
+        </span>
+      </Tooltip>
+    )
+  }
+  return (
+    <Tooltip content={text}>
+      <span className="shrink-0">
+        <Badge>
+          <Globe size={11} /> OpenRouter
+        </Badge>
+      </span>
+    </Tooltip>
+  )
+}
 
 /**
  * Where a loaded model runs: a "vast.ai" badge with the rental's label; "Reconnecting" while the connection is being

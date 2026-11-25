@@ -11,12 +11,12 @@ import {
 import type { BatchItem, BatchItemStatus, BatchOptions, BatchRun, BatchState, RePracticeTaskStats } from '@shared/types'
 import { toast } from 'sonner'
 import { errorMessage, invoke, on } from '../lib/api'
-import { RENTAL_NOTE } from '@shared/modes'
+import { CLOUD_BATCH_NOTE, RENTAL_NOTE } from '@shared/modes'
 import { cn, formatDuration, relativeTime } from '../lib/format'
-import { batchRentalGate } from '../lib/modeLogic'
+import { batchGate } from '../lib/modeLogic'
 import { activeModelId, useApp } from '../stores/app'
 import { useWorkspace } from '../stores/workspace'
-import { modelLabel, RentalBadge } from './common'
+import { CloudBadge, modelLabel, RentalBadge } from './common'
 import { Badge, Button, Input, Spinner, Switch } from './ui'
 
 const BATCH_OPTS_KEY = 'rulz.practiceBatchOptions'
@@ -136,10 +136,11 @@ export function BatchRunBox({
   const [stoppingMode, setStoppingMode] = useState<'after' | 'now' | null>(null)
   const modelId = useApp((s) => activeModelId(s.settings, s.connection))
   const rental = useApp((s) => s.connection.models.find((m) => m.id === modelId)?.rental)
-  /** The yes to run on a rented computer: asked for every run, never remembered, and gone when the model changes. */
+  const cloud = useApp((s) => s.connection.models.find((m) => m.id === modelId)?.cloud)
+  /** The yes to run on a rented computer or on OpenRouter: asked for every run, never remembered, and gone when the model changes. */
   const [rentalYes, setRentalYes] = useState(false)
   useEffect(() => setRentalYes(false), [modelId])
-  const gate = batchRentalGate(rental, rentalYes)
+  const gate = batchGate({ rental, cloud }, rentalYes)
 
   const options = useMemo(() => cleanBatchOptions({ ...opts, family }), [opts, family])
   const solvedIds = useMemo(() => new Set(tasks.filter((t) => t.solved > 0).map((t) => t.id)), [tasks])
@@ -274,14 +275,19 @@ export function BatchRunBox({
       />
       {gate.needsYes && (
         <div className="space-y-2 rounded-xl border border-warn/40 bg-warn/10 p-3 text-[13px]">
-          <RentalBadge model={{ rental }} />
+          {cloud ? <CloudBadge model={{ cloud }} /> : <RentalBadge model={{ rental }} />}
           <p>
-            {modelLabel(modelId)} runs on a rented computer. {RENTAL_NOTE.replace('This model runs on a rented computer. ', '')} A batch run sends all of that
-            for every task, without you watching.
+            {cloud ? (
+              <>
+                {modelLabel(modelId)} runs on OpenRouter. {CLOUD_BATCH_NOTE}
+              </>
+            ) : (
+              <>{modelLabel(modelId)} runs on a rented computer. {RENTAL_NOTE.replace('This model runs on a rented computer. ', '')} A batch run sends all of that for every task, without you watching.</>
+            )}
           </p>
           <label className="flex min-h-11 items-center gap-3 text-[14px]">
-            <Switch checked={rentalYes} onCheckedChange={setRentalYes} label="Yes, run this batch on the rented computer" />
-            <span className="min-w-0">Yes, run this batch on the rented computer</span>
+            <Switch checked={rentalYes} onCheckedChange={setRentalYes} label={cloud ? 'Yes, run this batch on OpenRouter' : 'Yes, run this batch on the rented computer'} />
+            <span className="min-w-0">{cloud ? 'Yes, run this batch on OpenRouter' : 'Yes, run this batch on the rented computer'}</span>
           </label>
         </div>
       )}
@@ -352,7 +358,7 @@ function RunCard({ run, active, onStateChange }: { run: BatchRun; active: boolea
           ) : (
             <Badge tone="neutral">done</Badge>
           )}
-          {run.rentalOk && <Badge>rental</Badge>}
+          {run.rentalOk && <Badge>{run.modelCloud ? 'OpenRouter' : 'rental'}</Badge>}
           <span className="shrink-0 text-[14px] tabular-nums">
             <span className="font-semibold">{pct(s)}</span>{' '}
             <span className="text-muted">

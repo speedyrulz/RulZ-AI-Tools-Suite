@@ -1,6 +1,7 @@
 import { ChevronRight } from 'lucide-react'
 import { useState } from 'react'
 import { adoptSampling, MODE_LABELS, SHARED_SAMPLING_KEYS, type AppMode, type LeftoverSampling } from '@shared/modes'
+import type { SamplerSupport } from '@shared/cloud'
 import type { SamplingParams } from '@shared/types'
 import { cn } from '../../lib/format'
 import { SamplingFields, ThinkingFields, VarietyFields } from '../chat/InferencePanel'
@@ -50,7 +51,8 @@ export function OwnSampling({
   appSampling,
   leftover,
   note,
-  onChange
+  onChange,
+  supports
 }: {
   mode: AppMode
   on: boolean
@@ -62,6 +64,8 @@ export function OwnSampling({
   /** An extra sentence under the fields, e.g. when the values are saved. */
   note?: string
   onChange: (next: { on: boolean; sampling: SamplingParams | null }) => void
+  /** An OpenRouter model: the controls it does not honour are disabled. Undefined = all live. */
+  supports?: SamplerSupport
 }) {
   const [varietyOpen, setVarietyOpen] = useState(false)
   const honoursLimits = mode === 'chat' || mode === 're'
@@ -82,7 +86,7 @@ export function OwnSampling({
       </Field>
       {on && sampling ? (
         <div className="space-y-3">
-          <SamplingFields sampling={sampling} onChange={editSampling} limits={honoursLimits} />
+          <SamplingFields sampling={sampling} onChange={editSampling} limits={honoursLimits} supports={supports} />
           <button
             type="button"
             aria-expanded={varietyOpen}
@@ -92,8 +96,8 @@ export function OwnSampling({
             <ChevronRight size={14} className={cn('transition-transform', varietyOpen && 'rotate-90')} />
             Repetition and variety
           </button>
-          {varietyOpen && <VarietyFields sampling={sampling} onChange={editSampling} />}
-          {honoursThinking && <ThinkingFields sampling={sampling} onChange={editSampling} />}
+          {varietyOpen && <VarietyFields sampling={sampling} onChange={editSampling} supports={supports} />}
+          {honoursThinking && <ThinkingFields sampling={sampling} onChange={editSampling} supports={supports} />}
         </div>
       ) : (
         <>

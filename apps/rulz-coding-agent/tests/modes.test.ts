@@ -4,8 +4,13 @@ import { describe, expect, it, vi } from 'vitest'
 import { familyCounts } from '@shared/batch'
 import { DEFAULT_SETTINGS } from '@shared/defaults'
 import {
+  CLOUD_FATAL_CODES,
   MAX_MODE_PROMPT_CHARS,
   chooseModel,
+  cloudOf,
+  formatDollars,
+  isCloudCode,
+  isCloudFatalCode,
   cleanRequestFields,
   describeModeUse,
   modeHeaders,
@@ -28,6 +33,66 @@ import { modelAdmin, RENTAL_SETTINGS_REFUSAL } from '../src/main/rulz/modelAdmin
 import { startMockRulz } from './helpers/mockRulz'
 
 const QWEN = 'Qwen3-Coder-30B-A3B-Instruct-Q5_K_M'
+
+describe('OpenRouter selection', () => {
+  const cloud: ModelInfo = { id: 'openrouter/model', loaded: true, cloud: { provider: 'openrouter', free: false } }
+  it('requires an explicit choice and never replaces a missing cloud choice', () => {
+    expect(pickDefaultModel([cloud])).toBe('')
+    expect(chooseModel(cloud.id, false, [cloud]).ok).toBe(false)
+    // `rental` means rental only; `cloud` means cloud.
+    expect(chooseModel(cloud.id, false, [cloud], true)).toEqual({ ok: true, model: cloud.id, rental: false, cloud: true })
+    const gone = chooseModel(cloud.id, false, [{ id: 'local', loaded: true }], true)
+    expect(gone).toEqual({ ok: false, reason: expect.stringContaining('not available on OpenRouter now') })
+    // Even with nothing listed at all (LLM Suite not reachable), a chosen cloud model is not used as if it were local.
+    expect(chooseModel(cloud.id, false, [], true).ok).toBe(false)
+  })
+  it('a local model and a rental behave as before', () => {
+    const rented: ModelInfo = { id: 'r', loaded: true, rental: { label: 'L', reconnecting: false } }
+    expect(chooseModel('local', false, [{ id: 'local', loaded: true }, cloud])).toEqual({ ok: true, model: 'local', rental: false })
+    expect(chooseModel('r', true, [rented, cloud])).toEqual({ ok: true, model: 'r', rental: true })
+    expect(chooseModel('', false, [rented, { id: 'gemma', loaded: false }, cloud])).toEqual({ ok: true, model: 'gemma', rental: false })
+    // Only rentals: the old sentence, word for word.
+    expect(chooseModel('', false, [rented])).toEqual({ ok: false, reason: 'The only models right now are on rentals. Choose one yourself in Model settings, or load a model on this computer.' })
+  })
+  it('sends no rental header for an OpenRouter model, and keeps the rental ones', () => {
+    expect(modeHeaders('coding', false, true)).toEqual({ 'X-RulZ-Mode': 'coding' })
+    expect(modeHeaders('re', false, true)).toEqual({ 'X-RulZ-Mode': 're' })
+    expect(modeHeaders('coding', false)).toEqual({ 'X-RulZ-Mode': 'coding', 'X-RulZ-Rental': 'deny' })
+    expect(modeHeaders('coding', true)).toEqual({ 'X-RulZ-Mode': 'coding' })
+  })
+  it('keeps one list of fatal codes', () => {
+    expect([...CLOUD_FATAL_CODES].sort()).toEqual(['cloud_credits', 'cloud_key', 'cloud_limit', 'cloud_not_allowed', 'cloud_rate'])
+    for (const code of CLOUD_FATAL_CODES) expect([isCloudCode(code), isCloudFatalCode(code)]).toEqual([true, true])
+    for (const code of ['cloud_policy', 'cloud_request', 'cloud_error', 'cloud_', 'CLOUD_LIMIT']) expect(isCloudFatalCode(code)).toBe(false)
+    expect([isCloudCode('cloud_policy'), isCloudCode('rate_limit'), isCloudCode(undefined), isCloudCode(7)]).toEqual([true, false, false, false])
+  })
+  it('reads hostile cloud values safely', () => {
+    expect(cloudOf({ cloud: 'x' })).toBeUndefined()
+    expect(cloudOf({ cloud: ['openrouter'] })).toBeUndefined()
+    expect(cloudOf({ cloud: null })).toBeUndefined()
+    expect(cloudOf({ cloud: { provider: 'other', free: true } })).toBeUndefined()
+    expect(cloudOf({ cloud: { provider: 'openrouter' } })).toEqual({ provider: 'openrouter', free: false })
+    expect(cloudOf({ cloud: { provider: 'openrouter', free: 'yes' } })).toEqual({ provider: 'openrouter', free: false })
+    expect(cloudOf({ cloud: { provider: 'openrouter', free: true } })).toEqual({ provider: 'openrouter', free: true })
+    const parsed = parseModels({
+      data: [
+        { id: 'a', owned_by: 'rulz', state: 'loaded' },
+        { id: 'b', owned_by: 'rulz', cloud: 'x' },
+        { id: 'c', owned_by: 'rulz', cloud: { provider: 'other' } },
+        { id: 'openrouter/d', owned_by: 'rulz', state: 'loaded', cloud: { provider: 'openrouter' } },
+        null,
+        { owned_by: 'rulz', cloud: { provider: 'openrouter', free: true } }
+      ]
+    })
+    // A model that says it is cloud but is no valid OpenRouter entry is left out: never offered, never taken for a local one.
+    expect(parsed.models.map((m) => m.id)).toEqual(['a', 'openrouter/d'])
+    expect(parsed.models[1].cloud).toEqual({ provider: 'openrouter', free: false })
+    expect(parsed.models[0].cloud).toBeUndefined()
+  })
+  it('names a cost in dollars', () => {
+    expect([formatDollars(0.0042), formatDollars(0.5), formatDollars(1.374)]).toEqual(['$0.0042', '$0.50', '$1.37'])
+  })
+})
 
 const modes = (patch: { coding?: Partial<ModelModes['modes']['coding']>; re?: Partial<ModelModes['modes']['re']>; apiOverride?: Record<string, unknown> | null } = {}): ModelModes => ({
   id: QWEN,
@@ -460,6 +525,22 @@ describe('what the window and the phone may do to a model\'s settings', () => {
     await admin.setLoadSettings('local', null, 're')
     expect(client.setLoadSettings).toHaveBeenLastCalledWith('local', null, 're')
     expect(refreshed).toHaveBeenCalledTimes(3)
+  })
+
+  it('never sends a save, a preview or a reload for an OpenRouter model', async () => {
+    const { client } = make()
+    const admin = modelAdmin({
+      client,
+      models: () => [{ id: 'openrouter/x', loaded: true, cloud: { provider: 'openrouter', free: true } }],
+      assertIdle: () => undefined,
+      refreshModels: () => undefined
+    })
+    await expect(admin.setLoadSettings('openrouter/x', { parallel: 2 })).rejects.toThrow(/OpenRouter page/)
+    await expect(admin.previewLoadSettings('openrouter/x', {})).rejects.toThrow(/OpenRouter page/)
+    await expect(admin.reloadMode('openrouter/x', 'coding')).rejects.toThrow(/OpenRouter page/)
+    expect(client.setLoadSettings).not.toHaveBeenCalled()
+    expect(client.previewLoadSettings).not.toHaveBeenCalled()
+    expect(client.reloadMode).not.toHaveBeenCalled()
   })
 
   it('lets only a model id and a known mode into an address', async () => {

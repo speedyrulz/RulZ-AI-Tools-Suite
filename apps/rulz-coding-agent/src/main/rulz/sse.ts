@@ -63,9 +63,12 @@ export interface ChunkInfo {
   timings?: Timings
   /** Exact token counts, from llama.cpp's timings or an OpenAI-style usage block. */
   usage?: { prompt: number; completion: number }
+  /** An OpenRouter answer's cost in dollars (`usage.cost` of the last chunk). */
+  cost?: number
   gen?: GenTimings
   progress?: { processed: number; total: number }
   error?: string
+  errorCode?: string
 }
 
 /**
@@ -87,13 +90,14 @@ export function interpretChunk(json: unknown): ChunkInfo {
       finish_reason?: string | null
     }[]
     timings?: Timings
-    usage?: { prompt_tokens?: number; completion_tokens?: number } | null
+    usage?: { prompt_tokens?: number; completion_tokens?: number; cost?: unknown } | null
     prompt_progress?: { total?: number; processed?: number; cache?: number }
-    error?: { message?: string } | string
+    error?: { message?: string; code?: string } | string
   }
   const out: ChunkInfo = {}
   if (j.error) {
     out.error = typeof j.error === 'string' ? j.error : (j.error.message ?? JSON.stringify(j.error))
+    if (typeof j.error !== 'string' && typeof j.error.code === 'string') out.errorCode = j.error.code
     return out
   }
   if (j.type === 'content_block_delta') {
@@ -121,6 +125,7 @@ export function interpretChunk(json: unknown): ChunkInfo {
   } else if (typeof j.usage?.prompt_tokens === 'number') {
     out.usage = { prompt: j.usage.prompt_tokens, completion: j.usage.completion_tokens ?? 0 }
   }
+  if (typeof j.usage?.cost === 'number' && Number.isFinite(j.usage.cost) && j.usage.cost > 0) out.cost = j.usage.cost
   if (j.timings?.predicted_n !== undefined && j.timings.predicted_ms !== undefined) {
     out.gen = { generated: j.timings.predicted_n, genMs: j.timings.predicted_ms }
     if (j.timings.draft_n !== undefined) {
@@ -157,6 +162,16 @@ export class ToolCallAccumulator {
       .sort(([a], [b]) => a - b)
       .filter(([, c]) => c.name)
       .map(([i, c]) => ({ id: c.id || `call_${i}`, type: 'function' as const, function: { name: c.name, arguments: c.arguments } }))
+  }
+}
+
+/** The `error.code` of an error response body (LLM Suite's OpenRouter codes, `cloud_limit` and so on), if it has one. */
+export function errorCodeFromBody(text: string): string | undefined {
+  try {
+    const code = (JSON.parse(text) as { error?: { code?: unknown } } | null)?.error?.code
+    return typeof code === 'string' ? code.slice(0, 64) : undefined
+  } catch {
+    return undefined
   }
 }
 

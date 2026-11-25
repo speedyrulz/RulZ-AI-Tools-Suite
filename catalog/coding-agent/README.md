@@ -92,6 +92,11 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
 - **Models on a rented computer** (vast.ai, from RulZ LLM Suite) are marked **on a rental** and only used when you choose
   one; every other request says it must not be answered there. Your messages, attached PDFs, the files the agent reads
   and what its tools return go to that computer. A batch run there asks first, for every run.
+- **OpenRouter models** (0.24.0, from RulZ LLM Suite 0.36.0, only those ticked **Allow other apps** there) are marked
+  **OpenRouter, Free** or **Paid** and only used when you choose one; your code and messages go to OpenRouter. A task shows
+  what it cost. When the Suite's daily limit, the key or the credits refuse a request, the task ends with that sentence and
+  a batch run stops with the rest kept for later. A batch run asks first, for every run. The context limit is set on the
+  Suite's OpenRouter page.
 - **Settings → Record tasks for reverse-engineering training** (off by default): RulZ LLM Suite records each task as
   a reverse-engineering session, exactly as the model saw it. The sessions show on the Suite's Reverse Engineering
   page, labelled RulZ Coding Agent, where you grade them and export the good ones as `train.jsonl` for fine-tuning.

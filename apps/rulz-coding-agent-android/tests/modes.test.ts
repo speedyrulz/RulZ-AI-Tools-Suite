@@ -1,8 +1,18 @@
 import { describe, expect, it } from 'vitest'
-import { practiceScope, reloadOffer, rentalOf, triesText } from '../src/shared/modes'
+import { CLOUD_NOTE, chooseModel, cloudOf, modeHeaders, pickDefaultModel, practiceScope, reloadOffer, rentalOf, triesText } from '../src/shared/modes'
 import type { AppSettings, ConnectionInfo, ModelInfo, ModelModes, ModeSettings } from '../src/shared/types'
 import { DEFAULT_SETTINGS } from '../src/shared/defaults'
-import { batchRentalGate, chosenRentalGone, createModesStore, isUnknownChannel, openingSettingsFor, type ModesDeps } from '../src/lib/modeLogic'
+import { batchGate, batchRentalGate, chosenRentalGone, createModesStore, isUnknownChannel, openingSettingsFor, type ModesDeps } from '../src/lib/modeLogic'
+
+describe('OpenRouter choice', () => {
+  it('requires a remembered explicit choice', () => {
+    const cloud: ModelInfo = { id: 'openrouter/model', loaded: true, cloud: { provider: 'openrouter', free: true } }
+    expect(pickDefaultModel([cloud])).toBe('')
+    expect(chooseModel(cloud.id, false, [cloud]).ok).toBe(false)
+    expect(chooseModel(cloud.id, false, [cloud], true).ok).toBe(true)
+    expect(chooseModel(cloud.id, false, [], true).ok).toBe(false)
+  })
+})
 
 const mode = (p: Partial<ModeSettings> = {}): ModeSettings => ({ ownLoad: false, sampling: null, thinking: null, systemPrompt: '', matches: true, ...p })
 const modes = (instance: string, coding: Partial<ModeSettings> = {}, re: Partial<ModeSettings> = {}): ModelModes => ({
@@ -229,6 +239,45 @@ describe('the rental yes for a batch run', () => {
   })
   it('asks nothing for a local model, even with the switch left on', () => {
     expect(batchRentalGate(undefined, true)).toEqual({ needsYes: false, canStart: true, rentalOk: false })
+  })
+})
+
+describe('the yes for a batch run, knowing OpenRouter', () => {
+  const rental = { label: 'RTX 5090', reconnecting: false }
+  const cloud = { provider: 'openrouter', free: false }
+  it('asks for a rental and for an OpenRouter model, and says which', () => {
+    expect(batchGate({ rental }, false)).toEqual({ needsYes: true, canStart: false, rentalOk: false, kind: 'rental' })
+    expect(batchGate({ rental }, true)).toEqual({ needsYes: true, canStart: true, rentalOk: true, kind: 'rental' })
+    expect(batchGate({ cloud }, false)).toEqual({ needsYes: true, canStart: false, rentalOk: false, kind: 'cloud' })
+    expect(batchGate({ cloud }, true)).toEqual({ needsYes: true, canStart: true, rentalOk: true, kind: 'cloud' })
+  })
+  it('asks nothing for a local model, even with the switch left on, and agrees with the rental-only gate', () => {
+    expect(batchGate({}, true)).toEqual({ needsYes: false, canStart: true, rentalOk: false, kind: null })
+    expect(batchGate(undefined, true)).toEqual({ needsYes: false, canStart: true, rentalOk: false, kind: null })
+    for (const yes of [false, true]) {
+      const { kind: _kind, ...gate } = batchGate({ rental }, yes)
+      expect(gate).toEqual(batchRentalGate(rental, yes))
+    }
+  })
+  it('an OpenRouter model is no rental: no rental header, no rental choice, its own note', () => {
+    const info: ModelInfo = { id: 'openrouter/x', loaded: true, cloud }
+    expect(chooseModel(info.id, false, [info], true)).toEqual({ ok: true, model: info.id, rental: false, cloud: true })
+    expect(modeHeaders('coding', false, true)).toEqual({ 'X-RulZ-Mode': 'coding' })
+    expect(modeHeaders('coding', false)).toEqual({ 'X-RulZ-Mode': 'coding', 'X-RulZ-Rental': 'deny' })
+    expect(CLOUD_NOTE).toContain('OpenRouter')
+    expect(CLOUD_NOTE).not.toContain('rented')
+    expect(cloudOf({ cloud: 'x' })).toBeUndefined()
+    expect(cloudOf({ cloud: { provider: 'other' } })).toBeUndefined()
+    expect(cloudOf({ cloud: { provider: 'openrouter' } })).toEqual({ provider: 'openrouter', free: false })
+  })
+  it('says so when the chosen OpenRouter model is gone, and only then', () => {
+    const info = (id: string, cloudInfo?: ModelInfo['cloud']): ModelInfo => ({ id, loaded: true, ...(cloudInfo ? { cloud: cloudInfo } : {}) }) as ModelInfo
+    const conn = (models: ModelInfo[]): ConnectionInfo => ({ status: 'connected', url: '', models }) as ConnectionInfo
+    const s = (model: string, modelCloud: boolean): AppSettings => ({ ...DEFAULT_SETTINGS, model, modelCloud })
+    expect(chosenRentalGone(s('openrouter/x', true), conn([info('local')]))).toMatch(/not available on OpenRouter now/)
+    expect(chosenRentalGone(s('openrouter/x', true), conn([info('openrouter/x', cloud)]))).toBeNull()
+    expect(chosenRentalGone(s('openrouter/x', false), conn([info('openrouter/x', cloud)]))).toMatch(/Choose it again/)
+    expect(chosenRentalGone(s('local-gone', false), conn([info('local')]))).toBeNull()
   })
 })
 

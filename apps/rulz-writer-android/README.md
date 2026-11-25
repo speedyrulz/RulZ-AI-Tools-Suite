@@ -61,6 +61,8 @@ choose a path or type an action, and use the map to return to earlier passages. 
   them; **Keep as is** hides the bar. Nothing reloads by itself, and the settings are changed on the computer.
 - **Models on a rented computer** (vast.ai) are marked **Rental**; your text is sent there when you choose one. They are
   loaded on the computer only.
+- **OpenRouter models** (0.4.0; needs RulZ LLM Suite 0.36.0) ticked **Allow other apps** on the computer are marked
+  **OpenRouter** with **Free** or **Paid**; your text goes to OpenRouter when you choose one.
 - **Settings**: the model of the open project; notifications when a job finishes while the app is in the background,
   **Stay connected in the background** (Android shows a small ongoing notification for it); this phone's look and name;
   switch or forget computers.

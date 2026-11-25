@@ -86,11 +86,13 @@ export interface WritingModel {
   contextLength: number | null
   /** The rental it runs on; absent = this PC. */
   rental?: { label: string; reconnecting: boolean }
+  /** An OpenRouter model (text goes to OpenRouter). */
+  cloud?: { free: boolean }
 }
 
 export interface WritingModels {
   /** The model library. */
-  list(): { id: string; name: string; remote?: boolean }[]
+  list(): { id: string; name: string; remote?: boolean; cloud?: { free: boolean } }[]
   /** The ready instance of a model; with null, any ready instance (the desktop's "active model"). */
   ready(modelId: string | null): WritingModel | undefined
   /** Loads the model as the desktop does (instances:ensure) and resolves when it is ready. */
@@ -316,7 +318,8 @@ export class WritingRuns {
         id: m.id,
         name: m.name,
         loaded: !!ready,
-        ...(m.remote ? { rental: { label: ready?.rental?.label ?? null, reconnecting: !!ready?.rental?.reconnecting } } : {})
+        ...(m.remote ? { rental: { label: ready?.rental?.label ?? null, reconnecting: !!ready?.rental?.reconnecting } } : {}),
+        ...(m.cloud ? { cloud: { free: m.cloud.free } } : {})
       }
     })
   }

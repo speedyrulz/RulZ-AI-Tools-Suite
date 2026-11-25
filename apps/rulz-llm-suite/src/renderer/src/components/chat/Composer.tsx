@@ -111,8 +111,11 @@ export const Composer = forwardRef<ComposerHandle>(function Composer(_props, ref
   const model = modelById(targetId)
   let status: React.ReactNode
   if (autoLoading) status = <>Loading {modelById(autoLoading)?.name ?? 'model'}…</>
+  else if (inst?.status === 'ready' && inst.cloud) status = <>Chatting with <span className="text-muted">{inst.modelName}</span>. Your messages go to OpenRouter.</>
   else if (inst?.status === 'ready') status = <>Chatting with <span className="text-muted">{inst.modelName}</span>{inst.host ? <> on vast.ai ({inst.host.label}){inst.reconnecting ? ', reconnecting' : ''}</> : null}</>
+  else if (inst?.status === 'loading' && inst.cloud) status = <>Connecting {inst.modelName} at OpenRouter…</>
   else if (inst?.status === 'loading') status = <>Loading {inst.modelName}… {Math.round(inst.progress * 100)}%</>
+  else if (model?.cloud) status = <>Sending will connect <span className="text-muted">{model.name}</span> at OpenRouter. Your messages go there.</>
   else if (model) status = <>Sending will load <span className="text-muted">{model.name}</span> with its saved settings</>
   else
     status = (

@@ -18,7 +18,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   remoteToken: '',
   keepThinkingOpen: false,
   reRecording: false,
-  modelRental: false
+  modelRental: false,
+  modelCloud: false
 }
 
 export const isQwenCoder = (model: string): boolean => /qwen3[-_.]?coder/i.test(model)

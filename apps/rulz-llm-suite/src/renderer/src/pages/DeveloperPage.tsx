@@ -96,8 +96,9 @@ export function DeveloperPage() {
   const running = status.running
   const base = `http://${s.bind === 'lan' ? 'localhost' : '127.0.0.1'}:${status.running ? status.port : s.port}`
   const exampleModel = (() => {
-    const loaded = instances.find((i) => i.status === 'ready')
-    const m = models.find((x) => x.id === (loaded?.modelId ?? s.defaultModelId)) ?? models[0]
+    // Examples never name an OpenRouter model: copying one must not spend money.
+    const loaded = instances.find((i) => i.status === 'ready' && !i.cloud)
+    const m = models.find((x) => x.id === (loaded?.modelId ?? s.defaultModelId)) ?? models.find((x) => !x.cloud)
     return m?.name ?? 'your-model'
   })()
   const auth = s.apiKey ? ` \\\n  -H "Authorization: Bearer ${s.apiKey}"` : ''
@@ -198,7 +199,7 @@ export function DeveloperPage() {
             <Field label="Default model" hint="Used when a request names no model, or one you don't have, and no single model is loaded">
               <Select value={s.defaultModelId} onChange={(e) => set('defaultModelId', e.target.value)}>
                 <option value="">None (use the loaded model)</option>
-                {models.map((m) => (
+                {models.filter((m) => !m.cloud).map((m) => (
                   <option key={m.id} value={m.id}>
                     {m.name}
                   </option>

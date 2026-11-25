@@ -18,10 +18,10 @@ export function openingSettingsFor(modes: ModelModes | null | undefined): AgentM
 /** The sentence for a chosen model that ran on a rental and is not in the list now, or null. Nothing is started and no other model is used. */
 export function chosenRentalGone(settings: AppSettings | null, connection: ConnectionInfo): string | null {
   if (connection.status !== 'connected' || !settings?.model) return null
-  const c = chooseModel(settings.model, settings.modelRental === true, connection.models)
+  const c = chooseModel(settings.model, settings.modelRental === true, connection.models, settings.modelCloud === true)
   if (c.ok) return null
   const listed = connection.models.find((m) => m.id === settings.model)
-  return listed ? (listed.rental ? c.reason : null) : settings.modelRental === true ? c.reason : null
+  return listed ? (listed.rental || listed.cloud ? c.reason : null) : settings.modelRental === true || settings.modelCloud === true ? c.reason : null
 }
 
 /**
@@ -32,6 +32,26 @@ export function chosenRentalGone(settings: AppSettings | null, connection: Conne
 export function batchRentalGate(rental: ModelInfo['rental'], yes: boolean): { needsYes: boolean; canStart: boolean; rentalOk: boolean } {
   const needsYes = !!rental
   return { needsYes, canStart: !needsYes || yes, rentalOk: needsYes && yes }
+}
+
+/** What a batch run needs for the model in use, rental or OpenRouter. */
+export interface BatchGate {
+  needsYes: boolean
+  canStart: boolean
+  /** What `batch:start` gets: the owner's yes to a model off this computer (the one flag covers both kinds). */
+  rentalOk: boolean
+  kind: 'rental' | 'cloud' | null
+}
+
+/**
+ * The gate for the model in use. A rental's and an OpenRouter model both need the owner's yes for every run (OpenRouter
+ * sends the code away and may cost money); a model on the computer needs none. A computer older than this app does not
+ * mark OpenRouter models, so they do not show up and nothing is asked.
+ */
+export function batchGate(model: Pick<ModelInfo, 'rental' | 'cloud'> | undefined, yes: boolean): BatchGate {
+  const kind = model?.cloud ? 'cloud' : model?.rental ? 'rental' : null
+  const needsYes = kind !== null
+  return { needsYes, canStart: !needsYes || yes, rentalOk: needsYes && yes, kind }
 }
 
 // ---------- The modes of the model in use ----------

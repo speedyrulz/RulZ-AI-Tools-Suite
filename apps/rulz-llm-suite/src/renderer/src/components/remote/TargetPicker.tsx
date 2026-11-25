@@ -15,11 +15,13 @@ import {
   type HostChoice
 } from '../../lib/remote'
 import { invoke } from '../../lib/api'
+import { batchCostHint, isCloudId } from '../../lib/cloud'
 import { formatTokens } from '../../lib/format'
 import { modesFor } from '../../lib/modes'
 import { useApp } from '../../stores/app'
 import { useMcp } from '../../stores/mcp'
 import { useModels } from '../../stores/models'
+import { useCloud } from '../../stores/cloud'
 import { useRemote } from '../../stores/remote'
 import { Button, NumberInput, Switch, Tooltip } from '../ui'
 
@@ -32,7 +34,7 @@ export interface TargetState {
   view: ReactNode
 }
 
-const keyToHost = (k: string): BatchHost => (k === 'local' ? { kind: 'local' } : { kind: 'vast', rentalId: Number(k.slice(5)) })
+const keyToHost = (k: string): BatchHost => (k === 'local' ? { kind: 'local' } : k === 'cloud' ? { kind: 'cloud' } : { kind: 'vast', rentalId: Number(k.slice(5)) })
 
 /**
  * Where a batch run goes: the hosts that can run the run's model (a model on vast.ai runs on rentals only, a model
@@ -42,7 +44,8 @@ export function useHostChoices(modelId: string | null): HostChoice[] {
   const rentals = useRemote((s) => s.state?.rentals)
   const servers = useMcp((s) => s.servers)
   const reStdio = servers.find((s) => s.name === 'rea')?.transport === 'stdio'
-  return useMemo(() => hostChoices(modelId, rentals ?? [], reStdio), [modelId, rentals, reStdio])
+  const cloud = useModels((s) => isCloudId(modelId, s.models))
+  return useMemo(() => hostChoices(modelId, rentals ?? [], reStdio, cloud), [modelId, rentals, reStdio, cloud])
 }
 
 export function useTargetState(modelId: string | null, initial?: BatchTarget): TargetState {
@@ -66,6 +69,8 @@ export function useTargetState(modelId: string | null, initial?: BatchTarget): T
   const [ctx, setCtx] = useState<number | null | undefined>(initial ? initial.contextPerSession : undefined)
   const [stopAfter, setStopAfter] = useState(initial?.stopRentalsAfter ?? false)
   const remote = isRemoteModelId(modelId)
+  const cloud = choices.some((c) => c.host.kind === 'cloud')
+  const cloudState = useCloud((s) => s.state)
 
   const valid = choices.filter((c) => c.valid)
   const validKeys = valid.map((c) => hostKey(c.host))
@@ -77,9 +82,9 @@ export function useTargetState(modelId: string | null, initial?: BatchTarget): T
   const target: BatchTarget = { ...base, contextPerSession: ctx === undefined ? base.contextPerSession : ctx }
   const problems = targetProblems(target, choices)
   const ctxWarning = contextWarning(target)
-  const most = maxSessions(Math.max(1, hosts.length))
+  const most = maxSessions(Math.max(1, hosts.length), cloud)
   const hasRental = hosts.some((h) => h.kind === 'vast')
-  const whys = [...new Set(choices.filter((c) => !c.valid && c.host.kind === 'vast').map((c) => c.why))]
+  const whys = [...new Set(choices.filter((c) => !c.valid && c.host.kind !== 'local').map((c) => c.why))]
 
   const toggle = (k: string, on: boolean): void => setSel(on ? [...new Set([...keys, k])] : keys.filter((x) => x !== k))
 
@@ -99,10 +104,13 @@ export function useTargetState(modelId: string | null, initial?: BatchTarget): T
         {valid.length === 0 && <span className="text-faint">No host can run this model yet.</span>}
       </div>
       <div className="text-[11.5px] text-faint">
-        {remote
-          ? 'This model runs on vast.ai, so the run goes to rentals only. A run has one model; a model from this PC cannot join it.'
-          : 'This model is on this PC, so the run goes here. A model on vast.ai runs on rentals only.'}
+        {cloud
+          ? 'This model runs at OpenRouter, so the run goes there only. Every task sends its messages and tool results to OpenRouter.'
+          : remote
+            ? 'This model runs on vast.ai, so the run goes to rentals only. A run has one model; a model from this PC cannot join it.'
+            : 'This model is on this PC, so the run goes here. A model on vast.ai runs on rentals only.'}
       </div>
+      {cloud && <div className="text-[11.5px] text-warn tabular-nums">{batchCostHint(cloudState)}</div>}
       {remote && !(rentals ?? []).length && (
         <div className="flex items-center gap-2 text-[11.5px] text-muted">
           <Cloud size={13} /> No rented instance yet.
@@ -125,6 +133,7 @@ export function useTargetState(modelId: string | null, initial?: BatchTarget): T
             <NumberInput className="w-14" value={target.sessionsPerHost} min={1} max={most} onChange={(v) => setSessions(Math.min(most, Math.max(1, Math.round(v ?? 1))))} />
           </span>
         </Tooltip>
+        {!cloud && (
         <Tooltip
           content={`The model is loaded with this context for each task at once, so it uses more memory the more tasks run. ${
             known
@@ -145,6 +154,7 @@ export function useTargetState(modelId: string | null, initial?: BatchTarget): T
             tokens
           </span>
         </Tooltip>
+        )}
         {hasRental && (
           <Tooltip content="After the run ends, the rentals it used are stopped (with the usual countdown and a Keep running button). Their disks stay and are billed.">
             <label className="flex items-center gap-1.5">

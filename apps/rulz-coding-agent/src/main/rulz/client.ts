@@ -1,8 +1,8 @@
 // Talks to RulZ LLM Suite's local API server (OpenAI-compatible endpoints).
-import { parseModelModes, pickDefaultModel as pickDefault, rentalOf } from '@shared/modes'
+import { cloudOf, isCloudCode, parseModelModes, pickDefaultModel as pickDefault, rentalOf } from '@shared/modes'
 import type { AgentMode, ConnectionInfo, LoadSettings, ModelInfo, ModelLoadInfo, ModelModes, ReKind, ReOutcome, ReOverview, WireMessage, WireToolCall } from '@shared/types'
 import { noDraftMsPerToken } from './draft'
-import { errorFromBody, type GenTimings, interpretChunk, SseParser, ToolCallAccumulator } from './sse'
+import { errorCodeFromBody, errorFromBody, type GenTimings, interpretChunk, SseParser, ToolCallAccumulator } from './sse'
 import { jsonifyToolCallArgs, templateStringifiesArgs, validToolCallArgs } from './toolArgs'
 
 export interface ServerConfig {
@@ -50,11 +50,13 @@ export function parseModels(json: unknown): { isRulz: boolean; models: ModelInfo
     max_context_length?: number
     loaded_context_length?: number
     rental?: unknown
+    cloud?: unknown
   }
   const raw = data as Raw[]
   const isRulz = raw.length === 0 ? false : raw.some((m) => m.owned_by === 'rulz' || (m.path !== undefined && m.state !== undefined))
   const models = raw
-    .filter((m) => typeof m.id === 'string')
+    // An entry that says it is cloud but is not a valid OpenRouter one is left out: never offered, never taken for a local model.
+    .filter((m) => !!m && typeof m === 'object' && typeof m.id === 'string' && (!m.cloud || !!cloudOf(m)))
     .map((m) => ({
       id: m.id!,
       loaded: m.state === 'loaded',
@@ -62,7 +64,8 @@ export function parseModels(json: unknown): { isRulz: boolean; models: ModelInfo
       maxContext: m.max_context_length,
       arch: m.arch,
       quantization: m.quantization,
-      ...(rentalOf(m) ? { rental: rentalOf(m) } : {})
+      ...(rentalOf(m) ? { rental: rentalOf(m) } : {}),
+      ...(cloudOf(m) ? { cloud: cloudOf(m) } : {})
     }))
   return { isRulz, models }
 }
@@ -122,6 +125,8 @@ export interface TurnResult {
   finishReason: string
   /** Exact token counts when the server reports them. */
   usage?: { prompt: number; completion: number }
+  /** What an OpenRouter model's answer cost, in dollars (the last chunk's `usage.cost`). */
+  cost?: number
   /** Generation time and, when the server drafts, draft counts. */
   gen?: GenTimings
 }
@@ -137,7 +142,8 @@ export interface StreamHandlers {
 export class ServerError extends Error {
   constructor(
     message: string,
-    readonly status: number
+    readonly status: number,
+    readonly code?: string
   ) {
     super(message)
   }
@@ -189,9 +195,13 @@ export class RulzClient {
     if (cached) return cached
     const { url, apiKey } = this.config()
     const res = await fetch(`${url}/props?model=${encodeURIComponent(model)}`, { headers: { ...headers(apiKey), ...extra }, signal })
-    if (!res.ok) throw new ServerError(errorFromBody(res.status, await res.text()), res.status)
+    if (!res.ok) {
+      const text = await res.text()
+      throw new ServerError(errorFromBody(res.status, text), res.status, errorCodeFromBody(text))
+    }
     const j = (await res.json()) as { chat_template?: string; default_generation_settings?: { n_ctx?: number }; n_ctx?: number }
-    const props = { chatTemplate: j.chat_template, nCtx: j.default_generation_settings?.n_ctx ?? j.n_ctx }
+    const nCtx = j.default_generation_settings?.n_ctx ?? j.n_ctx
+    const props = { chatTemplate: j.chat_template, nCtx: known(nCtx) ? nCtx : undefined }
     this.props.set(model, props)
     return props
   }
@@ -219,7 +229,10 @@ export class RulzClient {
       body: JSON.stringify({ ...body, messages: this.prepareMessages(body.model, body.messages), stream: true, return_progress: true }),
       signal
     })
-    if (!res.ok || !res.body) throw new ServerError(errorFromBody(res.status, await res.text()), res.status)
+    if (!res.ok || !res.body) {
+      const text = await res.text()
+      throw new ServerError(errorFromBody(res.status, text), res.status, errorCodeFromBody(text))
+    }
     on.onFirstByte?.()
 
     const parser = new SseParser()
@@ -228,6 +241,7 @@ export class RulzClient {
     let content = ''
     let finishReason = ''
     let usage: TurnResult['usage']
+    let cost: number | undefined
     let gen: GenTimings | undefined
     const reader = res.body.getReader()
     for (;;) {
@@ -242,7 +256,7 @@ export class RulzClient {
           continue
         }
         const info = interpretChunk(json)
-        if (info.error) throw new ServerError(info.error, 500)
+        if (info.error) throw new ServerError(info.error, 500, info.errorCode)
         if (info.progress) on.onProgress?.(info.progress.processed, info.progress.total)
         if (info.reasoning) on.onReasoning?.(info.reasoning)
         if (info.content) {
@@ -255,12 +269,13 @@ export class RulzClient {
         }
         if (info.finishReason) finishReason = info.finishReason
         if (info.usage) usage = info.usage
+        if (info.cost !== undefined) cost = info.cost
         if (info.gen) gen = info.gen
       }
     }
     const baseline = gen && noDraftMsPerToken(gen)
     if (baseline) this.noDraftSpeed.set(body.model, baseline)
-    return { content, toolCalls: calls.result(), finishReason, usage, gen }
+    return { content, toolCalls: calls.result(), finishReason, usage, gen, ...(cost !== undefined ? { cost } : {}) }
   }
 
   /** The model's load settings in RulZ LLM Suite; with `mode`, the ones that mode loads with (0.35). */
@@ -294,7 +309,7 @@ export class RulzClient {
     })
     const text = await res.text()
     if (res.status === 404) return null
-    if (!res.ok) throw new ServerError(errorFromBody(res.status, text), res.status)
+    if (!res.ok) throw new ServerError(errorFromBody(res.status, text), res.status, errorCodeFromBody(text))
     return parseModelModes(JSON.parse(text))
   }
 
@@ -397,7 +412,15 @@ export class RulzClient {
   }
 
   /** Non-streamed completion without tools (used for summaries). */
-  async complete(model: string, messages: WireMessage[], maxTokens: number, signal?: AbortSignal, extra: Record<string, string> = {}): Promise<string> {
+  async complete(
+    model: string,
+    messages: WireMessage[],
+    maxTokens: number,
+    signal?: AbortSignal,
+    extra: Record<string, string> = {},
+    /** Told what the answer cost, when the server says (OpenRouter models). */
+    onCost?: (dollars: number) => void
+  ): Promise<string> {
     const { url, apiKey } = this.config()
     const res = await fetch(`${url}/v1/chat/completions`, {
       method: 'POST',
@@ -405,8 +428,12 @@ export class RulzClient {
       body: JSON.stringify({ model, messages, max_tokens: maxTokens, stream: false, temperature: 0.3 }),
       signal
     })
-    if (!res.ok) throw new ServerError(errorFromBody(res.status, await res.text()), res.status)
-    const j = (await res.json()) as { choices?: { message?: { content?: string } }[] }
+    if (!res.ok) {
+      const text = await res.text()
+      throw new ServerError(errorFromBody(res.status, text), res.status, errorCodeFromBody(text))
+    }
+    const j = (await res.json()) as { choices?: { message?: { content?: string } }[]; usage?: { cost?: unknown } }
+    if (typeof j.usage?.cost === 'number' && Number.isFinite(j.usage.cost) && j.usage.cost > 0) onCost?.(j.usage.cost)
     return j.choices?.[0]?.message?.content ?? ''
   }
 }
@@ -479,6 +506,8 @@ export function friendlyServerError(e: unknown): string {
     return 'I lost the connection to RulZ LLM Suite. Check that it is open and its server is started (Developer page), then try again.'
   }
   if (err instanceof ServerError) {
+    // OpenRouter errors: the server's own sentence says what to do.
+    if (isCloudCode(err.code)) return err.message
     // A rental refused (409), or lost its connection: LLM Suite's own sentence says what to do.
     if (err.status === 409 || (err.status >= 500 && /connection to the rental/i.test(err.message))) return err.message
     if (err.status === 503) return `The model could not be loaded: ${err.message}`

@@ -86,6 +86,9 @@ by itself, since every try counts towards the computer's limit; **Try again** on
   with **Settings for** to change each one's load settings, and a bar offers to reload a model that runs with others.
 - **Models on a rented computer** are marked **On a rental** and only used when you choose one. A batch run there needs
   its switch on, for every run. Practice counts are those of the model in use.
+- **OpenRouter models** (0.11.0; needs RulZ Coding Agent 0.24.0 and RulZ LLM Suite 0.36.0) are marked **OpenRouter** with
+  **Free** or **Paid**. They are only used when you choose one, a batch run there needs its switch on, and a task shows
+  what it cost.
 - These need RulZ Coding Agent 0.23.0 and RulZ LLM Suite 0.35.0 on the computer; with older ones they stay hidden.
 - **Only on the computer**: adding a note while a task runs, and the Copy, Edit, Run again and Delete buttons on
   messages.

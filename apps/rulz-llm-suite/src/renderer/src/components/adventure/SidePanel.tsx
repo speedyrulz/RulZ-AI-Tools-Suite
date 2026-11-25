@@ -133,7 +133,7 @@ function SettingsTab() {
       </Field>
       <Field label="Model">
         <Select value={s.modelId ?? ''} onChange={(e) => set({ modelId: e.target.value || null })}>
-          <option value="">Loaded model</option>
+          <option value="">Loaded model (not OpenRouter)</option>
           {!modelKnown && <option value={s.modelId ?? ''}>{s.modelId}</option>}
           {models.map((m) => (
             <option key={m.id} value={m.id}>

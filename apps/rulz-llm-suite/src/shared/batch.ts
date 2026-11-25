@@ -96,6 +96,8 @@ export interface BatchRun {
   hosts?: { label: string; dollarsPerHour: number }[]
   /** Estimated rental cost of the run in dollars (all its running periods); absent = none. */
   cost?: number
+  /** Why the run stopped by itself (the spending limit is used up, the key or credits are refused, OpenRouter rate limits); cleared when it is resumed. */
+  stopReason?: string
   /** Adapters the model had loaded when the run started, with the strengths its sessions used. Absent = none or an older run. */
   adapters?: { name: string; scale: number }[]
 }
@@ -129,9 +131,17 @@ export function sameBatchAdapters(a: { name: string; scale: number }[] | undefin
 export const UNATTENDED_DENIAL =
   'Not run: this tool needs the user’s approval and this session runs unattended. Continue with the tools that read the target.'
 
-/** The same for a call by a model on a rented instance. */
+/** The same for a call by a model that does not run on this PC: on a rented instance or at OpenRouter. */
 export const REMOTE_DENIAL =
+  'Not run: without asking, a model that does not run on this PC (a rented instance or OpenRouter) may only use static analysis, on absolute paths in this task’s folder. Continue with the given target.'
+
+/** What REMOTE_DENIAL said before OpenRouter models: saved chats carry it, and they still count as denied calls. */
+const OLD_REMOTE_DENIALS: readonly string[] = [
   'Not run: without asking, a model on a rented instance may only use static analysis, on absolute paths in this task’s folder. Continue with the given target.'
+]
+
+/** The result text of a call the fence refused (the current wording or an older one). */
+export const isRemoteDenial = (result: unknown): boolean => result === REMOTE_DENIAL || (typeof result === 'string' && OLD_REMOTE_DENIALS.includes(result))
 
 const clampInt = (v: unknown, min: number, max: number, fallback: number): number => {
   const n = typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : fallback
@@ -196,7 +206,7 @@ export function sessionStats(conv: Pick<Conversation, 'messages'>): Pick<BatchIt
     if (m.toolCalls?.length) toolRounds++
     promptTokens = Math.max(promptTokens, m.stats?.promptTokens ?? 0)
     outputTokens += m.stats?.predictedTokens ?? 0
-    for (const c of m.toolCalls ?? []) if (c.status === 'denied' && (c.result === UNATTENDED_DENIAL || c.result === REMOTE_DENIAL)) denied++
+    for (const c of m.toolCalls ?? []) if (c.status === 'denied' && (c.result === UNATTENDED_DENIAL || isRemoteDenial(c.result))) denied++
   }
   return { toolRounds, promptTokens, outputTokens, denied }
 }
@@ -366,6 +376,7 @@ export function cleanBatchRun(raw: unknown): BatchRun | null {
           )
         }
       : {}),
-    ...(optNum(r.cost) !== undefined ? { cost: optNum(r.cost) } : {})
+    ...(optNum(r.cost) !== undefined ? { cost: optNum(r.cost) } : {}),
+    ...(str(r.stopReason, 500) && status !== 'done' ? { stopReason: str(r.stopReason, 500) } : {})
   }
 }

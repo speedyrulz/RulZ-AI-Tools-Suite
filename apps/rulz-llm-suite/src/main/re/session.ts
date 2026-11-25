@@ -4,6 +4,7 @@
 // a scripted model.
 import { DEFAULT_SAMPLING } from '@shared/defaults'
 import { modePromptExtra, modeSampling, withPromptExtra, type ModelModeDefaults } from '@shared/modes'
+import { isCloudModelId } from '@shared/cloud'
 import { isRemoteModelId } from '@shared/remote'
 import { REMOTE_DENIAL, UNATTENDED_DENIAL, type TurnEndReason } from '@shared/batch'
 import {
@@ -96,7 +97,7 @@ export interface SessionSpec {
   /** 0 = no limit. Counted from the first request: loading is not the model's working time. */
   minutesPerTask: number
   collect: boolean
-  /** The instance is a rented one: its tool calls are held to the task's folder. A remote model id says so too. */
+  /** The instance is a rented one or OpenRouter: its tool calls are held to the task's folder. A remote or cloud model id says so too. */
   remote?: boolean
   /** Aborting it with 'stopNow', 'skip' or 'timeout' as the reason stops the session. */
   signal: AbortSignal
@@ -115,6 +116,8 @@ export interface SessionResult {
   replyAt: number | null
   /** The chat's last save failed (after retries): what is on disk is older than the session. */
   saveError?: string
+  /** The last request failed in a way the next would too (spending limit, key, credits, rate limit, model not allowed): the sentence. The run stops on it. */
+  fatal?: string
 }
 
 /** A failed save is tried again this many times, with these waits (ms) in between. */
@@ -132,7 +135,7 @@ const errorText = (e: unknown): string => (e instanceof Error ? e.message : Stri
 type Round =
   | { kind: 'final'; messageId: string; stopped: boolean }
   | { kind: 'tools'; messageId: string; calls: ToolCall[]; requestId: string }
-  | { kind: 'error'; messageId: string }
+  | { kind: 'error'; messageId: string; fatal?: string }
   | { kind: 'transport'; messageId: string }
 
 function abortReasonOf(signal: AbortSignal): AbortReason {
@@ -339,9 +342,10 @@ export async function runSession(deps: SessionDeps, spec: SessionSpec): Promise<
     streamingId = null
 
     if (end.type === 'error') {
-      if (end.transport) return { kind: 'transport', messageId }
+      // A cloud error is never a lost connection, and a fatal one is never waited on or sent again: retrying costs.
+      if (end.transport && !end.fatal && !isCloudModelId(spec.modelId ?? '')) return { kind: 'transport', messageId }
       patchMessage(messageId, (m) => ({ ...m, stats: end.stats, error: end.error }))
-      return { kind: 'error', messageId }
+      return { kind: 'error', messageId, ...(end.fatal ? { fatal: end.error } : {}) }
     }
     if (end.type !== 'done') return { kind: 'error', messageId }
     if (end.toolCalls?.length && end.stats.stopReason !== 'stopped') {
@@ -358,7 +362,7 @@ export async function runSession(deps: SessionDeps, spec: SessionSpec): Promise<
 
   // ---- tools ----
   // Decided once, not read off the instance, which may be gone by the time a call is checked.
-  const remote = spec.remote === true || isRemoteModelId(spec.modelId ?? '')
+  const remote = spec.remote === true || isRemoteModelId(spec.modelId ?? '') || isCloudModelId(spec.modelId ?? '')
   /** Marks calls that have not finished as stopped. */
   const stopCalls = (messageId: string): void =>
     patchMessage(messageId, (m) => ({
@@ -491,6 +495,7 @@ export async function runSession(deps: SessionDeps, spec: SessionSpec): Promise<
   // ---- the session ----
   let end: TurnEndReason = 'error'
   let lost = false
+  let fatal: string | undefined
   let transportSince: number | null = null
   const maxRounds = spec.maxToolRounds ?? first.re.maxToolRounds ?? 80
   try {
@@ -518,6 +523,7 @@ export async function runSession(deps: SessionDeps, spec: SessionSpec): Promise<
         transportSince = null
         if (r.kind === 'error') {
           end = 'error'
+          fatal = r.fatal
           conv = { ...conv, updatedAt: deps.now() }
           save(conv)
           live(true)
@@ -590,5 +596,5 @@ export async function runSession(deps: SessionDeps, spec: SessionSpec): Promise<
     failUngraded(timedOut ? `Batch run: stopped at the ${spec.minutesPerTask}-minute limit.` : 'Batch run: no answer within the tool round limit.')
   }
   await saveChain
-  return { conversation: conv, end, timedOut, lost, aborted: abortReason, replyAt, ...(saveError ? { saveError } : {}) }
+  return { conversation: conv, end, timedOut, lost, aborted: abortReason, replyAt, ...(saveError ? { saveError } : {}), ...(fatal ? { fatal } : {}) }
 }

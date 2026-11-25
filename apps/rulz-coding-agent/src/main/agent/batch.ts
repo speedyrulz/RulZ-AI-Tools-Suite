@@ -5,7 +5,7 @@
 import { randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 import { cleanBatchOptions, planBatch, settleRun } from '@shared/batch'
-import { RENTAL_NEEDS_YES, RENTAL_OLD_APP, type ModelChoice } from '@shared/modes'
+import { CLOUD_NEEDS_YES, CLOUD_OLD_APP, RENTAL_NEEDS_YES, RENTAL_OLD_APP, type ModelChoice } from '@shared/modes'
 import type { AgentEvent, BatchItem, BatchOptions, BatchRun, BatchState, ReOverview, TaskRecord } from '@shared/types'
 import { readJson, writeJsonAtomic } from '../util/jsonFile'
 import type { ReSessionInfo } from '../rulz/client'
@@ -181,6 +181,8 @@ export class BatchRunner {
     const opts = cleanBatchOptions(options)
     const chosen = this.choice()
     if (!chosen.ok) throw new Error(chosen.reason)
+    // `rentalOk` is the one yes a run needs for a model off this computer: a rental's, or OpenRouter's (an app that sends nothing is too old to ask).
+    if (chosen.cloud && rentalOk !== true) throw new Error(rentalOk === undefined ? CLOUD_OLD_APP : CLOUD_NEEDS_YES)
     if (chosen.rental && rentalOk !== true) throw new Error(rentalOk === undefined ? RENTAL_OLD_APP : RENTAL_NEEDS_YES)
     // The practice counts (and "only unsolved") are those of the model the run uses.
     const overview = await this.deps.client.reOverview(chosen.model)
@@ -197,6 +199,7 @@ export class BatchRunner {
       status: 'running',
       projectPath: session.root,
       modelName: chosen.model,
+      ...(chosen.cloud ? { modelCloud: true } : {}),
       kitDir: overview.practice.kitDir,
       record,
       options: opts,
@@ -248,6 +251,10 @@ export class BatchRunner {
   private modelProblem(run: BatchRun): string | null {
     const c = this.choice()
     if (!c.ok) return c.reason
+    // OpenRouter costs money and sends the code away: a run that is on one, or about to be, never moves to another model by itself.
+    if ((c.cloud || run.modelCloud) && (c.model !== run.modelName || !!c.cloud !== !!run.modelCloud)) {
+      return 'The model changed, and this run was started with the yes for another one. The run was stopped. Start a new run and review the model first.'
+    }
     if (c.rental && !run.rentalOk) {
       return `The model in use, ${c.model}, is now on a rented computer, and this run was not started with the yes for that. The run was stopped. Choose a model on this computer, or start a new run and say yes.`
     }
@@ -380,7 +387,14 @@ export class BatchRunner {
       return
     }
     // A rental that refused, was lost or is gone fails every task after this one the same way: stop the run instead.
-    if (task.outcome === 'error' && session.modelRefusal) this.halt = session.modelRefusal
+    if (task.outcome === 'error' && session.modelRefusal) {
+      this.halt = session.modelRefusal
+      // A fatal OpenRouter error (no money, our limit, a refused key...) means the task never got its try: it stays pending.
+      if (session.modelRefusalIsCloud) {
+        this.patchItem(index, { status: 'pending', startedAt: undefined, taskRecordId: undefined })
+        return
+      }
+    }
     this.patchItem(index, { status: 'error', ...common, error: lastProblem(session, task) })
   }
 }

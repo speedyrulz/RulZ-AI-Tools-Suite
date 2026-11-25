@@ -147,7 +147,7 @@ function useModelChoice(): [string, (id: string) => void, { id: string; name: st
   const reModel = useApp((s) => s.settings?.re.modelId ?? RE_DEFAULT_MODEL_ID)
   const update = useApp((s) => s.updateSettings)
   const re = useApp((s) => s.settings?.re)
-  const list = models.filter((m) => !m.error).map((m) => ({ id: m.id, name: m.remote ? `${m.name} (vast.ai)` : m.id }))
+  const list = models.filter((m) => !m.error).map((m) => ({ id: m.id, name: m.remote ? `${m.name} (vast.ai)` : m.cloud ? `${m.name} (OpenRouter)` : m.id }))
   const choose = (id: string): void => {
     if (re) void update({ re: { ...re, modelId: id } })
   }

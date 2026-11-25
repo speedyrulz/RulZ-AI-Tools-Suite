@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import type { BatchItem, BatchItemStatus, BatchOptions, BatchRun, BatchState, ReOverview } from '@shared/types'
 import { DEFAULT_BATCH_OPTIONS, cleanBatchOptions, familyCounts, nextPracticeTask, planBatch, summarize } from '@shared/batch'
-import { RENTAL_NOTE, practiceScope } from '@shared/modes'
+import { CLOUD_BATCH_NOTE, cloudText, RENTAL_NOTE, practiceScope } from '@shared/modes'
 import { errorMessage, invoke, on } from '../lib/api'
 import { cn, formatDuration, relativeTime } from '../lib/format'
 import { activeModelId, useApp } from '../stores/app'
@@ -220,6 +220,7 @@ function BatchBox({
   const project = useWorkspace((s) => s.project)
   const modelId = useApp((s) => activeModelId(s.settings, s.connection))
   const rental = useApp((s) => s.connection.models.find((m) => m.id === modelId)?.rental)
+  const cloud = useApp((s) => s.connection.models.find((m) => m.id === modelId)?.cloud)
   const [options, setOptions] = useState<BatchOptions>(() => ({ ...loadOptions(), family }))
   const [label, setLabel] = useState('')
   const [starting, setStarting] = useState(false)
@@ -247,7 +248,7 @@ function BatchBox({
     if (!project) return
     setStarting(true)
     try {
-      onState(await invoke('batch:start', project.path, label.trim(), cleanBatchOptions(options), record, !!rental && rentalYes))
+      onState(await invoke('batch:start', project.path, label.trim(), cleanBatchOptions(options), record, !!(rental || cloud) && rentalYes))
     } catch (e) {
       toast.error(errorMessage(e))
     } finally {
@@ -300,13 +301,21 @@ function BatchBox({
           <Switch checked={options.onlyUnsolved} onCheckedChange={(v) => patch({ onlyUnsolved: v })} />
         </Field>
       </div>
-      {rental && (
+      {(rental || cloud) && (
         <div className="space-y-1.5 rounded-lg border border-warn/40 bg-warn/10 p-3 text-[13px]">
           <div>
-            <Badge tone="warn">{rentalText({ rental })}</Badge> {modelLabel(modelId)} runs on a rented computer. {RENTAL_NOTE.replace('This model runs on a rented computer. ', '')}
+            {cloud ? (
+              <>
+                <Badge tone="warn">{cloudText({ cloud })}</Badge> {modelLabel(modelId)} runs on OpenRouter. {CLOUD_BATCH_NOTE}
+              </>
+            ) : (
+              <>
+                <Badge tone="warn">{rentalText({ rental })}</Badge> {modelLabel(modelId)} runs on a rented computer. {RENTAL_NOTE.replace('This model runs on a rented computer. ', '')}
+              </>
+            )}
           </div>
           <label className="flex items-center gap-2">
-            <Switch checked={rentalYes} onCheckedChange={setRentalYes} label="Yes, run this batch on the rented computer" /> Yes, run this batch on the rented computer
+            <Switch checked={rentalYes} onCheckedChange={setRentalYes} label={cloud ? 'Yes, run this batch on OpenRouter' : 'Yes, run this batch on the rented computer'} /> {cloud ? 'Yes, run this batch on OpenRouter' : 'Yes, run this batch on the rented computer'}
           </label>
         </div>
       )}
@@ -314,7 +323,7 @@ function BatchBox({
         <span className="text-[11.5px] text-faint">Tools that ask for approval are approved automatically in batch runs.</span>
         <div className="flex-1" />
         <span className="text-[13px] tabular-nums text-muted">{planned} {planned === 1 ? 'task' : 'tasks'}</span>
-        <Button variant="primary" disabled={!planned || busy || starting || !project || (!!rental && !rentalYes)} onClick={() => void startRun()}>
+        <Button variant="primary" disabled={!planned || busy || starting || !project || (!!(rental || cloud) && !rentalYes)} onClick={() => void startRun()}>
           {starting ? <LoaderCircle size={14} className="animate-spin" /> : <Play size={14} />} Start batch run
         </Button>
       </div>
@@ -408,7 +417,7 @@ function Scoreboard({ state, onState }: { state: BatchState; onState: (s: BatchS
                     <div className="flex items-center gap-2 text-[13px]">
                       <span className="truncate font-medium">{run.label || 'Unlabelled'}</span>
                       <Badge tone={run.status === 'running' ? 'accent' : run.status === 'done' ? 'ok' : 'neutral'}>{run.status}</Badge>
-                      {run.rentalOk && <Badge tone="warn">rental</Badge>}
+                      {run.rentalOk && <Badge tone="warn">{run.modelCloud ? 'OpenRouter' : 'rental'}</Badge>}
                     </div>
                     <div className="truncate text-[11.5px] text-muted">
                       {run.modelName} · {relativeTime(run.createdAt)} · {s.tasksSolved}/{s.tasksScored} tasks solved

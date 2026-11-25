@@ -2,7 +2,9 @@ import { useEffect, useState } from 'react'
 import { isRemoteModelId } from '@shared/remote'
 import type { GpuEstimate, LoadConfig, MemoryEstimate } from '@shared/types'
 import { invoke } from '../../lib/api'
+import { isCloudId } from '../../lib/cloud'
 import { cn, formatBytes } from '../../lib/format'
+import { useModels } from '../../stores/models'
 import { Badge } from '../ui'
 
 const VERDICT = {
@@ -20,7 +22,8 @@ export function useEstimate(modelId: string | null, config: LoadConfig, rentalId
   const [estimate, setEstimate] = useState<MemoryEstimate | null>(null)
   const key = JSON.stringify(config)
   useEffect(() => {
-    if (!modelId || (isRemoteModelId(modelId) && !rentalId)) return setEstimate(null)
+    // An OpenRouter model uses no memory here: there is nothing to estimate.
+    if (!modelId || isCloudId(modelId, useModels.getState().models) || (isRemoteModelId(modelId) && !rentalId)) return setEstimate(null)
     let cancelled = false
     const t = setTimeout(() => {
       const ask = isRemoteModelId(modelId) && rentalId ? invoke('remote:estimate', rentalId, modelId, config) : invoke('models:estimate', modelId, config)

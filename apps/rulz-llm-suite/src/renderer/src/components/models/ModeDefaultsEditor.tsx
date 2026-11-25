@@ -5,6 +5,7 @@ import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
 import { APP_MODES, leftoverSampling, MODE_LABELS, modeDefaultsEmpty, type AppMode, type ModeDefaults } from '@shared/modes'
 import type { LoadConfig, ModelEntry, ModelSampling, SamplingParams } from '@shared/types'
 import { errorMessage, invoke } from '../../lib/api'
+import { supportsOf } from '../../lib/cloud'
 import { modesFor } from '../../lib/modes'
 import { useApp } from '../../stores/app'
 import { useModels } from '../../stores/models'
@@ -87,6 +88,9 @@ function Editor({ modelId, model, remote, rentalId, scope, onScope, allView }: P
       .catch(() => seq === baseSeq.current && setBase(useApp.getState().settings?.defaultLoadConfig ?? DEFAULT_LOAD_CONFIG))
   }, [modelId, scope])
 
+  // An OpenRouter model has no load settings (nothing is loaded here), and honours only some sampling settings.
+  const cloud = !!model?.cloud
+  const supports = supportsOf(model)
   const mode: AppMode | null = scope === 'all' ? null : scope
   const saved = mode ? modes?.[mode] : undefined
   const view = mode ? (drafts[mode] ?? draftOf(saved)) : null
@@ -161,9 +165,11 @@ function Editor({ modelId, model, remote, rentalId, scope, onScope, allView }: P
       ) : (
         <div className="space-y-5">
           <p className="text-xs text-muted">
-            {WHEN[mode]} Load settings apply when the model is loaded.
+            {WHEN[mode]}
+            {cloud ? ' This model runs at OpenRouter, so it has no load settings.' : ' Load settings apply when the model is loaded.'}
           </p>
 
+          {!cloud && (
           <section className="space-y-3" aria-label="Own load settings">
             <Field inline label="Own load settings" hint={`Only for ${MODE_LABELS[mode]}`}>
               <Switch
@@ -181,14 +187,16 @@ function Editor({ modelId, model, remote, rentalId, scope, onScope, allView }: P
               <p className="text-xs text-muted">Uses the model&apos;s default load settings.</p>
             )}
           </section>
+          )}
 
           <OwnSampling
             mode={mode}
             on={view.ownSampling}
             sampling={view.sampling}
             appSampling={appSampling}
-            leftover={base ? leftoverSampling(saved?.load, base) : null}
+            leftover={!cloud && base ? leftoverSampling(saved?.load, base) : null}
             onChange={(n) => edit({ ownSampling: n.on, sampling: n.sampling })}
+            supports={supports}
           />
 
           <section className="space-y-2" aria-label="System prompt">

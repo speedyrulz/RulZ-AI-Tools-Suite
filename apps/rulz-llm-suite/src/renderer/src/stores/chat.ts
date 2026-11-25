@@ -26,6 +26,7 @@ import { chatDefaultsFor, followChatDefaults, isFollowable, modesFor } from '../
 import { once } from '../lib/once'
 import { WBENCH_BUSY, wbenchRunning } from '../lib/wbenchFlag'
 import { buildWire } from '../lib/wire'
+import { isCloudModelId } from '@shared/cloud'
 import { isRemoteModelId } from '@shared/remote'
 import { useApp } from './app'
 import { availableTools, effectiveToolMode, tokensOf, toolBudget, toolRequestFor } from './mcp'
@@ -579,7 +580,8 @@ export const useChat = create<ChatState>((set, get) => {
       if (effectiveToolMode({ re: isRe, files: scope, practice: !!get().genConversation?.re?.practice }) === 'dynamic') loadTools([target.qualifiedName])
       const s = useApp.getState().settings
       const gen = get().genConversation
-      const remote = isRemoteModelId(gen?.modelId ?? '')
+      // A model at OpenRouter gets the same fence as a rental: its text leaves this PC, so tools ask first and REA is private.
+      const remote = isRemoteModelId(gen?.modelId ?? '') || isCloudModelId(gen?.modelId ?? '')
       const chatKey = `${gen?.id ?? ''} ${call.name}`
       // RE sessions make dozens of read-only analysis calls; those run without asking.
       let approved =

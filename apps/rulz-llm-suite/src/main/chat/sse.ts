@@ -36,6 +36,14 @@ interface Timings {
   cache_n?: number
 }
 
+/** The `usage` object of an OpenAI-style final chunk (OpenRouter fills cost too). */
+export interface ChunkUsage {
+  prompt_tokens?: number
+  completion_tokens?: number
+  prompt_tokens_details?: { cached_tokens?: number }
+  cost?: number
+}
+
 export interface ToolCallDelta {
   index: number
   id?: string
@@ -51,6 +59,9 @@ export interface ChunkInfo {
   timings?: Timings
   progress?: { processed: number; total: number }
   error?: string
+  /** The code of an error chunk's body (a CloudErrorKind when it came from the OpenRouter side). */
+  errorCode?: string
+  usage?: ChunkUsage
 }
 
 /** Extracts what we need from one /v1/chat/completions stream chunk. */
@@ -66,13 +77,16 @@ export function interpretChunk(json: unknown): ChunkInfo {
     }[]
     timings?: Timings
     prompt_progress?: { total?: number; processed?: number; cache?: number }
-    error?: { message?: string } | string
+    error?: { message?: string; code?: unknown } | string
+    usage?: ChunkUsage
   }
   const out: ChunkInfo = {}
   if (j.error) {
     out.error = typeof j.error === 'string' ? j.error : (j.error.message ?? JSON.stringify(j.error))
+    if (typeof j.error === 'object' && typeof j.error.code === 'string') out.errorCode = j.error.code
     return out
   }
+  if (j.usage && typeof j.usage === 'object') out.usage = j.usage
   const choice = j.choices?.[0]
   if (choice?.delta?.content) out.content = choice.delta.content
   if (choice?.delta?.reasoning_content) out.reasoning = choice.delta.reasoning_content
@@ -107,6 +121,26 @@ export function statsFromTimings(t: Timings | undefined, extra: GenerationStats)
   }
 }
 
+/**
+ * Stats from OpenRouter's usage, for what llama-server's timings did not fill: tokens, cache hits, the cost (rounded up to a
+ * whole micro-dollar; the gateway has already added the provider's part of a BYOK request to it) and tokens/s.
+ */
+export function statsFromUsage(u: ChunkUsage, extra: GenerationStats, genSeconds: number): GenerationStats {
+  const out: GenerationStats = { ...extra }
+  if (typeof u.prompt_tokens === 'number') out.promptTokens = u.prompt_tokens
+  if (typeof u.completion_tokens === 'number') {
+    out.predictedTokens = u.completion_tokens
+    if (out.tokensPerSecond === undefined && genSeconds > 0) out.tokensPerSecond = u.completion_tokens / genSeconds
+  }
+  const cached = u.prompt_tokens_details?.cached_tokens
+  if (typeof cached === 'number') out.cachedTokens = cached
+  if (typeof u.cost === 'number' && u.cost >= 0) {
+    // toPrecision first: 0.000003 * 1e6 is 3.0000000000000004 and must not become 4.
+    out.costMicro = Math.ceil(Number((u.cost * 1e6).toPrecision(12)))
+  }
+  return out
+}
+
 /** Merges streamed tool-call fragments (keyed by index) into complete calls. */
 export class ToolCallAccumulator {
   private calls = new Map<number, { id: string; name: string; arguments: string }>()
@@ -139,4 +173,15 @@ export function errorFromBody(status: number, text: string): string {
     // not JSON
   }
   return text.trim() || `HTTP ${status}`
+}
+
+/** The `error.code` of an error response body when it is a string (the cloud gateway's CloudErrorKind). */
+export function errorCodeFromBody(text: string): string | undefined {
+  try {
+    const j = JSON.parse(text) as { error?: { code?: unknown } | string }
+    if (j.error && typeof j.error === 'object' && typeof j.error.code === 'string') return j.error.code
+  } catch {
+    // not JSON
+  }
+  return undefined
 }

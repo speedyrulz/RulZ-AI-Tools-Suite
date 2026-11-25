@@ -218,10 +218,10 @@ async function main(): Promise<void> {
     session: () => session,
     // Never a rental's model unless the owner chose it (and then only with the run's yes).
     modelName: () => {
-      const c = chooseModel(settings.get().model, settings.get().modelRental, connection.models)
+      const c = chooseModel(settings.get().model, settings.get().modelRental, connection.models, settings.get().modelCloud)
       return c.ok ? c.model : settings.get().model
     },
-    model: () => chooseModel(settings.get().model, settings.get().modelRental, connection.models),
+    model: () => chooseModel(settings.get().model, settings.get().modelRental, connection.models, settings.get().modelCloud),
     broadcast: (state) => broadcast('batch:changed', state)
   })
 
@@ -312,9 +312,9 @@ async function main(): Promise<void> {
   handle('settings:update', async (rawPatch) => {
     const before = settings.get()
     // Whether the chosen model is a rental's is worked out here, from the model list, never taken from the caller.
-    const { modelRental: _ignored, ...patch } = rawPatch
+    const { modelRental: _ignored, modelCloud: _ignoredCloud, ...patch } = rawPatch
     const next = await settings.update(
-      patch.model !== undefined ? { ...patch, modelRental: !!connection.models.find((m) => m.id === patch.model)?.rental } : patch
+      patch.model !== undefined ? { ...patch, modelRental: !!connection.models.find((m) => m.id === patch.model)?.rental, modelCloud: !!connection.models.find((m) => m.id === patch.model)?.cloud } : patch
     )
     if (next.theme !== before.theme) mainWindow?.setBackgroundColor(windowBackground(next.theme))
     if (next.serverUrl !== before.serverUrl || next.apiKey !== before.apiKey) void connect()
