@@ -3,6 +3,7 @@ import { stat } from 'node:fs/promises'
 import http, { type IncomingMessage, type ServerResponse } from 'node:http'
 import { isAbsolute } from 'node:path'
 import type { AdapterEntry, ApiReSession, ReOverview, RePracticeInfo, ApiRequestLog, ApiServerSettings, ApiServerStatus, GpuStat, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@shared/types'
+import { isCloudModelId, isLocalInstance } from '@shared/cloud'
 import { fileName } from '@shared/draft'
 import { modeLoad, modePromptExtra, reloadFor, type AppMode, type ModelModeDefaults } from '@shared/modes'
 import { API_RE_ID, RE_OUTCOMES, RE_SESSION_HEADER } from '@shared/re'
@@ -119,6 +120,8 @@ export interface ApiServerDeps {
   onRequest: (entry: ApiRequestLog) => void
   /** Clock for leases; tests. */
   now?: () => number
+  /** Whether other apps may use an OpenRouter model now (ticked for other apps, and a key is saved); asked on every request. Without it none may. */
+  cloudAllowed?: (modelId: string) => boolean
   /**
    * Per-mode settings and what a reload needs (docs/app-modes-design.md). Without it the mode routes answer 404 and the
    * X-RulZ-Mode header only leaves a lease.
@@ -274,8 +277,8 @@ export class ApiServer {
       entry.phase = 'done'
       this.record(entry)
     }
-    const fail = (status: number, message: string, type?: string): void => {
-      res.writeHead(status, { 'Content-Type': 'application/json' }).end(errorBody(message, type))
+    const fail = (status: number, message: string, type?: string, code?: string): void => {
+      res.writeHead(status, { 'Content-Type': 'application/json' }).end(errorBody(message, type, code))
       finish(status, message)
     }
     /** The body as a JSON object; on anything else the request has been answered and this gives null. */
@@ -337,7 +340,7 @@ export class ApiServer {
         const modes = this.deps.modes!
         const rawMode = modeRoute.kind === 'loadConfig' ? decodeURIComponent(modeRoute.mode) : null
         if (rawMode !== null && !isApiMode(rawMode)) return fail(404, 'Unknown mode: only coding and re are available.', 'not_found_error')
-        const model = resolveModel(this.deps.getModels(), decodeURIComponent(modeRoute.id))
+        const model = this.resolveApi(decodeURIComponent(modeRoute.id))
         if (!model || (model.remote && !this.deps.instances.readyFor(model.id))) return fail(404, 'Model not found.', 'not_found_error')
         if (modeRoute.kind === 'modes') {
           res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(this.modesBody(model)))
@@ -348,6 +351,7 @@ export class ApiServer {
           if (!json) return
           if (!isApiMode(json.mode)) return fail(400, 'mode must be "coding" or "re".', 'invalid_request_error')
           if (model.remote) return fail(409, remoteRefusal(model, 'reload it'), 'invalid_request_error')
+          if (model.cloud) return fail(409, cloudRefusal(model, 'reload it'), 'invalid_request_error')
           const r = this.requestModeReload(model, json.mode)
           if (r.status === 'blocked') return fail(409, r.why, 'invalid_request_error')
           res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(this.modesBody(model, r.status === 'started')))
@@ -357,6 +361,7 @@ export class ApiServer {
         const mode = rawMode as ApiMode
         // Changing the settings could reload the model, and the API never loads a rental's model.
         if (model.remote && method === 'POST') return fail(409, remoteRefusal(model, 'change its load settings'), 'invalid_request_error')
+        if (model.cloud && method === 'POST') return fail(409, cloudRefusal(model, 'change its load settings'), 'invalid_request_error')
         let preview: LoadConfig | undefined
         let blocked: string | undefined
         if (method === 'POST') {
@@ -393,10 +398,11 @@ export class ApiServer {
         return finish(200)
       }
       if (path.startsWith('/v1/models/') && path.endsWith(LOAD_CONFIG_SUFFIX) && (method === 'GET' || method === 'POST')) {
-        const model = resolveModel(this.deps.getModels(), decodeURIComponent(path.slice('/v1/models/'.length, -LOAD_CONFIG_SUFFIX.length)))
+        const model = this.resolveApi(decodeURIComponent(path.slice('/v1/models/'.length, -LOAD_CONFIG_SUFFIX.length)))
         if (!model || (model.remote && !this.deps.instances.readyFor(model.id))) return fail(404, 'Model not found.', 'not_found_error')
         // Changing the settings would reload the model, and the API never loads a rental's model.
         if (model.remote && method === 'POST') return fail(409, remoteRefusal(model, 'change its load settings'), 'invalid_request_error')
+        if (model.cloud && method === 'POST') return fail(409, cloudRefusal(model, 'change its load settings'), 'invalid_request_error')
         let preview: LoadConfig | undefined
         if (method === 'POST') {
           const json = await jsonBody()
@@ -417,9 +423,10 @@ export class ApiServer {
         return finish(200)
       }
       if (method === 'POST' && path.startsWith('/v1/models/') && path.endsWith(UNLOAD_SUFFIX)) {
-        const model = resolveModel(this.deps.getModels(), decodeURIComponent(path.slice('/v1/models/'.length, -UNLOAD_SUFFIX.length)))
+        const model = this.resolveApi(decodeURIComponent(path.slice('/v1/models/'.length, -UNLOAD_SUFFIX.length)))
         if (!model) return fail(404, 'Model not found.', 'not_found_error')
         if (model.remote) return fail(409, remoteRefusal(model, 'unload it'), 'invalid_request_error')
+        if (model.cloud) return fail(409, cloudRefusal(model, 'unload it'), 'invalid_request_error')
         const unloaded = await this.unloadModel(model.id)
         res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ ...(this.modelEntry(model) as object), unloaded }))
         return finish(200)
@@ -488,7 +495,7 @@ export class ApiServer {
         return finish(200)
       }
       if (method === 'GET' && path.startsWith('/v1/models/')) {
-        const model = resolveModel(this.deps.getModels(), decodeURIComponent(path.slice('/v1/models/'.length)))
+        const model = this.resolveApi(decodeURIComponent(path.slice('/v1/models/'.length)))
         if (!model || (model.remote && !this.deps.instances.readyFor(model.id))) return fail(404, 'Model not found.', 'not_found_error')
         res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(this.modelEntry(model)))
         return finish(200)
@@ -526,11 +533,16 @@ export class ApiServer {
       }
 
       // One entry per model: a rental's model may be ready on several rentals.
-      const ready = [...new Set(this.deps.instances.list().filter((i) => i.status === 'ready').map((i) => i.modelId))]
+      // (An OpenRouter instance is never in this list: the fallback and the single loaded model must not pick a paid model.)
+      const ready = [...new Set(this.deps.instances.list().filter((i) => i.status === 'ready' && !i.cloud).map((i) => i.modelId))]
       // A rental's model counts as a model only while it is loaded there, so it can't take over a fuzzy name match.
       const picked = pickModel(this.visibleModels(), requestedModel, ready, settings)
+      // Whoever names an OpenRouter model that is not available gets no other model in its place, whatever the fallback.
+      if (requestedModel && isCloudModelId(requestedModel.trim()) && (!picked || picked.fallback)) {
+        return fail(403, `${requestedModel.trim().slice(0, 200)} is not available to other apps. In RulZ LLM Suite, add it on the OpenRouter page, tick "Allow other apps" and save a key.`, 'permission_error', 'cloud_not_allowed')
+      }
       if (!picked) {
-        const asked = requestedModel ? resolveModel(this.deps.getModels(), requestedModel) : undefined
+        const asked = requestedModel ? this.resolveApi(requestedModel) : undefined
         if (asked?.remote) return fail(409, remoteRefusal(asked, 'load it'), 'invalid_request_error')
         const hint = requestedModel
           ? settings.unknownModelFallback
@@ -550,16 +562,27 @@ export class ApiServer {
       // Sent more than once, the values arrive as one list: a single deny in it counts.
       const denyRental = (headerValue(req, 'x-rulz-rental') ?? '').toLowerCase().split(',').some((v) => v.trim() === 'deny')
 
+      if (model.cloud) {
+        // OpenRouter is paid and the text leaves this computer: only a request that no web page could have made, and
+        // (when the server listens on the network) only with the API key set. Asked again on every request.
+        if (!this.deps.cloudAllowed?.(model.id)) return fail(404, 'Model not found.', 'not_found_error')
+        if (req.headers.origin !== undefined || !ownHost(req.headers.host)) return fail(403, 'OpenRouter models cannot be used from a web page.', 'permission_error')
+        if (settings.bind === 'lan' && !settings.apiKey) return fail(403, 'OpenRouter models need an API key when the server listens on the network. Set one in the API server settings.', 'permission_error')
+        if (method === 'POST' && !/^application\/json\b/i.test(String(req.headers['content-type'] ?? ''))) return fail(415, 'Send the request as application/json.', 'invalid_request_error')
+        if (!CLOUD_PATHS.has(`${method} ${path}`)) return fail(400, `${model.name} is an OpenRouter model: only chat completions, /props, /tokenize and /apply-template work with it.`, 'invalid_request_error')
+        if (denyRental) return fail(409, `${model.name} is an OpenRouter model, and this request says it must not use a rental or another computer.`, 'invalid_request_error')
+      }
+
       let inst = this.deps.instances.readyFor(model.id)
       if (!inst && model.remote) return fail(409, remoteRefusal(model, 'load it'), 'invalid_request_error')
       if (!inst) {
         entry.phase = 'loading'
         this.record(entry)
         try {
-          inst = await this.ensureLoaded(model.id, requestMode && MODE_LOAD_PATHS.has(path) ? requestMode : undefined)
+          inst = await this.ensureLoaded(model.id, requestMode && MODE_LOAD_PATHS.has(path) && !model.cloud ? requestMode : undefined)
         } catch (err) {
           if (clientGone) return
-          return fail(503, `Could not load ${model.name}: ${(err as Error).message}`, 'server_error')
+          return fail(503, model.cloud ? (err as Error).message : `Could not load ${model.name}: ${(err as Error).message}`, 'server_error')
         }
         // Nobody is waiting for the answer any more; don't make the model generate it.
         if (clientGone) return
@@ -604,13 +627,14 @@ export class ApiServer {
       const release = this.deps.instances.acquire(inst.instanceId, 'api', 'api request')
       if (this.jit.has(inst.instanceId)) this.jit.set(inst.instanceId, Date.now())
       // Another app's task is between two requests most of the time: the lease keeps its model from being reloaded then.
-      if (requestMode) this.lease(inst.modelId)
+      if (requestMode && !inst.cloud) this.lease(inst.modelId)
       this.emit()
       try {
-        await this.proxy(req, res, inst, path + url.search, body, entry, finish, (abort) => (onClientGone = abort), capture, entry.model ?? inst.modelName)
+        if (inst.cloud) await this.proxyCloud(res, inst, method, path, body, entry, finish, (abort) => (onClientGone = abort), capture, entry.model ?? inst.modelName)
+        else await this.proxy(req, res, inst, path + url.search, body, entry, finish, (abort) => (onClientGone = abort), capture, entry.model ?? inst.modelName)
       } finally {
         release()
-        if (requestMode) this.lease(inst.modelId)
+        if (requestMode && !inst.cloud) this.lease(inst.modelId)
         this.touch(inst.instanceId)
       }
     } catch (err) {
@@ -622,6 +646,85 @@ export class ApiServer {
       } else if (err instanceof URIError) fail(400, 'The request path has a malformed %-escape.', 'invalid_request_error')
       else fail(500, (err as Error).message, 'server_error')
     }
+  }
+
+  /**
+   * Answers a request for an OpenRouter model: the gateway is called in process (no port), and its Response is passed on
+   * the way proxy() passes on a llama-server's, with the same usage log and RE capture. A client that leaves aborts the request.
+   */
+  private async proxyCloud(
+    res: ServerResponse,
+    inst: LoadedInstance,
+    method: string,
+    path: string,
+    body: Buffer | null,
+    entry: ApiRequestLog,
+    finish: (status: number, error?: string) => void,
+    onClientGone: (abort: () => void) => void,
+    capture?: (reply: RecordedRound['response']) => void,
+    publicId?: string
+  ): Promise<void> {
+    const ctrl = new AbortController()
+    onClientGone(() => ctrl.abort())
+    let upstream: Response
+    try {
+      upstream = await this.deps.instances.fetch(inst, path, { method, body: body ? body.toString('utf8') : undefined, signal: ctrl.signal }, 'api')
+    } catch (err) {
+      // Aborted: the client left, and its 499 is already logged.
+      if (ctrl.signal.aborted) return
+      const message = err instanceof Error ? err.message : String(err)
+      if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'application/json', 'x-rulz-cloud': '1' }).end(errorBody(message, 'server_error'))
+      finish(502, message)
+      return
+    }
+    const out: Record<string, string> = { 'x-rulz-cloud': '1' }
+    for (const h of ['content-type', 'retry-after']) {
+      const v = upstream.headers.get(h)
+      if (v) out[h] = v
+    }
+    if (publicId) out['x-rulz-model'] = headerSafe(publicId)
+    res.writeHead(upstream.status, out)
+    const sse = /text\/event-stream/i.test(out['content-type'] ?? '')
+    const usage = new UsageReader(sse)
+    const reply = capture && upstream.status === 200 ? new ChatReplyCapture(sse) : null
+    try {
+      const reader = upstream.body?.getReader()
+      for (;;) {
+        const part = reader ? await reader.read() : { done: true as const, value: undefined }
+        if (part.done) break
+        const chunk = Buffer.from(part.value)
+        // A client reading slower than the model writes would otherwise have the whole reply buffered here.
+        if (!res.write(chunk) && !res.destroyed) {
+          await new Promise<void>((resolve) => {
+            const go = (): void => {
+              res.off('drain', go)
+              res.off('close', go)
+              resolve()
+            }
+            res.on('drain', go)
+            res.on('close', go)
+          })
+        }
+        usage.push(chunk)
+        reply?.push(chunk)
+      }
+    } catch (err) {
+      if (ctrl.signal.aborted) return
+      res.destroy()
+      finish(502, err instanceof Error ? err.message : String(err))
+      return
+    }
+    res.end()
+    const r = reply?.result()
+    if (r && capture) {
+      try {
+        capture(r)
+      } catch (err) {
+        console.error('Could not record an RE round:', err)
+      }
+    }
+    Object.assign(entry, usage.end())
+    finish(upstream.status, upstream.status >= 400 ? errorMessageFrom(usage.text()) : undefined)
   }
 
   private proxy(
@@ -725,7 +828,8 @@ export class ApiServer {
       p = this.deps.instances
         .ensure(modelId, mode)
         .then(({ instance, started }) => {
-          if (started) {
+          // An OpenRouter model has nothing to unload when idle, so it is never tracked as server-loaded.
+          if (started && !instance.cloud) {
             this.jit.set(instance.instanceId, Date.now())
             this.emit()
           }
@@ -741,7 +845,7 @@ export class ApiServer {
   private reload(modelId: string): void {
     const prev = this.deps.instances.list().find((i) => i.modelId === modelId && i.status !== 'stopping')
     // A rental's model is never reloaded from here.
-    if (!prev || prev.host) return
+    if (!prev || prev.host || prev.cloud) return
     // Keep auto-unloading a model only if the server loaded it in the first place.
     const wasJit = this.jit.delete(prev.instanceId)
     const p = this.deps.instances
@@ -783,6 +887,7 @@ export class ApiServer {
     const all = this.deps.instances.list().filter((i) => i.modelId === model.id && i.status !== 'stopping')
     if (!modes || !all.length) return { status: 'not-loaded' }
     if (model.remote) return { status: 'blocked', why: remoteRefusal(model, 'reload it') }
+    if (model.cloud) return { status: 'blocked', why: cloudRefusal(model, 'reload it') }
     const inst = all.find((i) => i.status === 'ready') ?? all[0]
     if (inst.status === 'loading' || this.loading.has(model.id)) return { status: 'blocked', why: `${model.name} is still loading.` }
     const wanted = reloadFor(inst.config, this.deps.getLoadDefaults(model.id).config, modes.get(model.id), mode)
@@ -827,7 +932,7 @@ export class ApiServer {
   /** Unloads every instance of a model, loading or ready; resolves how many there were. */
   private async unloadModel(modelId: string): Promise<number> {
     // Never a rental's instance: only the window unloads those.
-    const targets = this.deps.instances.list().filter((i) => i.modelId === modelId && i.status !== 'stopping' && !i.host)
+    const targets = this.deps.instances.list().filter((i) => i.modelId === modelId && i.status !== 'stopping' && isLocalInstance(i))
     for (const i of targets) this.jit.delete(i.instanceId)
     await Promise.all(targets.map((i) => this.deps.instances.unload(i.instanceId)))
     if (targets.length) this.emit()
@@ -840,7 +945,7 @@ export class ApiServer {
     const cutoff = Date.now() - minutes * 60_000
     const all = this.deps.instances.list()
     const live = new Set(all.map((i) => i.instanceId))
-    const remote = new Set(all.filter((i) => i.host).map((i) => i.instanceId))
+    const remote = new Set(all.filter((i) => !isLocalInstance(i)).map((i) => i.instanceId))
     let changed = false
     for (const instanceId of [...this.jit.keys()]) {
       if (!live.has(instanceId)) {
@@ -864,9 +969,15 @@ export class ApiServer {
     if (changed) this.emit()
   }
 
-  /** The models a client can use: the library's, and a rental's only while it is loaded on one. */
+  /** The models a client can use: the library's, a rental's only while it is loaded on one, and OpenRouter's only when ticked for other apps. */
   private visibleModels(): ModelEntry[] {
-    return this.deps.getModels().filter((m) => !m.remote || !!this.deps.instances.readyFor(m.id))
+    return this.deps.getModels().filter((m) => (m.cloud ? !!this.deps.cloudAllowed?.(m.id) : !m.remote || !!this.deps.instances.readyFor(m.id)))
+  }
+
+  /** A model by the name a client sent; an OpenRouter one only by its exact id, and only while other apps may use it. */
+  private resolveApi(requested: string): ModelEntry | undefined {
+    const m = resolveModel(this.deps.getModels(), requested)
+    return m && (!m.cloud || this.deps.cloudAllowed?.(m.id)) ? m : undefined
   }
 
   private listModels(): unknown {
@@ -874,6 +985,20 @@ export class ApiServer {
   }
 
   private modelEntry(m: ModelEntry): unknown {
+    if (m.cloud) {
+      return {
+        id: m.id,
+        object: 'model',
+        created: m.cloud.info.created || Math.floor(m.modifiedAt / 1000),
+        owned_by: 'openrouter',
+        path: m.id,
+        max_context_length: m.cloud.info.contextLength,
+        // Always usable: it connects with the first request.
+        state: 'loaded',
+        loaded_context_length: m.cloud.contextLimit,
+        cloud: { provider: 'openrouter', free: m.cloud.info.free }
+      }
+    }
     const inst = this.deps.instances.readyFor(m.id)
     return {
       id: publicModelId(m, this.deps.getModels()),
@@ -926,7 +1051,7 @@ export class ApiServer {
         sampling: fields?.sampling ?? null,
         thinking: fields?.thinking ?? null,
         system_prompt: modePromptExtra(all, mode),
-        matches: inst ? reloadFor(inst.config, base, all, mode) === null : null
+        matches: m.cloud ? true : inst ? reloadFor(inst.config, base, all, mode) === null : null
       }
     }
     return {
@@ -954,13 +1079,13 @@ export class ApiServer {
       has_draft: !!m.draft?.kind,
       // What "automatic" (draftFile null) uses, and what else can be picked.
       default_draft: m.draft?.kind ? { name: m.draft.builtIn ? 'Built-in MTP layers' : fileName(m.draft.path), kind: m.draft.kind, built_in: !!m.draft.builtIn } : null,
-      draft_choices: draftChoices(m, this.deps.getModels()),
+      draft_choices: m.cloud ? [] : draftChoices(m, this.deps.getModels()),
       adapters: config.adapters ?? [],
-      adapter_choices: adapterChoiceList(m, this.deps.getAdapters?.() ?? []),
-      gpus: m.remote ? [] : this.deps.gpus().map(({ index, name, memUsedMiB, memTotalMiB }) => ({ index, name, memUsedMiB, memTotalMiB })),
+      adapter_choices: m.cloud ? [] : adapterChoiceList(m, this.deps.getAdapters?.() ?? []),
+      gpus: m.remote || m.cloud ? [] : this.deps.gpus().map(({ index, name, memUsedMiB, memTotalMiB }) => ({ index, name, memUsedMiB, memTotalMiB })),
       // The estimate is about this PC's memory, which says nothing about a rental.
-      estimate: m.remote ? null : this.deps.estimate(m, config),
-      max_context_length: m.info?.contextLength,
+      estimate: m.remote || m.cloud ? null : this.deps.estimate(m, config),
+      max_context_length: m.cloud ? m.cloud.info.contextLength : m.info?.contextLength,
       // Layers whose experts cpuMoe can keep on the CPU; null for dense models.
       moe_layers: m.info?.expertCount ? (m.info.expertBytesByLayer?.length ?? m.info.blockCount ?? null) : null,
       state: inst?.status ?? 'not-loaded',
@@ -995,6 +1120,14 @@ export function ownHost(host: string | undefined): boolean {
   const name = (host ?? '').trim().toLowerCase().replace(/:\d+$/, '').replace(/\.$/, '')
   if (!name || name.startsWith('[') || !name.includes('.')) return true
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(name) || /\.(local|localhost|lan|home|internal|ts\.net)$/.test(name)
+}
+
+/** What an OpenRouter model answers to: a llama-server's chat, props, tokenize and template routes, as the gateway serves them. */
+const CLOUD_PATHS = new Set(['POST /v1/chat/completions', 'POST /v1/chat/completions/input_tokens', 'GET /props', 'POST /tokenize', 'POST /apply-template'])
+
+/** Why the API server won't reload, unload or change the settings of an OpenRouter model. */
+function cloudRefusal(model: ModelEntry, what: string): string {
+  return `${model.name} is an OpenRouter model, so nothing is loaded here and the API server cannot ${what}. Manage it on the OpenRouter page of the app.`
 }
 
 /** Why the API server won't load, unload or change a model that runs on a rented vast.ai instance. */

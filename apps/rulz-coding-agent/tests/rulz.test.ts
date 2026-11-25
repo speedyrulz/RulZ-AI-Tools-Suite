@@ -4,11 +4,27 @@ import { samplingRequest, skipsThinking } from '@shared/defaults'
 import { findServer, parseLoadInfo, parseModels, pickDefaultModel, RulzClient, type TurnResult } from '../src/main/rulz/client'
 import { parseSettings } from '../src/main/settings'
 import { addDraft, noDraftMsPerToken, turnSavedMs } from '../src/main/rulz/draft'
-import { errorFromBody, interpretChunk, SseParser, ToolCallAccumulator } from '../src/main/rulz/sse'
+import { errorCodeFromBody, errorFromBody, interpretChunk, SseParser, ToolCallAccumulator } from '../src/main/rulz/sse'
 import { jsonifyToolCallArgs, templateStringifiesArgs, validToolCallArgs } from '../src/main/rulz/toolArgs'
 import { QWEN_CODER_TEMPLATE, startMockRulz } from './helpers/mockRulz'
 
 describe('SseParser', () => {
+  it('preserves cloud error codes from streamed errors', () => {
+    expect(interpretChunk({ error: { message: 'Limit reached', code: 'cloud_limit' } })).toEqual({ error: 'Limit reached', errorCode: 'cloud_limit' })
+  })
+  it('reads the cost of an OpenRouter answer, and ignores a hostile one', () => {
+    expect(interpretChunk({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 5, cost: 0.0123 } })).toMatchObject({ usage: { prompt: 10, completion: 5 }, cost: 0.0123 })
+    for (const cost of ['1', -1, 0, Number.NaN, null, {}]) expect(interpretChunk({ usage: { prompt_tokens: 1, completion_tokens: 1, cost } }).cost).toBeUndefined()
+  })
+  it('reads the error code of a response body', () => {
+    expect(errorCodeFromBody('{"error":{"message":"m","type":"t","code":"cloud_limit"}}')).toBe('cloud_limit')
+    for (const body of ['not json', '{"error":"x"}', '{"error":{"code":7}}', 'null', '[]', '']) expect(errorCodeFromBody(body)).toBeUndefined()
+  })
+  it('keeps OpenRouter metadata from model entries', () => {
+    const parsed = parseModels({ data: [{ id: 'openrouter/a', state: 'loaded', loaded_context_length: 4096, cloud: { provider: 'openrouter', free: true } }] })
+    expect(parsed.models[0].cloud).toEqual({ provider: 'openrouter', free: true })
+    expect(pickDefaultModel(parsed.models)).toBe('')
+  })
   it('handles payloads split across chunks', () => {
     const p = new SseParser()
     expect(p.push('data: {"a":1}\n\nda')).toEqual(['{"a":1}'])

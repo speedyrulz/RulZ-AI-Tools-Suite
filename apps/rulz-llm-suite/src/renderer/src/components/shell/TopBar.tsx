@@ -4,7 +4,8 @@ import { cn, formatBytes } from '../../lib/format'
 import { isDarkTheme, useApp } from '../../stores/app'
 import { useModels } from '../../stores/models'
 import { CostChip } from '../remote/CostChip'
-import { HostBadge } from '../remote/HostBadge'
+import { OpenRouterChip } from '../cloud/CloudChip'
+import { CloudBadge, HostBadge } from '../remote/HostBadge'
 import { IconButton, Kbd, ProgressBar, Tooltip } from '../ui'
 
 export function TopBar() {
@@ -29,6 +30,7 @@ export function TopBar() {
             {active ? active.modelName : 'Select a model to load'}
           </span>
           {active?.host && <HostBadge host={active.host} reconnecting={active.reconnecting} compact />}
+          {active?.cloud && <CloudBadge compact />}
           <Kbd>Ctrl+L</Kbd>
           <ChevronDown size={14} className="shrink-0 text-faint" />
         </button>
@@ -39,6 +41,7 @@ export function TopBar() {
         </div>
       </div>
       <CostChip />
+      <OpenRouterChip />
       <HardwareMeters />
       <ThemeToggle />
     </header>
@@ -73,6 +76,7 @@ function InstanceChip({ inst, active }: { inst: LoadedInstance; active: boolean 
         <span className="flex max-w-56 items-center gap-1.5">
           <span className="truncate font-medium">{inst.modelName}</span>
           {inst.host && <HostBadge host={inst.host} reconnecting={inst.reconnecting} compact />}
+          {inst.cloud && <CloudBadge compact />}
         </span>
         {loading ? (
           <span className="flex w-40 items-center gap-1.5 text-[10px] text-muted">
@@ -81,14 +85,16 @@ function InstanceChip({ inst, active }: { inst: LoadedInstance; active: boolean 
           </span>
         ) : (
           <span className="text-[10px] text-muted">
-            {inst.status === 'stopping' ? 'Unloading…' : `${inst.contextLength ? `${inst.contextLength.toLocaleString()} ctx` : 'Ready'}${inst.hasVision ? ' · vision' : ''}`}
+            {inst.status === 'stopping' ? (inst.cloud ? 'Disconnecting…' : 'Unloading…') : `${inst.cloud ? 'OpenRouter · ' : ''}${inst.contextLength ? `${inst.contextLength.toLocaleString()} ctx` : 'Ready'}${inst.hasVision ? ' · vision' : ''}`}
           </span>
         )}
       </button>
-      <IconButton size="sm" label="Server log" onClick={() => showLog(inst.instanceId)}>
-        <FileText size={13} />
-      </IconButton>
-      <IconButton size="sm" label={loading ? 'Cancel loading' : 'Eject'} onClick={() => void unload(inst.instanceId)} disabled={inst.status === 'stopping'}>
+      {!inst.cloud && (
+        <IconButton size="sm" label="Server log" onClick={() => showLog(inst.instanceId)}>
+          <FileText size={13} />
+        </IconButton>
+      )}
+      <IconButton size="sm" label={loading ? (inst.cloud ? 'Cancel connecting' : 'Cancel loading') : inst.cloud ? 'Disconnect' : 'Eject'} onClick={() => void unload(inst.instanceId)} disabled={inst.status === 'stopping'}>
         <ArrowUpFromLine size={14} />
       </IconButton>
     </div>

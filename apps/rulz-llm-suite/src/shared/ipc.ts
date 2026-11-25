@@ -3,6 +3,7 @@ import type { AllModeDefaults, AppMode, ModeDefaults } from './modes'
 import type { AdventureDesktopInvoke, AdventureIpcEvents, AdventureIpcInvoke } from './adventure'
 import type { BatchOptions, BatchRun } from './batch'
 import type { BenchmarkRequest, BenchmarkRun } from './benchmark'
+import type { CloudIpcEvents, CloudIpcInvoke } from './cloud'
 import type { NovelIpcEvents, NovelIpcInvoke } from './novel'
 import type { PdfAttachmentResult } from './pdf'
 import type { PhoneIpcEvents, PhoneIpcInvoke, WritingIpcEvents, WritingIpcInvoke } from './phone'
@@ -65,7 +66,7 @@ export interface AppInfo {
 }
 
 /** Request/response channels (ipcRenderer.invoke ↔ ipcMain.handle). */
-export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke, PhoneIpcInvoke, WritingIpcInvoke, AdventureIpcInvoke, AdventureDesktopInvoke, RemoteIpcInvoke {
+export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke, PhoneIpcInvoke, WritingIpcInvoke, AdventureIpcInvoke, AdventureDesktopInvoke, RemoteIpcInvoke, CloudIpcInvoke {
   'app:info': () => AppInfo
   'settings:get': () => AppSettings
   'settings:update': (patch: Partial<AppSettings>) => AppSettings
@@ -190,7 +191,7 @@ export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke, PhoneI
 }
 
 /** Push channels (webContents.send → ipcRenderer.on). */
-export interface IpcEvents extends NovelIpcEvents, PhoneIpcEvents, WritingIpcEvents, AdventureIpcEvents, RemoteIpcEvents {
+export interface IpcEvents extends NovelIpcEvents, PhoneIpcEvents, WritingIpcEvents, AdventureIpcEvents, RemoteIpcEvents, CloudIpcEvents {
   'models:changed': ModelEntry[]
   'models:modeDefaults': AllModeDefaults
   'adapters:changed': AdapterEntry[]

@@ -1,6 +1,7 @@
 // What the window and the phone may do to a model's settings in RulZ LLM Suite. The rules live here, in
 // the main process: the phone calls the same handlers as the window, so nothing may rest on a button
 // being greyed out.
+import { CLOUD_CONTEXT_NOTE } from '@shared/modes'
 import type { AgentMode, LoadSettings, ModelInfo, ModelLoadInfo, ModelModes } from '@shared/types'
 import type { RulzClient } from './client'
 
@@ -19,6 +20,8 @@ export const RENTAL_SETTINGS_REFUSAL =
 export function modelAdmin(deps: ModelAdminDeps) {
   const rented = (model: string): boolean => !!deps.models().find((m) => m.id === model)?.rental
   const refuseRental = (model: string): void => {
+    // An OpenRouter model has no load settings and no reload (the server answers 409): the one setting is on LLM Suite's OpenRouter page.
+    if (deps.models().find((m) => m.id === model)?.cloud) throw new Error(CLOUD_CONTEXT_NOTE)
     if (rented(model)) throw new Error(RENTAL_SETTINGS_REFUSAL)
   }
   /** The phone sends what it likes: only a model id and one of the two modes go into an address. */

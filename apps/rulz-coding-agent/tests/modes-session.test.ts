@@ -7,13 +7,13 @@ import { basename, join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
 import { DEFAULT_BATCH_OPTIONS } from '@shared/batch'
 import { DEFAULT_SETTINGS } from '@shared/defaults'
-import { chooseModel, RENTAL_NEEDS_YES, RENTAL_OLD_APP } from '@shared/modes'
+import { CLOUD_FATAL_CODES, CLOUD_NEEDS_YES, CLOUD_OLD_APP, chooseModel, RENTAL_NEEDS_YES, RENTAL_OLD_APP } from '@shared/modes'
 import type { AgentEvent, AppSettings, BatchOptions, BatchRun, ModelInfo, ReTaskInfo, TaskRecord } from '@shared/types'
 import { BatchRunner, BatchStore } from '../src/main/agent/batch'
-import { ProjectSession } from '../src/main/agent/session'
+import { isContextOverflow, ProjectSession } from '../src/main/agent/session'
 import { CopySnapshots } from '../src/main/project/snapshots'
 import { emptyProject, ProjectStore } from '../src/main/project/store'
-import { RulzClient } from '../src/main/rulz/client'
+import { RulzClient, ServerError } from '../src/main/rulz/client'
 import { startMockRulz, type MockOptions, type MockTurn } from './helpers/mockRulz'
 
 const base = mkdtempSync(join(tmpdir(), 'rulz-agent-modes-'))
@@ -93,10 +93,10 @@ async function harness(
     store: batchStore,
     session: () => session,
     modelName: () => {
-      const c = chooseModel(settings.model, settings.modelRental, list)
+      const c = chooseModel(settings.model, settings.modelRental, list, settings.modelCloud)
       return c.ok ? c.model : settings.model
     },
-    model: () => chooseModel(settings.model, settings.modelRental, list),
+    model: () => chooseModel(settings.model, settings.modelRental, list, settings.modelCloud),
     broadcast: () => undefined
   })
   const notices = (): { text: string; tone: string }[] =>
@@ -491,6 +491,310 @@ describe('batch runs and rentals', () => {
       const run = await h.finished()
       expect(run.items.map((i) => i.taskId)).toEqual(['xor-1', 'xor-2'])
       expect(h.mock.overviewQueries).toEqual([LOCAL])
+    } finally {
+      await h.close()
+    }
+  }, 60_000)
+})
+
+describe('OpenRouter models in tasks', () => {
+  const CLOUD = 'openrouter/vendor/model-x'
+  const cloudModel = { id: CLOUD, state: 'loaded' as const, loaded_context_length: 32768, cloud: { provider: 'openrouter', free: false } }
+  const both: MockOptions['models'] = [{ id: 'gemma', state: 'loaded', loaded_context_length: 65536 }, cloudModel]
+  const chosen = { model: CLOUD, modelCloud: true }
+  const SENTENCE = 'OpenRouter says there are no credits left. Add some at openrouter.ai, then try again.'
+
+  it('is never picked by itself: a task without a choice uses the local model and still refuses rentals', async () => {
+    const h = await harness([{ content: 'Done.' }], { models: both, settings: { model: '' } })
+    const only = await harness([{ content: 'Done.' }], { models: [cloudModel], settings: { model: '' } })
+    try {
+      await h.run('Hi')
+      expect(h.mock.requests[0].body.model).toBe('gemma')
+      expect(h.mock.requests[0].rental).toBe('deny')
+      const task = await only.run('Hi')
+      expect(task.outcome).toBe('error')
+      expect(only.mock.requests).toHaveLength(0)
+      expect(only.mock.headerLog).toHaveLength(0)
+    } finally {
+      await h.close()
+      await only.close()
+    }
+  }, 30_000)
+
+  it('a chosen cloud model gets every request of the task by its exact id, with no rental header and no further yes', async () => {
+    const big = (n: number) => ({ toolCalls: [call('run_command', { command: `1..${n} | ForEach-Object { 'output line number ' + $_ }` })] })
+    const h = await harness([big(400), big(401), big(402), { content: 'first done' }, { content: 'second done' }], {
+      nCtx: 4000,
+      models: [{ ...cloudModel, loaded_context_length: 4000 }, { id: 'gemma', state: 'loaded' }],
+      settings: chosen,
+      mock: { modes: modesBody() }
+    })
+    try {
+      await h.run('First task')
+      const task = await h.run('Second task')
+      expect(task.outcome).toBe('done')
+      // Summary (compaction) requests are among them, and they name the chosen model too.
+      expect(h.mock.requests.some((r) => r.body.stream === false)).toBe(true)
+      for (const r of h.mock.requests) {
+        expect(r.body.model).toBe(CLOUD)
+        expect(r.rental).toBeUndefined()
+        expect(r.mode).toBe('coding')
+      }
+      expect(h.mock.headerLog.length).toBeGreaterThan(h.mock.requests.length)
+      for (const l of h.mock.headerLog) {
+        expect(l.model).toBe(CLOUD)
+        expect(l.rental).toBeUndefined()
+      }
+      expect(h.notices().filter((n) => n.tone === 'error')).toEqual([])
+    } finally {
+      await h.close()
+    }
+  }, 90_000)
+
+  it.each([...CLOUD_FATAL_CODES])('%s ends the task at once with the server\'s sentence and no second request', async (code) => {
+    const h = await harness([{ status: 402, error: SENTENCE, code }, { content: 'Should never be asked.' }], { models: both, settings: chosen })
+    try {
+      const task = await h.run('Hi')
+      expect(task.outcome).toBe('error')
+      expect(h.notices().at(-1)).toEqual({ text: SENTENCE, tone: 'error' })
+      expect(h.mock.requests).toHaveLength(1)
+      expect(h.session.modelRefusal).toBe(SENTENCE)
+      expect(h.session.modelRefusalIsCloud).toBe(true)
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('an error in the middle of a reply ends the task too, without a second request', async () => {
+    const h = await harness([{ streamError: { message: SENTENCE, code: 'cloud_limit' } }, { content: 'Should never be asked.' }], { models: both, settings: chosen })
+    try {
+      const task = await h.run('Hi')
+      expect(task.outcome).toBe('error')
+      expect(h.notices().at(-1)).toEqual({ text: SENTENCE, tone: 'error' })
+      expect(h.mock.requests).toHaveLength(1)
+      expect(h.session.modelRefusalIsCloud).toBe(true)
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it.each(['cloud_policy', 'cloud_request', 'cloud_error'])('%s ends the task as an ordinary error, and is not tried again', async (code) => {
+    // The sentence of a too-long prompt must not set off the "try again with less history" step either: that would cost money.
+    const message = `The request exceeds the available context size (${code}).`
+    const h = await harness([{ status: 400, error: message, code }, { content: 'Should never be asked.' }], { models: both, settings: chosen })
+    try {
+      const task = await h.run('Hi')
+      expect(task.outcome).toBe('error')
+      expect(h.notices().at(-1)).toEqual({ text: message, tone: 'error' })
+      expect(h.mock.requests).toHaveLength(1)
+      expect(h.session.modelRefusal).toBeNull()
+      expect(h.session.modelRefusalIsCloud).toBe(false)
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it.each([
+    ['cloud_credits', 402],
+    ['cloud_error', 500]
+  ])('a %s from the summary request ends the task: no mechanical summary, no second summary request', async (code, status) => {
+    const big = (n: number) => ({ toolCalls: [call('run_command', { command: `1..${n} | ForEach-Object { 'output line number ' + $_ }` })] })
+    const h = await harness([big(400), big(401), big(402), { content: 'first done' }, { content: 'Should never be asked.' }], {
+      nCtx: 4000,
+      models: [{ ...cloudModel, loaded_context_length: 4000 }],
+      settings: chosen,
+      mock: { complete: () => ({ status, error: SENTENCE, code }) }
+    })
+    try {
+      await h.run('First task')
+      const task = await h.run('Second task')
+      expect(task.outcome).toBe('error')
+      expect(h.notices().at(-1)).toEqual({ text: SENTENCE, tone: 'error' })
+      expect(h.mock.requests.filter((r) => r.body.stream === false)).toHaveLength(1)
+    } finally {
+      await h.close()
+    }
+  }, 90_000)
+
+  it('sums the cost of the turns and of the summary on the task, and records none for a local model', async () => {
+    const h = await harness([{ toolCalls: [call('list_files', {})], cost: 0.01 }, { content: 'Done.', cost: 0.0042 }], { models: both, settings: chosen })
+    const local = await harness([{ content: 'Done.' }])
+    try {
+      const task = await h.run('Hi')
+      expect(task.cost).toBeCloseTo(0.0142, 8)
+      expect(h.session.data.tasks[0].cost).toBeCloseTo(0.0142, 8)
+      expect((await local.run('Hi')).cost).toBeUndefined()
+    } finally {
+      await h.close()
+      await local.close()
+    }
+  }, 30_000)
+
+  it('also counts what a summary request cost', async () => {
+    const big = (n: number) => ({ toolCalls: [call('run_command', { command: `1..${n} | ForEach-Object { 'output line number ' + $_ }` })] })
+    const h = await harness([big(400), big(401), big(402), { content: 'first done' }, { content: 'second done' }], {
+      nCtx: 4000,
+      models: [{ ...cloudModel, loaded_context_length: 4000 }],
+      settings: chosen,
+      mock: { complete: () => ({ cost: 0.5 }) }
+    })
+    try {
+      await h.run('First task')
+      const task = await h.run('Second task')
+      expect(task.outcome).toBe('done')
+      expect(task.cost).toBeGreaterThanOrEqual(0.5)
+    } finally {
+      await h.close()
+    }
+  }, 90_000)
+
+  it('a chosen cloud model that is gone is never swapped for another one', async () => {
+    const h = await harness([{ content: 'Done.' }], { models: [{ id: 'gemma', state: 'loaded' }], settings: chosen })
+    try {
+      const task = await h.run('Hi')
+      expect(task.outcome).toBe('error')
+      expect(h.notices().at(-1)).toMatchObject({ tone: 'error', text: expect.stringContaining('not available on OpenRouter now') })
+      expect(h.mock.requests).toHaveLength(0)
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('keeps the context-overflow retry for everything that is not an OpenRouter error, rentals included', () => {
+    const text = 'the request exceeds the available context size, try increasing it'
+    expect(isContextOverflow(new ServerError(text, 400))).toBe(true)
+    expect(isContextOverflow(new ServerError(text, 409))).toBe(true)
+    expect(isContextOverflow(new ServerError(text, 400, 'invalid_request'))).toBe(true)
+    for (const code of ['cloud_limit', 'cloud_request', 'cloud_policy', 'cloud_error']) expect(isContextOverflow(new ServerError(text, 400, code))).toBe(false)
+  })
+})
+
+describe('batch runs and OpenRouter models', () => {
+  const CLOUD = 'openrouter/vendor/model-x'
+  const cloudModel = { id: CLOUD, state: 'loaded' as const, loaded_context_length: 32768, cloud: { provider: 'openrouter', free: true } }
+  const both: MockOptions['models'] = [{ id: LOCAL, state: 'loaded', loaded_context_length: 65536 }, cloudModel]
+  const chosen = { model: CLOUD, modelCloud: true }
+  const SENTENCE = 'Your daily OpenRouter spending limit is reached. Raise it on LLM Suite\'s OpenRouter page.'
+
+  it('is refused without the yes, in words that name OpenRouter, also for a phone app that sends nothing', async () => {
+    const h = await harness([], { models: both, settings: chosen })
+    try {
+      await expect(h.runner.start(h.root, '', h.options(), true, false)).rejects.toThrow(CLOUD_NEEDS_YES)
+      await expect(h.runner.start(h.root, '', h.options(), true)).rejects.toThrow(CLOUD_OLD_APP)
+      expect(CLOUD_NEEDS_YES).toContain('OpenRouter')
+      expect(CLOUD_OLD_APP).toContain('OpenRouter')
+      expect(CLOUD_NEEDS_YES).not.toContain('rented')
+      expect(h.runner.active).toBe(false)
+      expect(h.batchStore.list()).toEqual([])
+      expect(h.mock.requests).toHaveLength(0)
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('runs with the yes: every task names the model, there is no rental header, and the run is marked as OpenRouter', async () => {
+    const h = await harness([{ content: 'ANSWER: 42' }], { models: both, settings: chosen, mock: { practicePerModel: true } })
+    try {
+      await h.runner.start(h.root, 'c', h.options({ maxTasks: 1 }), true, true)
+      const run = await h.finished()
+      expect(run).toMatchObject({ status: 'done', modelName: CLOUD, modelCloud: true, rentalOk: true })
+      expect(run.items[0].status).toBe('solved')
+      expect(h.mock.requests[0].body.model).toBe(CLOUD)
+      expect(h.mock.requests[0].rental).toBeUndefined()
+      expect(h.mock.requests[0].mode).toBe('re')
+      expect(h.mock.overviewQueries).toEqual([CLOUD])
+    } finally {
+      await h.close()
+    }
+  }, 60_000)
+
+  it('a fatal OpenRouter error stops the run with the server\'s sentence and leaves that task pending, without another request', async () => {
+    const h = await harness([{ status: 429, error: SENTENCE, code: 'cloud_limit' }, { content: 'ANSWER: 42' }], { models: both, settings: chosen })
+    try {
+      await h.runner.start(h.root, '', h.options(), true, true)
+      const run = await h.finished()
+      expect(run.status).toBe('stopped')
+      expect(run.items.map((i) => i.status)).toEqual(['pending', 'pending'])
+      expect(run.items[0]).toMatchObject({ startedAt: undefined, taskRecordId: undefined })
+      expect(run.stopNote).toBe(SENTENCE)
+      expect(h.mock.requests).toHaveLength(1)
+    } finally {
+      await h.close()
+    }
+  }, 60_000)
+
+  it('a non-fatal OpenRouter error fails that task only: the run goes on and nothing is retried', async () => {
+    const h = await harness([{ status: 400, error: 'OpenRouter refused this request.', code: 'cloud_request' }, { content: 'ANSWER: 42' }], { models: both, settings: chosen })
+    try {
+      await h.runner.start(h.root, '', h.options(), true, true)
+      const run = await h.finished()
+      expect(run.items.map((i) => i.status)).toEqual(['error', 'solved'])
+      expect(run.items[0].error).toBe('OpenRouter refused this request.')
+      expect(run.stopNote).toBeUndefined()
+      expect(h.mock.requests).toHaveLength(2)
+    } finally {
+      await h.close()
+    }
+  }, 60_000)
+
+  it('stops between two tasks when the model changes from the cloud one, and when a local run moves to a cloud one', async () => {
+    const away = await harness([{ content: 'ANSWER: 42' }, { content: 'ANSWER: 42' }], {
+      models: both,
+      settings: chosen,
+      onTaskEnd: ({ settings }) => {
+        settings.model = LOCAL
+        settings.modelCloud = false
+      }
+    })
+    const toCloud = await harness([{ content: 'ANSWER: 42' }, { content: 'ANSWER: 42' }], {
+      models: both,
+      onTaskEnd: ({ settings }) => {
+        settings.model = CLOUD
+        settings.modelCloud = true
+      }
+    })
+    try {
+      await away.runner.start(away.root, '', away.options(), true, true)
+      const run = await away.finished()
+      expect(run.items.map((i) => i.status)).toEqual(['solved', 'pending'])
+      expect(run.status).toBe('stopped')
+      expect(run.stopNote).toMatch(/model changed/)
+      expect(away.mock.requests).toHaveLength(1)
+
+      await toCloud.runner.start(toCloud.root, '', toCloud.options(), true, false)
+      const run2 = await toCloud.finished()
+      expect(run2.items.map((i) => i.status)).toEqual(['solved', 'pending'])
+      expect(run2.stopNote).toMatch(/model changed/)
+      expect(toCloud.mock.requests).toHaveLength(1)
+    } finally {
+      await away.close()
+      await toCloud.close()
+    }
+  }, 60_000)
+
+  it('a run on a local model still goes on when the owner picks another local model (as before)', async () => {
+    const h = await harness([{ content: 'ANSWER: 42' }, { content: 'ANSWER: 42' }], {
+      models: [...both, { id: 'gemma', state: 'loaded' }],
+      onTaskEnd: ({ settings }) => {
+        settings.model = 'gemma'
+      }
+    })
+    try {
+      await h.runner.start(h.root, '', h.options(), true, false)
+      const run = await h.finished()
+      expect(run.items.map((i) => i.status)).toEqual(['solved', 'solved'])
+      expect(h.mock.requests.map((r) => r.body.model)).toEqual([LOCAL, 'gemma'])
+    } finally {
+      await h.close()
+    }
+  }, 60_000)
+
+  it('a rental refusal still leaves its task as an error, not pending (as before)', async () => {
+    const h = await harness([{ content: 'ANSWER: 42' }], { models: [{ id: LOCAL, state: 'loaded', rental }], list: [{ id: LOCAL, loaded: true }] })
+    try {
+      await h.runner.start(h.root, '', h.options(), true, false)
+      const run = await h.finished()
+      expect(run.items.map((i) => i.status)).toEqual(['error', 'pending'])
     } finally {
       await h.close()
     }

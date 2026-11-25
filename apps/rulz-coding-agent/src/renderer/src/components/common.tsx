@@ -1,6 +1,6 @@
 import { Check } from 'lucide-react'
 import { APPROVAL_LEVELS } from '@shared/defaults'
-import { RENTAL_NOTE } from '@shared/modes'
+import { CLOUD_NEVER_AUTO, CLOUD_NOTE, cloudText, RENTAL_NOTE } from '@shared/modes'
 import type { ApprovalLevel, ModelInfo } from '@shared/types'
 import { cn, formatTokens } from '../lib/format'
 import { Badge, Select } from './ui'
@@ -24,7 +24,7 @@ export function ModelSelect({ models, value, onChange }: { models: ModelInfo[]; 
       {sorted.map((m) => (
         <option key={m.id} value={m.id}>
           {modelLabel(m.id)}
-          {m.rental
+          {m.cloud ? `  (${cloudText(m)})` : m.rental
             ? `  (${rentalText(m)}${m.loadedContext ? `, ${formatTokens(m.loadedContext)} context` : ''})`
             : m.loaded
               ? `  (ready${m.loadedContext ? `, ${formatTokens(m.loadedContext)} context` : ''})`
@@ -35,8 +35,18 @@ export function ModelSelect({ models, value, onChange }: { models: ModelInfo[]; 
   )
 }
 
-/** The warning under a rental's model: what leaves this computer. */
-export function RentalNote({ model }: { model: Pick<ModelInfo, 'rental'> | undefined }) {
+/** The warning under a rental's or an OpenRouter model: what leaves this computer. */
+export function RentalNote({ model }: { model: Pick<ModelInfo, 'rental' | 'cloud'> | undefined }) {
+  if (model?.cloud) {
+    return (
+      <div className="rounded-lg border border-warn/40 bg-warn/10 p-3 text-[13px]">
+        <div className="mb-1 flex items-center gap-2">
+          <Badge tone="warn">{cloudText(model)}</Badge>
+        </div>
+        {CLOUD_NOTE} {CLOUD_NEVER_AUTO}
+      </div>
+    )
+  }
   if (!model?.rental) return null
   return (
     <div className="rounded-lg border border-warn/40 bg-warn/10 p-3 text-[13px]">

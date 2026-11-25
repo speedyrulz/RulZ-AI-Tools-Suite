@@ -1,4 +1,5 @@
 // Types shared by the main process, the preload bridge and the renderer.
+import type { CloudModelTag } from './cloud'
 import type { RemoteHost } from './remote'
 
 export type Theme = 'dark' | 'light' | 'system'
@@ -620,6 +621,8 @@ export interface ModelEntry {
   modifiedAt: number
   /** Runs on a vast.ai rental (docs/vast-design.md); path, files and sidecars then describe the source, not files to load here. */
   remote?: boolean
+  /** An OpenRouter model (docs/cloud-design.md): not a file, no load settings; never set together with `remote`. */
+  cloud?: CloudModelTag
 }
 
 export interface MemoryEstimate {
@@ -693,6 +696,8 @@ export interface LoadedInstance {
   host?: RemoteHost
   /** The connection to the rental is being re-made; the model is still loaded. */
   reconnecting?: boolean
+  /** A connected OpenRouter model: no process, no port (0), no GPU; requests go through InstanceManager.fetch. */
+  cloud?: { provider: 'openrouter'; free: boolean }
 }
 
 export interface InstanceErrorEvent {
@@ -741,6 +746,8 @@ export interface GenerationStats {
   totalMs?: number
   stopReason?: string
   modelName?: string
+  /** What OpenRouter charged for this reply, in micro-dollars (cloud models only). */
+  costMicro?: number
 }
 
 export interface ChatMessage {
@@ -859,4 +866,5 @@ export type StreamEvent =
   | { type: 'delta'; requestId: string; content?: string; reasoning?: string }
   | { type: 'done'; requestId: string; stats: GenerationStats; reasoningMs?: number; toolCalls?: WireToolCall[] }
   /** `transport`: the server could not be reached or the connection broke; says nothing about the model. */
-  | { type: 'error'; requestId: string; error: string; stats?: GenerationStats; transport?: boolean }
+  /** `fatal`: the same request would fail again (spending limit, key, credits), so a batch run stops. */
+  | { type: 'error'; requestId: string; error: string; stats?: GenerationStats; transport?: boolean; fatal?: boolean }

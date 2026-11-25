@@ -19,10 +19,13 @@ export function ReloadBar({ mode, busy: otherBusy, className }: { mode: AgentMod
   const { model, modes, older } = useModelModes()
   const kept = useModes((s) => s.kept[model])
   const running = useWorkspace((s) => s.running)
-  const rental = useApp((s) => s.connection.models.find((m) => m.id === model)?.rental)
+  const offSite = useApp((s) => {
+    const m = s.connection.models.find((m) => m.id === model)
+    return !!(m?.rental || m?.cloud)
+  })
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
-  const offer = older || rental ? null : reloadOffer(modes ?? null, mode, kept)
+  const offer = older || offSite ? null : reloadOffer(modes ?? null, mode, kept)
   const waiting = running || !!otherBusy
 
   const go = async (): Promise<void> => {

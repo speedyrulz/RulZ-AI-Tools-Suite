@@ -43,6 +43,8 @@ export interface AppSettings {
    * only; it lets the app say so when that model is gone, instead of quietly using another one.
    */
   modelRental: boolean
+  /** The chosen model was an OpenRouter one when it was chosen (worked out from the model list, like `modelRental`). */
+  modelCloud: boolean
 }
 
 /** How the model writes its answers. Missing = the recommended value for that model. */
@@ -78,6 +80,8 @@ export interface ModelInfo {
   quantization?: string
   /** Set while the model is loaded on a rental (a rented computer): what is sent to it leaves this PC. */
   rental?: ModelRental
+  /** Set for a model from OpenRouter (LLM Suite 0.36): what is sent to it leaves this PC, and it may cost money. Never a rental. */
+  cloud?: { provider: string; free: boolean }
 }
 
 /** A model loaded on a rented computer (from RulZ LLM Suite's `rental`, or a `vast/` path before 0.35). */
@@ -324,6 +328,8 @@ export interface TaskRecord {
   steps: Step[]
   files: ChangedFile[]
   draft?: DraftStats
+  /** What the task's requests cost at OpenRouter, in dollars, summed from the servers' `usage.cost`; missing for models that report none. */
+  cost?: number
   /** The agent's checklist for this task, as it last wrote it; missing when it kept none. */
   plan?: PlanItem[]
 }
@@ -411,6 +417,8 @@ export type AgentEvent =
   | { type: 'tasks'; projectPath: string; tasks: TaskRecord[] }
   | { type: 'context'; projectPath: string; context: ContextUsage }
   | { type: 'draft'; projectPath: string; taskId: string; draft: DraftStats }
+  /** What the task has cost at OpenRouter so far, in dollars (sent only for OpenRouter models; older apps ignore it). */
+  | { type: 'cost'; projectPath: string; taskId: string; cost: number }
   | { type: 'notes'; projectPath: string; notes: PendingNote[] }
   /** The agent wrote or updated its checklist (sent since 0.20.0). */
   | { type: 'plan'; projectPath: string; taskId: string; plan: PlanItem[] }
@@ -656,12 +664,14 @@ export interface BatchRun {
   projectPath: string
   /** The model the run started with. */
   modelName: string
+  /** The run's model is an OpenRouter one: the run's `rentalOk` is then the owner's yes to OpenRouter. */
+  modelCloud?: boolean
   kitDir: string
   /** Each task is recorded in RulZ LLM Suite for training. */
   record: boolean
   options: BatchOptions
   items: BatchItem[]
-  /** The run was started with the owner's yes to use a model on a rented computer. */
+  /** The run was started with the owner's yes to use a model on a rented computer (or, with `modelCloud`, on OpenRouter). */
   rentalOk?: boolean
   /** Why the run stopped by itself, when it did (the model became a rental's, a rental failed…). */
   stopNote?: string

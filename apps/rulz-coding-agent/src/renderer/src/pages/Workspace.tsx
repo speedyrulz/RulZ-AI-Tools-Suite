@@ -3,6 +3,7 @@ import { toast } from 'sonner'
 import { memo, useEffect, useLayoutEffect, useRef, useState, type DragEvent } from 'react'
 import { ApprovalDialog } from '../components/ApprovalDialog'
 import { ContextMeter } from '../components/ContextMeter'
+import { CostMeter } from '../components/CostMeter'
 import { DraftMeter } from '../components/DraftMeter'
 import { HistoryDialog } from '../components/HistoryDialog'
 import { NotesDialog } from '../components/NotesDialog'
@@ -23,7 +24,7 @@ import { chipsOf, useAttachments } from '../stores/attachments'
 import { undoableTask, useWorkspace } from '../stores/workspace'
 import { ThemeToggle } from './Home'
 import { whyNotDelete, whyNotRedo } from '@shared/history'
-import { RENTAL_NOTE } from '@shared/modes'
+import { CLOUD_NOTICE, cloudText, RENTAL_NOTE } from '@shared/modes'
 import { attachedLabel, MAX_PDFS_PER_MESSAGE } from '@shared/pdf'
 import type { TimelineItem } from '@shared/types'
 import { splitThink, thinkingOpen } from '@shared/think'
@@ -232,7 +233,10 @@ function ModelChip() {
     status = 'Not connected'
   } else if (gone) {
     dot = <span className="size-2 shrink-0 rounded-full bg-danger" />
-    status = model ? 'Choose it again' : 'Not on a rental now'
+    status = model ? 'Choose it again' : settings?.modelCloud ? 'Not on OpenRouter now' : 'Not on a rental now'
+  } else if (model?.cloud) {
+    dot = <span className="size-2 shrink-0 rounded-full bg-warn" />
+    status = 'Your code goes to OpenRouter'
   } else if (model?.rental) {
     dot = <span className="size-2 shrink-0 rounded-full bg-warn" />
     status = model.rental.reconnecting ? 'Rental reconnecting…' : 'Ready on a rental'
@@ -251,7 +255,7 @@ function ModelChip() {
       trigger={
         <button
           aria-label="Change the AI model"
-          title={gone ?? (model?.rental ? RENTAL_NOTE : undefined)}
+          title={gone ?? (model?.cloud ? CLOUD_NOTICE : model?.rental ? RENTAL_NOTE : undefined)}
           className="ml-2 flex h-9 max-w-[340px] min-w-0 items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 text-left transition-colors hover:border-accent/60"
         >
           {dot}
@@ -263,7 +267,7 @@ function ModelChip() {
       items={[
         // Switching mid-task would change models between steps, so it waits for the task to end.
         ...sorted.map((m) => ({
-          label: `${modelLabel(m.id)}${m.rental ? `  (${rentalText(m)})` : m.loaded ? '  (ready)' : ''}`,
+          label: `${modelLabel(m.id)}${m.cloud ? `  (${cloudText(m)})` : m.rental ? `  (${rentalText(m)})` : m.loaded ? '  (ready)' : ''}`,
           icon: <Check size={13} className={m.id === id ? 'text-accent' : 'invisible'} />,
           disabled: running,
           onSelect: () => void update({ model: m.id })
@@ -847,6 +851,7 @@ function Composer() {
           </div>
           <div className="flex items-center gap-3">
             <DraftMeter />
+            <CostMeter />
             <ContextMeter />
             {noting && (
               <>

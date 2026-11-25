@@ -178,7 +178,7 @@ function ActiveRun({ run: active }: { run: BatchRun }) {
             <span className="min-w-0 flex-1 truncate">
               <span className="font-mono">{i.taskId}</span>
               {active.options.attempts > 1 ? ` (try ${i.attempt})` : ''}
-              <span className="text-faint"> · {i.host ?? 'This PC'}</span>
+              <span className="text-faint"> · {i.host ?? (t?.hosts.some((h) => h.kind === 'cloud') ? 'OpenRouter' : 'This PC')}</span>
             </span>
             <span className="shrink-0 text-muted">{i.startedAt ? `${Math.max(0, Math.floor((now - i.startedAt) / 60000))} min` : 'starting'}</span>
             {i.conversationId && (
@@ -316,7 +316,13 @@ function RunRow({ run }: { run: BatchRun }) {
             <span className="min-w-0">
               <span className="flex items-center gap-1.5">
                 <span className="truncate">{run.label || baseName(run.modelName || run.modelId || 'Unknown model')}</span>
-                {running ? <Badge tone="accent">running</Badge> : run.status === 'stopped' && <Badge tone="warn">stopped</Badge>}
+                {running ? <Badge tone="accent">running</Badge> : run.status === 'stopped' && (
+                  <Tooltip content={run.stopReason ?? 'You stopped this run.'}>
+                    <span>
+                      <Badge tone="warn">stopped</Badge>
+                    </span>
+                  </Tooltip>
+                )}
               </span>
               <span className="block truncate text-[10.5px] text-faint" title={run.modelId ?? ''}>
                 {run.label ? `${baseName(run.modelName || run.modelId || '')} · ` : ''}
@@ -326,6 +332,7 @@ function RunRow({ run }: { run: BatchRun }) {
                 {run.target && run.target.sessionsPerHost > 1 ? `${run.target.sessionsPerHost} at once · ` : ''}
                 {relativeTime(run.createdAt)}
               </span>
+              {run.status === 'stopped' && run.stopReason && <span className="block truncate text-[10.5px] text-warn">Stopped itself: {run.stopReason}</span>}
             </span>
           </button>
         </td>
@@ -396,6 +403,7 @@ function RunRow({ run }: { run: BatchRun }) {
                 Limits: {run.maxToolRounds} tool rounds, {o.minutesPerTask ? `${o.minutesPerTask} min per task` : 'no time limit'}
               </span>
               {o.attempts > 1 && <span>{o.attempts} tries per task</span>}
+              {run.status === 'stopped' && run.stopReason && <span className="text-warn">Stopped itself: {run.stopReason}</span>}
               {run.target && (
                 <span>
                   {run.target.sessionsPerHost} task{run.target.sessionsPerHost === 1 ? '' : 's'} at once on each of {run.target.hosts.length} host

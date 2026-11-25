@@ -67,7 +67,7 @@ export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputE
     <input
       ref={ref}
       className={cn(
-        'h-8.5 w-full rounded-lg border border-border bg-panel px-2.5 text-[13px] placeholder:text-faint focus:border-accent focus:outline-none',
+        'h-8.5 w-full rounded-lg border border-border bg-panel px-2.5 text-[13px] placeholder:text-faint focus:border-accent focus:outline-none disabled:pointer-events-none disabled:opacity-45',
         className
       )}
       {...props}
@@ -290,10 +290,10 @@ export function Badge({ children, tone = 'neutral', className }: { children: Rea
   )
 }
 
-export function ProgressBar({ value, className }: { value: number; className?: string }) {
+export function ProgressBar({ value, className, tone = 'accent' }: { value: number; className?: string; tone?: 'accent' | 'warn' | 'danger' }) {
   return (
     <div className={cn('h-1 overflow-hidden rounded-full bg-track', className)}>
-      <div className="h-full rounded-full bg-accent transition-[width] duration-200" style={{ width: `${Math.round(Math.min(1, Math.max(0, value)) * 100)}%` }} />
+      <div className={cn('h-full rounded-full transition-[width] duration-200', tone === 'danger' ? 'bg-danger' : tone === 'warn' ? 'bg-warn' : 'bg-accent')} style={{ width: `${Math.round(Math.min(1, Math.max(0, value)) * 100)}%` }} />
     </div>
   )
 }
@@ -332,7 +332,8 @@ export function NumberInput({
   min,
   max,
   step,
-  className
+  className,
+  disabled
 }: {
   value: number | null
   onChange: (v: number | null) => void
@@ -341,6 +342,7 @@ export function NumberInput({
   max?: number
   step?: number
   className?: string
+  disabled?: boolean
 }) {
   // null while not editing: the field then shows `value`, so outside changes (sliders, presets) show at once.
   const [draft, setDraft] = useState<string | null>(null)
@@ -366,6 +368,7 @@ export function NumberInput({
       min={min}
       max={max}
       step={step}
+      disabled={disabled}
       onChange={(e) => setDraft(e.target.value)}
       onBlur={commit}
       onKeyDown={(e) => {

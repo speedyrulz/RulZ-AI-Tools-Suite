@@ -12,10 +12,48 @@ export const MAX_MODE_PROMPT_CHARS = 20_000
 export const MODE_HEADER = 'X-RulZ-Mode'
 export const RENTAL_HEADER = 'X-RulZ-Rental'
 
-/** Headers every request of a task carries; `deny` makes LLM Suite refuse an answer from a rental's model. */
-export function modeHeaders(mode: AgentMode, rentalAllowed: boolean): Record<string, string> {
-  return { [MODE_HEADER]: mode, ...(rentalAllowed ? {} : { [RENTAL_HEADER]: 'deny' }) }
+/**
+ * Headers every request of a task carries; `deny` makes LLM Suite refuse an answer from a rental's model.
+ * A request for an OpenRouter model carries no rental header at all: it is not a rental, and the server only
+ * answers it from the exact model id it names.
+ */
+export function modeHeaders(mode: AgentMode, rentalAllowed: boolean, cloud = false): Record<string, string> {
+  return { [MODE_HEADER]: mode, ...(rentalAllowed || cloud ? {} : { [RENTAL_HEADER]: 'deny' }) }
 }
+
+// ---------- OpenRouter (LLM Suite 0.36): models in the cloud ----------
+
+/**
+ * The codes of an OpenRouter error after which the same request would fail again (our spending limit, no or a
+ * refused key, no credits, rate limit, model not allowed for other apps). A task that meets one ends at once with
+ * the server's sentence, and a batch run stops with that task left pending. The other `cloud_` codes
+ * (cloud_policy, cloud_request, cloud_error) end the task as an ordinary error. Neither is ever retried: a retry costs money.
+ */
+export const CLOUD_FATAL_CODES: readonly string[] = ['cloud_limit', 'cloud_key', 'cloud_credits', 'cloud_rate', 'cloud_not_allowed']
+export const isCloudCode = (code: unknown): boolean => typeof code === 'string' && code.startsWith('cloud_')
+export const isCloudFatalCode = (code: unknown): boolean => typeof code === 'string' && CLOUD_FATAL_CODES.includes(code)
+
+/** The OpenRouter entry of a /v1/models item; anything that is not `{provider: 'openrouter'}` is not one. A missing `free` counts as paid. */
+export function cloudOf(entry: { cloud?: unknown }): { provider: string; free: boolean } | undefined {
+  const c = entry.cloud
+  if (!c || typeof c !== 'object' || Array.isArray(c)) return undefined
+  const o = c as { provider?: unknown; free?: unknown }
+  return o.provider === 'openrouter' ? { provider: 'openrouter', free: o.free === true } : undefined
+}
+
+/** "OpenRouter, Free" / "OpenRouter, Paid", for a model list. */
+export const cloudText = (m: { cloud?: { free: boolean } }): string => `OpenRouter, ${m.cloud?.free ? 'Free' : 'Paid'}`
+
+export const CLOUD_NOTICE = 'Your code and messages go to OpenRouter.'
+export const CLOUD_NOTE =
+  'This model runs on OpenRouter. Your messages, the PDFs you attach, the files it reads and what its tools return are sent to OpenRouter, and it may cost money.'
+export const CLOUD_NEVER_AUTO = "It is never picked for you: only when you choose it. LLM Suite's daily spending limit applies."
+export const CLOUD_CONTEXT_NOTE = "The context limit of this model is set on LLM Suite's OpenRouter page."
+export const CLOUD_BATCH_NOTE =
+  "A batch run sends your code, the files it reads and what its tools return to OpenRouter for every task, without you watching. It may cost money; LLM Suite's daily spending limit applies and a run stops when it is reached."
+
+/** A cost in dollars, small amounts to four decimals ("$0.0042", "$1.37"). */
+export const formatDollars = (n: number): string => `$${n < 0.01 ? n.toFixed(4) : n.toFixed(2)}`
 
 // ---------- Rentals ----------
 
@@ -39,12 +77,15 @@ export const rentalGoneMessage = (id: string): string =>
 export const rentalChooseAgainMessage = (id: string): string =>
   `${shortModelName(id)} runs on a rented computer now. Choose it again from the model list to use it there, or choose another model.`
 
+export const cloudGoneMessage = (id: string): string =>
+  `${shortModelName(id)} is not available on OpenRouter now. Choose another model, or check LLM Suite's OpenRouter page.`
+
 export const RENTAL_NOTE =
   'This model runs on a rented computer. Your messages, the PDFs you attach, the files it reads and what its tools return are sent to that computer.'
 
 /** The model to use when none is chosen: a loaded coder model, then any loaded one, then a coder model. Never a rental's. */
 export function pickDefaultModel(all: ModelInfo[]): string {
-  const models = all.filter((m) => !m.rental)
+  const models = all.filter((m) => !m.rental && !m.cloud)
   const coder = (m: ModelInfo): boolean => /qwen3[-_.]?coder/i.test(m.id)
   return (
     models.find((m) => m.loaded && coder(m)) ??
@@ -55,7 +96,8 @@ export function pickDefaultModel(all: ModelInfo[]): string {
   )?.id ?? ''
 }
 
-export type ModelChoice = { ok: true; model: string; rental: boolean } | { ok: false; reason: string }
+/** `rental` is true only for a model on a rented computer; `cloud` is set only for an OpenRouter model. */
+export type ModelChoice = { ok: true; model: string; rental: boolean; cloud?: true } | { ok: false; reason: string }
 
 /**
  * The model a task uses. The chosen one when the list has it (`rental` says whether it runs on a
@@ -64,17 +106,22 @@ export type ModelChoice = { ok: true; model: string; rental: boolean } | { ok: f
  * a local one; one that was on a rental is never swapped for another model behind the owner's back.
  * Without a list (RulZ LLM Suite not reachable) the chosen model is used and counts as local.
  */
-export function chooseModel(chosen: string, chosenWasRental: boolean, models: ModelInfo[]): ModelChoice {
+export function chooseModel(chosen: string, chosenWasRental: boolean, models: ModelInfo[], chosenWasCloud = false): ModelChoice {
   if (chosen) {
     const info = models.find((m) => m.id === chosen)
+    if (info?.cloud && !chosenWasCloud) return { ok: false, reason: 'This model runs on OpenRouter now. Choose it again to use it there.' }
     if (info?.rental && !chosenWasRental) return { ok: false, reason: rentalChooseAgainMessage(chosen) }
+    if (info?.cloud) return { ok: true, model: chosen, rental: false, cloud: true }
     if (info) return { ok: true, model: chosen, rental: !!info.rental }
+    // A chosen OpenRouter model that is no longer listed (key removed, "Allow other apps" off) is never swapped for another model.
+    if (chosenWasCloud) return { ok: false, reason: cloudGoneMessage(chosen) }
     if (!models.length) return { ok: true, model: chosen, rental: false }
     if (chosenWasRental) return { ok: false, reason: rentalGoneMessage(chosen) }
   }
   const pick = pickDefaultModel(models)
   if (pick) return { ok: true, model: pick, rental: false }
   if (models.length) {
+    if (models.some((m) => m.cloud)) return { ok: false, reason: 'The only models right now are on rentals or OpenRouter. Choose one yourself in Model settings, or load a model on this computer.' }
     return { ok: false, reason: 'The only models right now are on rentals. Choose one yourself in Model settings, or load a model on this computer.' }
   }
   return { ok: false, reason: 'RulZ LLM Suite has no models yet. Add one on its My Models page, then try again.' }
@@ -85,6 +132,11 @@ export const RENTAL_NEEDS_YES =
   'This model runs on a rented computer, so the run needs a yes first: its messages, the files it reads and what its tools return are sent there.'
 export const RENTAL_OLD_APP =
   "This model runs on a rented computer, and this version of the app can't ask for the yes a run needs. Update the app, or start the run on the computer."
+/** The same for an OpenRouter model: a run sends code to OpenRouter and may cost money, so it needs a yes (the app's `rentalOk` flag carries it). */
+export const CLOUD_NEEDS_YES =
+  "This model runs on OpenRouter, so the run needs a yes first: its messages, the files it reads and what its tools return are sent to OpenRouter and it may cost money. If this app can't ask for it, update the app or start the run on the computer."
+export const CLOUD_OLD_APP =
+  "This model runs on OpenRouter, and this version of the app can't ask for the yes a run needs. Update the app, or start the run on the computer."
 
 // ---------- Reading LLM Suite's answer (untrusted) ----------
 
@@ -277,7 +329,7 @@ export function reloadOffer(modes: ModelModes | null, mode: AgentMode, kept: str
 }
 
 /** The part of a model's list entry that, when it changes, means its modes should be asked for again. */
-export const modesStamp = (m: ModelInfo | undefined): string => (m ? `${m.loaded ? 1 : 0}|${m.loadedContext ?? ''}|${m.rental ? 'r' : ''}` : '')
+export const modesStamp = (m: ModelInfo | undefined): string => (m ? `${m.loaded ? 1 : 0}|${m.loadedContext ?? ''}|${m.rental ? 'r' : ''}${m.cloud ? '|c' : ''}` : '')
 
 // ---------- Practice per model ----------
 

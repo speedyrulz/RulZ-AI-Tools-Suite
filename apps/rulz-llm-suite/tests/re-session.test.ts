@@ -19,6 +19,8 @@ interface Step {
   /** The request fails with this text. */
   error?: string
   transport?: boolean
+  /** The error is one the same request would meet again (spending limit, key, credits). */
+  fatal?: boolean
   /** Never answers; it ends when the request is aborted. */
   hang?: boolean
 }
@@ -111,7 +113,7 @@ function harness(
         if (s.reasoning) emit({ type: 'delta', requestId: req.requestId, reasoning: s.reasoning })
         if (s.content) emit({ type: 'delta', requestId: req.requestId, content: s.content })
         if (s.error) {
-          emit({ type: 'error', requestId: req.requestId, error: s.error, stats: { stopReason: 'error' }, ...(s.transport ? { transport: true } : {}) })
+          emit({ type: 'error', requestId: req.requestId, error: s.error, stats: { stopReason: 'error' }, ...(s.transport ? { transport: true } : {}), ...(s.fatal ? { fatal: true } : {}) })
           return
         }
         emit({
@@ -181,6 +183,16 @@ describe('a session on a rented instance', () => {
       expect(sessionStats(r.conversation)).toMatchObject({ denied: 2 })
       expect(r.conversation.re?.outcome).toBe('solved')
     }
+  })
+
+  it('fences a session by the model id of an OpenRouter model, without the remote flag', async () => {
+    const h = harness(structuredClone(steps), { settings: loose })
+    const r = await runSession(h.deps, { ...h.spec, modelId: 'openrouter/vendor/model' })
+    expect(h.toolCalls.map((c) => c.arguments)).toEqual(['{"path":"C:\\\\work\\\\xor-1\\\\1\\\\xor-1.exe"}', '{"address":"0x10"}'])
+    const calls = r.conversation.messages.flatMap((m) => m.toolCalls ?? [])
+    expect(calls.map((c) => c.status)).toEqual(['denied', 'done', 'denied', 'done'])
+    expect(calls[0].result).toBe(REMOTE_DENIAL)
+    expect(r.fatal).toBeUndefined()
   })
 
   it('leaves a model on this PC with the approval settings', async () => {
@@ -479,6 +491,53 @@ describe('a practice session', () => {
     expect(toolMsgs[1].content).toBe('y'.repeat(2000))
     // The chat itself keeps the whole result.
     expect(assistants(r.conversation)[0].toolCalls![0].result).toHaveLength(2000)
+  })
+
+  describe('a fatal error of a cloud model', () => {
+    const SENTENCE = 'The daily spending limit is used up.'
+
+    it('ends the session at once, with the sentence in the chat and on the result, and never sends the round again', async () => {
+      // Whatever else is set: a transport flag, an instance that would come back.
+      const h = harness([{ content: 'half', error: SENTENCE, fatal: true, transport: true }, { content: 'ANSWER: 42' }], { state: () => 'ready' })
+      const r = await runSession(h.deps, { ...h.spec, modelId: 'openrouter/vendor/model', remote: true })
+      expect(r).toMatchObject({ end: 'error', lost: false, fatal: SENTENCE })
+      expect(h.requests).toHaveLength(1)
+      expect(h.clock.t).toBe(1_000_000)
+      expect(assistants(r.conversation)).toHaveLength(1)
+      expect(assistants(r.conversation)[0].error).toBe(SENTENCE)
+      expect(itemResult(r.conversation, r.end)).toEqual({ status: 'error', error: SENTENCE })
+      expect(h.saves.at(-1)!.conv.messages.at(-1)!.error).toBe(SENTENCE)
+    })
+
+    it('is not waited on after a tool round either', async () => {
+      const h = harness([{ tools: [{ name: 'rea__xrefs' }] }, { error: SENTENCE, fatal: true }, { content: 'ANSWER: 42' }])
+      const r = await runSession(h.deps, { ...h.spec, modelId: 'openrouter/vendor/model' })
+      expect(r).toMatchObject({ end: 'error', fatal: SENTENCE })
+      expect(h.requests).toHaveLength(2)
+    })
+
+    it('is carried by a fatal error of a model on this PC too, and nothing is retried', async () => {
+      const h = harness([{ error: SENTENCE, fatal: true, transport: true }, { content: 'ANSWER: 42' }], { state: () => 'reconnecting' })
+      const r = await runSession(h.deps, h.spec)
+      expect(r).toMatchObject({ end: 'error', lost: false, fatal: SENTENCE })
+      expect(h.requests).toHaveLength(1)
+    })
+
+    it('never treats an error of a cloud model as a lost connection, fatal or not', async () => {
+      const h = harness([{ error: 'The provider answered 500.', transport: true }, { content: 'ANSWER: 42' }], { state: () => 'reconnecting' })
+      const r = await runSession(h.deps, { ...h.spec, modelId: 'openrouter/vendor/model' })
+      expect(r).toMatchObject({ end: 'error', lost: false })
+      expect(r.fatal).toBeUndefined()
+      expect(h.requests).toHaveLength(1)
+      expect(h.clock.t).toBe(1_000_000)
+    })
+
+    it('leaves an ordinary (not fatal) error of a session without a result field', async () => {
+      const h = harness([{ error: 'bad request' }])
+      const r = await runSession(h.deps, h.spec)
+      expect(r.end).toBe('error')
+      expect(r).not.toHaveProperty('fatal')
+    })
   })
 
   describe('when the instance cannot be reached', () => {

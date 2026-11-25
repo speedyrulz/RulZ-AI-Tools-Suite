@@ -1,6 +1,6 @@
-import { Check, Server } from 'lucide-react'
+import { Check, Cloud, Server } from 'lucide-react'
 import { APPROVAL_LEVELS } from '@shared/defaults'
-import { RENTAL_NOTE } from '@shared/modes'
+import { CLOUD_NEVER_AUTO, CLOUD_NOTE, cloudText, RENTAL_NOTE } from '@shared/modes'
 import type { ApprovalLevel, ModelInfo } from '@shared/types'
 import { cn, formatTokens } from '../lib/format'
 import { chosenRentalGone } from '../lib/modeLogic'
@@ -38,7 +38,7 @@ export function ModelSelect({ models, value, onChange }: { models: ModelInfo[]; 
       {sorted.map((m) => (
         <option key={m.id} value={m.id}>
           {modelLabel(m.id)}
-          {m.rental
+          {m.cloud ? `  (${cloudText(m)})` : m.rental
             ? `  (${rentalText(m)}${m.loadedContext ? `, ${formatTokens(m.loadedContext)} context` : ''})`
             : m.loaded
               ? `  (ready${m.loadedContext ? `, ${formatTokens(m.loadedContext)} context` : ''})`
@@ -49,8 +49,29 @@ export function ModelSelect({ models, value, onChange }: { models: ModelInfo[]; 
   )
 }
 
-/** What leaves the computer when the model runs on a rental, and that it is never picked for you. */
-export function RentalNote({ model }: { model: Pick<ModelInfo, 'rental'> | undefined }) {
+/** The neutral badge for an OpenRouter model: an icon and the words, never colour alone. */
+export function CloudBadge({ model }: { model: Pick<ModelInfo, 'cloud'> }) {
+  if (!model.cloud) return null
+  return (
+    <Badge className="max-w-full min-w-0">
+      <Cloud size={12} className="shrink-0" aria-hidden />
+      <span className="truncate">{cloudText(model)}</span>
+    </Badge>
+  )
+}
+
+/** What leaves the computer when the model runs on a rental or on OpenRouter, and that it is never picked for you. */
+export function RentalNote({ model }: { model: Pick<ModelInfo, 'rental' | 'cloud'> | undefined }) {
+  if (model?.cloud) {
+    return (
+      <div className="space-y-1.5 rounded-xl border border-border bg-panel-2 p-3 text-[13px] text-muted">
+        <CloudBadge model={model} />
+        <p>
+          {CLOUD_NOTE} {CLOUD_NEVER_AUTO}
+        </p>
+      </div>
+    )
+  }
   if (!model?.rental) return null
   return (
     <div className="space-y-1.5 rounded-xl border border-border bg-panel-2 p-3 text-[13px] text-muted">

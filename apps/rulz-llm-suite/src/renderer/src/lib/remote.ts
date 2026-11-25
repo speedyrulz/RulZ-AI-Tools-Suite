@@ -20,6 +20,7 @@ import {
   type RentIntent,
   type Rental
 } from '@shared/remote'
+import { MAX_CLOUD_SESSIONS, isCloudModelId } from '@shared/cloud'
 import { RE_MIN_CONTEXT } from '@shared/re'
 import type { LoadConfig, ModelEntry } from '@shared/types'
 
@@ -464,7 +465,8 @@ export interface HostChoice {
 }
 
 /** Does a model id name a remote model (the run then uses rentals only); a local one runs on this PC only. */
-export function hostKindFor(modelId: string | null | undefined): 'local' | 'vast' {
+export function hostKindFor(modelId: string | null | undefined): 'local' | 'vast' | 'cloud' {
+  if (modelId && isCloudModelId(modelId)) return 'cloud'
   return isRemoteModelId(modelId) ? 'vast' : 'local'
 }
 
@@ -473,8 +475,15 @@ export function batchModelId(wanted: string | null | undefined, models: { id: st
   return wanted && models.some((m) => m.id === wanted) ? wanted : activeModelId
 }
 
-/** Every host a run could use, with why a host is not usable. */
-export function hostChoices(modelId: string | null, rentals: Rental[], reIsStdio: boolean): HostChoice[] {
+/**
+ * Every host a run could use, with why a host is not usable. A model at OpenRouter (`cloud`) has exactly one choice,
+ * OpenRouter, and runs nowhere else; with a REA that is not stdio it cannot run (the rental rule: private REA per task).
+ */
+export function hostChoices(modelId: string | null, rentals: Rental[], reIsStdio: boolean, cloud = false): HostChoice[] {
+  if (cloud) {
+    const why = reIsStdio ? '' : 'REA must be a stdio server to run tasks on OpenRouter models.'
+    return [{ host: { kind: 'cloud' }, label: 'OpenRouter', valid: !why, why }]
+  }
   const remote = isRemoteModelId(modelId)
   const out: HostChoice[] = []
   out.push({
@@ -495,11 +504,12 @@ export function hostChoices(modelId: string | null, rentals: Rental[], reIsStdio
   return out
 }
 
-export const hostKey = (h: BatchHost): string => (h.kind === 'local' ? 'local' : `vast:${h.rentalId}`)
+export const hostKey = (h: BatchHost): string => (h.kind === 'local' ? 'local' : h.kind === 'cloud' ? 'cloud' : `vast:${h.rentalId}`)
 
-/** Most tasks at once on each host for this many hosts. */
-export function maxSessions(hostCount: number): number {
-  return Math.max(1, Math.min(MAX_SESSIONS_PER_HOST, Math.floor(MAX_LANES / Math.max(1, hostCount))))
+/** Most tasks at once on each host for this many hosts; OpenRouter (`cloud`) allows up to MAX_CLOUD_SESSIONS. */
+export function maxSessions(hostCount: number, cloud = false): number {
+  const most = Math.max(1, Math.min(MAX_SESSIONS_PER_HOST, Math.floor(MAX_LANES / Math.max(1, hostCount))))
+  return cloud ? Math.min(most, MAX_CLOUD_SESSIONS) : most
 }
 
 export const CONTEXT_PER_SESSION_PARALLEL = 65536
@@ -534,10 +544,13 @@ function tasksFitting(total: number, most: number): number {
 export function targetFor(hosts: BatchHost[], prev?: Partial<BatchTarget>, total?: number | null): BatchTarget {
   const hs = hosts.length ? hosts : DEFAULT_BATCH_TARGET.hosts
   const hasRental = hs.some((h) => h.kind === 'vast')
-  const most = maxSessions(hs.length)
+  // OpenRouter: one task unless the user asks for more (every task costs money), and the context is the model's own.
+  const cloud = hs.some((h) => h.kind === 'cloud')
+  const most = maxSessions(hs.length, cloud)
   const known = total && total > 0 ? total : null
   const fallbackN = hasRental ? (known ? tasksFitting(known, most) : 4) : 1
   const n = Math.min(most, Math.max(1, prev?.sessionsPerHost ?? fallbackN))
+  if (cloud) return { hosts: hs, sessionsPerHost: n, contextPerSession: null, stopRentalsAfter: false }
   const needCtx = n > 1 || hasRental
   const share = known ? (n === 1 ? known : Math.max(1024, Math.floor(known / n / 1024) * 1024)) : CONTEXT_PER_SESSION_PARALLEL
   const ctx = prev?.contextPerSession ?? (needCtx ? share : null)
@@ -560,8 +573,10 @@ export function targetProblems(t: BatchTarget, choices: HostChoice[]): string[] 
     if (!c) out.push('A chosen host is no longer there.')
     else if (!c.valid) out.push(c.why)
   }
-  if (t.sessionsPerHost > maxSessions(Math.max(1, t.hosts.length))) out.push(`At most ${maxSessions(t.hosts.length)} tasks at once on each.`)
-  if ((t.sessionsPerHost > 1 || t.hosts.some((h) => h.kind === 'vast')) && t.contextPerSession === null) out.push('Set the context per session.')
+  const cloud = t.hosts.some((h) => h.kind === 'cloud')
+  if (t.sessionsPerHost > maxSessions(Math.max(1, t.hosts.length), cloud)) out.push(`At most ${maxSessions(t.hosts.length, cloud)} tasks at once on each.`)
+  // A model at OpenRouter has its own context (it is not loaded), so tasks at once need no context share.
+  if (!cloud && (t.sessionsPerHost > 1 || t.hosts.some((h) => h.kind === 'vast')) && t.contextPerSession === null) out.push('Set the context per session.')
   return out
 }
 

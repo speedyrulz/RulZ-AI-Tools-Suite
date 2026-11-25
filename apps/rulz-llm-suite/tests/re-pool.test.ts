@@ -42,7 +42,19 @@ const request = (n: number, t: BatchTarget = DEFAULT_BATCH_TARGET, extra: Partia
   ...extra
 })
 
-type Behavior = 'solved' | 'wrong' | 'lost' | 'hang' | 'error'
+type Behavior = 'solved' | 'wrong' | 'lost' | 'hang' | 'error' | 'fatal'
+
+/** The sentence a 'fatal' session of this task ends with. */
+const fatalText = (taskId: string): string => `Fatal for ${taskId}: the spending limit is used up.`
+
+const cloudHost = (o: Partial<PoolHost> = {}): PoolHost => host(0, { instanceId: 'cloud-1', hostLabel: 'OpenRouter', dollarsPerHour: 3, cloud: true, ...o })
+const cloudTarget = (sessions: number, extra: Partial<BatchTarget> = {}): BatchTarget => ({
+  hosts: [{ kind: 'cloud' }],
+  sessionsPerHost: sessions,
+  contextPerSession: null,
+  stopRentalsAfter: false,
+  ...extra
+})
 
 function convOf(id: string, taskId: string, outcome: 'solved' | 'failed'): Conversation {
   return {
@@ -169,6 +181,7 @@ function make(o: Setup = {}) {
         // Let the other lanes run in between.
         await new Promise((r) => setTimeout(r, o.delayMs ?? 0))
         clock.t += 60_000
+        if (b === 'fatal') return { ...base, conversation: convOf(spec.conversationId, taskId, 'failed'), end: 'error', fatal: fatalText(taskId) }
         if (b === 'lost') return { ...base, conversation: convOf(spec.conversationId, taskId, 'failed'), end: 'error', lost: true }
         if (b === 'error') throw new Error('boom')
         return { ...base, conversation: convOf(spec.conversationId, taskId, b === 'solved' ? 'solved' : 'failed'), end: 'done' }
@@ -442,6 +455,30 @@ describe('PracticePool', () => {
       expect(seen).toEqual([true, false, false, false])
     })
 
+    it('runs a lane on a cloud host with the rental fence and never on the shared REA', async () => {
+      const alone: boolean[] = []
+      const remote: (boolean | undefined)[] = []
+      const open = (opts: { alone: boolean }): PoolScope => {
+        alone.push(opts.alone)
+        return { beginTask: () => undefined, callTool: async () => ({ text: '', isError: false }), close: async () => undefined }
+      }
+      const t = make({ hosts: [cloudHost()], openScope: open, behave: (_id, _inst, spec) => (remote.push(spec.remote), 'solved') })
+      await t.pool.start(request(2, cloudTarget(1)))
+      await t.pool.whenIdle()
+      expect(alone).toEqual([false])
+      expect(remote).toEqual([true, true])
+      // A lane on this PC and on a rental keep their own rules.
+      const local: (boolean | undefined)[] = []
+      const l = make({ behave: (_id, _inst, spec) => (local.push(spec.remote), 'solved') })
+      await l.pool.start(request(1))
+      await l.pool.whenIdle()
+      const rented: (boolean | undefined)[] = []
+      const r = make({ hosts: [host(1)], behave: (_id, _inst, spec) => (rented.push(spec.remote), 'solved') })
+      await r.pool.start(request(1, target([1], 1)))
+      await r.pool.whenIdle()
+      expect([local, rented]).toEqual([[false], [true]])
+    })
+
     it('marks a task whose chat could not be saved as an error instead of recording its grade', async () => {
       const t = make()
       const inner = t.deps.runSession!
@@ -598,6 +635,143 @@ describe('PracticePool', () => {
       t.stored.set(run.id, { ...saved, status: 'stopped' })
       t.deps.prepareHosts = async () => Promise.reject(new Error('Rental 1 is stopped.'))
       await expect(t.pool.resume(run.id, DEFAULT_BATCH_TARGET)).rejects.toThrow('Rental 1 is stopped.')
+    })
+  })
+
+  describe('a cloud host', () => {
+    it('clamps the sessions at once to the cloud limit, whatever the target or the host says', async () => {
+      const t = make({ hosts: [cloudHost()], delayMs: 5 })
+      const run = await t.pool.start(request(10, cloudTarget(8)))
+      expect(run.target).toMatchObject({ sessionsPerHost: 4 })
+      expect(t.log.scopesOpened).toBe(4)
+      await t.pool.whenIdle()
+      expect(t.log.maxRunning).toBe(4)
+      // The host is what says it is a cloud one: a target that does not say so is capped as well.
+      const u = make({ hosts: [cloudHost()], delayMs: 5 })
+      await u.pool.start(request(10, target([0], 8)))
+      expect(u.log.scopesOpened).toBe(4)
+      await u.pool.whenIdle()
+      expect(u.log.maxRunning).toBe(4)
+      // A local host still gets what was validated.
+      const l = make({ delayMs: 5 })
+      const lrun = await l.pool.start(request(10, target([0], 6)))
+      expect(lrun.target).toMatchObject({ sessionsPerHost: 6 })
+      expect(l.log.scopesOpened).toBe(6)
+      await l.pool.whenIdle()
+    })
+
+    it('accrues no cost by the hour, and is never one of the rentals to stop', async () => {
+      const t = make({ hosts: [cloudHost()] })
+      const run = await t.pool.start(request(3, cloudTarget(2, { stopRentalsAfter: true })))
+      expect(run.hosts).toEqual([{ label: 'OpenRouter', dollarsPerHour: 0 }])
+      await t.pool.whenIdle()
+      const final = t.stored.get(run.id)!
+      expect(final.status).toBe('done')
+      expect(final.cost).toBeUndefined()
+      expect(t.log.ended[0].rentals).toEqual([])
+    })
+
+    it('does not mark a cloud host that has a rental id as a rental to stop', async () => {
+      const t = make({ hosts: [cloudHost({ rentalId: 9 })] })
+      await t.pool.start(request(1, cloudTarget(1, { stopRentalsAfter: true })))
+      await t.pool.whenIdle()
+      expect(t.log.ended[0].rentals).toEqual([])
+    })
+  })
+
+  describe('a fatal error', () => {
+    it('puts the task back to pending and ends the run with the sentence, which is saved', async () => {
+      const t = make({ hosts: [cloudHost()], behave: (id) => (id === 't02' ? 'fatal' : 'solved') })
+      const run = await t.pool.start(request(5, cloudTarget(1)))
+      await t.pool.whenIdle()
+      const final = t.stored.get(run.id)!
+      expect(final.status).toBe('stopped')
+      expect(final.stopReason).toBe(fatalText('t02'))
+      expect(items(final)).toEqual(['t01:solved', 't02:pending', 't03:pending', 't04:pending', 't05:pending'])
+      expect(final.items[1].conversationId).toBeUndefined()
+      expect(final.items[1].startedAt).toBeUndefined()
+      expect(final.items[1].error).toBeUndefined()
+      // No lane claimed another task.
+      expect(t.log.runs.map((r) => r.taskId)).toEqual(['t01', 't02'])
+      expect(t.pool.activeId).toBeNull()
+      expect(t.log.usedHosts.size).toBe(0)
+      expect(t.log.scopesClosed).toBe(1)
+      // The window was told it is stopping, with the sentence on the run.
+      expect(t.log.changes.some((c) => c.stopping === 'after' && c.run.stopReason === fatalText('t02'))).toBe(true)
+    })
+
+    it('lets the other lanes finish the request they are in, as "stop after this" does, and starts no more', async () => {
+      const t = make({ hosts: [cloudHost()], delayMs: 20, behave: (id) => (id === 't01' ? 'fatal' : 'solved') })
+      const run = await t.pool.start(request(10, cloudTarget(3)))
+      await t.pool.whenIdle()
+      const final = t.stored.get(run.id)!
+      expect(final.stopReason).toBe(fatalText('t01'))
+      expect(t.log.runs).toHaveLength(3)
+      expect(items(final).slice(0, 3)).toEqual(['t01:pending', 't02:solved', 't03:solved'])
+      expect(final.items.slice(3).every((i) => i.status === 'pending')).toBe(true)
+      expect(final.status).toBe('stopped')
+    })
+
+    it('puts both tasks back when two lanes meet it at once, and keeps the first sentence', async () => {
+      const t = make({ hosts: [cloudHost()], delayMs: 20, behave: (id) => (id === 't01' || id === 't02' ? 'fatal' : 'solved') })
+      const run = await t.pool.start(request(6, cloudTarget(2)))
+      await t.pool.whenIdle()
+      const final = t.stored.get(run.id)!
+      expect(items(final)).toEqual(['t01:pending', 't02:pending', 't03:pending', 't04:pending', 't05:pending', 't06:pending'])
+      expect(final.stopReason).toBe(fatalText('t01'))
+      expect(final.items.every((i) => i.conversationId === undefined)).toBe(true)
+      expect(t.log.runs).toHaveLength(2)
+    })
+
+    it('does not outrank "stop now", and a task cut off by it still goes back', async () => {
+      const t = make({ hosts: [cloudHost()], delayMs: 20, behave: (id) => (id === 't01' ? 'fatal' : 'hang') })
+      const run = await t.pool.start(request(4, cloudTarget(2)))
+      await t.waitFor(() => t.log.runs.length >= 2)
+      // t01 ends fatal soon; t02 hangs until stopped.
+      await t.waitFor(() => t.log.changes.some((c) => c.run.stopReason))
+      expect(t.pool.stopping).toBe('after')
+      t.pool.stop('now')
+      expect(t.pool.stopping).toBe('now')
+      await t.pool.whenIdle()
+      const final = t.stored.get(run.id)!
+      expect(items(final)).toEqual(['t01:pending', 't02:pending', 't03:pending', 't04:pending'])
+      expect(final.stopReason).toBe(fatalText('t01'))
+    })
+
+    it('ignores a fatal sentence on a session that hit the time limit', async () => {
+      const t = make({ hosts: [cloudHost()] })
+      t.deps.runSession = async (_d, spec) => ({
+        conversation: convOf(spec.conversationId, spec.practice.taskId, 'failed'),
+        end: 'stopped',
+        timedOut: true,
+        lost: false,
+        aborted: 'timeout',
+        replyAt: 1,
+        fatal: 'late'
+      })
+      const run = await t.pool.start(request(2, cloudTarget(1)))
+      await t.pool.whenIdle()
+      const final = t.stored.get(run.id)!
+      expect(final.stopReason).toBeUndefined()
+      expect(items(final)).toEqual(['t01:timeout', 't02:timeout'])
+    })
+
+    it('is cleared when the run is resumed, and the tasks start again', async () => {
+      let mode: Behavior = 'fatal'
+      const t = make({ hosts: [cloudHost()], behave: () => mode })
+      const run = await t.pool.start(request(3, cloudTarget(1)))
+      await t.pool.whenIdle()
+      expect(t.stored.get(run.id)!.stopReason).toBe(fatalText('t01'))
+      mode = 'solved'
+      t.log.runs.length = 0
+      const again = await t.pool.resume(run.id, cloudTarget(1))
+      expect(again).not.toHaveProperty('stopReason')
+      await t.pool.whenIdle()
+      const final = t.stored.get(run.id)!
+      expect(final.status).toBe('done')
+      expect(final).not.toHaveProperty('stopReason')
+      expect(items(final)).toEqual(['t01:solved', 't02:solved', 't03:solved'])
+      expect(t.log.saves.some((s) => s.stopReason === undefined && s.status === 'running')).toBe(true)
     })
   })
 

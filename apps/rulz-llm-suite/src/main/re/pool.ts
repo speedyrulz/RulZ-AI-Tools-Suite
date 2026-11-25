@@ -13,6 +13,7 @@ import {
   type BatchRun,
   type BatchStop
 } from '@shared/batch'
+import { MAX_CLOUD_SESSIONS } from '@shared/cloud'
 import { RE_MIN_CONTEXT } from '@shared/re'
 import { cleanBatchTarget, type BatchTarget } from '@shared/remote'
 import type { BatchStartRequest } from '@shared/ipc'
@@ -24,9 +25,11 @@ export interface PoolHost {
   instanceId: string
   /** "This PC", "RTX 4090 (12345)". */
   hostLabel: string
-  /** 0 for this PC. */
+  /** 0 for this PC, and for OpenRouter (paid per token, so nothing accrues by the hour). */
   dollarsPerHour: number
   rentalId?: number
+  /** An OpenRouter model: its lanes run with the rental tool fence and never share REA. */
+  cloud?: boolean
   modelName: string
   contextLength: number | null
   adapters: { name: string; scale: number }[] | undefined
@@ -102,6 +105,14 @@ export const LANE_STAGGER_MS = 3000
 export const SAVE_INTERVAL_MS = 1000
 /** A task whose instance was lost this many times becomes an error instead of going back to pending. */
 export const MAX_LOST_PER_ITEM = 2
+
+/** A target as the pool runs it: on OpenRouter the sessions at once are capped (a rented or local host is as validated). */
+function cleanTarget(raw: unknown): BatchTarget {
+  const t = cleanBatchTarget(raw)
+  return t.hosts.some((h) => h.kind === 'cloud') ? { ...t, sessionsPerHost: Math.min(t.sessionsPerHost, MAX_CLOUD_SESSIONS) } : t
+}
+
+const hostDollars = (h: PoolHost): number => (h.cloud ? 0 : h.dollarsPerHour)
 
 interface Lane {
   n: number
@@ -190,7 +201,7 @@ export class PracticePool {
     const items = planBatch(req.tasks, options, new Set(req.solved))
     if (!items.length) throw new Error('No practice tasks match this selection.')
     if (!req.modelId) throw new Error('Load a model first, or choose one under New session.')
-    const target = cleanBatchTarget(req.target)
+    const target = cleanTarget(req.target)
     this.starting = true
     try {
       const hosts = await this.prepare(target, req.modelId)
@@ -210,7 +221,7 @@ export class PracticePool {
         options,
         items,
         target,
-        hosts: hosts.map((h) => ({ label: h.hostLabel, dollarsPerHour: h.dollarsPerHour })),
+        hosts: hosts.map((h) => ({ label: h.hostLabel, dollarsPerHour: hostDollars(h) })),
         ...(batchAdapters(first.adapters) ? { adapters: batchAdapters(first.adapters) } : {})
       }
       return this.begin(run, target, hosts, 0)
@@ -229,7 +240,7 @@ export class PracticePool {
       const items = saved.items.map((i): BatchItem => (i.status === 'running' ? { ...i, status: 'pending', startedAt: undefined } : i))
       if (!items.some((i) => i.status === 'pending')) throw new Error('Every task of this run has been tried.')
       if (!saved.modelId) throw new Error('This run has no model recorded.')
-      const target = cleanBatchTarget(rawTarget)
+      const target = cleanTarget(rawTarget)
       const hosts = await this.prepare(target, saved.modelId)
       if (this.disposed) throw new Error('RulZ LLM Suite is closing.')
       // Results already recorded were made with the run's adapters; resuming with others would mix them.
@@ -237,13 +248,15 @@ export class PracticePool {
         const used = adapterLabel(saved.adapters) || 'no adapters'
         throw new Error(`This run used other adapters (${used}). Load the model with the same adapters, or start a new run.`)
       }
+      // The reason the run stopped last time is not true of the resumed run.
+      const { stopReason: _stopReason, ...rest } = saved
       const run: BatchRun = {
-        ...saved,
+        ...rest,
         status: 'running',
         finishedAt: undefined,
         items,
         target,
-        hosts: hosts.map((h) => ({ label: h.hostLabel, dollarsPerHour: h.dollarsPerHour })),
+        hosts: hosts.map((h) => ({ label: h.hostLabel, dollarsPerHour: hostDollars(h) })),
         modelName: hosts[0].modelName,
         contextLength: hosts[0].contextLength
       }
@@ -279,12 +292,13 @@ export class PracticePool {
     // One scope per lane, opened (not yet started) here so a run that cannot work fails before it exists.
     const lanes: Lane[] = []
     const releases: (() => void)[] = []
-    // A rented host never gets the shared REA: what chats have open there is not for its model to read.
-    const alone = hosts.length * target.sessionsPerHost === 1 && hosts[0].rentalId === undefined
+    // A rented or cloud host never gets the shared REA: what chats have open there is not for its model to read.
+    const slots = (h: PoolHost): number => (h.cloud ? Math.min(target.sessionsPerHost, MAX_CLOUD_SESSIONS) : target.sessionsPerHost)
+    const alone = hosts.length === 1 && slots(hosts[0]) === 1 && hosts[0].rentalId === undefined && !hosts[0].cloud
     try {
       for (const [hostIndex, host] of hosts.entries()) {
         releases.push(this.deps.useHost(host.instanceId))
-        for (let slot = 0; slot < target.sessionsPerHost; slot++) {
+        for (let slot = 0; slot < slots(host); slot++) {
           lanes.push({ n: lanes.length, host, hostIndex, scope: this.deps.openScope({ alone }), ended: false })
         }
       }
@@ -319,7 +333,8 @@ export class PracticePool {
     const t = this.deps.now()
     let total = this.baseCost
     this.hostTimes.forEach((h, i) => {
-      const dph = this.lanes.find((l) => l.hostIndex === i)?.host.dollarsPerHour ?? 0
+      const lane = this.lanes.find((l) => l.hostIndex === i)
+      const dph = lane ? hostDollars(lane.host) : 0
       const ms = h.accrued + (h.active > 0 ? t - h.since : 0)
       total += (dph * ms) / 3_600_000
     })
@@ -422,7 +437,7 @@ export class PracticePool {
         goal: prepared.prompt,
         modelId: run.modelId,
         instanceId: lane.host.instanceId,
-        remote: lane.host.rentalId !== undefined,
+        remote: lane.host.rentalId !== undefined || lane.host.cloud === true,
         practice: { taskId: item.taskId, family: prepared.family, tier: prepared.tier, kitDir: run.kitDir },
         minutesPerTask: run.options.minutesPerTask,
         collect: this.deps.settings().re.collect ?? true,
@@ -442,6 +457,13 @@ export class PracticePool {
       // "Stop now" cut it off: it has not had its try, so a resumed run starts it again (in a new chat; the
       // cut-off one stays in the chat list).
       this.patchItem(index, { status: 'pending', startedAt: undefined, conversationId: undefined })
+      return false
+    }
+    if (result.fatal && !result.timedOut) {
+      // The next request would fail the same way (spending limit, key, credits, rate limit): the task has not had its try, so a
+      // resumed run starts it again, and the run stops (the tasks in progress finish their request, as with "stop after this").
+      this.patchItem(index, { status: 'pending', startedAt: undefined, conversationId: undefined })
+      this.stopForFatal(result.fatal)
       return false
     }
     if (result.lost) {
@@ -525,7 +547,7 @@ export class PracticePool {
       ...(cost > 0 ? { cost: Math.round(cost * 10000) / 10000 } : {})
     }
     this.run = ended
-    const rentalIds = [...new Set(lanes.flatMap((l) => (l.host.rentalId !== undefined ? [l.host.rentalId] : [])))]
+    const rentalIds = [...new Set(lanes.flatMap((l) => (l.host.rentalId !== undefined && !l.host.cloud ? [l.host.rentalId] : [])))]
     const stopAfter = ended.target?.stopRentalsAfter === true
     // The run is over before its last save is written, so the window never sees it still running.
     this.runEnded = true
@@ -554,6 +576,14 @@ export class PracticePool {
     this.stopMode = this.stopMode === 'now' ? 'now' : mode
     if (this.stopMode === 'now') for (const r of this.running.values()) r.ctrl.abort('stopNow')
     this.emit()
+  }
+
+  /** A session met an error that stops the run: the first sentence is kept, and no lane claims another task. */
+  private stopForFatal(reason: string): void {
+    if (this.runEnded || !this.run) return
+    if (!this.run.stopReason) this.run = { ...this.run, stopReason: reason.slice(0, 500) }
+    this.stop('after')
+    this.saveSoon(false)
   }
 
   /** Stops one session; its task is marked stopped and the lane takes the next. */

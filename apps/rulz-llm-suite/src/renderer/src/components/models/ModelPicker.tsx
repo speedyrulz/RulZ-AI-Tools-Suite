@@ -1,12 +1,13 @@
 import * as DialogPrimitive from '@radix-ui/react-dialog'
-import { Cloud, Eye, RotateCcw, Search, X } from 'lucide-react'
+import { Cloud, Eye, Globe, RotateCcw, Search, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
 import { APP_MODES, leftoverSampling, MODE_LABELS, modeDefaultsEmpty } from '@shared/modes'
 import type { LoadConfig, ModelEntry, SamplingParams } from '@shared/types'
 import { toast } from 'sonner'
 import { errorMessage, invoke } from '../../lib/api'
-import { cn, formatBytes } from '../../lib/format'
+import { priceShort } from '../../lib/cloud'
+import { cn, formatBytes, formatTokens } from '../../lib/format'
 import { modesFor, pickerScope, scopeFromValue, scopeLoad, scopeValue, startLoad, startScope, withModeLoad, withModeSaves, type PickerScope } from '../../lib/modes'
 import { loadPlan, rentalLabel } from '../../lib/remote'
 import { WBENCH_BUSY, wbenchRunning } from '../../lib/wbenchFlag'
@@ -15,6 +16,7 @@ import { useChat } from '../../stores/chat'
 import { modeDefaultsOf, useModels } from '../../stores/models'
 import { loadRemoteModel, useRemote } from '../../stores/remote'
 import { Badge, Button, Field, Select, Switch, Tooltip } from '../ui'
+import { CloudPanel } from './CloudPanel'
 import { EstimateView, useEstimate } from './EstimateView'
 import { LoadSettingsForm } from './LoadSettingsForm'
 import { OwnSampling } from './OwnSampling'
@@ -39,7 +41,7 @@ export function ModelPicker() {
 
 function matches(m: ModelEntry, q: string): boolean {
   if (!q) return true
-  const hay = `${m.id} ${m.info?.architecture ?? ''} ${m.info?.quantization ?? ''}`.toLowerCase()
+  const hay = `${m.id} ${m.name} ${m.info?.architecture ?? ''} ${m.info?.quantization ?? ''}`.toLowerCase()
   return q
     .toLowerCase()
     .split(/\s+/)
@@ -78,7 +80,7 @@ function PickerBody({ preselect, onDone }: { preselect: string | null; onDone: (
           <input
             ref={searchRef}
             className="h-8 flex-1 bg-transparent text-sm placeholder:text-faint focus:outline-none"
-            placeholder={`Search ${models.length} local models…`}
+            placeholder={`Search ${models.length} models…`}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
@@ -134,13 +136,34 @@ function PickerBody({ preselect, onDone }: { preselect: string | null; onDone: (
                       </span>
                     </Tooltip>
                   )}
-                  {inst && <Badge tone={inst.status === 'ready' ? 'ok' : 'accent'}>{inst.status === 'ready' ? 'Loaded' : 'Loading'}</Badge>}
+                  {m.cloud && (
+                    <Tooltip content="Runs at OpenRouter. Your messages go there and cost money unless the model is free.">
+                      <span>
+                        <Badge>
+                          <Globe size={11} /> OpenRouter
+                        </Badge>
+                      </span>
+                    </Tooltip>
+                  )}
+                  {inst && <Badge tone={inst.status === 'ready' ? 'ok' : 'accent'}>{inst.status === 'ready' ? (m.cloud ? 'Connected' : 'Loaded') : m.cloud ? 'Connecting' : 'Loading'}</Badge>}
                 </div>
                 {hosts.length > 0 && (
                   <div className="truncate text-[11px] text-muted">
                     {hosts.map((i) => `${i.host!.label}${i.reconnecting ? ' (reconnecting)' : ''}`).join(' · ')}
                   </div>
                 )}
+                {m.cloud ? (
+                  <div className="flex items-center gap-1.5 text-[11px] text-muted tabular-nums">
+                    <span>{priceShort(m.cloud.info)}</span>
+                    <span className="text-faint">· {formatTokens(m.cloud.contextLimit)} context</span>
+                    <span className="flex-1" />
+                    {m.cloud.info.vision && (
+                      <Tooltip content="Takes images">
+                        <Eye size={12} className="text-accent" />
+                      </Tooltip>
+                    )}
+                  </div>
+                ) : (
                 <div className="flex items-center gap-1.5 text-[11px] text-muted">
                   {m.info?.sizeLabel && <span>{m.info.sizeLabel}</span>}
                   {m.info?.architecture && <span className="text-faint">· {m.info.architecture}</span>}
@@ -153,6 +176,7 @@ function PickerBody({ preselect, onDone }: { preselect: string | null; onDone: (
                   {m.info?.quantization && <Badge>{m.info.quantization}</Badge>}
                   <span className="w-14 text-right tabular-nums">{formatBytes(m.sizeBytes)}</span>
                 </div>
+                )}
               </button>
             )
           })}
@@ -162,13 +186,13 @@ function PickerBody({ preselect, onDone }: { preselect: string | null; onDone: (
         <div className="flex items-start justify-between gap-3 border-b border-border px-5 py-3">
           <div className="min-w-0">
             <div className="truncate text-[15px] font-semibold">{selected?.name ?? 'No model selected'}</div>
-            <div className="truncate text-xs text-faint">{selected?.remote ? 'Runs on a rented vast.ai instance' : selected?.folder || ' '}</div>
+            <div className="truncate text-xs text-faint">{selected?.remote ? 'Runs on a rented vast.ai instance' : selected?.cloud ? selected.cloud.slug : selected?.folder || ' '}</div>
           </div>
           <DialogPrimitive.Close className="rounded-md p-1 text-muted hover:bg-hover hover:text-text" aria-label="Close">
             <X size={16} />
           </DialogPrimitive.Close>
         </div>
-        {selected ? <LoadPanel key={selected.id} model={selected} onDone={onDone} /> : <div className="flex-1" />}
+        {selected ? selected.cloud ? <CloudPanel key={selected.id} model={selected} onDone={onDone} /> : <LoadPanel key={selected.id} model={selected} onDone={onDone} /> : <div className="flex-1" />}
       </div>
     </div>
   )

@@ -25,7 +25,8 @@ const kept = new Set<string>()
 /** Why the model cannot be reloaded right now (something uses it), or null. */
 export function reloadBlockReason(): string | null {
   if (wbenchRunning()) return WBENCH_BUSY
-  const why = aiBusyReason()
+  // Only models on this PC or a rental get a reload bar, so a reply from an OpenRouter model does not block it.
+  const why = aiBusyReason(undefined, { local: true })
   if (why) return why
   if (isRunning(useAdventure.getState().job)) return 'An adventure passage is being written.'
   return null
@@ -66,7 +67,8 @@ export const ModeReloadBar = memo(function ModeReloadBar({ modelId, mode }: { mo
     }
   }, [modelId, modes, inst?.instanceId, instKey])
 
-  if (!modelId || !inst) return null
+  // A model at OpenRouter is never loaded here, so there is nothing to reload.
+  if (!modelId || !inst || inst.cloud) return null
   const key = `${inst.instanceId}|${mode}`
   const offer = reloadOffer(inst.config, base?.modelId === modelId ? base.config : null, modes, mode, kept.has(key))
   if (!offer) return null

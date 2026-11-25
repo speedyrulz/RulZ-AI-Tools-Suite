@@ -3,7 +3,7 @@ import { Cloud, Info, Loader2 } from 'lucide-react'
 import { useEffect, useMemo, useReducer } from 'react'
 import { toast } from 'sonner'
 import type { PhoneMode } from '@shared/phone'
-import { applies, ModeController } from '../lib/mode'
+import { applies, cloudLabel, ModeController } from '../lib/mode'
 import { isNative } from '../lib/native'
 import { link } from '../lib/remote'
 import { useLink } from '../stores/link'
@@ -53,11 +53,12 @@ export function ModeLine({ mode, modelId }: { mode: PhoneMode; modelId: string |
   if (!controller || !info || !info.modelId) return null
   const details = applies(info)
   return <div className="shrink-0 space-y-2 border-b border-border bg-panel px-4 py-2 text-[12px] text-muted">
-    <div className="flex flex-wrap items-center gap-x-2 gap-y-1"><span className="min-w-0 break-words">{info.name}</span>{info.rental && <Badge><Cloud size={12} /> Rental</Badge>}{info.rental && info.rental.label === null && <span>Not loaded on a rental</span>}{info.rental?.reconnecting && <span>Reconnecting</span>}{details && <span>{details}</span>}</div>
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1"><span className="min-w-0 break-words">{info.name}</span>{info.cloud && <Badge><Cloud size={12} /> {cloudLabel(info)}</Badge>}{info.rental && <Badge><Cloud size={12} /> Rental</Badge>}{info.rental && info.rental.label === null && <span>Not loaded on a rental</span>}{info.rental?.reconnecting && <span>Reconnecting</span>}{details && <span>{details}</span>}</div>
+    {info.cloud && <p>Your text goes to OpenRouter and may cost money.</p>}
     {info.rental && <p>Your text is sent to the rented computer.</p>}
     <div aria-live="polite">
     {controller.loading && <p>Loading the model…</p>}
-    {info.reload && !info.rental && !controller.isKept && <div className="space-y-2 rounded-lg border border-border bg-panel-2 p-3">
+    {info.reload && !info.rental && !info.cloud && !controller.isKept && <div className="space-y-2 rounded-lg border border-border bg-panel-2 p-3">
       <p className="flex gap-2"><Info size={16} className="shrink-0" /><span>{info.name} runs with other settings than its {info.reload.label}.</span></p>
       <div className="flex flex-wrap gap-2"><Button size="sm" aria-busy={controller.busy} disabled={controller.busy || !!info.reload.blocked} onClick={() => void controller.reload().then((error) => { if (error) toast.error(error) })}>{controller.busy && <Loader2 size={14} className="animate-spin" />} Reload</Button><Button size="sm" variant="ghost" onClick={() => controller.keep()}>Keep as is</Button></div>
       {info.reload.blocked && <p>{info.reload.blocked}</p>}

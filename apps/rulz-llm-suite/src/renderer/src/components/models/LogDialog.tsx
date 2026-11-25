@@ -44,7 +44,7 @@ export function LogDialog() {
       open={!!id}
       onOpenChange={(o) => !o && showLog(null)}
       title={`Server log${inst ? ` — ${inst.modelName}` : ''}`}
-      description={inst ? `llama-server on 127.0.0.1:${inst.port} · PID ${inst.pid ?? '?'}` : 'This instance has stopped; showing its last output.'}
+      description={inst?.cloud ? 'A model at OpenRouter runs there, not as a process on this PC, so there may be no output here.' : inst ? `llama-server on 127.0.0.1:${inst.port} · PID ${inst.pid ?? '?'}` : 'This instance has stopped; showing its last output.'}
       className="w-[min(1000px,calc(100vw-32px))]"
       footer={
         <Button

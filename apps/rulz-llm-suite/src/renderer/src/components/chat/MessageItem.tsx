@@ -1,9 +1,11 @@
 import { Check, Copy, CornerDownRight, FastForward, FileText, GitBranch, Pencil, RotateCcw, Trash2, TriangleAlert } from 'lucide-react'
 import { memo, useEffect, useRef, useState } from 'react'
 import type { ChatMessage, GenerationStats } from '@shared/types'
+import { costText } from '../../lib/cloud'
 import { cn, formatBytes, formatDuration, formatNumber } from '../../lib/format'
 import { useApp } from '../../stores/app'
 import { isChatBusy, isPoolChat, useChat } from '../../stores/chat'
+import { useModels } from '../../stores/models'
 import { Button, IconButton, ProgressBar, Textarea, Tooltip } from '../ui'
 import { Markdown } from './Markdown'
 import { splitThink, ThinkingBlock } from './ThinkingBlock'
@@ -25,6 +27,8 @@ function StatsLine({ stats }: { stats: GenerationStats }) {
   if (stats.promptTokens) {
     parts.push(['Prompt', `${formatNumber(stats.promptTokens)} tokens${stats.cachedTokens ? ` (${formatNumber(stats.cachedTokens)} cached)` : ''}`])
   }
+  const cost = costText(stats.costMicro)
+  if (cost) parts.push(['Cost at OpenRouter', cost])
   if (stats.stopReason) parts.push(['Stop reason', STOP_REASONS[stats.stopReason] ?? stats.stopReason])
   return (
     <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-faint">
@@ -57,6 +61,8 @@ export const MessageItem = memo(function MessageItem({
   const busy = useChat(isChatBusy)
   // A batch run writes this chat in the main process: nothing here may change it.
   const poolOwned = useChat((s) => isPoolChat(s, s.current?.id))
+  // An error of a reply from an OpenRouter model (limit, key, credits) is fixed on the OpenRouter page.
+  const fromCloud = useModels((s) => s.models.some((m) => m.cloud && (m.cloud.slug === message.stats?.modelName || m.id === s.activeModelId)))
   const { regenerate, continueMessage, deleteMessage, branchFrom } = useChat.getState()
   const isUser = message.role === 'user'
 
@@ -169,7 +175,12 @@ export const MessageItem = memo(function MessageItem({
       {message.error && (
         <div className="mt-2 flex items-start gap-2 rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
           <TriangleAlert size={14} className="mt-px shrink-0" />
-          <span className="whitespace-pre-wrap">{message.error}</span>
+          <span className="min-w-0 flex-1 whitespace-pre-wrap">{message.error}</span>
+          {fromCloud && (
+            <button className="shrink-0 underline underline-offset-2 hover:text-text" onClick={() => useApp.getState().setPage('openrouter')}>
+              Open the OpenRouter page
+            </button>
+          )}
         </div>
       )}
       {!streaming && message.stats && <StatsLine stats={message.stats} />}

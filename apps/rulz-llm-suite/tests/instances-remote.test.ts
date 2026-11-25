@@ -425,7 +425,9 @@ describe('ChatService on a rental', () => {
       readyFor,
       get: (id: string) => instances.find((i) => i.instanceId === id),
       acquire,
-      baseUrl: () => 'http://127.0.0.1:9'
+      baseUrl: () => 'http://127.0.0.1:9',
+      // As InstanceManager.fetch does for a rental: the global fetch, which the tests stub.
+      fetch: (_i: LoadedInstance, path: string, init?: RequestInit) => fetch(`http://127.0.0.1:9${path}`, init)
     } as unknown as InstanceManager
     return { chat: new ChatService(manager, (e) => events.push(e)), events, readyFor, acquire }
   }

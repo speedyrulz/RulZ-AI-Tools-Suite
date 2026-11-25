@@ -1,9 +1,12 @@
 import type { ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { adapterPathUsable } from '@shared/adapters'
+import { isLocalInstance } from '@shared/cloud'
+import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
 import type { AppMode } from '@shared/modes'
 import type { RemoteHost } from '@shared/remote'
 import type { AdapterEntry, InstanceAdapter, InstanceErrorEvent, LoadAdapter, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry, SidecarFile } from '@shared/types'
+import type { CloudGateway } from '../cloud/contract'
 import { buildServerArgs } from './args'
 import type { EngineService } from './engine'
 import { killOrphanProcesses, savePidFile, startLocalServer } from './localServer'
@@ -26,6 +29,8 @@ interface Running {
   /** Null only while a remote server is still being started (nothing to stop yet). */
   handle: ServerHandle | null
   host?: RemoteHost
+  /** An OpenRouter model: no process, no port; it is its own host key and nothing on this PC touches it. */
+  cloud?: boolean
   log: string[]
   ready: Promise<LoadedInstance>
   exited: boolean
@@ -45,6 +50,8 @@ interface Running {
 
 /** Where an instance runs, as a map key: loads, queues and "unload the previous model" are per host. */
 const hostKey = (host?: RemoteHost): string => (host ? `${host.kind}:${host.rentalId}` : 'local')
+/** The host key of a running instance: OpenRouter is a host of its own, so it never counts as "this PC". */
+const runKey = (r: { host?: RemoteHost; cloud?: boolean }): string => (r.cloud ? 'cloud' : hostKey(r.host))
 
 export interface InstanceManagerDeps {
   engine: EngineService
@@ -77,6 +84,8 @@ export interface InstanceManagerDeps {
   onUse?: (instance: LoadedInstance, by: UseBy, what: string) => () => void
   /** Milliseconds between checks of the tunnels of remote instances; for tests. */
   reconnectPollMs?: number
+  /** The OpenRouter side; without it cloud models cannot be connected. */
+  cloud?: CloudGateway
 }
 
 function sameConfig(a: LoadConfig, b: LoadConfig): boolean {
@@ -164,6 +173,54 @@ export class InstanceManager {
   }
 
   /**
+   * Every request to an instance goes through here: a plain fetch on its port for this PC and rentals, and the
+   * OpenRouter gateway (in process, no port) for a cloud model. `by` tells the gateway who asks.
+   */
+  fetch(instance: LoadedInstance, path: string, init?: RequestInit, by: UseBy = 'window'): Promise<Response> {
+    if (!instance.cloud) return fetch(`${this.baseUrl(instance)}${path}`, init)
+    const gateway = this.deps.cloud
+    if (!gateway) return Promise.reject(new Error('OpenRouter models are not available in this build.'))
+    const body = init?.body
+    if (body !== undefined && body !== null && typeof body !== 'string') return Promise.reject(new Error('A request to an OpenRouter model must have a text body.'))
+    return gateway.fetch(instance.modelId, path, { method: init?.method, body: body ?? undefined, signal: init?.signal ?? undefined }, by)
+  }
+
+  /**
+   * The cloud models' limits or the list changed: connected ones read their context and vision again, and one that
+   * is not in the list any more (or has lost its key) is ejected.
+   */
+  async refreshCloud(): Promise<void> {
+    const gateway = this.deps.cloud
+    if (!gateway) return
+    let changed = false
+    const gone: string[] = []
+    for (const run of this.running.values()) {
+      if (!run.cloud || run.info.status !== 'ready') continue
+      try {
+        gateway.check(run.info.modelId)
+        const p = gateway.props(run.info.modelId)
+        if (run.info.contextLength !== p.contextLength || run.info.hasVision !== p.hasVision || run.info.cloud?.free !== p.free) {
+          run.info.contextLength = p.contextLength
+          run.info.hasVision = p.hasVision
+          run.info.cloud = { provider: 'openrouter', free: p.free }
+          run.info.config = this.cloudConfig(p.contextLength)
+          changed = true
+        }
+      } catch {
+        gone.push(run.info.instanceId)
+      }
+    }
+    if (changed) this.emit()
+    await Promise.all(gone.map((id) => this.unload(id).catch(() => undefined)))
+  }
+
+  /** The settings of a cloud instance: plain defaults, since nothing is loaded and the API sampling override stays off. */
+  private cloudConfig(contextLength: number): LoadConfig {
+    const sampling = Object.freeze({ ...DEFAULT_LOAD_CONFIG.sampling, override: false })
+    return Object.freeze({ ...DEFAULT_LOAD_CONFIG, contextLength, sampling, adapters: Object.freeze([]) as unknown as LoadAdapter[] }) as LoadConfig
+  }
+
+  /**
    * Loads a model. A remote model is loaded on `host`; without one, an instance of it that already exists is
    * reloaded on its own host, and when there is none the call fails (this never starts or rents anything).
    */
@@ -186,6 +243,10 @@ export class InstanceManager {
     const model = this.deps.getModel(modelId)
     // A missing model is reported by the load itself.
     if (!model) return host
+    if (model.cloud) {
+      if (host) throw new Error(`${model.name} runs at OpenRouter, not on a rental.`)
+      return undefined
+    }
     if (!model.remote) {
       if (host) throw new Error(`${model.name} runs on this PC, not on a rental.`)
       return undefined
@@ -212,7 +273,8 @@ export class InstanceManager {
     } catch (err) {
       return Promise.reject(err)
     }
-    const key = hostKey(target)
+    // A cloud model queues with other cloud models only: it never waits for a load on this PC.
+    const key = this.deps.getModel(modelId)?.cloud ? 'cloud' : hostKey(target)
     const entry = { modelId, host: target }
     this.pending.push(entry)
     const started = (this.loadQueues.get(key) ?? Promise.resolve()).then(() => this.startLoad(modelId, config, reuseAny, target, mode, refuse))
@@ -287,6 +349,11 @@ export class InstanceManager {
     this.checkDisposed()
     const found = this.deps.getModel(modelId)
     if (!found) throw new Error(`Model not found: ${modelId}`)
+    // OpenRouter: before the engine, draft, estimate and settings steps, which are all about this PC.
+    if (found.cloud) {
+      if (host) throw new Error(`${found.name} runs at OpenRouter, not on a rental.`)
+      return this.startCloud(found)
+    }
     // Refused before anything is unloaded: a request that cannot be placed must not cost a running model.
     if (found.remote && !host) throw new Error(`Load ${found.name} on a rental first (vast.ai page).`)
     if (!found.remote && host) throw new Error(`${found.name} runs on this PC, not on a rental.`)
@@ -294,18 +361,18 @@ export class InstanceManager {
     const model = { ...found, draft: this.deps.draftFor(found, cfg) }
     const key = hostKey(host)
 
-    const existing = [...this.running.values()].find((r) => r.info.modelId === modelId && hostKey(r.host) === key && r.info.status !== 'stopping')
+    const existing = [...this.running.values()].find((r) => r.info.modelId === modelId && runKey(r) === key && r.info.status !== 'stopping')
     if (existing && (reuseAny || sameConfig(existing.info.config, cfg))) return { ready: existing.ready, started: false }
     // Asked in the same step as the first unload, so nothing can start using a model in between; what has to go then goes
     // at once, not one after another.
     const why = refuse?.()
     if (why) throw new Error(why)
-    if (refuse && this.deps.unloadPreviousOnLoad()) await this.unloadWhere((r) => hostKey(r.host) === key)
+    if (refuse && this.deps.unloadPreviousOnLoad()) await this.unloadWhere((r) => runKey(r) === key)
     // Quitting during any of these waits must not leave a llama-server running after the app is gone.
     else if (existing) await this.unload(existing.info.instanceId)
     this.checkDisposed()
     // Only the previous models of the same host go: a rental's model never makes room on this PC, nor the reverse.
-    if (this.deps.unloadPreviousOnLoad()) await this.unloadWhere((r) => hostKey(r.host) === key)
+    if (this.deps.unloadPreviousOnLoad()) await this.unloadWhere((r) => runKey(r) === key)
     this.checkDisposed()
     if (found.remote) return this.startRemote(model, cfg, host!)
     const exe = await this.deps.engine.resolveExe()
@@ -347,6 +414,44 @@ export class InstanceManager {
     // Avoid an unhandled rejection when nobody awaits a failed background load.
     run.ready.catch(() => undefined)
     void this.savePids()
+    this.emit()
+    return { ready: run.ready, started: true }
+  }
+
+  /**
+   * Connects an OpenRouter model: nothing is started, unloaded or waited for. One instance per model, so a second
+   * connect returns it. The instance is ready at once (the gateway's check already said the key and the model are there).
+   */
+  private startCloud(model: ModelEntry): { ready: Promise<LoadedInstance>; started: boolean } {
+    const gateway = this.deps.cloud
+    if (!gateway) throw new Error('OpenRouter models are not available in this build.')
+    const existing = [...this.running.values()].find((r) => r.cloud && r.info.modelId === model.id && r.info.status !== 'stopping')
+    if (existing) return { ready: existing.ready, started: false }
+    gateway.check(model.id)
+    const props = gateway.props(model.id)
+    const instanceId = randomUUID()
+    const info: LoadedInstance = {
+      instanceId,
+      modelId: model.id,
+      // The slug: stable and unique, so traces and scoreboards group by it.
+      modelName: model.id.slice(model.id.indexOf('/') + 1),
+      port: 0,
+      pid: null,
+      status: 'ready',
+      progress: 1,
+      stage: 'Ready',
+      config: this.cloudConfig(props.contextLength),
+      startedAt: Date.now(),
+      contextLength: props.contextLength,
+      hasVision: props.hasVision,
+      adapters: [],
+      estimate: null,
+      cloud: { provider: 'openrouter', free: props.free }
+    }
+    const run = this.newRun(info, null, [`[cloud] Connected ${info.modelName} through OpenRouter (nothing is loaded on this PC)`])
+    run.cloud = true
+    run.ready = Promise.resolve({ ...info })
+    this.running.set(instanceId, run)
     this.emit()
     return { ready: run.ready, started: true }
   }
@@ -577,6 +682,13 @@ export class InstanceManager {
   async unload(instanceId: string): Promise<void> {
     const run = this.running.get(instanceId)
     if (!run) return
+    if (run.cloud) {
+      // Nothing to stop: the instance only goes. A request still running is aborted by whoever holds it (its instance is gone).
+      run.info.status = 'stopping'
+      run.info.stage = 'Unloading'
+      this.onExit(run, null)
+      return
+    }
     if (run.host) return this.unloadRemote(run)
     run.info.status = 'stopping'
     run.info.stage = 'Unloading'
@@ -633,7 +745,7 @@ export class InstanceManager {
 
   /** Unloads what runs on this PC only; a rental's models stay (benchmarks and anything else that needs the GPUs here). */
   async unloadAllLocal(): Promise<void> {
-    await this.unloadWhere((r) => !r.host)
+    await this.unloadWhere((r) => isLocalInstance(r.info))
   }
 
   /**

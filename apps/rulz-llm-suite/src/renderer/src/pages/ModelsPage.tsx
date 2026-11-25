@@ -1,5 +1,5 @@
-import { Cloud, Ellipsis, Eye, FolderOpen, FolderSearch, Gauge, Play, RefreshCw, Repeat, Search, Trash2 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { Cloud, Ellipsis, Eye, FolderOpen, FolderSearch, Gauge, Globe, Play, RefreshCw, Repeat, Search, Trash2 } from 'lucide-react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { adapterChoices } from '@shared/adapters'
 import type { AdapterEntry, LoadConfig, ModelEntry } from '@shared/types'
@@ -10,6 +10,7 @@ import { LoadSettingsForm } from '../components/models/LoadSettingsForm'
 import { ModeDefaultsEditor, type ModeScope } from '../components/models/ModeDefaultsEditor'
 import { Badge, Button, Dialog, DropdownMenu, IconButton, Input } from '../components/ui'
 import { errorMessage, invoke } from '../lib/api'
+import { badgesFor, priceLine, priceShort } from '../lib/cloud'
 import { cn, formatBytes, formatTokens } from '../lib/format'
 import { useApp } from '../stores/app'
 import { useModels } from '../stores/models'
@@ -36,14 +37,17 @@ export function ModelsPage() {
 
   const list = useMemo(() => {
     const q = query.trim().toLowerCase()
-    const filtered = q ? models.filter((m) => `${m.id} ${m.info?.architecture ?? ''}`.toLowerCase().includes(q)) : models
+    const filtered = q ? models.filter((m) => `${m.id} ${m.name} ${m.info?.architecture ?? ''}`.toLowerCase().includes(q)) : models
     return [...filtered].sort((a, b) =>
       sort === 'size' ? b.sizeBytes - a.sizeBytes : sort === 'modified' ? b.modifiedAt - a.modifiedAt : a.id.localeCompare(b.id)
     )
   }, [models, query, sort])
   const selected = models.find((m) => m.id === selectedId) ?? null
   // Remote models are definitions, not files on this PC: they are listed but not counted in the folder's size.
-  const localModels = models.filter((m) => !m.remote)
+  const localModels = models.filter((m) => !m.remote && !m.cloud)
+  const cloudCount = models.filter((m) => m.cloud).length
+  // OpenRouter models are listed last, under their own heading.
+  const ordered = useMemo(() => [...list.filter((m) => !m.cloud), ...list.filter((m) => m.cloud)], [list])
   const totalSize = localModels.reduce((sum, m) => sum + m.sizeBytes + (m.mmproj?.sizeBytes ?? 0), 0)
 
   const doRescan = async (): Promise<void> => {
@@ -62,7 +66,7 @@ export function ModelsPage() {
           <div className="min-w-0 flex-1">
             <h1 className="font-[family-name:var(--font-display)] text-base font-semibold">My Models</h1>
             <div className="truncate text-xs text-muted">
-              {localModels.length} models · {formatBytes(totalSize)}{models.length > localModels.length ? ` · ${models.length - localModels.length} on vast.ai` : ''} · <span className="font-mono">{settings?.modelsDir}</span>
+              {localModels.length} models · {formatBytes(totalSize)}{models.length - cloudCount > localModels.length ? ` · ${models.length - cloudCount - localModels.length} on vast.ai` : ''}{cloudCount > 0 ? ` · ${cloudCount} at OpenRouter` : ''} · <span className="font-mono">{settings?.modelsDir}</span>
             </div>
           </div>
           <Button size="sm" onClick={() => settings && void invoke('shell:openPath', settings.modelsDir)}>
@@ -125,28 +129,41 @@ export function ModelsPage() {
                 </tr>
               </thead>
               <tbody>
-                {list.map((m) => {
+                {ordered.map((m, idx) => {
                   const inst = instances.find((i) => i.modelId === m.id)
-                  const fits = m.remote ? [] : adapterChoices(m, adapters)
+                  const fits = m.remote || m.cloud ? [] : adapterChoices(m, adapters)
+                  const firstCloud = !!m.cloud && ordered.findIndex((x) => x.cloud) === idx
                   return (
+                    <Fragment key={m.id}>
+                    {firstCloud && (
+                      <tr>
+                        <td colSpan={7} className="border-b border-border pt-5 pb-2 pl-3 text-[11px] font-semibold tracking-wide text-faint uppercase">
+                          OpenRouter <span className="font-normal normal-case tabular-nums">· {cloudCount}</span>
+                        </td>
+                      </tr>
+                    )}
                     <tr
-                      key={m.id}
                       onClick={() => setSelectedId(m.id)}
                       className={cn('group cursor-default', selectedId === m.id ? 'bg-accent-soft/50' : 'hover:bg-hover/50')}
                     >
                       <td className="border-b border-border py-2 pr-3 pl-3">
                         <div className="flex items-center gap-1.5">
                           <span className="truncate font-medium">{m.name}</span>
-                          {m.mmproj && <Eye size={12} className="shrink-0 text-accent" aria-label="Vision" />}
+                          {(m.mmproj || m.cloud?.info.vision) && <Eye size={12} className="shrink-0 text-accent" aria-label="Vision" />}
+                          {m.cloud && (
+                            <Badge>
+                              <Globe size={11} /> OpenRouter
+                            </Badge>
+                          )}
                           {m.remote && (
                             <Badge>
                               <Cloud size={11} /> vast.ai
                             </Badge>
                           )}
-                          {inst && <Badge tone={inst.status === 'ready' ? 'ok' : 'accent'}>{inst.status === 'ready' ? 'Loaded' : 'Loading'}</Badge>}
+                          {inst && <Badge tone={inst.status === 'ready' ? 'ok' : 'accent'}>{inst.status === 'ready' ? (m.cloud ? 'Connected' : 'Loaded') : m.cloud ? 'Connecting' : 'Loading'}</Badge>}
                           {m.error && <Badge tone="danger">Unreadable</Badge>}
                         </div>
-                        <div className="truncate text-[11px] text-faint">{m.remote ? 'Runs on a rented instance. Edit it on the vast.ai page.' : m.folder || '/'}</div>
+                        <div className="truncate text-[11px] text-faint">{m.remote ? 'Runs on a rented instance. Edit it on the vast.ai page.' : m.cloud ? `Runs at OpenRouter. Edit it on the OpenRouter page. ${priceLine(m.cloud.info)}` : m.folder || '/'}</div>
                         {fits.length > 0 && (
                           <div className="truncate text-[11px] text-faint" title={fits.map((a) => a.name).join(', ')}>
                             Adapters: {fits.map((a) => a.name).join(', ')}
@@ -157,15 +174,15 @@ export function ModelsPage() {
                       <td className="border-b border-border py-2 text-muted">{m.info?.sizeLabel ?? '—'}</td>
                       <td className="border-b border-border py-2">{m.info?.quantization ? <Badge>{m.info.quantization}</Badge> : '—'}</td>
                       <td className="border-b border-border py-2 text-muted tabular-nums">
-                        {m.info?.contextLength ? formatTokens(m.info.contextLength) : '—'}
+                        {m.cloud ? formatTokens(m.cloud.contextLimit) : m.info?.contextLength ? formatTokens(m.info.contextLength) : '—'}
                       </td>
-                      <td className="border-b border-border py-2 text-right text-muted tabular-nums">{formatBytes(m.sizeBytes)}</td>
+                      <td className="border-b border-border py-2 text-right text-muted tabular-nums">{m.cloud ? priceShort(m.cloud.info) : formatBytes(m.sizeBytes)}</td>
                       <td className="border-b border-border py-2 pr-2">
                         <div className="flex justify-end gap-1" onClick={(e) => e.stopPropagation()}>
                           <Button size="sm" variant="ghost" onClick={() => openPicker(m.id)}>
-                            <Play size={12} /> Load
+                            <Play size={12} /> {m.cloud ? 'Use' : 'Load'}
                           </Button>
-                          {!m.remote && (
+                          {!m.remote && !m.cloud && (
                           <DropdownMenu
                             trigger={
                               <button className="rounded p-1.5 text-faint hover:bg-hover hover:text-text" aria-label="Model options">
@@ -183,6 +200,7 @@ export function ModelsPage() {
                         </div>
                       </td>
                     </tr>
+                    </Fragment>
                   )
                 })}
               </tbody>
@@ -327,6 +345,8 @@ function ModelDetails({ model, onClose, onBenchmark }: { model: ModelEntry; onCl
   const estimate = useEstimate(model.id, config ?? settings!.defaultLoadConfig)
 
   useEffect(() => {
+    // An OpenRouter model has no load settings.
+    if (model.cloud) return
     void invoke('models:getDefaults', model.id).then((d) => {
       setConfig(d.config)
       setCustom(d.custom)
@@ -334,7 +354,18 @@ function ModelDetails({ model, onClose, onBenchmark }: { model: ModelEntry; onCl
   }, [model.id])
 
   const i = model.info
-  const rows: [string, string | undefined][] = [
+  const cloud = model.cloud
+  const rows: [string, string | undefined][] = cloud
+    ? [
+        ['Provider', 'OpenRouter'],
+        ['Slug', cloud.slug],
+        ['Price', priceLine(cloud.info)],
+        ['Context the app uses', `${cloud.contextLimit.toLocaleString()} of ${cloud.info.contextLength.toLocaleString()}`],
+        ['Longest reply', cloud.replyLimit.toLocaleString()],
+        ['Features', badgesFor(cloud.info).map((b) => b.label).join(', ') || undefined],
+        ['Other apps', cloud.allowApps ? 'May use it' : 'May not use it']
+      ]
+    : [
     ['Architecture', i?.architecture],
     ['Name in file', i?.name],
     ['Parameters', i?.sizeLabel],
@@ -359,6 +390,8 @@ function ModelDetails({ model, onClose, onBenchmark }: { model: ModelEntry; onCl
           <div className="text-sm font-semibold break-words">{model.name}</div>
           {model.remote ? (
             <div className="mt-0.5 truncate text-[11px] text-faint">Runs on a rented vast.ai instance</div>
+          ) : cloud ? (
+            <div className="mt-0.5 text-[11px] text-faint">Runs at OpenRouter. Edit it on the OpenRouter page.</div>
           ) : (
             <button className="mt-0.5 truncate text-left text-[11px] text-faint hover:text-text" onClick={() => void invoke('shell:showItem', model.path)}>
               {model.path}
@@ -388,6 +421,9 @@ function ModelDetails({ model, onClose, onBenchmark }: { model: ModelEntry; onCl
           scope={scope}
           onScope={setScope}
           allView={
+            cloud ? (
+              <p className="text-xs text-muted">A model at OpenRouter is not loaded on this PC, so it has no load settings. Choose a mode above to set its own sampling and system prompt.</p>
+            ) : (
             <>
               <div>
                 <div className="mb-3 flex items-center justify-between">
@@ -398,16 +434,22 @@ function ModelDetails({ model, onClose, onBenchmark }: { model: ModelEntry; onCl
               </div>
               <EstimateView estimate={estimate} />
             </>
+            )
           }
         />
       </div>
       <div className="flex justify-end gap-2 border-t border-border px-5 py-3">
-        {!model.remote && (
+        {cloud && (
+          <Button variant="ghost" onClick={() => useApp.getState().setPage('openrouter')}>
+            <Globe size={14} /> OpenRouter page
+          </Button>
+        )}
+        {!model.remote && !cloud && (
           <Button variant="ghost" disabled={!!model.error} onClick={onBenchmark}>
             <Gauge size={14} /> Benchmark
           </Button>
         )}
-        {scope === 'all' && custom && (
+        {scope === 'all' && custom && !cloud && (
           <Button
             variant="ghost"
             onClick={async () => {
@@ -420,7 +462,7 @@ function ModelDetails({ model, onClose, onBenchmark }: { model: ModelEntry; onCl
             Reset
           </Button>
         )}
-        {scope === 'all' && (
+        {scope === 'all' && !cloud && (
           <Button
             variant="primary"
             disabled={!config}

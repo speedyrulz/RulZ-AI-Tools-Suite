@@ -162,6 +162,7 @@ export class BenchmarkRunner {
     const model = this.deps.getModel(req.modelId)
     if (!model) throw new Error('Model not found.')
     if (model.remote) throw new Error('A model on a vast.ai rental cannot be benchmarked: the benchmark loads models on this computer and reads its GPUs.')
+    if (model.cloud) throw new Error('An OpenRouter model cannot be benchmarked: nothing is loaded on this computer, so there is nothing to measure.')
     if (!model.info) throw new Error('This model has no readable file information, so it cannot be benchmarked.')
     for (const axis of req.axes) {
       if (axis.key === 'cpuMoe' && axis.values.some((v) => v !== 'off') && !(model.info.expertCount && model.info.expertCount > 0))

@@ -4,6 +4,7 @@ import { homedir } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { app, BrowserWindow, dialog, Menu, nativeTheme, safeStorage, shell, Tray } from 'electron'
 import { batchAdapters } from '@shared/batch'
+import { isLocalInstance, type CloudIpcInvoke } from '@shared/cloud'
 import { DEFAULT_SAMPLING } from '@shared/defaults'
 import { resolveDraft } from '@shared/draft'
 import { APP_MODES, modeSampling, type AppMode } from '@shared/modes'
@@ -11,6 +12,7 @@ import type { RemoteIpcInvoke } from '@shared/remote'
 import { META_TOOL_DEFS, toolCatalogNote } from '@shared/tools'
 import type { LoadConfig, LoadedInstance, McpServerConfig, ModelEntry, Theme } from '@shared/types'
 import { ChatService } from './chat/service'
+import { createCloudService } from './cloud/service'
 import { ConversationStore } from './chat/conversations'
 import { EngineService } from './engine/engine'
 import { HardwareMonitor } from './engine/hardware'
@@ -44,7 +46,7 @@ import { registerNovelIpc } from './novel/ipc'
 import { NovelStore, runAs, WINDOW_OWNER } from './novel/store'
 import { createPhoneService, type PhoneService } from './phone/host'
 import { settingsForRenderer, settingsPatchFromRenderer } from './phone/settings'
-import { ChatEventTap, chatAdapter, chatBusyReason, modelsAdapter, storeAdapter } from './writing/adapters'
+import { asPhone, ChatEventTap, chatAdapter, chatBusyReason, modelsAdapter, storeAdapter } from './writing/adapters'
 import { WritingEvents, writingHandlers } from './writing/ipc'
 import { PhoneModes } from './writing/modeInfo'
 import { WritingRuns } from './writing/runs'
@@ -177,8 +179,8 @@ async function main(): Promise<void> {
   const freeMemory = (cfg: LoadConfig): FreeMemory => {
     const snap = hardware.snapshot()
     // Models that will be unloaded first give their memory back.
-    // Models on rentals use no memory here and are not unloaded by a load here.
-    const unloading = settings.get().unloadPreviousOnLoad ? instances.list().filter((i) => !i.host) : []
+    // Models on rentals and at OpenRouter use no memory here and are not unloaded by a load here.
+    const unloading = settings.get().unloadPreviousOnLoad ? instances.list().filter(isLocalInstance) : []
     const freed = (index: number): number =>
       unloading.reduce((sum, i) => sum + (i.estimate?.perGpu?.find((g) => g.index === index)?.bytes ?? 0), 0)
     const all = [...snap.gpus]
@@ -245,11 +247,32 @@ async function main(): Promise<void> {
     onChange: (state) => broadcast('remote:changed', state),
     onModels: () => broadcast('models:changed', catalog.list())
   })
-  const catalog = createModelCatalog(library, remote.models)
+  // OpenRouter models (docs/cloud-design.md). instances, apiServer and catalog are used only when a call comes in, so they may come later.
+  const cloud = createCloudService({
+    userData,
+    safeStorage,
+    appVersion: app.getVersion(),
+    onChange: (state) => broadcast('cloud:changed', state),
+    onModels: () => {
+      broadcast('models:changed', catalog.list())
+      // Connected models read their limits again, and one that is gone from the list is ejected.
+      void instances.refreshCloud().catch((err) => console.error('Could not refresh the OpenRouter models:', cloud.scrub(err)))
+    },
+    eject: async (modelId) => {
+      for (const i of instances.list().filter((x) => x.modelId === modelId)) {
+        apiServer.forget(i.instanceId)
+        await instances.unload(i.instanceId)
+      }
+    },
+    usersOf: (modelId) => instances.list().filter((i) => i.modelId === modelId).reduce((n, i) => n + instances.usersOf(i.instanceId), 0),
+    forgetDefaults: (modelId) => forgetModel(modelId)
+  })
+  const catalog = createModelCatalog(library, remote.models, cloud.models)
 
   const instances = new InstanceManager({
     engine,
     launcher: remote.launcher,
+    cloud,
     onUse: (instance, by, what) => (instance.host ? remote.rentals.use(instance.host.rentalId, what, by) : () => undefined),
     getModel: (id) => catalog.get(id),
     draftFor,
@@ -316,6 +339,7 @@ async function main(): Promise<void> {
   const apiServer = new ApiServer({
     instances,
     getModels: () => catalog.list(),
+    cloudAllowed: (id) => cloud.allowedForApps(id),
     getAdapters: () => library.listAdapters(),
     getSettings: () => settings.get().apiServer,
     getLoadDefaults: (id) => settings.getModelDefaults(id),
@@ -470,6 +494,7 @@ async function main(): Promise<void> {
     const model = catalog.get(modelId)
     if (!model) throw new Error('Model not found')
     if (model.remote) throw new Error('This model is defined on the vast.ai page; delete it there.')
+    if (model.cloud) throw new Error('Remove it on the OpenRouter page.')
     if (instances.list().some((i) => i.modelId === modelId)) throw new Error('Eject the model before deleting it.')
     for (const f of model.files) await shell.trashItem(f)
     await forgetModel(modelId)
@@ -480,7 +505,7 @@ async function main(): Promise<void> {
     const adapter = library.getAdapter(adapterId)
     if (!adapter) throw new Error('Adapter not found')
     // A loaded adapter is held open by llama-server; its model has to be ejected first.
-    if (instances.list().some((i) => !i.host && i.adapters.some((a) => a.id === adapterId))) throw new Error('Eject the model using this adapter before deleting it.')
+    if (instances.list().some((i) => isLocalInstance(i) && i.adapters.some((a) => a.id === adapterId))) throw new Error('Eject the model using this adapter before deleting it.')
     await shell.trashItem(adapter.path)
     await library.scan()
   })
@@ -499,6 +524,8 @@ async function main(): Promise<void> {
   handle('models:estimate', (modelId, config) => {
     const model = catalog.get(modelId)
     if (!model) throw new Error('Model not found')
+    // Nothing is loaded here for an OpenRouter model, so there is no memory to estimate.
+    if (model.cloud) throw new Error('An OpenRouter model has no memory estimate.')
     return estimate(model, config)
   })
 
@@ -636,10 +663,11 @@ async function main(): Promise<void> {
   // ---- Practice batch runs: several sessions at once, here or on rentals (docs/vast-design.md, section 8) ----
   const poolHost = (i: LoadedInstance, dollarsPerHour: number): PoolHost => ({
     instanceId: i.instanceId,
-    hostLabel: i.host?.label ?? 'This PC',
+    hostLabel: i.cloud ? 'OpenRouter' : (i.host?.label ?? 'This PC'),
     dollarsPerHour,
     ...(i.host ? { rentalId: i.host.rentalId } : {}),
-    modelName: i.modelName,
+    ...(i.cloud ? { cloud: true } : {}),
+    modelName: i.cloud ? i.modelId : i.modelName,
     contextLength: i.contextLength,
     adapters: batchAdapters(i.adapters)
   })
@@ -661,13 +689,20 @@ async function main(): Promise<void> {
       const held = modelGate.busyReason()
       if (held) return held
       // A model here that is in use: a reply, a tool round or an API request.
-      return instances.list().some((i) => !i.host && i.status === 'ready' && instances.idleSince(i.instanceId) === null) ? 'A reply is still being written on this PC. Wait for it or stop it first.' : null
+      return instances.list().some((i) => isLocalInstance(i) && i.status === 'ready' && instances.idleSince(i.instanceId) === null) ? 'A reply is still being written on this PC. Wait for it or stop it first.' : null
     },
     prepareHosts: (target, modelId, load) =>
       Promise.all(
         target.hosts.map(async (h): Promise<PoolHost> => {
           const model = catalog.get(modelId)
           if (!model) throw new Error(`${modelId} is no longer in your models.`)
+          // An OpenRouter model has one host, OpenRouter, and nothing else runs there.
+          if (model.cloud && h.kind !== 'cloud') throw new Error(`${model.name} is an OpenRouter model. It can only run on the OpenRouter host, not on this PC or a rental.`)
+          if (h.kind === 'cloud') {
+            if (!model.cloud) throw new Error(`${model.name} is not an OpenRouter model. The OpenRouter host only runs models you added on the OpenRouter page.`)
+            // No load settings: nothing is loaded.
+            return poolHost((await instances.ensure(modelId, 're')).instance, 0)
+          }
           if (h.kind === 'local') {
             if (model.remote) throw new Error(`${model.name} runs on a vast.ai rental, not on this PC.`)
             const inst = load
@@ -722,6 +757,19 @@ async function main(): Promise<void> {
   const poolTable = poolHandlers(pool, (id) => batches.delete(id))
   for (const channel of Object.keys(poolTable) as (keyof typeof poolTable)[]) handle(channel, poolTable[channel] as never)
   handle('re:batches', () => batches.list())
+
+  // ---- OpenRouter (window only, like vast.ai: never registered for the phone or the API server) ----
+  for (const channel of Object.keys(cloud.handlers) as (keyof CloudIpcInvoke)[]) {
+    const fn = cloud.handlers[channel] as (...args: unknown[]) => Promise<unknown>
+    // Whatever goes wrong, the key never leaves in the message.
+    handle(channel, (async (...args: unknown[]) => {
+      try {
+        return await fn(...args)
+      } catch (err) {
+        throw new Error(cloud.scrub(err))
+      }
+    }) as never)
+  }
 
   // ---- vast.ai (window only: never registered for the phone or the API server) ----
   for (const channel of Object.keys(remote.handlers) as (keyof RemoteIpcInvoke)[]) handle(channel, remote.handlers[channel] as never)
@@ -804,7 +852,7 @@ async function main(): Promise<void> {
   const chatReasonPastGate = chatBusyReason(chat, () => bench.isRunning())
   // A batch run on rentals alone leaves this PC's model free.
   const busyReason = (pastGate = false): string | null =>
-    pool.busy && pool.activeInstances.some((id) => !instances.get(id)?.host)
+    pool.busy && pool.activeInstances.some((id) => { const i = instances.get(id); return !i || isLocalInstance(i) })
       ? 'A practice batch run is using the model on the computer.'
       : pastGate
         ? chatReasonPastGate()
@@ -821,12 +869,13 @@ async function main(): Promise<void> {
     if (pool.busy && pool.activeInstances.includes(instanceId)) return 'A practice batch run is using the model.'
     if (instances.usersOf(instanceId) > 0) return 'The model is in use.'
     // With "unload the previous model" on, the reload takes every other model on this PC down with it.
-    if (settings.get().unloadPreviousOnLoad && instances.list().some((i) => !i.host && instances.usersOf(i.instanceId) > 0)) {
+    if (settings.get().unloadPreviousOnLoad && instances.list().some((i) => isLocalInstance(i) && instances.usersOf(i.instanceId) > 0)) {
       return 'Another model on this PC is in use, and loading a model unloads it.'
     }
     return null
   }
-  const writingModels = modelsAdapter(catalog, instances)
+  // A phone may use only the OpenRouter models ticked for other apps.
+  const writingModels = modelsAdapter(catalog, instances, { by: 'phone', cloudAllowed: (id) => cloud.allowedForApps(id) })
   const writingRuns = new WritingRuns({
     store: storeAdapter(novel),
     chat: chatAdapter(chat, chatTap, 'phone'),
@@ -841,6 +890,7 @@ async function main(): Promise<void> {
   writingEvents.subscribe((job) => phone.emit('writing:job', job))
   const phoneModes = new PhoneModes({
     getEntry: (id) => catalog.get(id),
+    cloudAllowed: (id) => cloud.allowedForApps(id),
     newestReady: () => writingModels.ready(null)?.modelId ?? null,
     readyFor: (id) => instances.readyFor(id),
     modeDefaults: (id) => settings.modeDefaults(id),
@@ -867,7 +917,8 @@ async function main(): Promise<void> {
   const adventureRuns = new AdventureRuns({
     store: adventureStore,
     chat: chatAdapter(chat, chatTap),
-    models: modelsAdapter(catalog, instances),
+    // The window's own adventure jobs run as the window; a phone's calls are wrapped in asPhone below.
+    models: modelsAdapter(catalog, instances, { cloudAllowed: (id) => cloud.allowedForApps(id) }),
     gate: modelGate,
     busyReason,
     modeDefaults: (id) => settings.modeDefaults(id),
@@ -897,7 +948,7 @@ async function main(): Promise<void> {
   // The phone may call PHONE_ADVENTURE_CHANNELS only (no deletes, no save dialog); adventure:create's worldFolder is
   // checked in the phone dispatcher (phone/registry.ts).
   for (const channel of PHONE_ADVENTURE_CHANNELS) {
-    phone.handlers.register(channel, ((owner: string, ...args: unknown[]) => adventureTable[channel](owner, ...args)) as never)
+    phone.handlers.register(channel, ((owner: string, ...args: unknown[]) => asPhone(() => adventureTable[channel](owner, ...args))) as never)
   }
   void phone.access.start()
 
@@ -989,6 +1040,8 @@ async function main(): Promise<void> {
   mainWindow.on('focus', () => hardware.poke())
   hardware.start()
   void remote.load().catch((err) => console.error('Could not read the vast.ai state:', remote.scrub(err)))
+  // The OpenRouter models are known once its files are read, maybe after the window asked for the list.
+  void cloud.load().then(() => broadcast('models:changed', catalog.list())).catch((err) => console.error('Could not read the OpenRouter state:', cloud.scrub(err)))
   void library.scan()
   void engine.getInfo()
   if (settings.get().apiServer.autoStart) apiServer.start().catch(() => undefined)
@@ -1032,6 +1085,8 @@ async function main(): Promise<void> {
     library.dispose()
     // The benchmark first: it sets its stop flag and starts unloading before the servers are killed.
     void bench.stop()
+    // Requests to OpenRouter that are running are aborted (their reservations are settled at the next start).
+    cloud.dispose()
     instances.killAllSync()
     remote.rentals.dispose()
     void mcp.dispose()
