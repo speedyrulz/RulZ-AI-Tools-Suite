@@ -716,7 +716,8 @@ class MainWindow(QMainWindow):
                     and self.store.find(profile_id) is saved
                     and (inst is None or (self.manager.instance(profile_id) is inst and inst.active)))
 
-        self._page_opener.open(profile_id, current.name, url, current.open_rulzflow, valid)
+        self._page_opener.open(profile_id, current.name, url, current.open_rulzflow, valid,
+                               lambda: current.open_rulzflow)
 
     # ======================================================================
     # starting and stopping

@@ -77,6 +77,19 @@ def test_refused(app):
     assert urls == [base + "/rulzflow/"]
 
 
+def test_unticked_during_the_check(app, server):
+    server.release.clear()
+    urls, messages, wanted = [], [], [True]
+    opener = PageOpener(lambda url: urls.append(url.toString()), messages.append, app)
+    base = f"http://127.0.0.1:{server.server_port}"
+    opener.open("id", "Main", base, True, lambda: True, lambda: wanted[0])
+    wait_for(app, server.received.is_set)
+    wanted[0] = False
+    server.release.set()
+    wait_for(app, lambda: bool(urls))
+    assert urls == [base] and not messages
+
+
 @pytest.mark.parametrize("action", ["double", "quit", "removed"])
 def test_pending_check(app, server, action):
     server.release.clear()

@@ -15,7 +15,9 @@ class PageOpener(QObject):
         self._network = QNetworkAccessManager(self)
         self._network.setProxy(QNetworkProxy(QNetworkProxy.ProxyType.NoProxy))
 
-    def open(self, profile_id, name, server_url, rulzflow, valid):
+    def open(self, profile_id, name, server_url, rulzflow, valid, wanted=lambda: True):
+        """`valid` and `wanted` are asked again after the check: whether to open a page at all,
+        and whether it is still the RulZFlow one."""
         if self._stopped or profile_id in self._pending or not valid():
             return
         if not rulzflow:
@@ -26,6 +28,8 @@ class PageOpener(QObject):
         request.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
                              QNetworkRequest.RedirectPolicy.ManualRedirectPolicy)
         reply = self._network.get(request)
+        # Only the status code is read and nothing is sent, so a self-signed certificate is fine here.
+        reply.sslErrors.connect(lambda _errors: reply.ignoreSslErrors())
         self._pending[profile_id] = reply
         timer = QTimer(reply)
         timer.setSingleShot(True)
@@ -38,7 +42,9 @@ class PageOpener(QObject):
             reply.deleteLater()
             if self._stopped or not valid():
                 return
-            if code in (404, 503):
+            if not wanted():
+                self._open_url(QUrl(server_url))
+            elif code in (404, 503):
                 reason = "is not installed" if code == 404 else "has missing page files"
                 self._status(f"RulZFlow {reason} on {name}: opened the normal ComfyUI page.")
                 self._open_url(QUrl(server_url))

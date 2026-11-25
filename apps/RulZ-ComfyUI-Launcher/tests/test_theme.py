@@ -258,7 +258,8 @@ class _RecordingOpener:
     def __init__(self):
         self.calls = []
 
-    def open(self, profile_id, name, server_url, rulzflow, valid):
+    def open(self, profile_id, name, server_url, rulzflow, valid, wanted):
+        assert wanted() is rulzflow
         self.calls.append((profile_id, name, server_url, rulzflow, valid()))
 
     def stop(self):
