@@ -5,9 +5,9 @@ import json
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QGuiApplication
-from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox,
+from PySide6.QtCore import QByteArray, QTimer, Qt, Signal
+from PySide6.QtGui import QAction, QDesktopServices, QGuiApplication, QKeySequence, QPixmap, QShortcut
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QListWidget,
                                QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
                                QSizePolicy, QSpinBox, QSplitter, QStackedWidget, QSystemTrayIcon,
@@ -15,15 +15,16 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBo
 
 from .. import APP_NAME, __version__, wsl
 from ..command import (ENV_DUMP_SCRIPT, build_introspection_script, diff_shell_env, instance_url,
-                       launch_signature, parse_env_dump, preview_command, validate,
+                       launch_signature, page_url, parse_env_dump, preview_command, validate,
                        validate_together)
 from ..gpus import GpuMonitor
 from ..instance import InstanceManager, PortWatcher, State
-from ..model import GPU_AUTO, GPU_CPU, ConfigStore, Profile
+from ..model import GPU_AUTO, GPU_CPU, THEME_DARK, THEME_LIGHT, ConfigStore, Profile
 from ..options import Catalog, builtin_catalog, parse_introspection_output
 from . import theme
 from .profile_editor import ProfileEditor
-from .widgets import GpuStrip, LogView, StatusDot, fit_button
+from .page_opener import PageOpener
+from .widgets import ElidedLabel, GpuStrip, LogView, StatusDot, StatusPill, fit_button
 
 
 def _short_gpu(name: str) -> str:
@@ -60,28 +61,34 @@ class ProfileRow(QWidget):
         self.dot = StatusDot()
         text = QVBoxLayout()
         text.setSpacing(1)
-        self.name = QLabel()
-        self.name.setStyleSheet("font-weight: 600;")
-        self.sub = QLabel()
+        self.name = ElidedLabel()
+        self.name.setObjectName("rowName")
+        self.sub = ElidedLabel()
         self.sub.setObjectName("hint")
         for label in (self.name, self.sub):
-            # Long text is cut off instead of widening the list.
+            # Long text ends in ... instead of widening the list.
             label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         text.addWidget(self.name)
         text.addWidget(self.sub)
         self.button = QToolButton()
         self.button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.button.setMinimumWidth(64)
         self.button.clicked.connect(lambda: self.action_clicked.emit(self.profile_id))
         layout.addWidget(self.check)
         layout.addWidget(self.dot)
         layout.addLayout(text, 1)
         layout.addWidget(self.button)
 
-    def update_row(self, name: str, sub: str, color: str, checked: bool, action: str):
+    def polish_children(self):
+        for widget in (self, self.name, self.sub, self.check, self.button):
+            widget.ensurePolished()
+        self.layout().invalidate()
+
+    def update_row(self, name: str, sub: str, tone: str, checked: bool, action: str):
         self.name.setText(name or "(no name)")
         self.sub.setText(sub)
         self.setToolTip(f"{name}\n{sub}")
-        self.dot.set_color(color)
+        self.dot.set_tone(tone)
         if self.check.isChecked() != checked:
             self.check.blockSignals(True)
             self.check.setChecked(checked)
@@ -93,9 +100,16 @@ class PreferencesDialog(QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Preferences")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(460)
         form = QFormLayout(self)
-        form.setVerticalSpacing(10)
+        form.setContentsMargins(20, 16, 20, 16)
+        form.setVerticalSpacing(12)
+        form.setHorizontalSpacing(16)
+        self.theme = QComboBox()
+        self.theme.addItem("Dark", THEME_DARK)
+        self.theme.addItem("Light", THEME_LIGHT)
+        self.theme.setCurrentIndex(max(0, self.theme.findData(settings.theme)))
+        self.theme.setToolTip("The look of the launcher. The Light mode button in the sidebar switches it too.")
         self.stagger = QDoubleSpinBox()
         self.stagger.setRange(0.0, 120.0)
         self.stagger.setDecimals(1)
@@ -111,6 +125,9 @@ class PreferencesDialog(QDialog):
         self.log_lines.setRange(200, 200000)
         self.log_lines.setSingleStep(1000)
         self.log_lines.setValue(settings.log_max_lines)
+        for spin in (self.stagger, self.stop_timeout, self.log_lines):
+            spin.lineEdit().setTextMargins(9, 0, 0, 0)   # Qt ignores the style sheet's left padding here
+        form.addRow("Theme", self.theme)
         form.addRow("Pause between simultaneous starts", self.stagger)
         form.addRow("Wait for a clean stop", self.stop_timeout)
         form.addRow("Log lines kept per instance", self.log_lines)
@@ -123,15 +140,26 @@ class PreferencesDialog(QDialog):
             self.close_to_tray.setToolTip("No notification area is available on this system.")
         form.addRow(self.close_to_tray)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setProperty("primary", True)
         buttons.accepted.connect(self.accept)
+        self._focus_cleared = False
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
+
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._focus_cleared:
+            # no field is rung at start-up; Tab brings the ring to the first one
+            self._focus_cleared = True
+            QTimer.singleShot(0, lambda: self.setFocus(Qt.FocusReason.OtherFocusReason))
 
 
 class MainWindow(QMainWindow):
     def __init__(self, store: ConfigStore, job=None, parent=None):
         super().__init__(parent)
         self.store = store
+        theme.ensure_theme(QApplication.instance(), store.settings.theme)
         self.manager = InstanceManager(job, self)
         self.gpu_monitor = GpuMonitor(job, parent=self)
         self.watcher = PortWatcher(parent=self)
@@ -150,11 +178,12 @@ class MainWindow(QMainWindow):
         self._tray_hint_shown = False
         self._save_error = ""
         self._tray: QSystemTrayIcon | None = None
+        self._focus_cleared = False
 
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(theme.app_icon())
         self.resize(1280, 860)
-        self.setMinimumSize(980, 620)
+        self.setMinimumSize(1100, 640)
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -162,6 +191,10 @@ class MainWindow(QMainWindow):
         self._save_timer.timeout.connect(self._save_now)
 
         self._build_ui()
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)   # so the window itself can hold the focus at start
+        QShortcut(QKeySequence("Ctrl+Shift+L"), self, activated=self.toggle_theme)
+        self._page_opener = PageOpener(QDesktopServices.openUrl,
+                                       lambda message: self.statusBar().showMessage(message, 10000), self)
         self._build_tray()
         self._load_catalog_cache()
 
@@ -197,19 +230,14 @@ class MainWindow(QMainWindow):
         sidebar.setObjectName("sidebar")
         sidebar.setMinimumWidth(330)
         side = QVBoxLayout(sidebar)
-        side.setContentsMargins(0, 18, 0, 10)
+        side.setContentsMargins(0, 18, 0, 12)
         side.setSpacing(8)
 
         # Brand block, the same as in the other RulZ apps: logo, then the app's name.
-        logo = QLabel()
-        logo.setContentsMargins(18, 0, 0, 0)
-        pixmap = theme.logo_pixmap(150)
-        if pixmap.isNull():
-            logo.setText("RulZ")
-            logo.setObjectName("pageTitle")
-        else:
-            logo.setPixmap(pixmap)
-        side.addWidget(logo)
+        self.logo = QLabel()
+        self.logo.setContentsMargins(18, 0, 0, 0)
+        self._update_logo()
+        side.addWidget(self.logo)
         brand = QLabel("COMFYUI LAUNCHER")
         brand.setObjectName("brandSub")
         brand.setContentsMargins(20, 0, 0, 0)
@@ -224,20 +252,23 @@ class MainWindow(QMainWindow):
         tools = QHBoxLayout()
         tools.setContentsMargins(10, 0, 10, 0)
         tools.setSpacing(4)
-        for text, tip, slot in (
-            ("New", "Add a configuration", self._new_profile),
-            ("Duplicate", "Copy the selected configuration", self._duplicate_profile),
-            ("Delete", "Delete the selected configuration", self._delete_profile),
+        for text, tip, slot, danger in (
+            ("New", "Add a configuration", self._new_profile, False),
+            ("Duplicate", "Copy the selected configuration", self._duplicate_profile, False),
+            ("Delete", "Delete the selected configuration", self._delete_profile, True),
         ):
             button = QPushButton(text)
+            button.setProperty("controlSize", "sm")
+            button.setProperty("danger", danger)
             button.setToolTip(tip)
             button.clicked.connect(slot)
             fit_button(button, padding=26)
             tools.addWidget(button)
         tools.addStretch(1)
-        for text, tip, delta in (("▲", "Move up", -1), ("▼", "Move down", 1)):
+        for icon_name, tip, delta in (("arrow-up", "Move up", -1), ("arrow-down", "Move down", 1)):
             button = QToolButton()
-            button.setText(text)
+            button.setProperty("iconOnly", True)
+            theme.set_icon(button, icon_name, "muted", 16)
             button.setToolTip(tip)
             button.clicked.connect(lambda _=False, delta=delta: self._move_profile(delta))
             tools.addWidget(button)
@@ -252,7 +283,6 @@ class MainWindow(QMainWindow):
         bottom.setContentsMargins(10, 0, 10, 0)
         bottom.setSpacing(6)
         self.start_checked = QPushButton("Start checked")
-        self.start_checked.setProperty("primary", True)
         self.start_checked.setToolTip("Start every ticked configuration, one after the other.")
         self.start_checked.clicked.connect(self._start_checked)
         self.stop_all = QPushButton("Stop all")
@@ -263,11 +293,19 @@ class MainWindow(QMainWindow):
         bottom.addLayout(row)
         prefs = QPushButton("Preferences")
         prefs.setProperty("flat", True)
+        prefs.setProperty("controlSize", "sm")
         prefs.clicked.connect(self._open_preferences)
+        self.theme_button = QPushButton()
+        self.theme_button.setProperty("flat", True)
+        self.theme_button.setProperty("controlSize", "sm")
+        self.theme_button.setToolTip("Switch between dark and light (Ctrl+Shift+L)")
+        self.theme_button.clicked.connect(self.toggle_theme)
         about = QLabel(f"v{__version__}")
         about.setObjectName("hint")
         row = QHBoxLayout()
+        row.setSpacing(2)
         row.addWidget(prefs)
+        row.addWidget(self.theme_button)
         row.addStretch(1)
         row.addWidget(about)
         bottom.addLayout(row)
@@ -282,10 +320,9 @@ class MainWindow(QMainWindow):
 
         header = QHBoxLayout()
         header.setSpacing(10)
-        self.title = QLabel()
+        self.title = ElidedLabel()
         self.title.setObjectName("pageTitle")
-        self.pill = QLabel()
-        self.pill.setObjectName("pill")
+        self.pill = StatusPill()
         self.notice = QLabel()
         self.notice.setObjectName("notice")
         self.notice.setVisible(False)
@@ -295,12 +332,11 @@ class MainWindow(QMainWindow):
         name_row.setSpacing(10)
         name_row.addWidget(self.title)
         name_row.addWidget(self.pill)
-        name_row.addStretch(1)
+        name_row.addStretch(0)
         heading.addLayout(name_row)
         heading.addWidget(self.notice)
         header.addLayout(heading, 1)
         self.start_button = QPushButton("Start")
-        self.start_button.setProperty("primary", True)
         self.start_button.clicked.connect(self._start_current)
         self.stop_button = QPushButton("Stop")
         self.stop_button.clicked.connect(self._stop_current)
@@ -309,7 +345,7 @@ class MainWindow(QMainWindow):
         self.open_button = QPushButton("Open in browser")
         self.open_button.clicked.connect(self._open_current)
         for button in (self.start_button, self.stop_button, self.restart_button, self.open_button):
-            fit_button(button, button.text(), "Force stop")
+            fit_button(button, *(("Stop", "Force stop") if button is self.stop_button else (button.text(),)))
             header.addWidget(button, 0, Qt.AlignmentFlag.AlignTop)
         header.setContentsMargins(0, 0, 10, 0)
         column.addLayout(header)
@@ -322,6 +358,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.editor, "Settings")
 
         log_page = QWidget()
+        log_page.setObjectName("page")
         log_layout = QVBoxLayout(log_page)
         log_layout.setContentsMargins(0, 8, 10, 10)
         log_layout.setSpacing(6)
@@ -334,8 +371,10 @@ class MainWindow(QMainWindow):
         wrap.toggled.connect(self._set_log_wrap)
         self._wrap = wrap
         copy = QPushButton("Copy all")
+        copy.setProperty("controlSize", "sm")
         copy.clicked.connect(self._copy_log)
         clear = QPushButton("Clear")
+        clear.setProperty("controlSize", "sm")
         clear.clicked.connect(self._clear_log)
         bar.addWidget(self.url_label, 1)
         bar.addWidget(wrap)
@@ -358,11 +397,21 @@ class MainWindow(QMainWindow):
         self.gpu_strip = GpuStrip()
         self.statusBar().addWidget(self.gpu_strip, 1)
         self.statusBar().setSizeGripEnabled(False)
+        self._update_theme_button()
 
     def _build_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
         tray = QSystemTrayIcon(self.windowIcon(), self)
+        menu = self._build_tray_menu()
+        tray.setContextMenu(menu)
+        self._tray_menu = menu
+        tray.activated.connect(self._on_tray_activated)
+        tray.setToolTip(APP_NAME)
+        tray.show()
+        self._tray = tray
+
+    def _build_tray_menu(self) -> QMenu:
         menu = QMenu()
         show = QAction("Show window", menu)
         show.triggered.connect(self.show_and_raise)
@@ -384,12 +433,7 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction(to_tray)
         menu.addAction(leave)
-        tray.setContextMenu(menu)
-        self._tray_menu = menu
-        tray.activated.connect(self._on_tray_activated)
-        tray.setToolTip(APP_NAME)
-        tray.show()
-        self._tray = tray
+        return menu
 
     # ======================================================================
     # the configuration list
@@ -410,22 +454,24 @@ class MainWindow(QMainWindow):
             self._rows[profile.id] = row
             self._items[profile.id] = item
             self._refresh_row(profile)
+            row.polish_children()   # the theme fonts decide the height
             item.setSizeHint(row.sizeHint())
         self.list.blockSignals(False)
         self._refresh_start_checked()
 
     def _display_state(self, profile: Profile) -> tuple[str, str, bool]:
-        """(text, colour, is an outside server on the port) for a profile."""
+        """(text, tone, is an outside server on the port) for a profile. The tone is a name
+        (theme.TONE_*), not a colour: the colour comes from the active theme when it is drawn."""
         state = self.manager.state(profile.id)
         if state in (State.STOPPED, State.FAILED) and self._is_external(profile):
-            return "Port in use (not started here)", theme.EXTERNAL_COLOR, True
-        return state.value, theme.STATE_COLORS[state], False
+            return "Port in use (not started here)", theme.TONE_EXTERNAL, True
+        return state.value, theme.STATE_TONES[state], False
 
     def _refresh_row(self, profile: Profile):
         row = self._rows.get(profile.id)
         if row is None:
             return
-        text, color, external = self._display_state(profile)
+        text, tone, external = self._display_state(profile)
         state = self.manager.state(profile.id)
         sub = f"port {profile.port}  ·  {gpu_summary(profile)}"
         if external:
@@ -438,7 +484,7 @@ class MainWindow(QMainWindow):
             action = "Force"
         else:
             action = "Stop"
-        row.update_row(profile.name, sub, color, profile.checked, action)
+        row.update_row(profile.name, sub, tone, profile.checked, action)
         row.button.setToolTip({"Start": "Start this configuration", "Stop": "Stop this instance",
                                "Force": "It is still stopping. End it now."}[action])
 
@@ -527,10 +573,10 @@ class MainWindow(QMainWindow):
         if self.manager.is_busy(profile.id):
             QMessageBox.information(self, APP_NAME, f"'{profile.name}' is running. Stop it before deleting it.")
             return
-        answer = QMessageBox.question(self, "Delete configuration",
-                                      f"Delete the configuration '{profile.name}'?\n\n"
-                                      "This only removes it from the launcher. Nothing inside WSL is touched.")
-        if answer != QMessageBox.StandardButton.Yes:
+        if not self._confirm("Delete configuration",
+                             f"Delete the configuration '{profile.name}'?\n\n"
+                             "This only removes it from the launcher. Nothing inside WSL is touched.",
+                             "Delete", danger=True):
             return
         index = self.store.profiles.index(profile)
         self.store.remove(profile)
@@ -577,9 +623,9 @@ class MainWindow(QMainWindow):
         if profile is None:
             return
         self.title.setText(profile.name or "(no name)")
-        text, color, external = self._display_state(profile)
-        self.pill.setText(text)
-        self.pill.setStyleSheet(f"background: {color}; color: {theme.ON_STATUS};")
+        self.title.setToolTip(profile.name)
+        text, tone, external = self._display_state(profile)
+        self.pill.set_status(text, tone)
         state = self.manager.state(profile.id)
         idle = state in (State.STOPPED, State.FAILED)
         self.start_button.setEnabled(idle and not external)
@@ -587,6 +633,13 @@ class MainWindow(QMainWindow):
         self.stop_button.setText("Force stop" if state == State.STOPPING else "Stop")
         self.restart_button.setEnabled(state in (State.STARTING, State.RUNNING))
         self.open_button.setEnabled(state == State.RUNNING or external)
+        # One primary button in the view: Start while the configuration can be started, Open in
+        # browser once it is running (or its port is served by another program).
+        open_primary = self.open_button.isEnabled() and not self.start_button.isEnabled()
+        if bool(self.open_button.property("primary")) != open_primary \
+                or bool(self.start_button.property("primary")) == open_primary:
+            theme.set_role(self.open_button, primary=open_primary)
+            theme.set_role(self.start_button, primary=not open_primary)
 
         inst = self.manager.instance(profile.id)
         notice = ""
@@ -598,7 +651,7 @@ class MainWindow(QMainWindow):
         self.notice.setText(notice)
         self.notice.setVisible(bool(notice))
         url = inst.url if inst is not None and inst.active else instance_url(profile)
-        self.url_label.setText(url)
+        self.url_label.setText(page_url(url, profile.open_rulzflow))
 
     def _refresh_preview(self):
         profile = self._current
@@ -641,8 +694,7 @@ class MainWindow(QMainWindow):
             return
         notes = [i.message for i in issues if i.level == "warning"]
         if notes:
-            answer = QMessageBox.question(self, "Restart anyway?", "\n\n".join(notes) + "\n\nRestart anyway?")
-            if answer != QMessageBox.StandardButton.Yes:
+            if not self._confirm("Restart anyway?", "\n\n".join(notes) + "\n\nRestart anyway?", "Restart anyway"):
                 return
         self._save_now()
         self.manager.restart(profile, catalog, self.store.settings.stop_timeout)
@@ -653,7 +705,18 @@ class MainWindow(QMainWindow):
             return
         inst = self.manager.instance(profile.id)
         url = inst.url if inst is not None and inst.active else instance_url(profile)
-        QDesktopServices.openUrl(QUrl(url))
+        self._open_page(profile.id, profile, inst if inst is not None and inst.active else None, url)
+
+    def _open_page(self, profile_id, profile, inst, url):
+        saved = self.store.find(profile_id)
+        current = saved or profile
+
+        def valid():
+            return (not self._quitting and not self._closing_for_real
+                    and self.store.find(profile_id) is saved
+                    and (inst is None or (self.manager.instance(profile_id) is inst and inst.active)))
+
+        self._page_opener.open(profile_id, current.name, url, current.open_rulzflow, valid)
 
     # ======================================================================
     # starting and stopping
@@ -684,8 +747,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Cannot start", "\n\n".join(errors))
             return
         if warnings:
-            answer = QMessageBox.question(self, "Start anyway?", "\n\n".join(warnings) + "\n\nStart anyway?")
-            if answer != QMessageBox.StandardButton.Yes:
+            if not self._confirm("Start anyway?", "\n\n".join(warnings) + "\n\nStart anyway?", "Start anyway"):
                 return
 
         settings = self.store.settings
@@ -726,8 +788,10 @@ class MainWindow(QMainWindow):
 
     def _on_ready(self, profile_id: str):
         inst = self.manager.instance(profile_id)
-        if inst is not None and inst.profile is not None and inst.profile.auto_open:
-            QDesktopServices.openUrl(QUrl(inst.url))
+        if inst is not None and inst.profile is not None:
+            profile = self.store.find(profile_id) or inst.profile
+            if profile.auto_open:
+                self._open_page(profile_id, profile, inst, inst.url)
 
     def _on_state_changed(self, profile_id: str):
         inst = self.manager.instance(profile_id)
@@ -883,10 +947,9 @@ class MainWindow(QMainWindow):
                                     "Your ~/.bashrc does not set any variables that a launcher start is missing.")
             return
         listing = "\n".join(f"{name} = {value if len(value) < 90 else value[:87] + '...'}" for name, value in found)
-        answer = QMessageBox.question(self, "Import variables",
-                                      f"Add these {len(found)} variables to '{profile.name}'?\n"
-                                      f"Variables with the same name are replaced.\n\n{listing}")
-        if answer != QMessageBox.StandardButton.Yes:
+        if not self._confirm("Import variables",
+                             f"Add these {len(found)} variables to '{profile.name}'?\n"
+                             f"Variables with the same name are replaced.\n\n{listing}", "Add variables"):
             return
         names = {name for name, _value in found}
         profile.env = [pair for pair in profile.env if pair[0] not in names] + found
@@ -919,10 +982,64 @@ class MainWindow(QMainWindow):
     # ======================================================================
     # preferences, saving, tray, closing
     # ======================================================================
+    def _confirm(self, title: str, text: str, ok_text: str, danger: bool = False) -> bool:
+        """A question with its own action word on the answer button (red when it destroys something)."""
+        box = QMessageBox(QMessageBox.Icon.Question, title, text, QMessageBox.StandardButton.NoButton, self)
+        yes = box.addButton(ok_text, QMessageBox.ButtonRole.AcceptRole)
+        theme.set_role(yes, primary=not danger, danger=danger)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(box.button(QMessageBox.StandardButton.Cancel) if danger else yes)
+        box.exec()
+        return box.clickedButton() is yes
+
+    # ======================================================================
+    # theme
+    # ======================================================================
+    def _update_logo(self):
+        pixmap = theme.logo_pixmap(150)
+        if pixmap.isNull():
+            self.logo.setPixmap(QPixmap())
+            self.logo.setText("RulZ")
+            self.logo.setObjectName("pageTitle")
+        else:
+            self.logo.setPixmap(pixmap)
+
+    def _update_theme_button(self):
+        dark = theme.is_dark()
+        self.theme_button.setText("Light mode" if dark else "Dark mode")
+        theme.set_icon(self.theme_button, "sun" if dark else "moon", "muted", 16)
+        fit_button(self.theme_button, "Light mode", "Dark mode", padding=44)
+
+    def set_theme(self, mode: str):
+        """Switch the whole launcher to dark or light right away, and remember the choice."""
+        mode = mode if mode in (THEME_DARK, THEME_LIGHT) else THEME_DARK
+        self.store.settings.theme = mode
+        self._save_now()
+        if mode != theme.mode():
+            theme.apply_theme(QApplication.instance(), mode)
+        self._update_logo()
+        self._update_theme_button()
+        self._refresh_header()
+        for widget in QApplication.topLevelWidgets():
+            theme.retheme(widget)
+
+    def toggle_theme(self):
+        self.set_theme(THEME_LIGHT if theme.is_dark() else THEME_DARK)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._focus_cleared:
+            # Qt would put the focus on the first button or field and ring it at start-up.
+            self._focus_cleared = True
+            QTimer.singleShot(0, lambda: self.setFocus(Qt.FocusReason.OtherFocusReason))
+
     def _open_preferences(self):
         dialog = PreferencesDialog(self.store.settings, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             settings = self.store.settings
+            chosen = dialog.theme.currentData()
+            if chosen != settings.theme:
+                self.set_theme(chosen)
             settings.stagger_seconds = dialog.stagger.value()
             settings.stop_timeout = dialog.stop_timeout.value()
             settings.log_max_lines = dialog.log_lines.value()
@@ -1022,6 +1139,7 @@ class MainWindow(QMainWindow):
         box.setText(f"{count} ComfyUI instance{'s are' if count != 1 else ' is'} still running.")
         box.setInformativeText("Instances belong to the launcher: they stop when it exits.")
         stop = box.addButton("Stop all and exit", QMessageBox.ButtonRole.DestructiveRole)
+        theme.set_role(stop, primary=False, danger=True)
         keep = box.addButton("Keep running in the tray", QMessageBox.ButtonRole.AcceptRole) \
             if self._tray is not None else None
         box.addButton(QMessageBox.StandardButton.Cancel)
@@ -1035,6 +1153,7 @@ class MainWindow(QMainWindow):
 
     def _begin_quit(self):
         self._quitting = True
+        self._page_opener.stop()
         self.setEnabled(False)
         self.statusBar().showMessage("Stopping all instances ...")
         self.manager.stop_all()
@@ -1047,6 +1166,7 @@ class MainWindow(QMainWindow):
     def _finish_quit(self):
         if self._closing_for_real:
             return
+        self._page_opener.stop()
         while not self._save_now():
             self.setEnabled(True)
             answer = QMessageBox.warning(

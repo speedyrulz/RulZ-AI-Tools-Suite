@@ -22,6 +22,10 @@ GPU_SELECT = "select"  # pass --cuda-device with the chosen cards
 GPU_CPU = "cpu"        # pass --cpu
 GPU_MODES = (GPU_AUTO, GPU_SELECT, GPU_CPU)
 
+THEME_DARK = "dark"
+THEME_LIGHT = "light"
+THEMES = (THEME_DARK, THEME_LIGHT)
+
 
 def default_config_dir() -> Path:
     base = os.environ.get("APPDATA") or str(Path.home())
@@ -88,6 +92,7 @@ class Profile:
     env: list[list[str]] = field(default_factory=list)  # ordered [name, value] pairs
     pre_commands: str = ""            # bash lines run before ComfyUI starts
     auto_open: bool = False           # open the browser when the server is ready
+    open_rulzflow: bool = False
     checked: bool = False             # part of the "start checked" set
 
     def to_dict(self) -> dict:
@@ -108,6 +113,7 @@ class Profile:
             "env": [[k, v] for k, v in self.env],
             "pre_commands": self.pre_commands,
             "auto_open": self.auto_open,
+            "open_rulzflow": self.open_rulzflow,
             "checked": self.checked,
         }
 
@@ -148,6 +154,7 @@ class Profile:
                               "" if pair[1] is None else str(pair[1])])
         p.pre_commands = str(data.get("pre_commands") or "")
         p.auto_open = bool(data.get("auto_open", False))
+        p.open_rulzflow = data.get("open_rulzflow") is True
         p.checked = bool(data.get("checked", False))
         return p
 
@@ -171,6 +178,7 @@ class Settings:
     geometry: str = ""             # base64 of the saved window geometry
     splitter: list[int] = field(default_factory=list)
     close_to_tray: bool = False    # closing the window hides it to the tray instead of exiting
+    theme: str = THEME_DARK        # "dark" (default) or "light"
 
     def to_dict(self) -> dict:
         return {
@@ -178,6 +186,7 @@ class Settings:
             "stop_timeout": self.stop_timeout,
             "log_max_lines": self.log_max_lines,
             "close_to_tray": self.close_to_tray,
+            "theme": self.theme,
             "last_profile": self.last_profile,
             "geometry": self.geometry,
             "splitter": list(self.splitter),
@@ -202,6 +211,8 @@ class Settings:
         s.stop_timeout = number("stop_timeout", 10, 1, 300, int)
         s.log_max_lines = number("log_max_lines", 5000, 200, 200000, int)
         s.close_to_tray = data.get("close_to_tray") is True
+        theme = data.get("theme")
+        s.theme = theme if theme in THEMES else THEME_DARK
         s.last_profile = str(data.get("last_profile") or "")
         s.geometry = str(data.get("geometry") or "")
         splitter = data.get("splitter") or []

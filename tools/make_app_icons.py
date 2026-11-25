@@ -125,6 +125,9 @@ APPS = {
         p("M10 5H3", W), p("M12 19H3", W), p("M21 12h-9", W), p("M21 19h-5", W),
         p("M21 5h-7", W), p("M8 12H3", W),
         p("M14 3v4", R), p("M16 17v4", R), p("M8 10v4", R)], (0, 0)),
+    # Lucide workflow: two white boxes joined by a red line.
+    "comfyui-launcher": ("RulZ ComfyUI Launcher", "workflow", [
+        rect(3, 3, 8, 8, 2, W), rect(13, 13, 8, 8, 2, W), p("M7 11v4a2 2 0 0 0 2 2h4", R)], (0, 0)),
 }
 
 
@@ -266,6 +269,8 @@ INSTALL = [
     ("trainer-optimizer", "RulZ-AI-Trainer-Optimizer/assets/icon.png", "png", 256),
     ("trainer-optimizer", "RulZ-AI-Trainer-Optimizer/assets/icon.ico", "ico", ICO_SIZES),
     ("trainer-optimizer", "RulZ-AI-Trainer-Optimizer/rulz_optimizer/static/icon.png", "favicon", 64),
+    ("comfyui-launcher", "RulZ-ComfyUI-Launcher/rulz_comfy_launcher/assets/icon.png", "png", 256),
+    ("comfyui-launcher", "RulZ-ComfyUI-Launcher/rulz_comfy_launcher/assets/icon.ico", "ico", ICO_SIZES),
 ] + [("coding-agent-android", f"{RES}/mipmap-{d}/ic_launcher.png", "png", px) for d, px in DENSITY.items()] \
   + [("coding-agent-android", f"{RES}/mipmap-{d}/ic_launcher_round.png", "round", px) for d, px in DENSITY.items()] \
   + [("coding-agent-android", f"{RES}/mipmap-{d}/ic_launcher_foreground.png", "fg", round(px * 2.25))

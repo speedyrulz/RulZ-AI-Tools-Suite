@@ -451,3 +451,16 @@ def test_parse_env_dump_bashrc_noise():
 def test_only_plain_references_stay_live(value):
     # Anything but $NAME and ${NAME} is made literal, so no value can break the script.
     assert quote_env_value(value) == '"' + value.replace("$", "\\$") + '"'
+
+
+def test_page_url_and_toggle_does_not_change_launch(catalog):
+    from rulz_comfy_launcher.command import page_url, preview_command
+    p = Profile()
+    q = p.snapshot()
+    q.open_rulzflow = True
+    assert page_url("http://localhost:8188", False) == "http://localhost:8188"
+    assert page_url("http://localhost:8188/", True) == "http://localhost:8188/rulzflow/"
+    assert instance_url(p) == instance_url(q)
+    assert preview_command(p, catalog) == preview_command(q, catalog)
+    assert build_launch_script(p, catalog) == build_launch_script(q, catalog)
+    assert launch_signature(p, catalog) == launch_signature(q, catalog)

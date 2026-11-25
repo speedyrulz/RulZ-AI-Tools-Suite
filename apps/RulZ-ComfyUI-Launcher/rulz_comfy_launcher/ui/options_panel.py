@@ -48,7 +48,7 @@ class OptionRow(QWidget):
         grid.setColumnStretch(1, 1)
 
         self.check = QCheckBox(spec.name)
-        self.check.setFont(theme.mono_font(10))
+        self.check.setFont(theme.mono_font())
         self.check.setMinimumWidth(270)
         self.check.toggled.connect(self._on_toggled)
         grid.addWidget(self.check, 0, 0)
@@ -185,6 +185,8 @@ class OptionsPanel(QWidget):
         self.source_label.setObjectName("hint")
         self.refresh_button = QPushButton("Re-read from ComfyUI")
         self.refresh_button.setProperty("flat", True)
+        self.refresh_button.setProperty("controlSize", "sm")
+        self.refresh_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.refresh_button.setToolTip("Ask this ComfyUI install which options it supports. "
                                        "Use it after updating ComfyUI.")
         self.refresh_button.clicked.connect(self.refresh_requested)

@@ -192,6 +192,11 @@ def instance_url(profile: Profile) -> str:
     return f"{'https' if tls else 'http'}://{host}:{profile.port}"
 
 
+def page_url(server_url: str, rulzflow: bool) -> str:
+    """The requested browser page, leaving the server address unchanged."""
+    return server_url.rstrip("/") + "/rulzflow/" if rulzflow else server_url
+
+
 # --------------------------------------------------------------------------
 # validation
 # --------------------------------------------------------------------------

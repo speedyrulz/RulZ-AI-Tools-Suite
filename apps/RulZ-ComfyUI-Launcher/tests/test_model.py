@@ -311,3 +311,13 @@ def test_free_port():
     assert store.free_port(9000) == 9000
     store.profiles = [Profile(port=65535)]
     assert store.free_port(65535) == 65535   # gives up at the top of the range
+
+
+def test_open_rulzflow_roundtrip_and_strict_bool():
+    for value in (None, False, 0, 1, "true", [], {}):
+        assert Profile.from_dict({"open_rulzflow": value}).open_rulzflow is False
+    assert Profile.from_dict({}).open_rulzflow is False
+    profile = Profile(open_rulzflow=True)
+    assert Profile.from_dict(profile.to_dict()).open_rulzflow is True
+    assert profile.snapshot().open_rulzflow is True
+    assert profile.clone("Copy").open_rulzflow is True

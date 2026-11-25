@@ -1,12 +1,24 @@
 # Builds dist\RulZ ComfyUI Launcher\RulZ ComfyUI Launcher.exe
-# Needs: python -m pip install -r requirements-dev.txt
-$ErrorActionPreference = 'Stop'
-Set-Location -LiteralPath $PSScriptRoot
+# Usage:  powershell -ExecutionPolicy Bypass -File .\build.ps1 [-Test]
+# -Test runs the test suite first (always on in GitHub Actions, where a failure stops the release).
+param([switch]$Test)
+$ErrorActionPreference = "Stop"
+Set-Location $PSScriptRoot
 
-python -m pytest -q tests
-if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
+if (-not (Test-Path .venv)) {
+    python -m venv .venv
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
+}
+.\.venv\Scripts\python.exe -m pip install --quiet -r requirements.txt pyinstaller
+if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
-python -m PyInstaller --noconfirm 'RulZ ComfyUI Launcher.spec'
-if ($LASTEXITCODE -ne 0) { throw 'Packaging failed.' }
+if ($Test -or $env:GITHUB_ACTIONS -eq "true") {
+    .\.venv\Scripts\python.exe -m pip install --quiet pytest
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    .\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider tests
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
+}
 
-Write-Host 'Built dist\RulZ ComfyUI Launcher\RulZ ComfyUI Launcher.exe. Keep the whole folder together.'
+.\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean "RulZ ComfyUI Launcher.spec"
+if ($LASTEXITCODE) { exit $LASTEXITCODE }
+Write-Host "`nBuilt: $PSScriptRoot\dist\RulZ ComfyUI Launcher\RulZ ComfyUI Launcher.exe. Keep the whole folder together."

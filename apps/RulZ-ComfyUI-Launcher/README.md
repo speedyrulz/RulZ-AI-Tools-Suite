@@ -2,9 +2,17 @@
 
 A Windows app that starts and stops ComfyUI servers running inside WSL. Each saved
 configuration has its own port, GPUs, ComfyUI options and environment, and several
-configurations can run at the same time.
+configurations can run at the same time. Part of the RulZ AI Tools family.
 
-![The launcher's main window](docs/screenshot-settings.png)
+**[Download](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/releases)** (or install it from the [RulZ AI Tools Suite](https://github.com/speedyrulz/RulZ-AI-Tools-Suite) launcher, under **ComfyUI**) · **[Wiki: guides, FAQ and troubleshooting](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/ComfyUI-Launcher)**
+
+| Dark (default) | Light |
+| --- | --- |
+| ![Settings of a configuration in dark mode](docs/screenshots/01-settings-dark.png) | ![The same in light mode](docs/screenshots/02-settings-light.png) |
+
+![The log of a configuration](docs/screenshots/03-log.png)
+
+<sub>Screenshots show made-up configurations, graphics cards and log text.</sub>
 
 ## What it does
 
@@ -28,6 +36,11 @@ configurations can run at the same time.
   (a warning you can accept).
 - **Clean stop.** Stop sends Ctrl+C to ComfyUI. If it has not stopped after the waiting
   time, the launcher forces it.
+- **RulZFlow page.** A configuration can open the RulZFlow page of its server instead of
+  ComfyUI's own page. This needs the RulZFlow extension on that ComfyUI; see the settings table.
+- **Dark and light theme.** Black and red by default, or white and red, like the other RulZ
+  apps. Switch with the button at the bottom left (or Ctrl+Shift+L, or in Preferences); it takes
+  effect at once and is remembered.
 
 ## Requirements
 
@@ -37,7 +50,10 @@ configurations can run at the same time.
 
 ## Running it
 
-- Packaged: `dist\RulZ ComfyUI Launcher\RulZ ComfyUI Launcher.exe` (keep the folder together).
+- Installed from the RulZ AI Tools Suite launcher (under **ComfyUI**), or download
+  `RulZ-ComfyUI-Launcher-v<version>-win64.zip` from the suite's Releases page, unzip it anywhere
+  and double-click `RulZ ComfyUI Launcher.exe`. Keep the folder together.
+- Built yourself: `dist\RulZ ComfyUI Launcher\RulZ ComfyUI Launcher.exe` (see below).
 - From source: double-click `Launch.cmd`, or run `pythonw main.pyw`.
 
 `--config <file>` uses another config file, which gives you a second, separate launcher.
@@ -45,11 +61,13 @@ configurations can run at the same time.
 ## Building the .exe
 
 ```powershell
-python -m pip install -r requirements-dev.txt
-.\build.ps1
+.\build.ps1 -Test
 ```
 
-The script runs the tests and then PyInstaller.
+The script makes its own `.venv`, installs the requirements and PyInstaller into it, and builds
+the folder `dist\RulZ ComfyUI Launcher`. With `-Test` it runs the tests first (always on in
+GitHub Actions, where a failing test stops the release). To run the tests on their own:
+`python -m pip install -r requirements-dev.txt`, then `python -m pytest -q tests`.
 
 ## Settings of a configuration
 
@@ -65,6 +83,7 @@ The script runs the tests and then PyInstaller.
 | Environment | `NAME` and value pairs, applied from top to bottom. `$NAME` and `${NAME}` are replaced by bash, so `$CUDA_HOME/bin:$PATH` works. Everything else is literal; write `\$` for a dollar sign. |
 | Commands to run first | Bash lines run in the ComfyUI folder after the environment is set. |
 | Extra arguments | Added at the end of the command, as you would type them in a terminal. |
+| Open the RulZFlow page instead of ComfyUI's | Opens `<server address>/rulzflow/` instead of ComfyUI's own page, both when the server is ready and from **Open in browser**. Takes effect at once, without a restart. If the server has no RulZFlow extension, ComfyUI's normal page opens and the status bar says why. |
 
 The **Command** box always shows what will run.
 
@@ -103,7 +122,7 @@ from the number you would type by hand for the same card.
 
 | Path | Content |
 | --- | --- |
-| `%APPDATA%\RulZ ComfyUI Launcher\config.json` | Configurations and preferences. |
+| `%APPDATA%\RulZ ComfyUI Launcher\config.json` | Configurations and preferences, including the theme. |
 | `%APPDATA%\RulZ ComfyUI Launcher\catalogs.json` | The option lists read from your ComfyUI installs. |
 | `%APPDATA%\RulZ ComfyUI Launcher\error.log` | Details of unexpected errors, if any happened. |
 
@@ -117,7 +136,7 @@ from the number you would type by hand for the same card.
 | `rulz_comfy_launcher/instance.py` | Running instances: start, stop, restart, the start queue. |
 | `rulz_comfy_launcher/wsl.py`, `gpus.py`, `winjob.py` | `wsl.exe` helpers, GPU monitor, Windows job object. |
 | `rulz_comfy_launcher/textstream.py` | Terminal-style handling of process output. |
-| `rulz_comfy_launcher/ui/` | The window. `ui/theme.py` holds the RulZ colours (black with the logo red `#ED000D`). |
+| `rulz_comfy_launcher/ui/` | The window. `ui/theme.py` holds the RulZ colours for the dark and light theme (logo red `#ED000D`). |
 | `rulz_comfy_launcher/assets/` | The RulZ logo and app icon (see [LOGO-NOTICE.md](LOGO-NOTICE.md)). |
 | `rulz_comfy_launcher/scripts/introspect_args.py` | Runs inside WSL and lists ComfyUI's options. |
 | `tests/` | Unit tests: `python -m pytest -q tests`. |

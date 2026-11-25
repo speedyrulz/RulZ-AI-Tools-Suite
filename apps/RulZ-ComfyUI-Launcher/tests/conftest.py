@@ -1,4 +1,4 @@
-"""Shared fixtures. The tests only import the pure-logic modules (no Qt, WSL or GPUs)."""
+"""Shared fixtures. UI tests use offscreen Qt; no tests start WSL or use GPUs."""
 from __future__ import annotations
 
 import os
@@ -12,6 +12,11 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# Qt's offscreen platform on Windows finds no fonts by itself (every letter becomes a box, so
+# widths mean nothing). Point it at the system fonts before any QApplication exists.
+if os.name == "nt" and not os.environ.get("QT_QPA_FONTDIR") and os.path.isdir(r"C:\Windows\Fonts"):
+    os.environ["QT_QPA_FONTDIR"] = r"C:\Windows\Fonts"
 
 
 def _find_bash() -> str | None:

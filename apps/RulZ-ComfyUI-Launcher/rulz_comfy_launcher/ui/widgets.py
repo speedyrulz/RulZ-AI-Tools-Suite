@@ -1,8 +1,8 @@
 """Small reusable widgets."""
 from __future__ import annotations
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QPainter, QTextCursor
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QPainter, QPen, QPolygonF, QTextCursor
 from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QFrame,
                                QGridLayout, QHBoxLayout, QHeaderView, QLabel, QPlainTextEdit,
                                QProgressBar, QPushButton, QRadioButton, QSizePolicy, QSpinBox,
@@ -36,21 +36,114 @@ class NoWheelSpinBox(QSpinBox):
 
 
 class StatusDot(QWidget):
+    """A small status mark. The shape says it as well as the colour: a ring when stopped, a dot
+    when running or busy, a cross when failed, a triangle for a port used by another program.
+    The colour is read from the active palette at paint time, so a theme switch needs no call."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._color = QColor(theme.GRAY)
-        self.setFixedSize(QSize(12, 12))
+        self._tone = theme.TONE_STOPPED
+        self.setFixedSize(QSize(14, 14))
 
-    def set_color(self, color: str):
-        self._color = QColor(color)
-        self.update()
+    def set_tone(self, tone: str):
+        if tone != self._tone:
+            self._tone = tone
+            self.update()
+
+    def tone(self) -> str:
+        return self._tone
 
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(self._color)
-        painter.drawEllipse(1, 1, 10, 10)
+        color = theme.tone_colour(self._tone)
+        tone = self._tone
+        if tone == theme.TONE_STOPPED:
+            painter.setPen(QPen(color, 1.8))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(QRectF(2.5, 2.5, 9, 9))
+        elif tone == theme.TONE_FAILED:
+            painter.setPen(QPen(color, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.drawLine(QPointF(3.5, 3.5), QPointF(10.5, 10.5))
+            painter.drawLine(QPointF(10.5, 3.5), QPointF(3.5, 10.5))
+        elif tone == theme.TONE_EXTERNAL:
+            painter.setPen(QPen(color, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                                Qt.PenJoinStyle.RoundJoin))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolygon(QPolygonF([QPointF(7, 2.5), QPointF(12, 11.5), QPointF(2, 11.5)]))
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawEllipse(QRectF(2.5, 2.5, 9, 9))
+
+
+class ElidedLabel(QLabel):
+    """A one-line label that ends in ... instead of widening its layout."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        hint.setWidth(self.fontMetrics().horizontalAdvance(self.text()) + 2)
+        return hint
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        hint.setWidth(40)
+        hint.setHeight(max(hint.height(), self.fontMetrics().height()))
+        return hint
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        text = self.fontMetrics().elidedText(self.text(), Qt.TextElideMode.ElideRight, self.width())
+        painter.setPen(self.palette().color(self.foregroundRole()))
+        painter.drawText(self.rect(), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), text)
+
+
+class StatusPill(QFrame):
+    """A status badge: a Lucide icon and a short word in the status colour on a neutral fill."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("pill")
+        self._tone = theme.TONE_STOPPED
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 0, 10, 0)
+        layout.setSpacing(4)
+        self._icon = QLabel()
+        self._icon.setFixedSize(12, 12)
+        self._text = QLabel()
+        self._text.setObjectName("pillText")
+        layout.addWidget(self._icon)
+        layout.addWidget(self._text)
+        self.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(24)
+        self.setProperty("tone", self._tone)
+        self._draw_icon()
+
+    def set_status(self, text: str, tone: str):
+        self._text.setText(text)
+        self.updateGeometry()
+        if tone != self._tone:
+            self._tone = tone
+            theme.set_role(self, tone=tone)
+            theme.set_role(self._text)
+            self._draw_icon()
+
+    def text(self) -> str:
+        return self._text.text()
+
+    def tone(self) -> str:
+        return self._tone
+
+    def _draw_icon(self):
+        token = theme.tone_token(self._tone)
+        self._icon.setPixmap(theme.lucide_pixmap(theme.tone_icon(self._tone), theme.C[token], 12))
+
+    def retheme(self):
+        self._draw_icon()
 
 
 def fit_button(button, *texts: str, padding: int = 30):
@@ -67,8 +160,8 @@ class Card(QFrame):
         super().__init__(parent)
         self.setObjectName("card")
         self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(16, 12, 16, 14)
-        self._layout.setSpacing(10)
+        self._layout.setContentsMargins(16, 14, 16, 16)
+        self._layout.setSpacing(12)
         self.header = QHBoxLayout()
         self.header.setSpacing(8)
         label = QLabel(title)
@@ -129,11 +222,10 @@ class LogView(QPlainTextEdit):
     def __init__(self, max_lines: int = 5000, parent=None):
         super().__init__(parent)
         self.setReadOnly(True)
-        self.setFont(theme.mono_font(10))
+        self.setObjectName("logView")   # coloured by the theme's style sheet, so it follows a switch
+        self.setFont(theme.mono_font())
         self.setMaximumBlockCount(max_lines)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        self.setStyleSheet(f"QPlainTextEdit {{ background: {theme.LOG_BG}; border: 1px solid {theme.BORDER}; "
-                           "border-radius: 8px; padding: 6px; }")
         self._stream = TextStream()
         self._pending: list[str] = []
         self._timer = QTimer(self)
@@ -259,6 +351,7 @@ class GpuSelector(QWidget):
         while self._grid.count():
             item = self._grid.takeAt(0)
             if item.widget():
+                item.widget().hide()   # deleted later: must not be painted over the new rows meanwhile
                 item.widget().deleteLater()
         for button in self._primary_group.buttons():
             self._primary_group.removeButton(button)
@@ -399,7 +492,12 @@ class EnvTable(QWidget):
         self.table.setColumnWidth(0, 220)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setFont(theme.mono_font(10))
+        self.table.setFont(theme.mono_font())
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setDefaultSectionSize(30)
+        self.table.horizontalHeader().setFixedHeight(32)
+        self.table.horizontalHeader().setDefaultAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.table.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self.table)
 
@@ -407,6 +505,7 @@ class EnvTable(QWidget):
         add = QPushButton("Add variable")
         add.clicked.connect(self._add_row)
         remove = QPushButton("Remove selected")
+        remove.setProperty("danger", True)
         remove.clicked.connect(self._remove_selected)
         importer = QPushButton("Import from ~/.bashrc")
         importer.setToolTip("Find the variables your terminal sets in ~/.bashrc (for example CUDA paths) "

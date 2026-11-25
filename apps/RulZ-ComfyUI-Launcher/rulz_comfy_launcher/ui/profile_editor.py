@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QGuiApplication, QIntValidator
-from PySide6.QtWidgets import (QCheckBox, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
                                QPlainTextEdit, QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
 from ..command import Issue
@@ -39,6 +39,7 @@ class ProfileEditor(QWidget):
         self._profile: Profile | None = None
         self._loading = False
         self._distros: list[str] | None = None
+        self._issues: list[Issue] = []
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -47,6 +48,7 @@ class ProfileEditor(QWidget):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         outer.addWidget(scroll)
         page = QWidget()
+        page.setObjectName("page")
         scroll.setWidget(page)
         column = QVBoxLayout(page)
         column.setContentsMargins(4, 8, 12, 16)
@@ -58,28 +60,35 @@ class ProfileEditor(QWidget):
         grid.setHorizontalSpacing(12)
         grid.setVerticalSpacing(8)
         grid.setColumnStretch(1, 3)
-        grid.setColumnStretch(3, 2)
+        grid.setColumnStretch(3, 3)
 
         self.name = QLineEdit()
         self.name.setPlaceholderText("A name for this configuration")
         self.distro = NoWheelComboBox()
+        self.distro.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.distro.setMinimumContentsLength(14)
         self.comfy_dir = QLineEdit()
         self.comfy_dir.setPlaceholderText("~/ComfyUI")
-        self.comfy_dir.setFont(theme.mono_font(10))
+        self.comfy_dir.setFont(theme.mono_font())
         self.python = QLineEdit()
         self.python.setPlaceholderText("venv/bin/python")
-        self.python.setFont(theme.mono_font(10))
+        self.python.setFont(theme.mono_font())
         self.port = QLineEdit()
         self.port.setValidator(QIntValidator(1, 65535, self.port))
         self.port.setMaximumWidth(110)
         self.port.setPlaceholderText("8188")
         self.listen = NoWheelComboBox()
+        self.listen.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.listen.setMinimumContentsLength(14)
         self.listen.setEditable(True)
         for value, text in _LISTEN_CHOICES:
             self.listen.addItem(text, value)
         self.user = QLineEdit()
         self.user.setPlaceholderText("default user")
         self.auto_open = QCheckBox("Open the browser when the server is ready")
+        self.open_rulzflow = QCheckBox("Open the RulZFlow page instead of ComfyUI's")
+        self.open_rulzflow.setToolTip("Requires the RulZFlow extension on this ComfyUI. "
+                                     "Otherwise the normal page opens.")
 
         grid.addWidget(_label("Name"), 0, 0)
         grid.addWidget(self.name, 0, 1)
@@ -97,7 +106,8 @@ class ProfileEditor(QWidget):
                                         "a full path, or a command name. If an 'activate' script sits next "
                                         "to it, the virtual environment is activated first."), 3, 0)
         grid.addWidget(self.python, 3, 1)
-        grid.addWidget(self.auto_open, 3, 2, 1, 2)
+        grid.addWidget(self.auto_open, 4, 0, 1, 4)
+        grid.addWidget(self.open_rulzflow, 5, 0, 1, 4)
         card.body().addLayout(grid)
         column.addWidget(card)
 
@@ -126,7 +136,7 @@ class ProfileEditor(QWidget):
                                      "Run inside the ComfyUI folder after the variables above are set, "
                                      "for example: source ~/my-env.sh"))
         self.pre_commands = QPlainTextEdit()
-        self.pre_commands.setFont(theme.mono_font(10))
+        self.pre_commands.setFont(theme.mono_font())
         self.pre_commands.setPlaceholderText("for example: source ~/my-env.sh")
         self.pre_commands.setFixedHeight(64)
         self.pre_commands.setTabChangesFocus(True)
@@ -137,7 +147,7 @@ class ProfileEditor(QWidget):
         card = Card("Command")
         card.body().addWidget(_label("Extra arguments (added at the end, as you would type them in a terminal)"))
         self.extra_args = QLineEdit()
-        self.extra_args.setFont(theme.mono_font(10))
+        self.extra_args.setFont(theme.mono_font())
         self.extra_args.setPlaceholderText("anything the option list does not cover")
         card.body().addWidget(self.extra_args)
         row = QHBoxLayout()
@@ -145,12 +155,14 @@ class ProfileEditor(QWidget):
         row.addStretch(1)
         copy = QPushButton("Copy")
         copy.setProperty("flat", True)
+        copy.setProperty("controlSize", "sm")
+        copy.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         copy.clicked.connect(self._copy_preview)
         row.addWidget(copy)
         card.body().addLayout(row)
         self.preview = QPlainTextEdit()
         self.preview.setReadOnly(True)
-        self.preview.setFont(theme.mono_font(10))
+        self.preview.setFont(theme.mono_font())
         self.preview.setFixedHeight(84)
         card.body().addWidget(self.preview)
         self.issues = QLabel()
@@ -173,12 +185,17 @@ class ProfileEditor(QWidget):
         self.listen.currentIndexChanged.connect(self._on_field)
         self.listen.editTextChanged.connect(self._on_field)
         self.auto_open.toggled.connect(self._on_field)
+        self.open_rulzflow.toggled.connect(self._on_field)
         self.gpus.changed.connect(self.changed)
         self.options.changed.connect(self.changed)
         self.options.refresh_requested.connect(self.refresh_catalog_requested)
         self.env.changed.connect(self._on_field)
         self.env.import_requested.connect(self.import_env_requested)
         self.set_profile(None)
+
+    def retheme(self):
+        """Colours inside rich text come from the active palette, so draw them again."""
+        self._show_issues()
 
     # -- data in ------------------------------------------------------------
     def profile(self) -> Profile | None:
@@ -201,7 +218,10 @@ class ProfileEditor(QWidget):
         else:
             self.listen.setCurrentIndex(-1)
             self.listen.setEditText(p.listen)
+        if self.listen.lineEdit() is not None:
+            self.listen.lineEdit().setCursorPosition(0)   # show the start of the address, not its end
         self.auto_open.setChecked(p.auto_open)
+        self.open_rulzflow.setChecked(p.open_rulzflow)
         self.extra_args.setText(p.extra_args)
         self.pre_commands.setPlainText(p.pre_commands)
         self.env.set_rows(p.env)
@@ -231,15 +251,19 @@ class ProfileEditor(QWidget):
     def set_preview(self, command: str, issues: list[Issue]):
         if self.preview.toPlainText() != command:
             self.preview.setPlainText(command)
-        if issues:
+        self._issues = list(issues)
+        self._show_issues()
+
+    def _show_issues(self):
+        if self._issues:
             lines = []
-            for issue in issues:
-                color = theme.RED if issue.level == "error" else theme.AMBER
+            for issue in self._issues:
+                color = theme.C["danger-text" if issue.level == "error" else "warn-text"]
                 word = "Problem" if issue.level == "error" else "Note"
                 text = issue.message.replace("&", "&amp;").replace("<", "&lt;")
                 lines.append(f'<span style="color:{color}"><b>{word}:</b> {text}</span>')
             self.issues.setText("<br>".join(lines))
-        self.issues.setVisible(bool(issues))
+        self.issues.setVisible(bool(self._issues))
 
     # -- internals ----------------------------------------------------------
     def _fill_distros(self, current: str):
@@ -277,6 +301,7 @@ class ProfileEditor(QWidget):
         p.distro = self.distro.currentData() or ""
         p.listen = self._listen_value()
         p.auto_open = self.auto_open.isChecked()
+        p.open_rulzflow = self.open_rulzflow.isChecked()
         p.extra_args = self.extra_args.text()
         p.pre_commands = self.pre_commands.toPlainText()
         p.env = self.env.rows()
