@@ -383,6 +383,62 @@ never rents, stops or destroys an instance, so an instance you leave running kee
 the instance, the host keys, pulled runs) are in `~/.rulz_vast`; `RULZ_VAST_INSTANCE`, `RULZ_VAST_KEY`, `RULZ_VAST_DIR`
 and `RULZ_VAST_HOME` set the defaults. In Git Bash, set `MSYS_NO_PATHCONV=1` or paths like `/workspace/x` get rewritten.
 
+### Rent a GPU and send a run there from your own computer (since 4.5.0)
+
+The WebUI on your computer finds and rents a vast.ai instance, sends a run to it and brings the results back. It needs
+your vast.ai API key (`vastai set api-key <your key>` once, from https://cloud.vast.ai/manage-keys/) and your ssh key on
+your vast.ai account (the rent dialog can add it). Nothing of this shows on an instance's own WebUI.
+
+**Rent GPUs tab**
+
+- **Credit**: what is left, what bills now per hour (running instances and the disks of stopped ones apart) and when the
+  credit runs out at that rate. A chip at the top right shows it on every tab while anything bills: amber under 6 hours,
+  red under 1. Traffic is not included.
+- **Your instances**: Start, Stop and Destroy, each after a question that says what it costs or what is lost.
+- **Search**: every filter of vast.ai's own search page (rental type, number and model of GPUs, region and countries,
+  container size, reliability, duration, secure cloud, unverified / incompatible / unavailable offers, static IP, CUDA,
+  driver and Ubuntu versions, every price, GPU and machine range) and its nine sort orders, kept for next time. Search
+  and Enter only look.
+- **Rent** shows the price per hour and day, the disk, the template and how long the credit lasts with it, then rents on
+  its red button. Right before that the offer is looked up again: one that is gone or costs more is refused. Templates
+  are your own that set up RulZ AI Trainer, the newest first; without one the setup of `create_template.sh` is used.
+  On-demand and interruptible offers can be rented (an interruptible run can be paused when someone bids more);
+  reserved ones link to vast.ai.
+- A rent whose answer was lost is never sent again: your account is searched for it, and no other rent is possible until
+  that is settled.
+
+**Run on: This PC | vast.ai**, beside the buttons on Train, Dataset and Monitor and on the wizard's last page, turns the
+red button into **Send to vast.ai**. The dialog asks where (a running instance, a stopped one it starts, or a new one),
+then lists what goes up and what it costs. One send goes through these steps, shown with their progress in the dialog
+and on the Fleet tab; it goes on when the dialog is closed, and after a restart of the WebUI:
+
+1. rent or start the instance, wait until vast.ai runs it, ssh answers and RulZ AI Trainer is set up there;
+2. **model files** that exist only on this computer (your own fine-tune, a LoRA or state to carry on from): for each one
+   *Upload to the instance*, *Via a Hugging Face bucket* or, where there is one, *Use the standard file* the instance
+   downloads itself. Uploads are resumable and checked with sha256. The bucket route uploads to your bucket and the
+   instance downloads from it over 16 connections; your Hugging Face token stays on this computer (the instance only
+   gets a short-lived address). A default bucket can be saved; it is shown to confirm each time, and asked for when
+   there is none;
+3. **datasets**: every folder the run reads (a race's, the regularisation folder and reference photos included). A
+   folder already there and unchanged is not sent again; a changed one goes beside it;
+4. the settings, with this computer's paths rewritten, are checked there and put into the Fleet's queue for that
+   instance; the run starts once everything is in place;
+5. the results are downloaded by the Fleet's rules, and then the instance is **stopped** (the default), **destroyed**
+   (only one this app rented, only when every run ended well and every file but the resume states is here; otherwise it
+   is stopped and says why) or **left running**. A three-minute countdown with **Keep running** comes first, and nothing
+   happens while anything runs, waits or downloads there.
+
+A send that fails before its run starts stops the instance it rented or started (it never destroys it), unless *Leave it
+running* was chosen. With stop or destroy a small watchdog on the instance stops it after 60 idle minutes (adjustable),
+so a closed computer does not keep the GPU billing; it needs the instance's own API key, and the send says when there is
+none. Renting, starting and destroying work only in a browser on the computer that runs the WebUI.
+
+`python scripts/vast/rulz_market.py search|account|templates|instances|rentals` prints the same as JSON (it only reads).
+The rules all of this keeps to are in [docs/vast-send-contract.md](docs/vast-send-contract.md).
+
+*Not tried yet on a real rental: it was built and tested against stand-ins, with only the reading calls (search, credit,
+templates, instances) run against vast.ai.*
+
 ### Several instances at once: the fleet
 
 `scripts/vast/rulz_fleet.py` and the WebUI's **Fleet** tab treat every instance you have running as one fleet, from

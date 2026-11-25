@@ -85,9 +85,12 @@ MACHINE_METRICS = ("disk_free_gb", "gpu_temp", "gpu_util", "gpu_mem_mb")
 METRICS = RUN_METRICS + PROBE_METRICS + MACHINE_METRICS
 # the events a wait ends on unless told otherwise: the ones somebody has to look at
 WAIT_KINDS = ("watch", "run_done", "run_failed", "run_ended", "run_lost", "dispatch_failed", "instance_down",
-              "instance_gone", "download_failed", "queue_empty", "update_failed")
+              "instance_gone", "download_failed", "queue_empty", "update_failed", "send_failed", "send_alert")
 EVENT_KINDS = WAIT_KINDS + ("run_started", "dispatched", "instance_up", "instance_added", "instance_rebooting",
-                            "instance_rebooted", "instance_updated")
+                            "instance_rebooted", "instance_updated", "send_started", "instance_stopped_after_run",
+                            "instance_destroyed_after_run")
+# a kind of file that is only asked for by name (rulz_send.py's check before a destroy), never a rule of its own
+MANUAL_KINDS = ("tree",)
 RECENT_KEPT = 30
 FILLS_PER_TICK = 3  # runs whose settings and probes are fetched per instance and look
 PULL_RETRIES = 5
@@ -334,7 +337,7 @@ class Lane:
 class Fleet:
     def __init__(self, home: Path | None = None, pulls: Path | None = None, key: str | None = None,
                  folder: str = remote.REMOTE_DIR, connect=None, list_instances=None, fetch=None, send=None,
-                 vast=None, now=time.time):
+                 vast=None, now=time.time, skip_discovery=None):
         self.home = Path(home) if home else remote.STATE / "fleet"
         self._pulls_arg = Path(pulls) if pulls else None
         self._home_given = home is not None
@@ -345,6 +348,8 @@ class Fleet:
         self.fetch = fetch or remote.fetch
         self.send = send or remote.send
         self.vast = vast or remote.vastai  # the vastai CLI: its arguments in, its output out
+        # skip_discovery(raw instance) -> True: discover() leaves this instance out (see held_back_labels)
+        self.skip_discovery = skip_discovery
         self.lock = QueueLock(self.home / "state.lock")
         self.state_file = self.home / "state.json"
         self.downloads_file = self.home / "downloads.json"
@@ -723,7 +728,7 @@ class Fleet:
                 st["discovered"] = self.now()
                 st["discover_error"] = str(e)
             return str(e)
-        running = [i for i in listed.values() if i.get("actual_status") == "running"]
+        running = [i for i in listed.values() if i.get("actual_status") == "running" and not self._held_back(i)]
         joining = {str(i["id"]) for i in ([i for i in running if remote.is_rulztrainer(i)] or running)}
         with self.edit() as st:
             st["discovered"] = self.now()
@@ -748,6 +753,32 @@ class Fleet:
                     with self.guard:
                         self.remotes.pop(iid, None)
         return ""
+
+    def held_back_labels(self) -> set[str]:
+        """The labels of instances discovery must not take into the fleet: an open rent (intent) and an instance of a
+        send that has not reached it yet (rulz_send.py joins it itself once it is running and ssh answers), also a
+        rental made for such a send that its record does not name yet. Read from rentals.json and sends.json beside
+        the fleet's folder, so a daemon in another process honours it too."""
+        labels: set[str] = set()
+        sends = self._read_json(self.home.parent / "sends.json", {})
+        open_sends = set()
+        for row in (sends.get("sends") if isinstance(sends, dict) else None) or []:
+            if isinstance(row, dict) and not row.get("joined") and not row.get("dismissed"):
+                open_sends.add(row.get("id"))
+                if row.get("label"):
+                    labels.add(str(row["label"]))
+        rentals = self._read_json(self.home.parent / "rentals.json", {})
+        for key in ("intents", "rentals"):
+            for row in (rentals.get(key) if isinstance(rentals, dict) else None) or []:
+                if isinstance(row, dict) and row.get("label") and (key == "intents" or row.get("send") in open_sends):
+                    labels.add(str(row["label"]))
+        return labels
+
+    def _held_back(self, raw: dict) -> bool:
+        if self.skip_discovery is not None:
+            return bool(self.skip_discovery(raw))
+        label = raw.get("label")
+        return bool(label) and str(label) in self.held_back_labels()
 
     def _lose_runs(self, st: dict, iid: str, status: str) -> None:
         for rec in self.runs(instance=iid, state="running"):
@@ -960,7 +991,8 @@ class Fleet:
     # ---------------------------------------------------------------- the queue
 
     def plan(self, job: str, config: dict, sets=(), preset: str = "", instance=None, push=(), download=None,
-             overwrite: bool = False, split: int = 0, label: str = "") -> list[dict]:
+             overwrite: bool = False, split: int = 0, label: str = "", entry_id: str = "",
+             send: str = "") -> list[dict]:
         """The queue entries a run makes, nothing queued yet: one, or with split one per part of a race (its
         configurations dealt over that many instances; the parts are kept together as a group)."""
         if not job or Path(job).name != job:
@@ -974,17 +1006,20 @@ class Fleet:
         missing = [str(p) for p in push if not Path(p).exists()]
         if missing:
             raise Refused(f"Not found here: {', '.join(missing)}")
+        if entry_id and (split or not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", entry_id)):
+            raise Refused(f"Not an entry id for one run: {entry_id!r}")
         push = with_reg_folder(config, push)
         base = {"config": point_at_pushed(config, push), "set": list(sets), "preset": preset or "", "push": [str(Path(p)) for p in push],
                 "instance": int(instance) if instance else None, "download": modes, "overwrite": bool(overwrite),
-                "label": label or "", "added": self.now()}
+                "label": label or "", "added": self.now(), **({"send": send} if send else {})}
         if split:
             hands = race_parts(config, split)
             plans = [(f"{job}_{hand[0]}" if len(hand) == 1 else f"{job}_part{i + 1}", hand)
                      for i, hand in enumerate(hands)]
         else:
             plans = [(job, [])]
-        return [dict(base, id=uuid.uuid4().hex[:10], job=name, race_rows=rows, group=job if split else None)
+        return [dict(base, id=entry_id or uuid.uuid4().hex[:10], job=name, race_rows=rows,
+                     group=job if split else None)
                 for name, rows in plans]
 
     def enqueue(self, job: str = "", config: dict | None = None, entries: list[dict] | None = None, **options):
@@ -996,6 +1031,9 @@ class Fleet:
             clash = [e["job"] for e in entries if e["job"] in taken]
             if clash:
                 raise Refused(f"Already queued: {', '.join(clash)}")
+            ids = {e["id"] for e in st["queue"]["waiting"] + st["queue"]["active"]}
+            if any(e["id"] in ids for e in entries):
+                raise Refused(f"Already queued: entry {', '.join(e['id'] for e in entries if e['id'] in ids)}")
             st["queue"]["waiting"] += entries
         return entries
 
@@ -1025,7 +1063,7 @@ class Fleet:
                 "race_rows": e.get("race_rows") or None, "steps": cfg.get("steps"), "preset": cfg.get("preset"),
                 "set": e.get("set") or None, "push": e.get("push") or None, "label": e.get("label") or None,
                 "refused_by": e.get("refused_by") or None, "sent_to": e.get("sent_to"),
-                "uncertain_on": e.get("uncertain")}.items() if v is not None}
+                "uncertain_on": e.get("uncertain"), "send": e.get("send")}.items() if v is not None}
 
         return {"paused": q["paused"], "waiting": [line(e) for e in q["waiting"]],
                 "starting": [line(e) for e in q["active"]], "recent": q["recent"][:8]}
@@ -1076,7 +1114,8 @@ class Fleet:
             if live is not None:  # observe() makes the run's record from it in this tick, an ended one's too
                 live.setdefault("pending", {})[entry["job"]] = {
                     k: v for k, v in (("entry", entry["id"]), ("group", entry.get("group")),
-                                      ("download", entry.get("download")), ("label", entry.get("label"))) if v}
+                                      ("download", entry.get("download")), ("label", entry.get("label")),
+                                      ("send", entry.get("send"))) if v}
             note = "the connection dropped after it was sent"
             q["recent"] = ([{"id": entry["id"], "job": entry["job"], "instance": int(held), "group": entry.get("group"),
                              "time": now, "state": state, "note": note}] + q["recent"])[:RECENT_KEPT]
@@ -1091,7 +1130,9 @@ class Fleet:
                 inst = st["instances"][iid]
                 if not self.idle(inst, snaps.get(iid)):
                     continue
+                # a reserved instance (rulz_send.py is setting a run up on it) takes only that send's entry
                 entry = next((e for e in q["waiting"] if e.get("instance") in (None, int(iid))
+                              and inst.get("reserved") in (None, e.get("send"))
                               and iid not in (e.get("refused_by") or []) and self._may_take(st, e, iid)), None)
                 if entry is None:
                     continue
@@ -1284,7 +1325,8 @@ class Fleet:
                 if live is not None:
                     live.setdefault("pending", {})[entry["job"]] = {
                         k: v for k, v in (("entry", entry["id"]), ("group", entry.get("group")),
-                                          ("download", entry.get("download")), ("label", entry.get("label"))) if v}
+                                          ("download", entry.get("download")), ("label", entry.get("label")),
+                                          ("send", entry.get("send"))) if v}
                 q["recent"] = ([dict(done_line, state=reply.get("state"), note=message or None)]
                                + q["recent"])[:RECENT_KEPT]
                 self.event(st, "dispatched", instance=int(iid), job=entry["job"], entry=entry["id"],
@@ -1464,7 +1506,7 @@ class Fleet:
             r["pulled_at"] = self.now()
             if failure is None:
                 r["folder"] = result["folder"]
-                r["downloaded"] = sorted(set(r.get("downloaded") or []) | set(kinds))
+                r["downloaded"] = sorted(set(r.get("downloaded") or []) | (set(kinds) - set(MANUAL_KINDS)))
                 r["downloaded_files"] = r.get("downloaded_files", 0) + result["fetched"]
                 r["downloaded_mb"] = round(r.get("downloaded_mb", 0.0) + result["mb"], 1)
                 r.pop("pull_error", None)
@@ -1488,8 +1530,8 @@ class Fleet:
         rec = self.load_run(key)
         if rec is None:
             raise Refused(f"No run {key!r} on record (see runs).")
-        bad = [k for k in kinds if k not in DOWNLOAD_KINDS]
-        if bad or not kinds:
+        bad = [k for k in kinds if k not in DOWNLOAD_KINDS and k not in MANUAL_KINDS]
+        if bad or not kinds or (set(kinds) & set(MANUAL_KINDS) and len(kinds) > 1):
             raise Refused(f"Pick what to download: {', '.join(DOWNLOAD_KINDS)}.")
         iid = str(rec["instance"])
         inst = self.read()["instances"].get(iid)
@@ -1994,7 +2036,8 @@ class Fleet:
                 state = "idle"
             line = {"id": int(iid), "label": inst.get("label"), "gpu": inst.get("gpu"), "dph": inst.get("dph"),
                     "state": state, "status": inst.get("status"), "error": inst.get("error"),
-                    "accept": inst.get("accept", True), "webui_running": snap.get("webui_running"),
+                    "accept": inst.get("accept", True), "reserved": inst.get("reserved"),
+                    "webui_running": snap.get("webui_running"),
                     "disk_free_gb": snap.get("disk_free_gb"), "disk_total_gb": snap.get("disk_total_gb"),
                     "gpus": snap.get("gpus"), "datasets": snap.get("datasets"),
                     "age": round(now - snap["polled"]) if snap.get("polled") else None,
