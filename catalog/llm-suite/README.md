@@ -30,7 +30,8 @@ Discover/downloads, RAG and a CLI are planned.
   live server log; several models loaded at once.
   - **Settings per mode** (0.33.0): each model can have its own load settings, sampling and system prompt for Chat,
     Reverse engineering, Adventure and Writing (**My Models**, pick a model, **Settings for**). Anything a mode leaves
-    out stays as it is without it. The load dialog has **Load for**. When a model is loaded with other settings than the
+    out stays as it is without it. The load dialog has **Load for** and, for a mode, its **Own sampling** (0.34.1).
+    **API server sampling** is only for other programs and is set for all modes. When a model is loaded with other settings than the
     mode wants, a bar offers to reload it; it never reloads by itself. Existing chats, sessions and Writing projects keep
     their settings.
   - **Speculative decoding**: a draft-head sidecar next to the model (`mtp-*.gguf`, or eagle3/dflash/dspark) is
@@ -241,7 +242,8 @@ Discover/downloads, RAG and a CLI are planned.
     **Several tasks at once** (0.29.0): choose how many run side by side on each host and which hosts (this PC, or one
     or more vast.ai rentals with the model set up). Each task has its own REA process on this PC (about 1.3 GB of RAM
     each) and stays on one model server. Rows show the hosts and, for rentals, the cost and the cost per solved task.
-    **Stop the rentals when the run ends** is an option. A task cut off by a lost connection goes back to the queue
+    **Context per session** starts from the context saved in the model's Reverse engineering load settings, shared out over
+    the tasks at once (0.34.1). **Stop the rentals when the run ends** is an option. A task cut off by a lost connection goes back to the queue
     instead of counting as failed.
   - **Export**: writes `train.jsonl` in the kit's format (OpenAI / Hugging Face chat: `messages`, `tools`, `meta`;
     thinking in `reasoning_content`) plus `manifest.json`, from solved sessions by default, at most N per practice task

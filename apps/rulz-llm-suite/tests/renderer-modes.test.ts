@@ -18,7 +18,8 @@ import {
   scopeValue,
   startLoad,
   startScope,
-  withModeLoad
+  withModeLoad,
+  withModeSaves
 } from '../src/renderer/src/lib/modes'
 
 const calls: { channel: string; args: unknown[] }[] = []
@@ -146,7 +147,9 @@ describe('picker scope', () => {
     const base = loadWith({ contextLength: 4096 })
     const mine = loadWith({ contextLength: 32768 })
     const modes = { chat: own({ load: mine }) }
-    expect(scopeLoad(base, modes, 'chat')).toBe(mine)
+    expect(scopeLoad(base, modes, 'chat')).toEqual(mine)
+    const left = { ...mine, sampling: { ...mine.sampling, temperature: 1.9 } }
+    expect(scopeLoad(base, { chat: own({ load: left }) }, 'chat').sampling).toBe(base.sampling)
     expect(scopeLoad(base, modes, 're')).toBe(base)
     expect(scopeLoad(base, modes, null)).toBe(base)
   })
@@ -165,7 +168,7 @@ describe('what the picker first shows', () => {
     expect(startScope(null, modes)).toBeNull()
   })
   it("never shows one scope's running settings under another, so Remember cannot overwrite it", () => {
-    expect(startLoad(base, modes, 'adventure', re)).toBe(adv)
+    expect(startLoad(base, modes, 'adventure', re)).toEqual(adv)
     expect(startLoad(base, modes, null, re)).toBe(base)
   })
   it('all modes shows settings the model was loaded with by hand', () => {
@@ -192,13 +195,60 @@ describe('remember and reset for a mode', () => {
   })
 })
 
+describe("API sampling in a mode's stored load", () => {
+  const baseS = { ...DEFAULT_LOAD_CONFIG.sampling, temperature: 0.7 }
+  const withS = (over: Partial<LoadConfig['sampling']>, ctx = 8192): LoadConfig => ({ ...DEFAULT_LOAD_CONFIG, contextLength: ctx, sampling: { ...DEFAULT_LOAD_CONFIG.sampling, ...over } })
+
+  it("keeps what an entry has and gives a new one the default load settings' sampling", () => {
+    const existing = own({ load: withS({ temperature: 1 }, 4096) })
+    expect(withModeLoad(existing, withS({ temperature: 0.2 }, 16384), baseS)?.load).toMatchObject({ contextLength: 16384, sampling: { temperature: 1 } })
+    expect(withModeLoad(undefined, withS({ temperature: 0.2 }, 16384), baseS)?.load?.sampling).toEqual(baseS)
+  })
+
+  it('startLoad does not take a mode that differs only in sampling for a hand-made load', () => {
+    const base = withS({ temperature: 0.7 })
+    const modes = { re: own({ load: withS({ temperature: 1 }) }) }
+    expect(startLoad(base, modes, null, withS({ temperature: 1 }))).toBe(base)
+  })
+})
+
+describe('what the picker saves for a mode in one call', () => {
+  const baseS = { ...DEFAULT_LOAD_CONFIG.sampling, temperature: 0.7 }
+  const cfg = { ...DEFAULT_LOAD_CONFIG, contextLength: 16384, sampling: baseS }
+  const stored = { ...DEFAULT_LOAD_CONFIG, contextLength: 4096, sampling: { ...DEFAULT_LOAD_CONFIG.sampling, temperature: 1 } }
+  const mine = { ...DEFAULT_SAMPLING, temperature: 0.3, jsonSchema: '{"a":1}' }
+
+  it('saves nothing but what changed, and keeps the prompt', () => {
+    const existing = own({ load: stored, sampling: mine, systemPrompt: 'hi' })
+    expect(withModeSaves(existing, baseS, {})).toEqual(existing)
+    expect(withModeSaves(existing, baseS, { load: cfg })).toEqual({ ...existing, load: { ...cfg, sampling: stored.sampling } })
+    const next = { ...DEFAULT_SAMPLING, temperature: 0.9 }
+    expect(withModeSaves(existing, baseS, { sampling: next })).toEqual({ load: { ...stored, sampling: baseS }, sampling: next, systemPrompt: 'hi' })
+    expect(withModeSaves(existing, baseS, { sampling: null })).toEqual({ ...existing, sampling: null })
+  })
+
+  it('merges the load and the sampling in one entry; a saved jsonSchema is always empty', () => {
+    const got = withModeSaves(undefined, baseS, { load: cfg, sampling: mine })
+    expect(got).toEqual({ load: { ...cfg, sampling: baseS }, sampling: { ...mine, jsonSchema: '' }, systemPrompt: '' })
+  })
+
+  it('own sampling alone leaves a mode without its own load without one', () => {
+    expect(withModeSaves(undefined, baseS, { sampling: mine })?.load).toBeNull()
+  })
+
+  it('is null when nothing is left', () => {
+    expect(withModeSaves(own({ sampling: mine }), baseS, { sampling: null })).toBeNull()
+    expect(withModeSaves(undefined, baseS, {})).toBeNull()
+  })
+})
+
 describe('when the reload bar shows', () => {
   const base = loadWith({ contextLength: 4096 })
   const wanted = loadWith({ contextLength: 32768 })
   const modes = { writing: own({ load: wanted }) }
 
   it('offers the mode\'s settings when the model runs with others', () => {
-    expect(reloadOffer(base, base, modes, 'writing', false)).toBe(wanted)
+    expect(reloadOffer(base, base, modes, 'writing', false)).toEqual(wanted)
   })
   it('stays away when the model already runs with them', () => {
     expect(reloadOffer({ ...wanted }, base, modes, 'writing', false)).toBeNull()

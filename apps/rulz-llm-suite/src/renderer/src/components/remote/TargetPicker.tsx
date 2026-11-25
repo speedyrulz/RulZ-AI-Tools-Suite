@@ -1,19 +1,25 @@
 import { Cloud } from 'lucide-react'
-import { useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { isRemoteModelId, type BatchHost, type BatchTarget } from '@shared/remote'
+import type { LoadConfig } from '@shared/types'
 import {
   CONTEXT_PER_SESSION_PARALLEL,
+  contextWarning,
   hostChoices,
   hostKey,
+  knownReContext,
   maxSessions,
   ramHint,
   targetFor,
   targetProblems,
   type HostChoice
 } from '../../lib/remote'
+import { invoke } from '../../lib/api'
 import { formatTokens } from '../../lib/format'
+import { modesFor } from '../../lib/modes'
 import { useApp } from '../../stores/app'
 import { useMcp } from '../../stores/mcp'
+import { useModels } from '../../stores/models'
 import { useRemote } from '../../stores/remote'
 import { Button, NumberInput, Switch, Tooltip } from '../ui'
 
@@ -43,6 +49,18 @@ export function useTargetState(modelId: string | null, initial?: BatchTarget): T
   const rentals = useRemote((s) => s.state?.rentals)
   const setPage = useApp((s) => s.setPage)
   const choices = useHostChoices(modelId)
+  // The context the model is saved to load with: the Reverse engineering load settings, else the model's default ones.
+  const reLoad = useModels((s) => modesFor(s.modeDefaults, modelId)?.re?.load)
+  const [saved, setSaved] = useState<{ modelId: string; config: LoadConfig; custom: boolean } | null>(null)
+  const savedSeq = useRef(0)
+  useEffect(() => {
+    const seq = ++savedSeq.current
+    if (!modelId) return
+    invoke('models:getDefaults', modelId)
+      .then((d) => seq === savedSeq.current && setSaved({ modelId, config: d.config, custom: d.custom }))
+      .catch(() => seq === savedSeq.current && setSaved(null))
+  }, [modelId])
+  const known = knownReContext(reLoad, saved && saved.modelId === modelId ? saved : null)
   const [sel, setSel] = useState<string[]>(initial ? initial.hosts.map(hostKey) : [])
   const [sessions, setSessions] = useState<number | undefined>(initial?.sessionsPerHost)
   const [ctx, setCtx] = useState<number | null | undefined>(initial ? initial.contextPerSession : undefined)
@@ -55,9 +73,10 @@ export function useTargetState(modelId: string | null, initial?: BatchTarget): T
   // Nothing chosen (or what was chosen is gone): the first usable host is the default.
   const keys = chosen.length ? chosen : validKeys.slice(0, 1)
   const hosts = keys.map(keyToHost)
-  const base = targetFor(hosts, { sessionsPerHost: sessions, stopRentalsAfter: stopAfter })
+  const base = targetFor(hosts, { sessionsPerHost: sessions, stopRentalsAfter: stopAfter }, known?.total)
   const target: BatchTarget = { ...base, contextPerSession: ctx === undefined ? base.contextPerSession : ctx }
   const problems = targetProblems(target, choices)
+  const ctxWarning = contextWarning(target)
   const most = maxSessions(Math.max(1, hosts.length))
   const hasRental = hosts.some((h) => h.kind === 'vast')
   const whys = [...new Set(choices.filter((c) => !c.valid && c.host.kind === 'vast').map((c) => c.why))]
@@ -106,7 +125,13 @@ export function useTargetState(modelId: string | null, initial?: BatchTarget): T
             <NumberInput className="w-14" value={target.sessionsPerHost} min={1} max={most} onChange={(v) => setSessions(Math.min(most, Math.max(1, Math.round(v ?? 1))))} />
           </span>
         </Tooltip>
-        <Tooltip content={`The model is loaded with this context for each task at once, so it uses more memory the more tasks run. Default ${formatTokens(CONTEXT_PER_SESSION_PARALLEL)} when more than one runs or a rental is used.`}>
+        <Tooltip
+          content={`The model is loaded with this context for each task at once, so it uses more memory the more tasks run. ${
+            known
+              ? `Default: the ${formatTokens(known.total)} saved in this model's ${known.from === 're' ? 'Reverse engineering' : 'default'} load settings, shared out over the tasks at once.`
+              : `Default ${formatTokens(CONTEXT_PER_SESSION_PARALLEL)} when more than one runs or a rental is used.`
+          }`}
+        >
           <span className="flex items-center gap-1.5">
             Context per session
             <NumberInput
@@ -130,6 +155,7 @@ export function useTargetState(modelId: string | null, initial?: BatchTarget): T
       </div>
       {/* REA runs on this PC for every task, also when the model is on a rental. */}
       <div className="text-[11.5px] text-faint tabular-nums">{ramHint(target.sessionsPerHost * Math.max(1, hosts.length))}</div>
+      {ctxWarning && <div className="text-[11.5px] text-warn">{ctxWarning}</div>}
       {problems.length > 0 && (
         <ul className="space-y-0.5 text-[11.5px] text-warn">
           {problems.map((p) => (

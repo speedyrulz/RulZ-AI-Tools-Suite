@@ -1,8 +1,8 @@
 // Pure helpers for the per-model, per-mode defaults on the renderer side: which chats follow the active model's
 // defaults, where the picker starts, what "remember" saves, and when the reload bar shows.
 import type { AllModeDefaults, AppMode, ModeDefaults, ModelModeDefaults } from '@shared/modes'
-import { APP_MODES, chatPrompt, modeDefaultsEmpty, modeSampling, reloadFor, sameLoad } from '@shared/modes'
-import type { Conversation, LoadConfig, SamplingParams } from '@shared/types'
+import { APP_MODES, chatPrompt, matchesModeLoad, modeDefaultsEmpty, modeLoad, modeSampling, reloadFor } from '@shared/modes'
+import type { Conversation, LoadConfig, ModelSampling, SamplingParams } from '@shared/types'
 
 /** A model's settings in every mode; an own-property lookup, so a model id like "constructor" finds nothing. */
 export function modesFor(all: AllModeDefaults | undefined, modelId: string | null | undefined): ModelModeDefaults | undefined {
@@ -89,7 +89,7 @@ export function startScope(mode: PickerScope, modes: ModelModeDefaults | undefin
  */
 export function startLoad(base: LoadConfig, modes: ModelModeDefaults | undefined, scope: PickerScope, running: LoadConfig | undefined): LoadConfig {
   if (scope || !running) return scopeLoad(base, modes, scope)
-  return APP_MODES.some((m) => modes?.[m]?.load && sameLoad(running, modes[m].load)) ? base : running
+  return APP_MODES.some((m) => matchesModeLoad(running, base, modes, m)) ? base : running
 }
 
 /** The Select value of a scope and back. */
@@ -98,12 +98,40 @@ export const scopeFromValue = (v: string): PickerScope => (v === 'chat' || v ===
 
 /** The load settings the picker shows for a scope: that mode's own, else the model's default ones. */
 export function scopeLoad(base: LoadConfig, modes: ModelModeDefaults | undefined, scope: PickerScope): LoadConfig {
-  return (scope && modes?.[scope]?.load) || base
+  return modeLoad(base, modes, scope ?? undefined)
+}
+
+/**
+ * A mode's load settings as they are stored: the API-server sampling in them is not the mode's to set, so an entry that
+ * has one keeps what it has and a new one gets the model's default load settings' (`baseSampling`).
+ */
+export function storedModeLoad(existing: ModeDefaults | undefined, load: LoadConfig | null, baseSampling: ModelSampling | undefined): LoadConfig | null {
+  if (!load) return null
+  const sampling = existing?.load?.sampling ?? baseSampling ?? load.sampling
+  return { ...load, sampling }
 }
 
 /** What "Remember settings" saves for a mode: its load settings replaced, its sampling and prompt kept. null = the entry is gone. */
-export function withModeLoad(existing: ModeDefaults | undefined, load: LoadConfig | null): ModeDefaults | null {
-  const next: ModeDefaults = { load, sampling: existing?.sampling ?? null, systemPrompt: existing?.systemPrompt ?? '' }
+export function withModeLoad(existing: ModeDefaults | undefined, load: LoadConfig | null, baseSampling?: ModelSampling): ModeDefaults | null {
+  const next: ModeDefaults = { load: storedModeLoad(existing, load, baseSampling), sampling: existing?.sampling ?? null, systemPrompt: existing?.systemPrompt ?? '' }
+  return modeDefaultsEmpty(next) ? null : next
+}
+
+/**
+ * What the picker's load button saves for a mode, in one entry: `load` (the settings shown) only when they are
+ * remembered, `sampling` only when it was edited (null = off). Everything not given stays as `existing` (read just
+ * before saving); the prompt always does. Saving own sampling ON hands the stored load's API sampling back to the
+ * model's default one, so leftover values are not offered again. null = the entry is gone.
+ */
+export function withModeSaves(
+  existing: ModeDefaults | undefined,
+  baseSampling: ModelSampling | undefined,
+  change: { load?: LoadConfig; sampling?: SamplingParams | null }
+): ModeDefaults | null {
+  const sampling = change.sampling === undefined ? (existing?.sampling ?? null) : change.sampling ? { ...change.sampling, jsonSchema: '' } : null
+  let load = change.load ? storedModeLoad(existing, change.load, baseSampling) : (existing?.load ?? null)
+  if (load && change.sampling && baseSampling) load = { ...load, sampling: baseSampling }
+  const next: ModeDefaults = { load, sampling, systemPrompt: existing?.systemPrompt ?? '' }
   return modeDefaultsEmpty(next) ? null : next
 }
 

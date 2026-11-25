@@ -20,7 +20,8 @@ import {
   type RentIntent,
   type Rental
 } from '@shared/remote'
-import type { ModelEntry } from '@shared/types'
+import { RE_MIN_CONTEXT } from '@shared/re'
+import type { LoadConfig, ModelEntry } from '@shared/types'
 
 const GIB = 1024 ** 3
 
@@ -504,15 +505,50 @@ export function maxSessions(hostCount: number): number {
 export const CONTEXT_PER_SESSION_PARALLEL = 65536
 export const REA_GB_PER_TASK = 1.3
 
-/** A target for the chosen hosts, with sessions and context defaults: 1 task for this PC alone, 4 when a rental is in it. */
-export function targetFor(hosts: BatchHost[], prev?: Partial<BatchTarget>): BatchTarget {
+/**
+ * The context a model is saved to load with for reverse engineering, to share out over a batch run's tasks: the mode's
+ * own load settings', else the model's default ones' when those are saved (`custom`) and enough for one task: a small
+ * context saved for chatting says nothing about practice. null = not known (also auto, or the app's defaults).
+ */
+export function knownReContext(
+  reLoad: LoadConfig | null | undefined,
+  base: { config: LoadConfig; custom: boolean } | null | undefined
+): { total: number; from: 're' | 'default' } | null {
+  const ok = (n: number | null | undefined): n is number => typeof n === 'number' && Number.isFinite(n) && n > 0
+  if (reLoad && ok(reLoad.contextLength)) return { total: reLoad.contextLength, from: 're' }
+  if (base?.custom && ok(base.config.contextLength) && base.config.contextLength >= RE_MIN_CONTEXT) return { total: base.config.contextLength, from: 'default' }
+  return null
+}
+
+/** The most tasks at once (up to 4, within `most`) that each get at least RE_MIN_CONTEXT of `total`; at least 1. */
+function tasksFitting(total: number, most: number): number {
+  for (let k = Math.min(4, most); k > 1; k--) if (Math.floor(total / k) >= RE_MIN_CONTEXT) return k
+  return 1
+}
+
+/**
+ * A target for the chosen hosts, with sessions and context defaults. Without a known context (`total`): 1 task for this
+ * PC alone, 4 when a rental is in it, each with 65536 tokens. With one, it is the total the model loads with over all
+ * tasks at once (llama-server splits it over its slots), so the default shares it out and never goes over it.
+ */
+export function targetFor(hosts: BatchHost[], prev?: Partial<BatchTarget>, total?: number | null): BatchTarget {
   const hs = hosts.length ? hosts : DEFAULT_BATCH_TARGET.hosts
   const hasRental = hs.some((h) => h.kind === 'vast')
   const most = maxSessions(hs.length)
-  const n = Math.min(most, Math.max(1, prev?.sessionsPerHost ?? (hasRental ? 4 : 1)))
+  const known = total && total > 0 ? total : null
+  const fallbackN = hasRental ? (known ? tasksFitting(known, most) : 4) : 1
+  const n = Math.min(most, Math.max(1, prev?.sessionsPerHost ?? fallbackN))
   const needCtx = n > 1 || hasRental
-  const ctx = prev?.contextPerSession ?? (needCtx ? CONTEXT_PER_SESSION_PARALLEL : null)
-  return { hosts: hs, sessionsPerHost: n, contextPerSession: needCtx ? (ctx ?? CONTEXT_PER_SESSION_PARALLEL) : ctx, stopRentalsAfter: hasRental ? (prev?.stopRentalsAfter ?? false) : false }
+  const share = known ? (n === 1 ? known : Math.max(1024, Math.floor(known / n / 1024) * 1024)) : CONTEXT_PER_SESSION_PARALLEL
+  const ctx = prev?.contextPerSession ?? (needCtx ? share : null)
+  return { hosts: hs, sessionsPerHost: n, contextPerSession: needCtx ? (ctx ?? share) : ctx, stopRentalsAfter: hasRental ? (prev?.stopRentalsAfter ?? false) : false }
+}
+
+/** A sentence when a task gets less context than reverse engineering works well with; null = fine. Not a blocking problem. */
+export function contextWarning(t: Pick<BatchTarget, 'contextPerSession'>): string | null {
+  const c = t.contextPerSession
+  if (c === null || c >= RE_MIN_CONTEXT) return null
+  return `${c.toLocaleString('en-US')} tokens per task is little for reverse engineering; ${RE_MIN_CONTEXT.toLocaleString('en-US')} or more works much better.`
 }
 
 /** Sentences why the target cannot start; empty = it can. */

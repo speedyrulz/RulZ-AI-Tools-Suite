@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_AUTO_STOP, DEFAULT_BATCH_TARGET, DEFAULT_OFFER_FILTER, type RemoteModelDef, type RemoteOffer, type Rental } from '../src/shared/remote'
+import { DEFAULT_LOAD_CONFIG } from '../src/shared/defaults'
+import type { LoadConfig } from '../src/shared/types'
+import { DEFAULT_AUTO_STOP, DEFAULT_BATCH_TARGET, DEFAULT_OFFER_FILTER, type BatchHost, type RemoteModelDef, type RemoteOffer, type Rental } from '../src/shared/remote'
 import {
   autoStopLine,
   balanceHours,
@@ -36,6 +38,8 @@ import {
   sortOffers,
   statusWords,
   stopConfirmText,
+  contextWarning,
+  knownReContext,
   targetFor,
   targetProblems,
   totals,
@@ -367,6 +371,50 @@ describe('batch target', () => {
     expect(targetFor([{ kind: 'local' }], { sessionsPerHost: 3 }).contextPerSession).toBe(65536)
     expect(targetFor([], undefined).hosts).toEqual(DEFAULT_BATCH_TARGET.hosts)
     expect(targetFor([{ kind: 'local' }], { stopRentalsAfter: true }).stopRentalsAfter).toBe(false)
+  })
+
+  it('shares a known saved context out over the tasks at once', () => {
+    const rent = [{ kind: 'vast', rentalId: 1 }] as BatchHost[]
+    const local = [{ kind: 'local' }] as BatchHost[]
+    // 86016 only fits one task of 65536: the saved context unchanged.
+    expect(targetFor(rent, undefined, 86016)).toMatchObject({ sessionsPerHost: 1, contextPerSession: 86016 })
+    expect(targetFor(rent, undefined, 262144)).toMatchObject({ sessionsPerHost: 4, contextPerSession: 65536 })
+    expect(targetFor(rent, undefined, 196608)).toMatchObject({ sessionsPerHost: 3, contextPerSession: 65536 })
+    expect(targetFor(rent, undefined, 131072)).toMatchObject({ sessionsPerHost: 2, contextPerSession: 65536 })
+    // Tasks the user sets re-divide the default, rounded down to 1024, never over the total.
+    expect(targetFor(rent, { sessionsPerHost: 4 }, 86016)).toMatchObject({ sessionsPerHost: 4, contextPerSession: 21504 })
+    expect(targetFor(rent, { sessionsPerHost: 3 }, 100000)).toMatchObject({ contextPerSession: 32768 })
+    // A typed context wins.
+    expect(targetFor(rent, { contextPerSession: 40000 }, 262144)).toMatchObject({ sessionsPerHost: 4, contextPerSession: 40000 })
+    // This PC: one task, the model's own context; several tasks share the total.
+    expect(targetFor(local, undefined, 86016)).toMatchObject({ sessionsPerHost: 1, contextPerSession: null })
+    expect(targetFor(local, { sessionsPerHost: 2 }, 131072)).toMatchObject({ sessionsPerHost: 2, contextPerSession: 65536 })
+    // Within the lane limit: sixteen hosts allow one task each.
+    const many = (n: number): BatchHost[] => Array.from({ length: n }, (_, i) => ({ kind: 'vast', rentalId: i + 1 }))
+    expect(targetFor(many(16), undefined, 1_000_000).sessionsPerHost).toBe(1)
+    // Unknown (null, 0, undefined) = today's defaults.
+    for (const t of [null, 0, undefined]) expect(targetFor(rent, undefined, t)).toMatchObject({ sessionsPerHost: 4, contextPerSession: 65536 })
+  })
+
+  it("knows the context to share out: the RE load's, else the saved default load's", () => {
+    const cfg = (c: number | null): LoadConfig => ({ ...DEFAULT_LOAD_CONFIG, contextLength: c })
+    expect(knownReContext(cfg(86016), { config: cfg(32768), custom: true })).toEqual({ total: 86016, from: 're' })
+    expect(knownReContext(null, { config: cfg(131072), custom: true })).toEqual({ total: 131072, from: 'default' })
+    expect(knownReContext(cfg(null), { config: cfg(65536), custom: true })).toEqual({ total: 65536, from: 'default' })
+    // A small default context was saved for other uses; a small RE one was saved for this.
+    expect(knownReContext(null, { config: cfg(32768), custom: true })).toBeNull()
+    expect(knownReContext(cfg(32768), null)).toEqual({ total: 32768, from: 're' })
+    expect(knownReContext(null, { config: cfg(131072), custom: false })).toBeNull()
+    expect(knownReContext(null, { config: cfg(null), custom: true })).toBeNull()
+    expect(knownReContext(undefined, null)).toBeNull()
+  })
+
+  it('warns, without blocking, when a task gets little context', () => {
+    expect(contextWarning({ contextPerSession: 21504 })).toBe('21,504 tokens per task is little for reverse engineering; 65,536 or more works much better.')
+    expect(contextWarning({ contextPerSession: 65536 })).toBeNull()
+    expect(contextWarning({ contextPerSession: null })).toBeNull()
+    const choices = hostChoices('vast/q', models('vast/q'), true)
+    expect(targetProblems(targetFor([{ kind: 'vast', rentalId: 1 }], { sessionsPerHost: 4 }, 86016), choices)).toEqual([])
   })
 
   it('clamps tasks at once by the lane limits', () => {

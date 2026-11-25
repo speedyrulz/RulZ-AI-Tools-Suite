@@ -6,8 +6,12 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DEFAULT_LOAD_CONFIG, DEFAULT_SAMPLING } from '@shared/defaults'
 import {
+  adoptSampling,
   APP_MODES,
+  builtInSampling,
   chatPrompt,
+  leftoverSampling,
+  matchesModeLoad,
   modeDefaultsEmpty,
   modeLoad,
   modePromptExtra,
@@ -51,7 +55,7 @@ describe('mode helpers', () => {
   it('takes the mode\'s load settings, else the model\'s own', () => {
     const base = load({ contextLength: 8192 })
     const re = load({ contextLength: 65536 })
-    expect(modeLoad(base, { re: entry({ load: re }) }, 're')).toBe(re)
+    expect(modeLoad(base, { re: entry({ load: re }) }, 're')).toEqual(re)
     expect(modeLoad(base, { re: entry({ load: re }) }, 'chat')).toBe(base)
     expect(modeLoad(base, { re: entry({ sampling: DEFAULT_SAMPLING }) }, 're')).toBe(base)
     expect(modeLoad(base, undefined, 're')).toBe(base)
@@ -93,6 +97,42 @@ describe('mode helpers', () => {
     expect(sameLoad(load({ adapters: [{ id: 'a', scale: 1 }] }), load({ adapters: [{ id: 'a', scale: 0.5 }] }))).toBe(false)
   })
 
+  it("always takes the API server sampling from the model's default load settings", () => {
+    const base = load({ contextLength: 8192, sampling: { ...DEFAULT_LOAD_CONFIG.sampling, temperature: 0.7 } })
+    const re = load({ contextLength: 65536, sampling: { ...DEFAULT_LOAD_CONFIG.sampling, temperature: 1, topK: 0 } })
+    const got = modeLoad(base, { re: entry({ load: re }) }, 're')
+    expect(got.contextLength).toBe(65536)
+    expect(got.sampling).toBe(base.sampling)
+    expect(re.sampling.temperature).toBe(1)
+  })
+
+  describe("leftover API sampling in a mode's load settings", () => {
+    const base = load()
+    const mine = (over: Partial<LoadConfig['sampling']>): LoadConfig => load({ sampling: { ...DEFAULT_LOAD_CONFIG.sampling, ...over } })
+
+    it('is nothing when the mode has no load, or its sampling is empty or the same as the default one', () => {
+      expect(leftoverSampling(null, base)).toBeNull()
+      expect(leftoverSampling(undefined, base)).toBeNull()
+      expect(leftoverSampling(mine({}), base)).toBeNull()
+      expect(leftoverSampling(mine({ override: true }), base)).toBeNull()
+      const same = mine({ temperature: 0.5 })
+      expect(leftoverSampling(same, same)).toBeNull()
+    })
+
+    it('lists every value that is set when one differs, never override', () => {
+      const own = mine({ temperature: 1, topK: 0, drySequenceBreakers: ['\n'], override: true })
+      expect(leftoverSampling(own, base)).toEqual({ temperature: 1, topK: 0, drySequenceBreakers: ['\n'] })
+      const other = load({ sampling: { ...base.sampling, topP: 1 } })
+      expect(leftoverSampling(mine({ topP: 1, topK: 5 }), other)).toEqual({ topP: 1, topK: 5 })
+    })
+
+    it("adopted values go over the mode's built-in sampling", () => {
+      const got = adoptSampling('re', DEFAULT_SAMPLING, { temperature: 1, topK: 0 })
+      expect(got).toEqual({ ...builtInSampling('re', DEFAULT_SAMPLING), temperature: 1, topK: 0, jsonSchema: '' })
+      expect(adoptSampling('writing', DEFAULT_SAMPLING, {}).temperature).toBe(FICTION_SAMPLING.temperature)
+    })
+  })
+
   describe('reloadFor', () => {
     const base = load({ contextLength: 8192 })
     const big = load({ contextLength: 65536 })
@@ -121,6 +161,24 @@ describe('mode helpers', () => {
     it('offers nothing for a model with no mode settings', () => {
       expect(reloadFor(big, base, undefined, 're')).toBeNull()
       expect(reloadFor(big, base, { re: entry({ sampling: DEFAULT_SAMPLING }) }, 're')).toBeNull()
+    })
+
+    it("does not offer a reload because of leftover API sampling in a mode's stored load", () => {
+      const left = { ...big, sampling: { ...big.sampling, temperature: 1, topK: 0 } }
+      const withLeft: ModelModeDefaults = { re: entry({ load: left }) }
+      // Loaded now: runs with the mode's load plus the default API sampling.
+      expect(reloadFor(modeLoad(base, withLeft, 're'), base, withLeft, 're')).toBeNull()
+      // Loaded before: runs with the stored load as it is, leftover included.
+      expect(reloadFor(left, base, withLeft, 're')).toBeNull()
+      expect(matchesModeLoad(left, base, withLeft, 're')).toBe(true)
+      expect(reloadFor(left, base, withLeft, 'chat')).toEqual(base)
+      expect(reloadFor(base, base, withLeft, 're')).toEqual(modeLoad(base, withLeft, 're'))
+    })
+
+    it("a stored load that only differs in sampling still counts as the mode's own", () => {
+      const only: ModelModeDefaults = { re: entry({ load: { ...base, sampling: { ...base.sampling, temperature: 1 } } }) }
+      expect(reloadFor(base, base, only, 're')).toBeNull()
+      expect(reloadFor(big, base, only, 're')).toEqual(base)
     })
 
     it('does not mind the order of the fields of a running config', () => {

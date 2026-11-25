@@ -1,18 +1,17 @@
-import { ChevronRight, RotateCcw } from 'lucide-react'
+import { RotateCcw } from 'lucide-react'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { toast } from 'sonner'
 import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
-import { APP_MODES, builtInSampling, MODE_LABELS, modeDefaultsEmpty, type AppMode, type ModeDefaults } from '@shared/modes'
-import type { LoadConfig, ModelEntry, SamplingParams } from '@shared/types'
+import { APP_MODES, leftoverSampling, MODE_LABELS, modeDefaultsEmpty, type AppMode, type ModeDefaults } from '@shared/modes'
+import type { LoadConfig, ModelEntry, ModelSampling, SamplingParams } from '@shared/types'
 import { errorMessage, invoke } from '../../lib/api'
-import { cn } from '../../lib/format'
 import { modesFor } from '../../lib/modes'
 import { useApp } from '../../stores/app'
 import { useModels } from '../../stores/models'
-import { SamplingFields, ThinkingFields, VarietyFields } from '../chat/InferencePanel'
 import { Button, Field, Select, Switch, Textarea } from '../ui'
 import { EstimateView, useEstimate } from './EstimateView'
 import { LoadSettingsForm } from './LoadSettingsForm'
+import { OwnSampling } from './OwnSampling'
 
 /** 'all' = the model's default load settings (the host shows its own view for it). */
 export type ModeScope = 'all' | AppMode
@@ -34,20 +33,15 @@ const draftOf = (saved: ModeDefaults | undefined): Draft => ({
   prompt: saved?.systemPrompt ?? ''
 })
 
-const valueOf = (d: Draft): ModeDefaults | null => {
-  const value: ModeDefaults = {
-    load: d.ownLoad ? d.load : null,
-    sampling: d.ownSampling && d.sampling ? { ...d.sampling, jsonSchema: '' } : null,
-    systemPrompt: d.prompt
-  }
+/**
+ * What a draft saves. The mode's load keeps the API-server sampling it was stored with (the form does not edit it); saved
+ * with own sampling on, it gets the model's default one (`baseSampling`), so leftover values are not offered again.
+ */
+const valueOf = (d: Draft, baseSampling?: ModelSampling): ModeDefaults | null => {
+  const sampling = d.ownSampling && d.sampling ? { ...d.sampling, jsonSchema: '' } : null
+  const load = d.ownLoad && d.load ? (sampling && baseSampling ? { ...d.load, sampling: baseSampling } : d.load) : null
+  const value: ModeDefaults = { load, sampling, systemPrompt: d.prompt }
   return modeDefaultsEmpty(value) ? null : value
-}
-
-const FALLBACK: Record<AppMode, string> = {
-  chat: 'Uses the new-chat sampling in Settings.',
-  re: 'Uses the built-in values for tool use.',
-  adventure: "Uses the app's built-in sampling.",
-  writing: 'Uses the fiction sampling new projects start with.'
 }
 
 const WHEN: Record<AppMode, string> = {
@@ -82,7 +76,6 @@ function Editor({ modelId, model, remote, rentalId, scope, onScope, allView }: P
   const [drafts, setDrafts] = useState<Partial<Record<AppMode, Draft>>>({})
   const [base, setBase] = useState<LoadConfig | null>(null)
   const [busy, setBusy] = useState(false)
-  const [varietyOpen, setVarietyOpen] = useState(false)
   const baseSeq = useRef(0)
 
   // The model's default load settings, as they are now: a mode's own settings start from them.
@@ -103,9 +96,6 @@ function Editor({ modelId, model, remote, rentalId, scope, onScope, allView }: P
     if (!mode) return
     setDrafts((d) => ({ ...d, [mode]: { ...(d[mode] ?? draftOf(saved)), ...patch } }))
   }
-  const editSampling = <K extends keyof SamplingParams>(key: K, value: SamplingParams[K]): void => {
-    if (view?.sampling) edit({ sampling: { ...view.sampling, [key]: value } })
-  }
 
   const finish = async (m: AppMode, draft: Draft | undefined): Promise<void> => {
     // Read the saved state again, then drop the draft unless it was edited meanwhile.
@@ -120,7 +110,7 @@ function Editor({ modelId, model, remote, rentalId, scope, onScope, allView }: P
     if (!mode || !drafts[mode]) return
     const m = mode
     const draft = drafts[m]
-    const value = draft ? valueOf(draft) : null
+    const value = draft ? valueOf(draft, base?.sampling) : null
     setBusy(true)
     try {
       await invoke('models:setModeDefaults', modelId, m, value)
@@ -150,8 +140,6 @@ function Editor({ modelId, model, remote, rentalId, scope, onScope, allView }: P
       setBusy(false)
     }
   }
-
-  const honoursLimits = mode === 'chat' || mode === 're'
 
   return (
     <div className="space-y-4">
@@ -185,7 +173,7 @@ function Editor({ modelId, model, remote, rentalId, scope, onScope, allView }: P
             </Field>
             {view.ownLoad && view.load ? (
               <>
-                <LoadSettingsForm model={model} config={view.load} onChange={(c) => edit({ load: c })} estimate={estimate} remote={remote} />
+                <LoadSettingsForm model={model} config={view.load} onChange={(c) => edit({ load: c })} estimate={estimate} remote={remote} hideApiSampling />
                 <EstimateView estimate={estimate} />
               </>
             ) : (
@@ -193,38 +181,14 @@ function Editor({ modelId, model, remote, rentalId, scope, onScope, allView }: P
             )}
           </section>
 
-          <section className="space-y-3" aria-label="Own sampling">
-            <Field inline label="Own sampling" hint={`Only for ${MODE_LABELS[mode]}`}>
-              <Switch
-                checked={view.ownSampling}
-                onCheckedChange={(on) =>
-                  edit({
-                    ownSampling: on,
-                    sampling: on ? (view.sampling ?? (appSampling ? structuredClone(builtInSampling(mode, appSampling)) : null)) : view.sampling
-                  })
-                }
-                disabled={!appSampling}
-              />
-            </Field>
-            {view.ownSampling && view.sampling ? (
-              <div className="space-y-3">
-                <SamplingFields sampling={view.sampling} onChange={editSampling} limits={honoursLimits} />
-                <button
-                  type="button"
-                  aria-expanded={varietyOpen}
-                  onClick={() => setVarietyOpen(!varietyOpen)}
-                  className="flex w-full items-center gap-1 text-[11px] font-semibold tracking-wide text-faint uppercase hover:text-text"
-                >
-                  <ChevronRight size={14} className={cn('transition-transform', varietyOpen && 'rotate-90')} />
-                  Repetition and variety
-                </button>
-                {varietyOpen && <VarietyFields sampling={view.sampling} onChange={editSampling} />}
-                {honoursLimits && <ThinkingFields sampling={view.sampling} onChange={editSampling} />}
-              </div>
-            ) : (
-              <p className="text-xs text-muted">{FALLBACK[mode]}</p>
-            )}
-          </section>
+          <OwnSampling
+            mode={mode}
+            on={view.ownSampling}
+            sampling={view.sampling}
+            appSampling={appSampling}
+            leftover={base ? leftoverSampling(saved?.load, base) : null}
+            onChange={(n) => edit({ ownSampling: n.on, sampling: n.sampling })}
+          />
 
           <section className="space-y-2" aria-label="System prompt">
             <Field
