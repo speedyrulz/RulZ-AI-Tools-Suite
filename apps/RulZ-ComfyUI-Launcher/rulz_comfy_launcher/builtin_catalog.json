@@ -1,0 +1,1905 @@
+{
+ "version": "0.45.0",
+ "options": [
+  {
+   "name": "--listen",
+   "flags": [
+    "--listen"
+   ],
+   "dest": "listen",
+   "kind": "optional",
+   "type": "str",
+   "choices": null,
+   "default": "127.0.0.1",
+   "const": "0.0.0.0,::",
+   "metavar": "IP",
+   "help": "Specify the IP address to listen on (default: 127.0.0.1). You can give a list of ip addresses by separating them with a comma like: 127.2.2.2,127.3.3.3 If --listen is provided without an argument, it defaults to 0.0.0.0,:: (listens on all ipv4 and ipv6)",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--port",
+   "flags": [
+    "--port"
+   ],
+   "dest": "port",
+   "kind": "value",
+   "type": "int",
+   "choices": null,
+   "default": 8188,
+   "const": null,
+   "metavar": null,
+   "help": "Set the listen port.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--tls-keyfile",
+   "flags": [
+    "--tls-keyfile"
+   ],
+   "dest": "tls_keyfile",
+   "kind": "value",
+   "type": "str",
+   "choices": null,
+   "default": null,
+   "const": null,
+   "metavar": null,
+   "help": "Path to TLS (SSL) key file. Enables TLS, makes app accessible at https://... requires --tls-certfile to function",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--tls-certfile",
+   "flags": [
+    "--tls-certfile"
+   ],
+   "dest": "tls_certfile",
+   "kind": "value",
+   "type": "str",
+   "choices": null,
+   "default": null,
+   "const": null,
+   "metavar": null,
+   "help": "Path to TLS (SSL) certificate file. Enables TLS, makes app accessible at https://... requires --tls-keyfile to function",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--enable-cors-header",
+   "flags": [
+    "--enable-cors-header"
+   ],
+   "dest": "enable_cors_header",
+   "kind": "optional",
+   "type": "str",
+   "choices": null,
+   "default": null,
+   "const": "*",
+   "metavar": "ORIGIN",
+   "help": "Enable CORS (Cross-Origin Resource Sharing) with optional origin or allow all with default '*'.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--max-upload-size",
+   "flags": [
+    "--max-upload-size"
+   ],
+   "dest": "max_upload_size",
+   "kind": "value",
+   "type": "float",
+   "choices": null,
+   "default": 100,
+   "const": null,
+   "metavar": null,
+   "help": "Set the maximum upload size in MB.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--base-directory",
+   "flags": [
+    "--base-directory"
+   ],
+   "dest": "base_directory",
+   "kind": "value",
+   "type": "str",
+   "choices": null,
+   "default": null,
+   "const": null,
+   "metavar": null,
+   "help": "Set the ComfyUI base directory for models, custom_nodes, input, output, temp, and user directories.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--extra-model-paths-config",
+   "flags": [
+    "--extra-model-paths-config"
+   ],
+   "dest": "extra_model_paths_config",
+   "kind": "multi",
+   "type": "str",
+   "choices": null,
+   "default": null,
+   "const": null,
+   "metavar": "PATH",
+   "help": "Load one or more extra_model_paths.yaml files.",
+   "repeat": true,
+   "min_values": 1
+  },
+  {
+   "name": "--output-directory",
+   "flags": [
+    "--output-directory"
+   ],
+   "dest": "output_directory",
+   "kind": "value",
+   "type": "str",
+   "choices": null,
+   "default": null,
+   "const": null,
+   "metavar": null,
+   "help": "Set the ComfyUI output directory. Overrides --base-directory.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--temp-directory",
+   "flags": [
+    "--temp-directory"
+   ],
+   "dest": "temp_directory",
+   "kind": "value",
+   "type": "str",
+   "choices": null,
+   "default": null,
+   "const": null,
+   "metavar": null,
+   "help": "Set the ComfyUI temp directory (default is in the ComfyUI directory). Overrides --base-directory.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--input-directory",
+   "flags": [
+    "--input-directory"
+   ],
+   "dest": "input_directory",
+   "kind": "value",
+   "type": "str",
+   "choices": null,
+   "default": null,
+   "const": null,
+   "metavar": null,
+   "help": "Set the ComfyUI input directory. Overrides --base-directory.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--previews-directory",
+   "flags": [
+    "--previews-directory"
+   ],
+   "dest": "previews_directory",
+   "kind": "value",
+   "type": "str",
+   "choices": null,
+   "default": null,
+   "const": null,
+   "metavar": null,
+   "help": "Set the directory for generated asset previews. Overrides --base-directory.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--auto-launch",
+   "flags": [
+    "--auto-launch"
+   ],
+   "dest": "auto_launch",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Automatically launch ComfyUI in the default browser.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-auto-launch",
+   "flags": [
+    "--disable-auto-launch"
+   ],
+   "dest": "disable_auto_launch",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Disable auto launching the browser.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--cuda-device",
+   "flags": [
+    "--cuda-device"
+   ],
+   "dest": "cuda_device",
+   "kind": "value",
+   "type": "str",
+   "choices": null,
+   "default": null,
+   "const": null,
+   "metavar": "DEVICE_ID",
+   "help": "Set the ids of cuda devices this instance will use, as a comma-separated list (e.g. '0' or '0,1'), or 'all' to leave all currently visible devices available. All other devices will not be visible.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--default-device",
+   "flags": [
+    "--default-device"
+   ],
+   "dest": "default_device",
+   "kind": "value",
+   "type": "int",
+   "choices": null,
+   "default": null,
+   "const": null,
+   "metavar": "DEFAULT_DEVICE_ID",
+   "help": "Set the id of the default device, all other devices will stay visible.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--cuda-malloc",
+   "flags": [
+    "--cuda-malloc"
+   ],
+   "dest": "cuda_malloc",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Enable cudaMallocAsync (enabled by default for torch 2.0 and up).",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-cuda-malloc",
+   "flags": [
+    "--disable-cuda-malloc"
+   ],
+   "dest": "disable_cuda_malloc",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Disable cudaMallocAsync.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--force-fp32",
+   "flags": [
+    "--force-fp32"
+   ],
+   "dest": "force_fp32",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Force fp32 (If this makes your GPU work better please report it).",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--force-fp16",
+   "flags": [
+    "--force-fp16"
+   ],
+   "dest": "force_fp16",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Force fp16.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--fp32-unet",
+   "flags": [
+    "--fp32-unet"
+   ],
+   "dest": "fp32_unet",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Run the diffusion model in fp32.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--fp64-unet",
+   "flags": [
+    "--fp64-unet"
+   ],
+   "dest": "fp64_unet",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Run the diffusion model in fp64.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--bf16-unet",
+   "flags": [
+    "--bf16-unet"
+   ],
+   "dest": "bf16_unet",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Run the diffusion model in bf16.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--fp16-unet",
+   "flags": [
+    "--fp16-unet"
+   ],
+   "dest": "fp16_unet",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Run the diffusion model in fp16",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--fp8_e4m3fn-unet",
+   "flags": [
+    "--fp8_e4m3fn-unet"
+   ],
+   "dest": "fp8_e4m3fn_unet",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Store unet weights in fp8_e4m3fn.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--fp8_e5m2-unet",
+   "flags": [
+    "--fp8_e5m2-unet"
+   ],
+   "dest": "fp8_e5m2_unet",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Store unet weights in fp8_e5m2.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--fp8_e8m0fnu-unet",
+   "flags": [
+    "--fp8_e8m0fnu-unet"
+   ],
+   "dest": "fp8_e8m0fnu_unet",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Store unet weights in fp8_e8m0fnu.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--fp16-vae",
+   "flags": [
+    "--fp16-vae"
+   ],
+   "dest": "fp16_vae",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Run the VAE in fp16, might cause black images.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--fp32-vae",
+   "flags": [
+    "--fp32-vae"
+   ],
+   "dest": "fp32_vae",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Run the VAE in full precision fp32.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--bf16-vae",
+   "flags": [
+    "--bf16-vae"
+   ],
+   "dest": "bf16_vae",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Run the VAE in bf16.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--cpu-vae",
+   "flags": [
+    "--cpu-vae"
+   ],
+   "dest": "cpu_vae",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Run the VAE on the CPU.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--fp8_e4m3fn-text-enc",
+   "flags": [
+    "--fp8_e4m3fn-text-enc"
+   ],
+   "dest": "fp8_e4m3fn_text_enc",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Store text encoder weights in fp8 (e4m3fn variant).",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--fp8_e5m2-text-enc",
+   "flags": [
+    "--fp8_e5m2-text-enc"
+   ],
+   "dest": "fp8_e5m2_text_enc",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Store text encoder weights in fp8 (e5m2 variant).",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--fp16-text-enc",
+   "flags": [
+    "--fp16-text-enc"
+   ],
+   "dest": "fp16_text_enc",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Store text encoder weights in fp16.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--fp32-text-enc",
+   "flags": [
+    "--fp32-text-enc"
+   ],
+   "dest": "fp32_text_enc",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Store text encoder weights in fp32.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--bf16-text-enc",
+   "flags": [
+    "--bf16-text-enc"
+   ],
+   "dest": "bf16_text_enc",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Store text encoder weights in bf16.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--fp16-intermediates",
+   "flags": [
+    "--fp16-intermediates"
+   ],
+   "dest": "fp16_intermediates",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Experimental: Use fp16 for intermediate tensors between nodes instead of fp32.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--force-channels-last",
+   "flags": [
+    "--force-channels-last"
+   ],
+   "dest": "force_channels_last",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Force channels last format when inferencing the models.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--oneapi-device-selector",
+   "flags": [
+    "--oneapi-device-selector"
+   ],
+   "dest": "oneapi_device_selector",
+   "kind": "value",
+   "type": "str",
+   "choices": null,
+   "default": null,
+   "const": null,
+   "metavar": "SELECTOR_STRING",
+   "help": "Sets the oneAPI device(s) this instance will use.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--supports-fp8-compute",
+   "flags": [
+    "--supports-fp8-compute"
+   ],
+   "dest": "supports_fp8_compute",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "ComfyUI will act like if the device supports fp8 compute.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--enable-triton-backend",
+   "flags": [
+    "--enable-triton-backend"
+   ],
+   "dest": "enable_triton_backend",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "ComfyUI will enable the use of Triton backend in comfy-kitchen. Is disabled at launch by default.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-triton-backend",
+   "flags": [
+    "--disable-triton-backend"
+   ],
+   "dest": "disable_triton_backend",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Force-disable the comfy-kitchen Triton backend, overriding --enable-triton-backend.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--preview-method",
+   "flags": [
+    "--preview-method"
+   ],
+   "dest": "preview_method",
+   "kind": "value",
+   "type": "str",
+   "choices": [
+    "none",
+    "auto",
+    "latent2rgb",
+    "taesd"
+   ],
+   "default": "none",
+   "const": null,
+   "metavar": "[none,auto,latent2rgb,taesd]",
+   "help": "Default preview method for sampler nodes.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--preview-size",
+   "flags": [
+    "--preview-size"
+   ],
+   "dest": "preview_size",
+   "kind": "value",
+   "type": "int",
+   "choices": null,
+   "default": 512,
+   "const": null,
+   "metavar": null,
+   "help": "Sets the maximum preview size for sampler nodes.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--cache-ram",
+   "flags": [
+    "--cache-ram"
+   ],
+   "dest": "cache_ram",
+   "kind": "multi",
+   "type": "float",
+   "choices": null,
+   "default": [],
+   "const": null,
+   "metavar": "GB",
+   "help": "Use RAM pressure caching with the specified headroom thresholds. This is the default caching mode. The first value sets the active-cache threshold; the optional second value sets the inactive-cache/pin threshold. Defaults when no values are provided: active 10% of system RAM (min 2GB, max 10GB), inactive 100% of system RAM (max 128GB).",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--cache-classic",
+   "flags": [
+    "--cache-classic"
+   ],
+   "dest": "cache_classic",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Use the old style (aggressive) caching.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--cache-lru",
+   "flags": [
+    "--cache-lru"
+   ],
+   "dest": "cache_lru",
+   "kind": "value",
+   "type": "int",
+   "choices": null,
+   "default": 0,
+   "const": null,
+   "metavar": null,
+   "help": "Use LRU caching with a maximum of N node results cached. May use more RAM/VRAM.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--cache-none",
+   "flags": [
+    "--cache-none"
+   ],
+   "dest": "cache_none",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Reduced RAM/VRAM usage at the expense of executing every node for each run.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--high-ram",
+   "flags": [
+    "--high-ram"
+   ],
+   "dest": "high_ram",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Can improve performance slightly on high RAM or on systems where pagefile use is preferred over model loading.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--use-split-cross-attention",
+   "flags": [
+    "--use-split-cross-attention"
+   ],
+   "dest": "use_split_cross_attention",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Use the split cross attention optimization. Ignored when xformers is used.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--use-quad-cross-attention",
+   "flags": [
+    "--use-quad-cross-attention"
+   ],
+   "dest": "use_quad_cross_attention",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Use the sub-quadratic cross attention optimization . Ignored when xformers is used.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--use-pytorch-cross-attention",
+   "flags": [
+    "--use-pytorch-cross-attention"
+   ],
+   "dest": "use_pytorch_cross_attention",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Use the new pytorch 2.0 cross attention function.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--use-sage-attention",
+   "flags": [
+    "--use-sage-attention"
+   ],
+   "dest": "use_sage_attention",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Use sage attention.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--use-flash-attention",
+   "flags": [
+    "--use-flash-attention"
+   ],
+   "dest": "use_flash_attention",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Use FlashAttention.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--use-ck-attention",
+   "flags": [
+    "--use-ck-attention"
+   ],
+   "dest": "use_ck_attention",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Use Comfy Kitchen attention.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-xformers",
+   "flags": [
+    "--disable-xformers"
+   ],
+   "dest": "disable_xformers",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Disable xformers.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--force-upcast-attention",
+   "flags": [
+    "--force-upcast-attention"
+   ],
+   "dest": "force_upcast_attention",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Force enable attention upcasting, please report if it fixes black images.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--dont-upcast-attention",
+   "flags": [
+    "--dont-upcast-attention"
+   ],
+   "dest": "dont_upcast_attention",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Disable all upcasting of attention. Should be unnecessary except for debugging.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--enable-manager",
+   "flags": [
+    "--enable-manager"
+   ],
+   "dest": "enable_manager",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Enable the ComfyUI-Manager feature.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--enable-agent",
+   "flags": [
+    "--enable-agent"
+   ],
+   "dest": "enable_agent",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Enable the ComfyUI agent feature.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-manager-ui",
+   "flags": [
+    "--disable-manager-ui"
+   ],
+   "dest": "disable_manager_ui",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Disables only the ComfyUI-Manager UI and endpoints. Scheduled installations and similar background tasks will still operate.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--enable-manager-legacy-ui",
+   "flags": [
+    "--enable-manager-legacy-ui"
+   ],
+   "dest": "enable_manager_legacy_ui",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Enables the legacy UI of ComfyUI-Manager. Implies --enable-manager.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--gpu-only",
+   "flags": [
+    "--gpu-only"
+   ],
+   "dest": "gpu_only",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Store and run everything (text encoders/CLIP models, etc... on the GPU).",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--highvram",
+   "flags": [
+    "--highvram"
+   ],
+   "dest": "highvram",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "By default models will be unloaded to CPU memory after being used. This option keeps them in GPU memory.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--lowvram",
+   "flags": [
+    "--lowvram"
+   ],
+   "dest": "lowvram",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Doesn't do anything if dynamic vram is enabled. If dynamic vram isn't being used this option makes the text encoders run on the CPU.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--novram",
+   "flags": [
+    "--novram"
+   ],
+   "dest": "novram",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "When lowvram isn't enough.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--cpu",
+   "flags": [
+    "--cpu"
+   ],
+   "dest": "cpu",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "To use the CPU for everything (slow).",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--reserve-vram",
+   "flags": [
+    "--reserve-vram"
+   ],
+   "dest": "reserve_vram",
+   "kind": "value",
+   "type": "float",
+   "choices": null,
+   "default": null,
+   "const": null,
+   "metavar": null,
+   "help": "Set the amount of vram in GB you want to reserve for use by your OS/other software. By default some amount is reserved depending on your OS.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--vram-headroom",
+   "flags": [
+    "--vram-headroom"
+   ],
+   "dest": "vram_headroom",
+   "kind": "value",
+   "type": "float",
+   "choices": null,
+   "default": 0,
+   "const": null,
+   "metavar": null,
+   "help": "Set the amount of vram in GB for DynamicVRAM to maintain as extra headroom above default. ComfyUI will try and keep this much VRAM completely free and unused, even counting VRAM from other apps.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-nvml-pressure",
+   "flags": [
+    "--disable-nvml-pressure"
+   ],
+   "dest": "disable_nvml_pressure",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Use CUDA instead of NVML for DynamicVRAM memory pressure.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--async-offload",
+   "flags": [
+    "--async-offload"
+   ],
+   "dest": "async_offload",
+   "kind": "optional",
+   "type": "int",
+   "choices": null,
+   "default": null,
+   "const": 2,
+   "metavar": "NUM_STREAMS",
+   "help": "Use async weight offloading. An optional argument controls the amount of offload streams. Default is 2. Enabled by default on Nvidia.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-async-offload",
+   "flags": [
+    "--disable-async-offload"
+   ],
+   "dest": "disable_async_offload",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Disable async weight offloading.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-dynamic-vram",
+   "flags": [
+    "--disable-dynamic-vram"
+   ],
+   "dest": "disable_dynamic_vram",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Disable dynamic VRAM and use estimate based model loading.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--enable-dynamic-vram",
+   "flags": [
+    "--enable-dynamic-vram"
+   ],
+   "dest": "enable_dynamic_vram",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Enable dynamic VRAM on systems where it's not enabled by default.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--fast-disk",
+   "flags": [
+    "--fast-disk"
+   ],
+   "dest": "fast_disk",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Force disk-backed dynamic loading and offload over unpinned RAM. Can be faster for users with fast NVME disks.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-fast-disk",
+   "flags": [
+    "--disable-fast-disk"
+   ],
+   "dest": "disable_fast_disk",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Disable disk-backed dynamic loading and offload over unpinned RAM. Overrides --fast-disk.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-cuda-graphs",
+   "flags": [
+    "--disable-cuda-graphs"
+   ],
+   "dest": "disable_cuda_graphs",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Disable CUDA graphs.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-comfy-compiler",
+   "flags": [
+    "--disable-comfy-compiler"
+   ],
+   "dest": "disable_comfy_compiler",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Disable the Comfy model compiler, including its CUDA graph subfeature.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--assert-graph-breaks",
+   "flags": [
+    "--assert-graph-breaks"
+   ],
+   "dest": "assert_graph_breaks",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Fail on Comfy model compiler graph breaks.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--force-non-blocking",
+   "flags": [
+    "--force-non-blocking"
+   ],
+   "dest": "force_non_blocking",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Force ComfyUI to use non-blocking operations for all applicable tensors. This may improve performance on some non-Nvidia systems but can cause issues with some workflows.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--default-hashing-function",
+   "flags": [
+    "--default-hashing-function"
+   ],
+   "dest": "default_hashing_function",
+   "kind": "value",
+   "type": "str",
+   "choices": [
+    "md5",
+    "sha1",
+    "sha256",
+    "sha512"
+   ],
+   "default": "sha256",
+   "const": null,
+   "metavar": null,
+   "help": "Allows you to choose the hash function to use for duplicate filename / contents comparison. Default is sha256.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-smart-memory",
+   "flags": [
+    "--disable-smart-memory"
+   ],
+   "dest": "disable_smart_memory",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Force ComfyUI to agressively offload to regular ram instead of keeping models in vram when it can.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--deterministic",
+   "flags": [
+    "--deterministic"
+   ],
+   "dest": "deterministic",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Make pytorch use slower deterministic algorithms when it can. Note that this might not make images deterministic in all cases.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--fast",
+   "flags": [
+    "--fast"
+   ],
+   "dest": "fast",
+   "kind": "multi",
+   "type": "str",
+   "choices": [
+    "fp16_accumulation",
+    "fp8_matrix_mult",
+    "cublas_ops",
+    "autotune"
+   ],
+   "default": null,
+   "const": null,
+   "metavar": null,
+   "help": "Enable some untested and potentially quality deteriorating optimizations. This is used to test new features so using it might crash your comfyui. --fast with no arguments enables everything. You can pass a list specific optimizations if you only want to enable specific ones. Current valid optimizations: fp16_accumulation fp8_matrix_mult cublas_ops autotune",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--debug-hang",
+   "flags": [
+    "--debug-hang"
+   ],
+   "dest": "debug_hang",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Enable stack trace dumps on Ctrl-C for debugging hangs.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-pinned-memory",
+   "flags": [
+    "--disable-pinned-memory"
+   ],
+   "dest": "disable_pinned_memory",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Disable pinned memory use.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--mmap-torch-files",
+   "flags": [
+    "--mmap-torch-files"
+   ],
+   "dest": "mmap_torch_files",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Use mmap when loading ckpt/pt files.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-mmap",
+   "flags": [
+    "--disable-mmap"
+   ],
+   "dest": "disable_mmap",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Don't use mmap when loading safetensors.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--dont-print-server",
+   "flags": [
+    "--dont-print-server"
+   ],
+   "dest": "dont_print_server",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Don't print server output.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-product-tips",
+   "flags": [
+    "--disable-product-tips"
+   ],
+   "dest": "disable_product_tips",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Hide console tips about new products from Comfy-Org. Same as setting the env var COMFYUI_DISABLE_PRODUCT_TIPS=1.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--quick-test-for-ci",
+   "flags": [
+    "--quick-test-for-ci"
+   ],
+   "dest": "quick_test_for_ci",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Quick test for CI.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--windows-standalone-build",
+   "flags": [
+    "--windows-standalone-build"
+   ],
+   "dest": "windows_standalone_build",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Windows standalone build: Enable convenient things that most people using the standalone windows build will probably enjoy (like auto opening the page on startup and turning on the assets system; --disable-assets turns it off).",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-metadata",
+   "flags": [
+    "--disable-metadata"
+   ],
+   "dest": "disable_metadata",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Disable saving prompt metadata in files.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-all-custom-nodes",
+   "flags": [
+    "--disable-all-custom-nodes"
+   ],
+   "dest": "disable_all_custom_nodes",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Disable loading all custom nodes.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--whitelist-custom-nodes",
+   "flags": [
+    "--whitelist-custom-nodes"
+   ],
+   "dest": "whitelist_custom_nodes",
+   "kind": "multi",
+   "type": "str",
+   "choices": null,
+   "default": [],
+   "const": null,
+   "metavar": null,
+   "help": "Specify custom node folders to load even when --disable-all-custom-nodes is enabled.",
+   "repeat": false,
+   "min_values": 1
+  },
+  {
+   "name": "--disabled-nodes-config",
+   "flags": [
+    "--disabled-nodes-config"
+   ],
+   "dest": "disabled_nodes_config",
+   "kind": "value",
+   "type": "str",
+   "choices": null,
+   "default": null,
+   "const": null,
+   "metavar": "PATH",
+   "help": "Path to a YAML file listing node IDs to disable.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-partner-nodes",
+   "flags": [
+    "--disable-partner-nodes"
+   ],
+   "dest": "disable_partner_nodes",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Disable loading partner nodes (the paid API nodes). The frontend keeps its internet access.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--offline",
+   "flags": [
+    "--offline"
+   ],
+   "dest": "offline",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Prevent the frontend from communicating with the internet by setting a restrictive Content-Security-Policy header. Also disables partner nodes.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-api-nodes",
+   "flags": [
+    "--disable-api-nodes"
+   ],
+   "dest": "disable_api_nodes",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Deprecated alias for --offline. Use --offline, or --disable-partner-nodes to only disable partner nodes.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--multi-user",
+   "flags": [
+    "--multi-user"
+   ],
+   "dest": "multi_user",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Enables per-user storage.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--verbose",
+   "flags": [
+    "--verbose"
+   ],
+   "dest": "verbose",
+   "kind": "multi",
+   "type": "str",
+   "choices": null,
+   "default": [],
+   "const": null,
+   "metavar": "LEVEL FILE",
+   "help": "Set console logging with no values or LEVEL, or add a LEVEL FILE log output. May be repeated.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--log-stdout",
+   "flags": [
+    "--log-stdout"
+   ],
+   "dest": "log_stdout",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Send normal process output to stdout instead of stderr (default).",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--front-end-version",
+   "flags": [
+    "--front-end-version"
+   ],
+   "dest": "front_end_version",
+   "kind": "value",
+   "type": "str",
+   "choices": null,
+   "default": "comfyanonymous/ComfyUI@latest",
+   "const": null,
+   "metavar": null,
+   "help": "Specifies the version of the frontend to be used. This command needs internet connectivity to query and download available frontend implementations from GitHub releases. The version string should be in the format of: [repoOwner]/[repoName]@[version] where version is one of: \"latest\" or a valid version number (e.g. \"1.0.0\")",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--front-end-root",
+   "flags": [
+    "--front-end-root"
+   ],
+   "dest": "front_end_root",
+   "kind": "value",
+   "type": "path",
+   "choices": null,
+   "default": null,
+   "const": null,
+   "metavar": null,
+   "help": "The local filesystem path to the directory where the frontend is located. Overrides --front-end-version.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--user-directory",
+   "flags": [
+    "--user-directory"
+   ],
+   "dest": "user_directory",
+   "kind": "value",
+   "type": "path",
+   "choices": null,
+   "default": null,
+   "const": null,
+   "metavar": null,
+   "help": "Set the ComfyUI user directory with an absolute path. Overrides --base-directory.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--models-directory",
+   "flags": [
+    "--models-directory"
+   ],
+   "dest": "models_directory",
+   "kind": "value",
+   "type": "path",
+   "choices": null,
+   "default": null,
+   "const": null,
+   "metavar": null,
+   "help": "Set the ComfyUI models directory. Overrides the models folder in --base-directory.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--enable-compress-response-body",
+   "flags": [
+    "--enable-compress-response-body"
+   ],
+   "dest": "enable_compress_response_body",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Enable compressing response body.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--comfy-api-base",
+   "flags": [
+    "--comfy-api-base"
+   ],
+   "dest": "comfy_api_base",
+   "kind": "value",
+   "type": "str",
+   "choices": null,
+   "default": "https://api.comfy.org",
+   "const": null,
+   "metavar": null,
+   "help": "Set the base URL for the ComfyUI API. (default: https://api.comfy.org)",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--database-url",
+   "flags": [
+    "--database-url"
+   ],
+   "dest": "database_url",
+   "kind": "value",
+   "type": "str",
+   "choices": null,
+   "default": null,
+   "const": null,
+   "metavar": null,
+   "help": "Specify the database URL, e.g. for an in-memory database you can use 'sqlite:///:memory:'. Defaults to 'comfyui.db' in the effective user directory.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--enable-assets",
+   "flags": [
+    "--enable-assets"
+   ],
+   "dest": "enable_assets",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Enable the assets system (API routes, database synchronization, and background scanning). Off by default.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--disable-assets",
+   "flags": [
+    "--disable-assets"
+   ],
+   "dest": "disable_assets",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Disable the assets system, even when --enable-assets is also given.",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--enable-asset-hashing",
+   "flags": [
+    "--enable-asset-hashing"
+   ],
+   "dest": "enable_asset_hashing",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Compute blake3 content hashes when scanning assets. Files uploaded through the API are hashed either way. Hashing enables future asset-portability features (deduplication, cross-machine model resolution) but adds startup cost and per-output cost on large models directories. Off by default; enable to opt in. Requires the assets system (--enable-assets or --windows-standalone-build).",
+   "repeat": false,
+   "min_values": 0
+  },
+  {
+   "name": "--feature-flag",
+   "flags": [
+    "--feature-flag"
+   ],
+   "dest": "feature_flag",
+   "kind": "value",
+   "type": "str",
+   "choices": null,
+   "default": [],
+   "const": null,
+   "metavar": "KEY[=VALUE]",
+   "help": "Set a server feature flag. Use KEY=VALUE to set an explicit value, or bare KEY to set it to true. Can be specified multiple times. Boolean values (true/false) and numbers are auto-converted. Examples: --feature-flag show_signin_button=true or --feature-flag show_signin_button",
+   "repeat": true,
+   "min_values": 0
+  },
+  {
+   "name": "--list-feature-flags",
+   "flags": [
+    "--list-feature-flags"
+   ],
+   "dest": "list_feature_flags",
+   "kind": "flag",
+   "type": "str",
+   "choices": null,
+   "default": false,
+   "const": true,
+   "metavar": null,
+   "help": "Print the registry of known CLI-settable feature flags as JSON and exit.",
+   "repeat": false,
+   "min_values": 0
+  }
+ ],
+ "groups": [
+  [
+   "--cuda-malloc",
+   "--disable-cuda-malloc"
+  ],
+  [
+   "--force-fp32",
+   "--force-fp16"
+  ],
+  [
+   "--fp32-unet",
+   "--fp64-unet",
+   "--bf16-unet",
+   "--fp16-unet",
+   "--fp8_e4m3fn-unet",
+   "--fp8_e5m2-unet",
+   "--fp8_e8m0fnu-unet"
+  ],
+  [
+   "--fp16-vae",
+   "--fp32-vae",
+   "--bf16-vae"
+  ],
+  [
+   "--fp8_e4m3fn-text-enc",
+   "--fp8_e5m2-text-enc",
+   "--fp16-text-enc",
+   "--fp32-text-enc",
+   "--bf16-text-enc"
+  ],
+  [
+   "--cache-ram",
+   "--cache-classic",
+   "--cache-lru",
+   "--cache-none",
+   "--high-ram"
+  ],
+  [
+   "--use-split-cross-attention",
+   "--use-quad-cross-attention",
+   "--use-pytorch-cross-attention",
+   "--use-sage-attention",
+   "--use-flash-attention",
+   "--use-ck-attention"
+  ],
+  [
+   "--force-upcast-attention",
+   "--dont-upcast-attention"
+  ],
+  [
+   "--disable-manager-ui",
+   "--enable-manager-legacy-ui"
+  ],
+  [
+   "--gpu-only",
+   "--highvram",
+   "--lowvram",
+   "--novram",
+   "--cpu"
+  ]
+ ]
+}
