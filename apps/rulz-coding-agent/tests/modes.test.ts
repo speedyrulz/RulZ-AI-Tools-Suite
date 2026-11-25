@@ -261,7 +261,8 @@ describe('rentals in the model list', () => {
 
   it('a model list entry that is a rental now wins over an old "was a rental" flag', () => {
     expect(chooseModel('gemma', true, [local('gemma')])).toEqual({ ok: true, model: 'gemma', rental: false })
-    expect(chooseModel('gemma', false, [rented('gemma')])).toEqual({ ok: true, model: 'gemma', rental: true })
+    // Chosen as a local model and on a rental now: not used there until the owner chooses it again.
+    expect(chooseModel('gemma', false, [rented('gemma'), local('other')])).toMatchObject({ ok: false, reason: expect.stringContaining('Choose it again') })
   })
 })
 
@@ -459,6 +460,20 @@ describe('what the window and the phone may do to a model\'s settings', () => {
     await admin.setLoadSettings('local', null, 're')
     expect(client.setLoadSettings).toHaveBeenLastCalledWith('local', null, 're')
     expect(refreshed).toHaveBeenCalledTimes(3)
+  })
+
+  it('lets only a model id and a known mode into an address', async () => {
+    const { client, admin } = make()
+    const bad = '../../unload' as never
+    await expect(admin.loadSettings('local', bad)).rejects.toThrow(/Unknown mode/)
+    await expect(admin.previewLoadSettings('local', {}, bad)).rejects.toThrow(/Unknown mode/)
+    await expect(admin.setLoadSettings('local', {}, bad)).rejects.toThrow(/Unknown mode/)
+    await expect(admin.reloadMode('local', bad)).rejects.toThrow(/Unknown mode/)
+    await expect(admin.reloadMode('local', undefined as never)).rejects.toThrow(/Unknown mode/)
+    await expect(admin.modes('..')).rejects.toThrow(/not a model/)
+    await expect(admin.loadSettings(7 as never)).rejects.toThrow(/not a model/)
+    expect(client.loadSettings).not.toHaveBeenCalled()
+    expect(client.reloadMode).not.toHaveBeenCalled()
   })
 
   it('refuses a reload and a save while a task or batch run goes', async () => {

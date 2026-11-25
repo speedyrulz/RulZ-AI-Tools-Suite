@@ -316,7 +316,7 @@ export class RulzClient {
 
   private async loadConfigRequest(model: string, method: 'GET' | 'POST', body?: unknown, mode?: AgentMode): Promise<ModelLoadInfo> {
     const { url, apiKey } = this.config()
-    const res = await fetch(`${url}/v1/models/${encodeURIComponent(model)}${mode ? `/modes/${mode}` : ''}/load-config`, {
+    const res = await fetch(`${url}/v1/models/${encodeURIComponent(model)}${mode ? `/modes/${encodeURIComponent(mode)}` : ''}/load-config`, {
       method,
       headers: headers(apiKey, !!body),
       body: body ? JSON.stringify(body) : undefined,

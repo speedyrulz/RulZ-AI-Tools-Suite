@@ -101,7 +101,7 @@ function ModelSheet({ open, onOpenChange, current }: { open: boolean; onOpenChan
             disabled={running}
             onClick={() => {
               onOpenChange(false)
-              if (m.id !== current) void update({ model: m.id })
+              if (m.id !== current || m.rental) void update({ model: m.id })
             }}
           >
             <Check size={18} className={m.id === current ? 'text-accent' : 'invisible'} />
@@ -155,7 +155,7 @@ function ModelLine() {
       <button aria-label="Change the AI model" className="flex max-w-full min-w-0 items-center gap-1.5 text-left text-[12px] text-faint" onClick={() => setOpen(true)}>
         {dot}
         <span className="truncate">{id ? modelLabel(id) : 'No model'}</span>
-        {gone ? <span className="shrink-0">· not on a rental now</span> : model?.rental && <span className="shrink-0">· {model.rental.reconnecting ? 'rental reconnecting' : 'on a rental'}</span>}
+        {gone ? <span className="shrink-0">· {model ? 'choose it again' : 'not on a rental now'}</span> : model?.rental && <span className="shrink-0">· {model.rental.reconnecting ? 'rental reconnecting' : 'on a rental'}</span>}
         <ChevronDown size={12} className="shrink-0" />
         {pct !== null && (
           <span className={cn('shrink-0', pct >= 85 ? 'text-danger' : pct >= 60 && 'text-warn')}>

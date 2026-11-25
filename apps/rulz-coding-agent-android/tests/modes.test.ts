@@ -241,6 +241,7 @@ describe('a chosen rental that is gone', () => {
     expect(chosenRentalGone(settings('vast/qwen', true), conn([info('local')]))).toMatch(/is not loaded on a rental now/)
     expect(chosenRentalGone(settings('vast/qwen', true), conn([info('vast/qwen', { label: null, reconnecting: false })]))).toBeNull()
     expect(chosenRentalGone(settings('local-gone', false), conn([info('local')]))).toBeNull()
+    expect(chosenRentalGone(settings('moved', false), conn([info('moved', { label: null, reconnecting: false })]))).toMatch(/Choose it again/)
     expect(chosenRentalGone(settings('vast/qwen', true), conn([info('local')], 'unreachable' as ConnectionInfo['status']))).toBeNull()
     expect(chosenRentalGone(settings('', true), conn([info('local')]))).toBeNull()
   })

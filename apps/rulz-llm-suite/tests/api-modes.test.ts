@@ -256,6 +256,11 @@ describe('GET /v1/models/{id}/modes', () => {
   it('is refused from a web page, and a rental\'s model that is not loaded is not found', async () => {
     const t = await setup()
     const origin = { Origin: 'https://example.com' }
+    // DNS rebinding: a page's own name that points here.
+    expect((await call(t.port, 'GET', `/v1/models/${enc(LOCAL.id)}/modes`, undefined, { Host: 'evil.example.com:1234' })).status).toBe(403)
+    for (const Host of ['localhost:1234', '127.0.0.1:1234', '[::1]:1234', 'my-pc:1234', '100.88.1.2:1234', 'my-pc.tail1.ts.net']) {
+      expect((await call(t.port, 'GET', `/v1/models/${enc(LOCAL.id)}/modes`, undefined, { Host })).status).toBe(200)
+    }
     expect((await call(t.port, 'GET', `/v1/models/${enc(LOCAL.id)}/modes`, undefined, { Origin: '' })).status).toBe(403)
     expect((await call(t.port, 'GET', `/v1/models/${enc(LOCAL.id)}/modes`, undefined, origin)).status).toBe(403)
     expect((await call(t.port, 'POST', `/v1/models/${enc(LOCAL.id)}/reload`, { mode: 'coding' }, origin)).status).toBe(403)

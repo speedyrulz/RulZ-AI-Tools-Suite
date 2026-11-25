@@ -149,12 +149,6 @@ async function main(): Promise<void> {
     const changed = JSON.stringify(next) !== JSON.stringify(connection)
     connection = next
     if (changed) broadcast('server:changed', connection)
-    // The chosen model turns out to be a rental's (chosen before this was kept track of): remembered, so that another
-    // model is never used in its place once it is gone.
-    const chosen = settings.get().model
-    if (chosen && !settings.get().modelRental && next.models.some((m) => m.id === chosen && m.rental)) {
-      void settings.update({ modelRental: true }).catch(() => undefined)
-    }
     if (next.status === 'connected' && next.url !== settings.get().lastServerUrl) void settings.update({ lastServerUrl: next.url })
   }
   let connecting: Promise<ConnectionInfo> | null = null

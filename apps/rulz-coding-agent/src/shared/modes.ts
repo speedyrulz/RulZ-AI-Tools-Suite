@@ -36,6 +36,9 @@ export const shortModelName = (id: string): string => (id.split(/[\\/]/).pop() ?
 export const rentalGoneMessage = (id: string): string =>
   `${shortModelName(id)} is not loaded on a rental now. Load it on LLM Suite's vast.ai page, or choose another model.`
 
+export const rentalChooseAgainMessage = (id: string): string =>
+  `${shortModelName(id)} runs on a rented computer now. Choose it again from the model list to use it there, or choose another model.`
+
 export const RENTAL_NOTE =
   'This model runs on a rented computer. Your messages, the PDFs you attach, the files it reads and what its tools return are sent to that computer.'
 
@@ -56,13 +59,15 @@ export type ModelChoice = { ok: true; model: string; rental: boolean } | { ok: f
 
 /**
  * The model a task uses. The chosen one when the list has it (`rental` says whether it runs on a
- * rental). A chosen model that is gone from the list is replaced by the default pick only when it was
+ * rental); when it runs on a rental but was not one when it was chosen, the owner has not agreed to that and
+ * chooses it again. A chosen model that is gone from the list is replaced by the default pick only when it was
  * a local one; one that was on a rental is never swapped for another model behind the owner's back.
  * Without a list (RulZ LLM Suite not reachable) the chosen model is used and counts as local.
  */
 export function chooseModel(chosen: string, chosenWasRental: boolean, models: ModelInfo[]): ModelChoice {
   if (chosen) {
     const info = models.find((m) => m.id === chosen)
+    if (info?.rental && !chosenWasRental) return { ok: false, reason: rentalChooseAgainMessage(chosen) }
     if (info) return { ok: true, model: chosen, rental: !!info.rental }
     if (!models.length) return { ok: true, model: chosen, rental: false }
     if (chosenWasRental) return { ok: false, reason: rentalGoneMessage(chosen) }

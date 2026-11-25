@@ -19,7 +19,9 @@ export function openingSettingsFor(modes: ModelModes | null | undefined): AgentM
 export function chosenRentalGone(settings: AppSettings | null, connection: ConnectionInfo): string | null {
   if (connection.status !== 'connected' || !settings?.model) return null
   const c = chooseModel(settings.model, settings.modelRental === true, connection.models)
-  return !c.ok && settings.modelRental === true && !connection.models.some((m) => m.id === settings.model) ? c.reason : null
+  if (c.ok) return null
+  const listed = connection.models.find((m) => m.id === settings.model)
+  return listed ? (listed.rental ? c.reason : null) : settings.modelRental === true ? c.reason : null
 }
 
 /**

@@ -232,7 +232,7 @@ function ModelChip() {
     status = 'Not connected'
   } else if (gone) {
     dot = <span className="size-2 shrink-0 rounded-full bg-danger" />
-    status = 'Not on a rental now'
+    status = model ? 'Choose it again' : 'Not on a rental now'
   } else if (model?.rental) {
     dot = <span className="size-2 shrink-0 rounded-full bg-warn" />
     status = model.rental.reconnecting ? 'Rental reconnecting…' : 'Ready on a rental'

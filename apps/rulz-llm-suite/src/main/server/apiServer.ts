@@ -308,7 +308,8 @@ export class ApiServer {
     // The mode routes carry system prompts and change load settings: only other apps may call them, never a web page
     // (CORS may be on), and a POST must be JSON, which a plain form cannot send.
     const modeRoute = this.deps.modes ? parseModeRoute(method, path) : null
-    if (modeRoute && req.headers.origin !== undefined) return fail(403, 'Mode calls cannot come from a web page.', 'permission_error')
+    // A page that points its own name at this computer (DNS rebinding) sends no Origin with a GET; its Host gives it away.
+    if (modeRoute && (req.headers.origin !== undefined || !ownHost(req.headers.host))) return fail(403, 'Mode calls cannot come from a web page.', 'permission_error')
     if (modeRoute && method === 'POST' && !/^application\/json\b/i.test(String(req.headers['content-type'] ?? ''))) {
       return fail(415, 'Send the request as application/json.', 'invalid_request_error')
     }
@@ -987,6 +988,13 @@ export class ApiServer {
 function headerValue(req: IncomingMessage, name: string): string | undefined {
   const v = req.headers[name]
   return typeof v === 'string' ? v.trim() : undefined
+}
+
+/** A Host that means this computer or a local network name, not a name on the internet a web page could point here. */
+export function ownHost(host: string | undefined): boolean {
+  const name = (host ?? '').trim().toLowerCase().replace(/:\d+$/, '').replace(/\.$/, '')
+  if (!name || name.startsWith('[') || !name.includes('.')) return true
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(name) || /\.(local|localhost|lan|home|internal|ts\.net)$/.test(name)
 }
 
 /** Why the API server won't load, unload or change a model that runs on a rented vast.ai instance. */

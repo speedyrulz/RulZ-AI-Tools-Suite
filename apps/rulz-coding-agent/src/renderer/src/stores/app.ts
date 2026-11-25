@@ -90,9 +90,11 @@ export function activeModelId(settings: AppSettings | null, connection: Connecti
   return c.ok ? c.model : chosen
 }
 
-/** The sentence for a chosen model that ran on a rental and is not in the list now, or null. */
+/** The sentence for a chosen model that ran on a rental and is not in the list now, or that runs on one the owner has not chosen it for; else null. */
 export function chosenRentalGone(settings: AppSettings | null, connection: ConnectionInfo): string | null {
   if (connection.status !== 'connected' || !settings?.model) return null
   const c = chooseModel(settings.model, settings.modelRental, connection.models)
-  return !c.ok && settings.modelRental && !connection.models.some((m) => m.id === settings.model) ? c.reason : null
+  if (c.ok) return null
+  const listed = connection.models.find((m) => m.id === settings.model)
+  return listed ? (listed.rental ? c.reason : null) : settings.modelRental ? c.reason : null
 }

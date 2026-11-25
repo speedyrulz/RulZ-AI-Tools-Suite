@@ -21,13 +21,23 @@ export function modelAdmin(deps: ModelAdminDeps) {
   const refuseRental = (model: string): void => {
     if (rented(model)) throw new Error(RENTAL_SETTINGS_REFUSAL)
   }
+  /** The phone sends what it likes: only a model id and one of the two modes go into an address. */
+  const check = (model: unknown, mode?: unknown): void => {
+    if (typeof model !== 'string' || !model || model === '.' || model === '..') throw new Error('That is not a model.')
+    if (mode !== undefined && mode !== null && mode !== 'coding' && mode !== 're') throw new Error('Unknown mode: only coding and re are available.')
+  }
   return {
-    loadSettings: (model: string, mode?: AgentMode): Promise<ModelLoadInfo> => deps.client.loadSettings(model, mode),
+    async loadSettings(model: string, mode?: AgentMode): Promise<ModelLoadInfo> {
+      check(model, mode)
+      return deps.client.loadSettings(model, mode)
+    },
     previewLoadSettings: async (model: string, config: Partial<LoadSettings>, mode?: AgentMode): Promise<ModelLoadInfo> => {
+      check(model, mode)
       refuseRental(model)
       return deps.client.previewLoadSettings(model, config, mode)
     },
     async setLoadSettings(model: string, config: Partial<LoadSettings> | null, mode?: AgentMode): Promise<ModelLoadInfo> {
+      check(model, mode)
       // Restarting the model would cut off the answer it is writing.
       deps.assertIdle('change the load settings')
       refuseRental(model)
@@ -36,8 +46,12 @@ export function modelAdmin(deps: ModelAdminDeps) {
       return info
     },
     /** null: a RulZ LLM Suite older than 0.35. */
-    modes: (model: string): Promise<ModelModes | null> => deps.client.modelModes(model),
+    async modes(model: string): Promise<ModelModes | null> {
+      check(model)
+      return deps.client.modelModes(model)
+    },
     async reloadMode(model: string, mode: AgentMode): Promise<ModelModes> {
+      check(model, mode ?? '')
       deps.assertIdle('reload the model')
       refuseRental(model)
       const modes = await deps.client.reloadMode(model, mode)
