@@ -4,7 +4,7 @@
 import { DEFAULT_SAMPLING } from './defaults'
 import { FICTION_SAMPLING } from './novelPrompts'
 import { reSampling } from './re'
-import type { LoadConfig, SamplingParams } from './types'
+import type { LoadConfig, ModelSampling, SamplingParams } from './types'
 
 export type AppMode = 'chat' | 're' | 'adventure' | 'writing'
 
@@ -38,9 +38,13 @@ export function modeDefaultsEmpty(d: ModeDefaults | null | undefined): boolean {
   return !d || (!d.load && !d.sampling && !d.systemPrompt.trim())
 }
 
-/** The load settings a model gets in a mode: its own for that mode, else the model's default ones. */
+/**
+ * The load settings a model gets in a mode: its own for that mode, else the model's default ones. The sampling that
+ * only the API server uses always comes from the default ones, so a mode's copy of it is never used.
+ */
 export function modeLoad(base: LoadConfig, modes: ModelModeDefaults | undefined, mode: AppMode | undefined): LoadConfig {
-  return (mode && modes?.[mode]?.load) || base
+  const own = mode && modes?.[mode]?.load
+  return own ? { ...own, sampling: base.sampling } : base
 }
 
 /** The sampling a mode starts from when the model sets none for it. */
@@ -91,13 +95,67 @@ export function sameLoad(a: LoadConfig, b: LoadConfig): boolean {
 }
 
 /**
+ * Whether a running load is what a mode's own load settings give: the effective settings, or the stored ones as they
+ * are (a model loaded before the API sampling stopped being a mode's own, with leftover values in it).
+ */
+export function matchesModeLoad(running: LoadConfig, base: LoadConfig, modes: ModelModeDefaults | undefined, mode: AppMode): boolean {
+  const own = modes?.[mode]?.load
+  return !!own && (sameLoad(running, modeLoad(base, modes, mode)) || sameLoad(running, own))
+}
+
+/**
  * The settings to offer a reload with when a model that runs with `running` is used in `mode`; null = no offer.
  * Only for models with load settings for some mode. A model loaded by hand with settings of its own is left alone in
  * a mode that has none, unless it runs with another mode's settings.
  */
 export function reloadFor(running: LoadConfig, base: LoadConfig, modes: ModelModeDefaults | undefined, mode: AppMode): LoadConfig | null {
   const wanted = modeLoad(base, modes, mode)
-  if (sameLoad(running, wanted)) return null
+  if (sameLoad(running, wanted) || matchesModeLoad(running, base, modes, mode)) return null
   if (modes?.[mode]?.load) return wanted
-  return APP_MODES.some((m) => modes?.[m]?.load && sameLoad(running, modes[m].load)) ? wanted : null
+  return APP_MODES.some((m) => matchesModeLoad(running, base, modes, m)) ? wanted : null
+}
+
+/** Sampling keys a mode's load (ModelSampling) and a mode's own sampling (SamplingParams) both have. */
+export const SHARED_SAMPLING_KEYS = [
+  'temperature',
+  'topK',
+  'topP',
+  'minP',
+  'repeatPenalty',
+  'presencePenalty',
+  'dryMultiplier',
+  'dryBase',
+  'dryAllowedLength',
+  'dryPenaltyLastN',
+  'drySequenceBreakers',
+  'xtcProbability',
+  'xtcThreshold'
+] as const satisfies readonly (keyof ModelSampling & keyof SamplingParams)[]
+
+export type SharedSamplingKey = (typeof SHARED_SAMPLING_KEYS)[number]
+
+/** The values of an API-server sampling that are set. */
+export type LeftoverSampling = Partial<Pick<SamplingParams, SharedSamplingKey>>
+
+/**
+ * Sampling values stored in a mode's own load settings that only the API server used: every value that is set, when at
+ * least one differs from the model's default load settings. null = nothing to adopt.
+ */
+export function leftoverSampling(own: LoadConfig | null | undefined, base: LoadConfig): LeftoverSampling | null {
+  const s = own?.sampling
+  if (!s) return null
+  const out: Record<string, unknown> = {}
+  let differs = false
+  for (const k of SHARED_SAMPLING_KEYS) {
+    const v = s[k]
+    if (v === null || v === undefined) continue
+    out[k] = Array.isArray(v) ? [...v] : v
+    if (stable(v) !== stable(base.sampling[k])) differs = true
+  }
+  return differs ? (out as LeftoverSampling) : null
+}
+
+/** A mode's own sampling that starts from its built-in one with these values on top. */
+export function adoptSampling(mode: AppMode, appDefault: SamplingParams, leftover: LeftoverSampling): SamplingParams {
+  return { ...structuredClone(builtInSampling(mode, appDefault)), ...structuredClone(leftover), jsonSchema: '' }
 }

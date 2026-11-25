@@ -29,11 +29,14 @@ export function LoadSettingsForm({
   config,
   onChange,
   estimate,
-  remote
+  remote,
+  hideApiSampling
 }: {
   model: ModelEntry | null
   config: LoadConfig
   onChange: (c: LoadConfig) => void
+  /** Leaves the API server sampling out: for the load settings of one mode, which never use it (the default ones do). */
+  hideApiSampling?: boolean
   /** Shown next to each GPU's split slider. */
   estimate?: MemoryEstimate | null
   /** A model that runs on a vast.ai rental: the settings that name this PC's GPUs, threads, memory lock and template file are left out. */
@@ -318,49 +321,51 @@ export function LoadSettingsForm({
 
       {model && !remote && <AdapterPicker model={model} adapters={config.adapters ?? []} onChange={(a) => set('adapters', a)} />}
 
-      <Collapsible.Root open={samplingOpen} onOpenChange={setSamplingOpen}>
-        <Collapsible.Trigger className="flex items-center gap-1 text-xs font-medium text-muted hover:text-text">
-          <ChevronRight size={14} className={samplingOpen ? 'rotate-90 transition-transform' : 'transition-transform'} />
-          Sampling defaults{samplingSet > 0 && <span className="text-faint"> · {samplingSet} set{config.sampling.override ? ', override' : ''}</span>}
-        </Collapsible.Trigger>
-        <Collapsible.Content className="mt-3 space-y-1">
-          <p className="pb-1 text-[11px] text-faint">
-            Used by programs that reach this model through the API server, when a request leaves a value out. Empty = llama.cpp's
-            default. The chat in this app uses its own sampling settings.
-          </p>
-          {SAMPLING_FIELDS.map((f) => (
-            <Field key={f.key} inline label={f.label} hint={f.hint}>
-              <NumberInput
-                value={config.sampling[f.key]}
-                placeholder={f.placeholder}
-                min={f.min}
-                max={f.max}
-                step={f.step}
-                onChange={(v) => setSampling(f.key, v === null ? null : Math.max(f.min, Math.min(f.max, f.integer ? Math.round(v) : v)))}
+      {!hideApiSampling && (
+        <Collapsible.Root open={samplingOpen} onOpenChange={setSamplingOpen}>
+          <Collapsible.Trigger className="flex items-center gap-1 text-xs font-medium text-muted hover:text-text">
+            <ChevronRight size={14} className={samplingOpen ? 'rotate-90 transition-transform' : 'transition-transform'} />
+            API server sampling{samplingSet > 0 && <span className="text-faint"> · {samplingSet} set{config.sampling.override ? ', override' : ''}</span>}
+          </Collapsible.Trigger>
+          <Collapsible.Content className="mt-3 space-y-1">
+            <p className="pb-1 text-[11px] text-faint">
+              Used by programs that reach this model through the API server, when a request leaves a value out. Empty = llama.cpp's
+              default. Chats and the app's modes use their own sampling settings, not these.
+            </p>
+            {SAMPLING_FIELDS.map((f) => (
+              <Field key={f.key} inline label={f.label} hint={f.hint}>
+                <NumberInput
+                  value={config.sampling[f.key]}
+                  placeholder={f.placeholder}
+                  min={f.min}
+                  max={f.max}
+                  step={f.step}
+                  onChange={(v) => setSampling(f.key, v === null ? null : Math.max(f.min, Math.min(f.max, f.integer ? Math.round(v) : v)))}
+                />
+              </Field>
+            ))}
+            <Field label="DRY sequence breakers" hint="One per line; empty = llama.cpp's own. Names added here are never penalised by DRY. Write a newline as \n">
+              <Textarea
+                rows={2}
+                className="font-mono text-xs"
+                placeholder={'\\n\n:\n"\n*'}
+                defaultValue={breakersToText(config.sampling.drySequenceBreakers ?? [])}
+                onBlur={(e) => {
+                  const list = textToBreakers(e.target.value)
+                  setSampling('drySequenceBreakers', list.length ? list : null)
+                }}
               />
             </Field>
-          ))}
-          <Field label="DRY sequence breakers" hint="One per line; empty = llama.cpp's own. Names added here are never penalised by DRY. Write a newline as \n">
-            <Textarea
-              rows={2}
-              className="font-mono text-xs"
-              placeholder={'\\n\n:\n"\n*'}
-              defaultValue={breakersToText(config.sampling.drySequenceBreakers ?? [])}
-              onBlur={(e) => {
-                const list = textToBreakers(e.target.value)
-                setSampling('drySequenceBreakers', list.length ? list : null)
-              }}
-            />
-          </Field>
-          <Field
-            inline
-            label="Override what programs send"
-            hint="Use the values above even when a request sets its own, e.g. Claude Code's temperature. Empty values still keep the request's"
-          >
-            <Switch checked={config.sampling.override} onCheckedChange={(v) => setSampling('override', v)} />
-          </Field>
-        </Collapsible.Content>
-      </Collapsible.Root>
+            <Field
+              inline
+              label="Override what programs send"
+              hint="Use the values above even when a request sets its own, e.g. Claude Code's temperature. Empty values still keep the request's"
+            >
+              <Switch checked={config.sampling.override} onCheckedChange={(v) => setSampling('override', v)} />
+            </Field>
+          </Collapsible.Content>
+        </Collapsible.Root>
+      )}
 
       <Collapsible.Root open={advanced} onOpenChange={setAdvanced}>
         <Collapsible.Trigger className="flex items-center gap-1 text-xs font-medium text-muted hover:text-text">

@@ -2,12 +2,12 @@ import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { Cloud, Eye, RotateCcw, Search, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
-import { APP_MODES, MODE_LABELS, modeDefaultsEmpty } from '@shared/modes'
-import type { LoadConfig, ModelEntry } from '@shared/types'
+import { APP_MODES, leftoverSampling, MODE_LABELS, modeDefaultsEmpty } from '@shared/modes'
+import type { LoadConfig, ModelEntry, SamplingParams } from '@shared/types'
 import { toast } from 'sonner'
 import { errorMessage, invoke } from '../../lib/api'
 import { cn, formatBytes } from '../../lib/format'
-import { modesFor, pickerScope, scopeFromValue, scopeLoad, scopeValue, startLoad, startScope, withModeLoad, type PickerScope } from '../../lib/modes'
+import { modesFor, pickerScope, scopeFromValue, scopeLoad, scopeValue, startLoad, startScope, withModeLoad, withModeSaves, type PickerScope } from '../../lib/modes'
 import { loadPlan, rentalLabel } from '../../lib/remote'
 import { WBENCH_BUSY, wbenchRunning } from '../../lib/wbenchFlag'
 import { useApp } from '../../stores/app'
@@ -17,6 +17,7 @@ import { loadRemoteModel, useRemote } from '../../stores/remote'
 import { Badge, Button, Field, Select, Switch, Tooltip } from '../ui'
 import { EstimateView, useEstimate } from './EstimateView'
 import { LoadSettingsForm } from './LoadSettingsForm'
+import { OwnSampling } from './OwnSampling'
 
 export function ModelPicker() {
   const open = useApp((s) => s.pickerOpen)
@@ -183,6 +184,8 @@ function LoadPanel({ model, onDone }: { model: ModelEntry; onDone: () => void })
   const modes = modesFor(allModes, model.id)
   const [config, setConfig] = useState<LoadConfig | null>(null)
   const [remember, setRemember] = useState(false)
+  // The mode's own sampling as edited here; null = not edited, so it shows (and keeps) what is saved.
+  const [samplingEdit, setSamplingEdit] = useState<{ on: boolean; sampling: SamplingParams | null } | null>(null)
   // The model's default load settings (what a mode without its own falls back to).
   const [base, setBase] = useState<{ config: LoadConfig; custom: boolean } | null>(null)
   // Where the user is decides what the load settings are for; they can pick another.
@@ -216,6 +219,7 @@ function LoadPanel({ model, onDone }: { model: ModelEntry; onDone: () => void })
   // A new choice shows that scope's own settings, else the model's default ones, whatever was edited before.
   const pickScope = (next: PickerScope): void => {
     setScope(next)
+    setSamplingEdit(null)
     if (!base) return
     setConfig(scopeLoad(base.config, modeDefaultsOf(model.id), next))
     setRemember(next ? hasOwnMode(next) : base.custom)
@@ -225,10 +229,17 @@ function LoadPanel({ model, onDone }: { model: ModelEntry; onDone: () => void })
 
   const doLoad = async (): Promise<void> => {
     if (wbenchRunning()) return void toast(WBENCH_BUSY)
-    if (remember) {
-      // Not remembering them is no reason not to load. A mode keeps its sampling and prompt.
+    // Not remembering the load settings is no reason not to load. A mode's own sampling is saved when it was edited,
+    // remembered or not; what was not edited stays as it is saved now.
+    const samplingChange = scope && samplingEdit ? (samplingEdit.on && samplingEdit.sampling ? samplingEdit.sampling : null) : undefined
+    if (scope ? remember || samplingChange !== undefined : remember) {
       const save = scope
-        ? invoke('models:setModeDefaults', model.id, scope, withModeLoad(modeDefaultsOf(model.id)?.[scope], config))
+        ? invoke(
+            'models:setModeDefaults',
+            model.id,
+            scope,
+            withModeSaves(modeDefaultsOf(model.id)?.[scope], base?.config.sampling, { ...(remember ? { load: config } : {}), ...(samplingChange !== undefined ? { sampling: samplingChange } : {}) })
+          )
         : invoke('models:setDefaults', model.id, config)
       await save.catch((e) => toast.error(`Could not save the settings: ${errorMessage(e)}`))
     }
@@ -271,8 +282,20 @@ function LoadPanel({ model, onDone }: { model: ModelEntry; onDone: () => void })
             ))}
           </Select>
         </Field>
-        <LoadSettingsForm model={model} config={config} onChange={setConfig} estimate={estimate} remote={model.remote} />
+        <LoadSettingsForm model={model} config={config} onChange={setConfig} estimate={estimate} remote={model.remote} hideApiSampling={!!scope} />
         <EstimateView estimate={estimate} />
+        {scope && (
+          <OwnSampling
+            key={scope}
+            mode={scope}
+            on={samplingEdit ? samplingEdit.on : !!modes?.[scope]?.sampling}
+            sampling={samplingEdit ? samplingEdit.sampling : (modes?.[scope]?.sampling ?? null)}
+            appSampling={settings?.defaultSampling}
+            leftover={base ? leftoverSampling(modes?.[scope]?.load, base.config) : null}
+            note="Saved for this model when you load it."
+            onChange={setSamplingEdit}
+          />
+        )}
       </div>
       <div className="flex items-center gap-3 border-t border-border px-5 py-3">
         <label className="flex items-center gap-2 text-xs text-muted">
@@ -287,7 +310,7 @@ function LoadPanel({ model, onDone }: { model: ModelEntry; onDone: () => void })
                 // Only the chosen scope's load settings go; a mode keeps its sampling and prompt.
                 const target = scope
                 try {
-                  if (target) await invoke('models:setModeDefaults', model.id, target, withModeLoad(modeDefaultsOf(model.id)?.[target], null))
+                  if (target) await invoke('models:setModeDefaults', model.id, target, withModeLoad(modeDefaultsOf(model.id)?.[target], null, base?.config.sampling))
                   else await invoke('models:setDefaults', model.id, null)
                 } catch (e) {
                   toast.error(`Could not reset the settings: ${errorMessage(e)}`)
