@@ -1,7 +1,14 @@
 import type { PhoneMode, PhoneModeInfo, PhoneModel } from '@shared/phone'
 
-export const rentalLabel = (model: PhoneModel): string => model.rental?.label ?? 'Not loaded on a rental'
-export const canPickModel = (model: PhoneModel, chosen: string | null): boolean => !model.rental || model.rental.label !== null || model.id === chosen
+/** "OpenRouter, Free" or "OpenRouter, Paid"; anything but `free: true` counts as paid, whatever the computer sent. */
+export const cloudLabel = (model: { cloud?: unknown }): string =>
+  `OpenRouter, ${model.cloud && typeof model.cloud === 'object' && (model.cloud as { free?: unknown }).free === true ? 'Free' : 'Paid'}`
+export const rentalLabel = (model: PhoneModel): string => (model.cloud ? cloudLabel(model) : (model.rental?.label ?? 'Not loaded on a rental'))
+/** A rental that is not loaded cannot be newly picked. An OpenRouter model is listed only when LLM Suite allows it for other apps, and can always be picked. */
+export const canPickModel = (model: PhoneModel, chosen: string | null): boolean => !!model.cloud || !model.rental || model.rental.label !== null || model.id === chosen
+/** A chosen model that is no longer listed: never swapped for another one; an OpenRouter one is named as such. */
+export const isCloudId = (id: string): boolean => id.startsWith('openrouter/')
+export const missingModelLabel = (id: string): string => (isCloudId(id) ? `${id.slice('openrouter/'.length)} (OpenRouter, not available now)` : id)
 export function applies(info: PhoneModeInfo): string {
   return [info.ownLoad && 'own load settings', info.mode !== 'writing' && info.ownSampling && 'own sampling', info.hasPrompt && 'own prompt'].filter(Boolean).join(', ')
 }
@@ -52,7 +59,7 @@ export class ModeController {
   }
   async reload(): Promise<string | null> {
     const info = this.info
-    if (this.busy || !info?.modelId || !info.reload || info.reload.blocked || info.rental) return null
+    if (this.busy || !info?.modelId || !info.reload || info.reload.blocked || info.rental || info.cloud) return null
     this.busy = true; this.changed()
     // An answer still on its way is from before the reload: it is dropped.
     const generation = ++this.generation

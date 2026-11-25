@@ -6,11 +6,13 @@ import {
   batchAdapters,
   cleanBatchRun,
   DEFAULT_BATCH_OPTIONS,
+  isRemoteDenial,
   isScored,
   isStaleChatError,
   itemResult,
   median,
   planBatch,
+  REMOTE_DENIAL,
   sameBatchAdapters,
   sessionStats,
   settleRun,
@@ -174,6 +176,43 @@ describe('adapters of a run and the host of a task', () => {
     const r = cleanBatchRun({ id: 'ok', items: [{ taskId: 'a', host: 'RTX 4090 (12)', lost: 1 }, { taskId: 'b', host: 7 }] })!
     expect(r.items[0]).toMatchObject({ host: 'RTX 4090 (12)', lost: 1 })
     expect(r.items[1]).not.toHaveProperty('host')
+  })
+
+  it('keeps why a run stopped by itself, and drops anything that is not a sentence', () => {
+    const base = { id: 'ok', items: [], status: 'stopped' }
+    expect(cleanBatchRun({ ...base, stopReason: 'The daily limit is used up.' })!.stopReason).toBe('The daily limit is used up.')
+    expect(cleanBatchRun({ ...base, stopReason: 'x'.repeat(900) })!.stopReason).toHaveLength(500)
+    for (const bad of [7, null, {}, ['a'], '', true]) expect(cleanBatchRun({ ...base, stopReason: bad })).not.toHaveProperty('stopReason')
+    expect(cleanBatchRun({ ...base })).not.toHaveProperty('stopReason')
+    // A finished run has nothing to explain.
+    expect(cleanBatchRun({ ...base, status: 'done', stopReason: 'old' })).not.toHaveProperty('stopReason')
+  })
+
+  it('counts a call refused with the old wording of the rental fence, and with the new one', () => {
+    const oldText =
+      'Not run: without asking, a model on a rented instance may only use static analysis, on absolute paths in this task' +
+      String.fromCharCode(0x2019) +
+      's folder. Continue with the given target.'
+    expect(oldText).not.toBe(REMOTE_DENIAL)
+    expect(isRemoteDenial(oldText)).toBe(true)
+    expect(isRemoteDenial(REMOTE_DENIAL)).toBe(true)
+    expect(isRemoteDenial('The user declined to run this tool.')).toBe(false)
+    expect(isRemoteDenial(undefined)).toBe(false)
+    // It names both kinds of model it is shown to.
+    expect(REMOTE_DENIAL).toContain('rented instance')
+    expect(REMOTE_DENIAL).toContain('OpenRouter')
+    const c = conv({}, [
+      { role: 'user' },
+      {
+        toolCalls: [
+          { id: '1', name: 'rea__run', arguments: '{}', status: 'denied', result: oldText },
+          { id: '2', name: 'rea__run', arguments: '{}', status: 'denied', result: REMOTE_DENIAL },
+          { id: '3', name: 'rea__run', arguments: '{}', status: 'denied', result: 'The user declined to run this tool.' }
+        ],
+        stats: { promptTokens: 10, predictedTokens: 1 }
+      }
+    ])
+    expect(sessionStats(c).denied).toBe(2)
   })
 
   it('recognises the refusal of a stale chat copy, however the error was wrapped on its way over IPC', () => {

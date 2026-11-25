@@ -225,7 +225,8 @@ export interface RentRequest {
 
 // ---------- Batch targets ----------
 
-export type BatchHost = { kind: 'local' } | { kind: 'vast'; rentalId: number }
+/** 'cloud' = OpenRouter (a cloud model has no other host). */
+export type BatchHost = { kind: 'local' } | { kind: 'vast'; rentalId: number } | { kind: 'cloud' }
 
 /** Where a batch run runs. */
 export interface BatchTarget {
@@ -249,6 +250,7 @@ export function cleanBatchTarget(raw: unknown): BatchTarget {
   for (const h of Array.isArray(r.hosts) ? r.hosts : []) {
     const x = h as { kind?: unknown; rentalId?: unknown } | null
     if (x?.kind === 'local' && !hosts.some((y) => y.kind === 'local')) hosts.push({ kind: 'local' })
+    else if (x?.kind === 'cloud' && !hosts.some((y) => y.kind === 'cloud')) hosts.push({ kind: 'cloud' })
     else if (x?.kind === 'vast' && Number.isSafeInteger(x.rentalId) && !hosts.some((y) => y.kind === 'vast' && y.rentalId === x.rentalId)) {
       hosts.push({ kind: 'vast', rentalId: x.rentalId as number })
     }

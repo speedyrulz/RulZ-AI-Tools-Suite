@@ -10,6 +10,7 @@ import type { ModeReloadResult } from '../server/apiServer'
 const MAX_MODEL_ID = 1024
 
 export const LEASED = 'RulZ Coding Agent is using the model.'
+export const CLOUD_RELOAD = 'An OpenRouter model has no load settings, so there is nothing to reload.'
 export const RENTAL_RELOAD = "A rented model can only be reloaded in LLM Suite on the computer."
 
 export interface PhoneModesDeps {
@@ -26,8 +27,10 @@ export interface PhoneModesDeps {
   leased: (modelId: string) => boolean
   /** Starts the reload; takes the model gate until the load has ended (ApiServer.requestModeReload). */
   reload: (model: ModelEntry, mode: PhoneMode, also: () => string | null) => ModeReloadResult
-  /** A model of the library (or a rental's) by id. */
+  /** A model of the library (or a rental's, or an OpenRouter one) by id. */
   getEntry: (modelId: string) => ModelEntry | undefined
+  /** Whether other apps (so a phone) may use an OpenRouter model; without it none may. */
+  cloudAllowed?: (modelId: string) => boolean
 }
 
 /** The phone's mode and model arguments, checked: a phone is not trusted to send the right shapes. */
@@ -49,8 +52,10 @@ export class PhoneModes {
     const d = this.deps
     const id = modelId ?? d.newestReady()
     if (!id) return { mode, modelId: null, name: '', loaded: false, ownLoad: false, ownSampling: false, hasPrompt: false, reload: null }
-    const entry = d.getEntry(id)
-    const inst = d.readyFor(id)
+    // A phone sees an OpenRouter model only when it is ticked for other apps; otherwise it is as good as unknown.
+    const found = d.getEntry(id)
+    const entry = found?.cloud && !d.cloudAllowed?.(id) ? undefined : found
+    const inst = entry?.cloud || !found?.cloud ? d.readyFor(id) : undefined
     const modes = d.modeDefaults(id)
     const own = modes[mode]
     const out: PhoneModeInfo = {
@@ -64,7 +69,9 @@ export class PhoneModes {
       reload: null
     }
     if (entry?.remote) out.rental = { label: inst?.host?.label ?? null, reconnecting: !!inst?.reconnecting }
-    if (inst && reloadFor(inst.config, d.loadDefaults(id), modes, mode) !== null) {
+    // An OpenRouter model has no load settings: never a reload.
+    if (entry?.cloud) out.cloud = { free: entry.cloud.info.free }
+    else if (inst && reloadFor(inst.config, d.loadDefaults(id), modes, mode) !== null) {
       const blocked = inst.host ? RENTAL_RELOAD : (d.reloadBlock(inst.instanceId) ?? (d.leased(id) ? LEASED : null))
       out.reload = { label: own?.load ? `${MODE_LABELS[mode]} settings` : 'default settings', blocked }
     }
@@ -75,8 +82,9 @@ export class PhoneModes {
   reloadMode(mode: PhoneMode, modelId: string): PhoneModeInfo {
     const d = this.deps
     const entry = d.getEntry(modelId)
-    if (!entry) throw new Error('That model is not in the library.')
+    if (!entry || (entry.cloud && !d.cloudAllowed?.(modelId))) throw new Error('That model is not in the library.')
     if (entry.remote) throw new Error(RENTAL_RELOAD)
+    if (entry.cloud) throw new Error(CLOUD_RELOAD)
     const r = d.reload(entry, mode, () => (d.leased(modelId) ? LEASED : null))
     if (r.status === 'blocked') throw new Error(r.why)
     const info = this.info(mode, modelId)

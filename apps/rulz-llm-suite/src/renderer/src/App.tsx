@@ -19,6 +19,8 @@ import { useServer } from './stores/server'
 import { SettingsPage } from './pages/SettingsPage'
 import { VastPage } from './pages/VastPage'
 import { useRemote } from './stores/remote'
+import { OpenRouterPage } from './pages/OpenRouterPage'
+import { useCloud } from './stores/cloud'
 import { ComingSoonPage } from './pages/ComingSoonPage'
 import { useShortcuts } from './hooks/useShortcuts'
 import { useApp } from './stores/app'
@@ -46,6 +48,7 @@ export function App() {
       await useAdventure.getState().init()
       // Not awaited: a slow or failing vast.ai read must not hold up the start (it reports its own error).
       void useRemote.getState().init()
+      void useCloud.getState().init()
       if (!cancelled) setReady(true)
     })()
     return () => {
@@ -74,6 +77,7 @@ export function App() {
             {page === 'discover' && <ComingSoonPage title="Discover" what="Search Hugging Face for GGUF models, pick a quantization that fits your GPUs, and download it straight into your models folder." />}
             {page === 'developer' && <DeveloperPage />}
             {page === 'vast' && <VastPage />}
+            {page === 'openrouter' && <OpenRouterPage />}
           </main>
         </div>
       </div>

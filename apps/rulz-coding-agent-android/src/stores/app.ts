@@ -91,13 +91,13 @@ media.addEventListener('change', () => {
 })
 
 /**
- * The model the agent will use: the chosen one, or the server's best guess (never a rental's; same rule
+ * The model the agent will use: the chosen one, or the server's best guess (never a rental's or an OpenRouter one; same rule
  * as the computer). A chosen model that was on a rental and is gone stays shown as chosen: the app says
  * so and does not use another one (see `chosenRentalGone`).
  */
 export function activeModelId(settings: AppSettings | null, connection: ConnectionInfo): string {
   const chosen = settings?.model ?? ''
-  const c = chooseModel(chosen, settings?.modelRental === true, connection.models)
+  const c = chooseModel(chosen, settings?.modelRental === true, connection.models, settings?.modelCloud === true)
   return c.ok ? c.model : chosen
 }
 

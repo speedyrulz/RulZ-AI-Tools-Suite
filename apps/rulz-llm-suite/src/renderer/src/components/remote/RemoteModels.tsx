@@ -92,7 +92,7 @@ export function RemoteModels({ state }: { state: RemoteState }) {
 function ModelDefDialog({ def, onClose }: { def: RemoteModelDef | null; onClose: () => void }) {
   const run = useRemote((s) => s.run)
   const saving = useRemote((s) => isChannelBusy(s, 'remote:saveModel'))
-  const library = useModels((s) => s.models).filter((m) => !m.remote && !m.error)
+  const library = useModels((s) => s.models).filter((m) => !m.remote && !m.cloud && !m.error)
   const [src, setSrc] = useState<RemoteModelSource>(def?.source ?? { kind: 'local', modelId: '' })
   const [name, setName] = useState(def?.name ?? '')
   const [named, setNamed] = useState(!!def)

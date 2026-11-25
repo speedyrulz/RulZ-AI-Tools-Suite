@@ -202,6 +202,8 @@ export interface PhoneModel {
   name: string
   loaded: boolean
   rental?: { label: string | null; reconnecting: boolean }
+  /** An OpenRouter model: text goes to OpenRouter. Only ones ticked for other apps are listed. */
+  cloud?: { free: boolean }
 }
 
 export type PhoneMode = 'writing' | 'adventure'
@@ -209,6 +211,8 @@ export const PHONE_MODES: readonly PhoneMode[] = ['writing', 'adventure']
 
 export interface PhoneModeInfo {
   mode: PhoneMode
+  /** The model is an OpenRouter one (never reloaded; text goes to OpenRouter). */
+  cloud?: { free: boolean }
   /** The model that would write: the given one, else the newest loaded one; null when there is none. */
   modelId: string | null
   name: string

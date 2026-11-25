@@ -109,6 +109,9 @@ Discover/downloads, RAG and a CLI are planned.
   request with `X-RulZ-Mode: coding` (or `re`) loads a model that isn't loaded with that mode's settings, and one with
   `X-RulZ-Rental: deny` is refused instead of being answered on a rented computer. Replies name the model that answered
   (`X-RulZ-Model`) and say when it ran on a rental (`X-RulZ-Rental: 1`).
+  OpenRouter models ticked **Allow other apps** are listed as `openrouter/…` with `cloud: {provider, free}` (0.36.0); only
+  chat completions, token counting and `/props` work with them, and their answers carry `x-rulz-cloud: 1`. Naming one that
+  is not ticked answers 403 with code `cloud_not_allowed`; a used-up limit answers 402 with `cloud_limit`.
   Default port 1234 (pick another if LM Studio is running).
 - **Writing mode** (`Ctrl+7`) — write a novel with a local model. A project is a plain folder of Markdown files
   (default `Documents\RulZ Novels`, set in **Settings → Writing**), so Obsidian, VS Code or a sync client can open it
@@ -211,6 +214,25 @@ Discover/downloads, RAG and a CLI are planned.
   - Needs a vast.ai API key (typed in the app and kept encrypted, or taken from `VAST_API_KEY` or the `vastai` CLI) and
     an ssh key in `~/.ssh` that is on the vast.ai account (the app can add it).
   - Design: [docs/vast-design.md](docs/vast-design.md). Not yet tried on a real rental.
+- **OpenRouter** (`Ctrl+0`, 0.36.0) — use models that run at [OpenRouter](https://openrouter.ai) in Chat, MCP tools,
+  Writing, Adventure, Reverse Engineering and batch practice. Their text goes to OpenRouter and to the provider that
+  answers; models on this PC and on rentals never send anything there.
+  - **Your key** is typed on the page, checked with OpenRouter and kept encrypted. No environment variable or other file
+    is read. **Privacy**: requests only go to providers that do not keep or train on prompts, unless you allow it.
+  - **Spending**: a daily limit ($1.00 to start with; change it or switch it off). Before each request the app books the
+    most it could cost and refuses the request if that would pass the limit; it is settled with what OpenRouter charged.
+    Cost per reply, per model and per day are shown. The estimate is rough, so one request can end slightly above it. Set
+    a credit limit on the key at OpenRouter as well.
+  - **Models**: pick them from OpenRouter's list (search, free, images, tools, prices per million tokens). Each has a
+    context limit (32,768 tokens at first, because Chat and Writing fill what they are given) and a reply limit. Router,
+    batch and image-output models are left out. Settings a model does not take are greyed out; load settings, adapters and
+    benchmarks do not apply.
+  - **Allow other apps** (off at first, per model) lets the API server, RulZ Coding Agent and the phone apps use a model.
+    It is only used when a request names it exactly (`openrouter/…`); no fallback or default ever picks one. Web pages
+    cannot use them, and on a network address the API key must be set.
+  - Practice runs take 1 to 4 tasks at once, with the same tool limits as rentals. A run stops when the limit, the key or
+    the credits refuse a request, and the tasks not done can be resumed.
+  - Design: [docs/cloud-design.md](docs/cloud-design.md). Tried with a stand-in for OpenRouter, not yet with a real key.
 - **Reverse Engineering mode** (`Ctrl+6`) — runs a local model as a reverse engineer with the REA MCP tools, and
   collects fine-tuning data while it works. Tuned first for Ornith 1.5 35B-A3B (Heretic MTP APEX I-Mini).
   - **Sessions**: pick a program, library, package or folder and a goal (overview, license check, network, config,

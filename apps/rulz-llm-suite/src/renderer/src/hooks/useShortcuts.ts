@@ -8,6 +8,7 @@ export const SHORTCUTS: [string, string][] = [
   ['Ctrl+L', 'Open the model picker'],
   ['Ctrl+N', 'New chat'],
   ['Ctrl+1 … 9', 'Chat / My Models / MCP Tools / Developer / Settings / Reverse Engineering / Writing / Adventure / vast.ai'],
+  ['Ctrl+0', 'OpenRouter'],
   ['Ctrl+E', 'Eject all models'],
   ['Ctrl+B', 'Toggle the chat settings panel, or the side panel on the Writing page'],
   ['Ctrl+F', 'Search in the Writing editor'],
@@ -16,7 +17,7 @@ export const SHORTCUTS: [string, string][] = [
   ['F12', 'Developer tools']
 ]
 
-const PAGE_KEYS: Record<string, Page> = { '1': 'chat', '2': 'models', '3': 'mcp', '4': 'developer', '5': 'settings', '6': 're', '7': 'writing', '8': 'adventure', '9': 'vast' }
+const PAGE_KEYS: Record<string, Page> = { '1': 'chat', '2': 'models', '3': 'mcp', '4': 'developer', '5': 'settings', '6': 're', '7': 'writing', '8': 'adventure', '9': 'vast', '0': 'openrouter' }
 
 /**
  * Esc stops the reply only when nothing else used the key: closing a dialog or menu, or

@@ -1,6 +1,7 @@
 import { Ban, Check, ChevronRight, Circle, CircleDot, Gauge, FileMinus, FilePen, FilePlus, Hourglass, LoaderCircle, Minus, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { diffLines, withContext } from '@shared/diff'
+import { formatDollars } from '@shared/modes'
 import type { ChangedFile, FileDiff, PlanItem, Step, TaskRecord } from '@shared/types'
 import { errorMessage, invoke } from '../lib/api'
 import { draftSummary } from '../lib/drafts'
@@ -58,6 +59,19 @@ export function DraftReadout() {
           <p className="text-[12px] text-faint">{summary.how}</p>
         </div>
       )}
+    </div>
+  )
+}
+
+/** What the shown task has cost at OpenRouter so far (only OpenRouter models report a cost). */
+export function CostReadout() {
+  const tasks = useWorkspace((s) => s.tasks)
+  const selected = useWorkspace((s) => s.selectedTaskId)
+  const cost = shownTask(tasks, selected)?.cost
+  if (!cost) return null
+  return (
+    <div className="px-4 pt-2 text-[13px] text-faint tabular-nums" aria-label={`Cost ${formatDollars(cost)} at OpenRouter`}>
+      Cost {formatDollars(cost)} at OpenRouter (without requests that were cut off)
     </div>
   )
 }

@@ -419,6 +419,14 @@ describe('BenchmarkRunner', () => {
     expect(h.instances.unloadAllLocal).not.toHaveBeenCalled()
   })
 
+  it('refuses an OpenRouter model, and never touches instances', async () => {
+    const h = harness({ models: [model({ cloud: { provider: 'openrouter' } as never })] })
+    await expect(h.runner.start(request())).rejects.toThrow(/OpenRouter model cannot be benchmarked/)
+    expect(h.runner.isRunning()).toBe(false)
+    expect(h.instances.load).not.toHaveBeenCalled()
+    expect(h.instances.unloadAllLocal).not.toHaveBeenCalled()
+  })
+
   it('a stop during the baseline reading does not start a load', async () => {
     const h = harness()
     let release!: () => void

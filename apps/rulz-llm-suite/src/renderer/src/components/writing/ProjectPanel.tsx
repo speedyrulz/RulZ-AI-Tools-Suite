@@ -7,6 +7,7 @@ import { MAX_ADAPTER_SCALE, MIN_ADAPTER_SCALE, adapterBaseMatch } from '@shared/
 import { modeSampling } from '@shared/modes'
 import type { LoadAdapter, SamplingParams } from '@shared/types'
 import { chatAdapters, formatScale, onScale, withChatScale } from '../../lib/adapters'
+import { NOT_SUPPORTED, supportsOf } from '../../lib/cloud'
 import { errorMessage, invoke } from '../../lib/api'
 import { formatBytes } from '../../lib/format'
 import { STYLE_PATH, useNovel } from '../../stores/novel'
@@ -19,12 +20,12 @@ import { CodeEditor } from './CodeEditor'
 import { ConfirmDialog, DraftInput, PanelSection } from './common'
 import { HistoryDialog } from './HistoryDialog'
 
-function SliderRow({ label, hint, value, min, max, step, onChange }: { label: string; hint?: string; value: number; min: number; max: number; step: number; onChange: (v: number) => void }) {
+function SliderRow({ label, hint, value, min, max, step, onChange, off }: { label: string; hint?: string; value: number; min: number; max: number; step: number; onChange: (v: number) => void; off?: boolean }) {
   return (
-    <Field label={label} hint={hint}>
+    <Field label={label} hint={off ? NOT_SUPPORTED : hint}>
       <div className="flex items-center gap-2.5">
-        <Slider value={value} min={min} max={max} step={step} onChange={onChange} />
-        <NumberInput className="w-18" value={value} min={min} max={max} step={step} onChange={(v) => onChange(Math.min(max, Math.max(min, v ?? min)))} />
+        <Slider value={value} min={min} max={max} step={step} onChange={onChange} disabled={off} />
+        <NumberInput className="w-18" value={value} min={min} max={max} step={step} disabled={off} onChange={(v) => onChange(Math.min(max, Math.max(min, v ?? min)))} />
       </div>
     </Field>
   )
@@ -113,6 +114,9 @@ export function ProjectPanel() {
   const rows = chatAdapters(loaded, project.adapters)
   const setAdapter = (id: string, scale: number): void => void store.patchProject({ adapters: withChatScale(loaded, project.adapters, id, scale) as LoadAdapter[] })
   const modelEntry = models.find((m) => m.id === modelId)
+  // An OpenRouter model honours only some settings; undefined for any other model.
+  const supports = supportsOf(modelEntry)
+  const off = (k: keyof NonNullable<typeof supports>): boolean => !!supports && !supports[k]
   const libraryEntry = (id: string) => adapterLibrary.find((a) => a.id === id)
   const pickExportFolder = async (): Promise<void> => {
     try {
@@ -193,13 +197,13 @@ export function ProjectPanel() {
           </IconButton>
         }
       >
-        <SliderRow label="Temperature" value={sp.temperature} min={0} max={2} step={0.01} onChange={(v) => setS('temperature', v)} />
-        <SliderRow label="Min P" value={sp.minP} min={0} max={1} step={0.01} onChange={(v) => setS('minP', v)} />
-        <SliderRow label="Top P" value={sp.topP} min={0} max={1} step={0.01} onChange={(v) => setS('topP', v)} />
-        <SliderRow label="Top K" hint="0 = off" value={sp.topK} min={0} max={200} step={1} onChange={(v) => setS('topK', Math.round(v))} />
-        <SliderRow label="Repeat penalty" value={sp.repeatPenalty} min={0.8} max={2} step={0.01} onChange={(v) => setS('repeatPenalty', v)} />
-        <Field inline label="Seed" hint="Empty = random each time">
-          <NumberInput value={sp.seed} placeholder="Random" onChange={(v) => setS('seed', v === null ? null : Math.round(v))} />
+        <SliderRow label="Temperature" value={sp.temperature} min={0} max={2} step={0.01} off={off('temperature')} onChange={(v) => setS('temperature', v)} />
+        <SliderRow label="Min P" value={sp.minP} min={0} max={1} step={0.01} off={off('minP')} onChange={(v) => setS('minP', v)} />
+        <SliderRow label="Top P" value={sp.topP} min={0} max={1} step={0.01} off={off('topP')} onChange={(v) => setS('topP', v)} />
+        <SliderRow label="Top K" hint="0 = off" value={sp.topK} min={0} max={200} step={1} off={off('topK')} onChange={(v) => setS('topK', Math.round(v))} />
+        <SliderRow label="Repeat penalty" value={sp.repeatPenalty} min={0.8} max={2} step={0.01} off={off('repeatPenalty')} onChange={(v) => setS('repeatPenalty', v)} />
+        <Field inline label="Seed" hint={off('seed') ? NOT_SUPPORTED : 'Empty = random each time'}>
+          <NumberInput value={sp.seed} placeholder="Random" disabled={off('seed')} onChange={(v) => setS('seed', v === null ? null : Math.round(v))} />
         </Field>
         <Collapsible.Root open={varietyOpen} onOpenChange={setVarietyOpen}>
           <Collapsible.Trigger className="flex w-full items-center gap-1 text-[11px] font-semibold tracking-wide text-faint uppercase hover:text-text">
@@ -208,14 +212,16 @@ export function ProjectPanel() {
             {varietyOn > 0 && <span className="font-normal normal-case"> · {varietyOn} on</span>}
           </Collapsible.Trigger>
           <Collapsible.Content className="mt-3 space-y-3">
-            <VarietyFields sampling={sp} onChange={setS} />
+            <VarietyFields sampling={sp} onChange={setS} supports={supports} />
           </Collapsible.Content>
         </Collapsible.Root>
         <p className="text-[11px] text-faint">Thinking is turned off for prose and allowed for summaries and outlines.</p>
       </PanelSection>
 
       <PanelSection title="Adapters">
-        {loaded.length === 0 ? (
+        {modelEntry?.cloud ? (
+          <p className="text-[11px] text-faint">Models at OpenRouter have no adapters.</p>
+        ) : loaded.length === 0 ? (
           <p className="text-[11px] text-faint">{inst ? 'This model was loaded without adapters.' : 'The model is not loaded.'} Adapters are chosen when you load the model (Ctrl+L).</p>
         ) : (
           <>

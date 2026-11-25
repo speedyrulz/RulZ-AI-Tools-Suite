@@ -42,7 +42,8 @@ const schema = z.object({
   remoteToken: z.string().catch(D.remoteToken),
   keepThinkingOpen: z.boolean().catch(D.keepThinkingOpen),
   reRecording: z.boolean().catch(D.reRecording),
-  modelRental: z.boolean().catch(D.modelRental)
+  modelRental: z.boolean().catch(D.modelRental),
+  modelCloud: z.boolean().catch(D.modelCloud)
 })
 
 export function parseSettings(raw: unknown): AppSettings {

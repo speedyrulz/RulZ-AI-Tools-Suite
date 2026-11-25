@@ -8,6 +8,7 @@ import type { LoadedInstance } from '@shared/types'
 export function pickActive(instances: LoadedInstance[], active: string | null, loading: string | null): string | null {
   const stillThere = active !== null && (active === loading || instances.some((i) => i.modelId === active && i.status !== 'stopping'))
   if (stillThere) return active
-  const newest = [...instances].filter((i) => i.status !== 'stopping').sort((a, b) => b.startedAt - a.startedAt)[0]
+  // Never jumps to a model at OpenRouter by itself: it costs money, so it is active only when the user connected it.
+  const newest = [...instances].filter((i) => i.status !== 'stopping' && !i.cloud).sort((a, b) => b.startedAt - a.startedAt)[0]
   return newest?.modelId ?? null
 }

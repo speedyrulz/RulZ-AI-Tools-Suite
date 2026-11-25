@@ -20,10 +20,13 @@ export function ReloadBar({ mode, className }: { mode: AgentMode; className?: st
   const keep = useModes((s) => s.keep)
   const reload = useModes((s) => s.reload)
   const running = useWorkspace((s) => s.running)
-  const rental = useApp((s) => s.connection.models.find((m) => m.id === model)?.rental)
+  const offSite = useApp((s) => {
+    const m = s.connection.models.find((m) => m.id === model)
+    return !!(m?.rental || m?.cloud)
+  })
   const [busy, setBusy] = useState(false)
-  // A rental's model is not reloaded from here.
-  const offer = rental ? null : reloadOffer(modes ?? null, mode, kept)
+  // A rental's or an OpenRouter model is not reloaded from here.
+  const offer = offSite ? null : reloadOffer(modes ?? null, mode, kept)
   if (!offer) return null
 
   const go = async (): Promise<void> => {

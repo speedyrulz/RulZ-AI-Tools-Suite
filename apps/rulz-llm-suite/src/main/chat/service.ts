@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { requestLora } from '@shared/adapters'
+import { isFatalCloudError } from '@shared/cloud'
 import type {
   ChatRequest,
   GenerationStats,
@@ -13,8 +14,10 @@ import type {
 import type { InstanceManager } from '../engine/instances'
 import { parseChatAdapters } from '../settings/schema'
 import { fitToContext, IMAGE_TOKENS, imageCount, textOf, type ContextApi } from './context'
-import { errorFromBody, interpretChunk, SseParser, statsFromTimings, ToolCallAccumulator } from './sse'
+import { errorCodeFromBody, errorFromBody, interpretChunk, SseParser, statsFromTimings, statsFromUsage, ToolCallAccumulator, type ChunkUsage } from './sse'
 import { jsonifyToolCallArgs, templateStringifiesArgs } from './toolArgs'
+
+type UseBy = 'window' | 'api' | 'phone'
 
 /** Streamed text is sent to the renderer at most this often (one IPC message per token is wasteful). */
 const DELTA_FLUSH_MS = 30
@@ -66,6 +69,16 @@ const SESSION_MEMORY = 500
 
 /** The connection to the server broke; says nothing about the model. */
 class TransportError extends Error {}
+
+/** An error OpenRouter's side reported, with the code of its error body (CloudErrorKind); never a transport error. */
+class CloudRequestError extends Error {
+  constructor(
+    message: string,
+    readonly code: string | undefined
+  ) {
+    super(message)
+  }
+}
 
 const TRANSPORT_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'EPIPE', 'ETIMEDOUT', 'UND_ERR_SOCKET', 'UND_ERR_CLOSED', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT'])
 
@@ -294,6 +307,8 @@ export class ChatService {
   private stringifiesArgs(instance: LoadedInstance): Promise<boolean> {
     let p = this.argQuirk.get(instance.instanceId)
     if (!p) {
+      // OpenRouter has no chat template to ask about; the adapter takes JSON arguments as they are.
+      if (instance.cloud) return Promise.resolve(false)
       p = fetch(`${this.instances.baseUrl(instance)}/props`, { signal: AbortSignal.timeout(10000) })
         .then(async (r) => (r.ok ? templateStringifiesArgs(((await r.json()) as { chat_template?: string }).chat_template) : false))
         .catch(() => false)
@@ -336,18 +351,17 @@ export class ChatService {
   private toolTokenCache = new Map<string, Map<string, number>>()
 
   /** `tools` are the definitions sent with the request; they take context space too. */
-  contextApi(instance: LoadedInstance, tools: unknown[] = []): ContextApi {
-    const base = this.instances.baseUrl(instance)
+  contextApi(instance: LoadedInstance, tools: unknown[] = [], by: UseBy = 'window'): ContextApi {
     const limit = this.tokenizeLimits.get(instance.instanceId) ?? limiter(TOKENIZE_CONCURRENCY)
     this.tokenizeLimits.set(instance.instanceId, limit)
     const tokenize = (content: string): Promise<number | null> =>
       limit(async () => {
-        const res = await fetch(`${base}/tokenize`, {
+        const res = await this.instances.fetch(instance, '/tokenize', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ content, add_special: true }),
           signal: AbortSignal.timeout(15000)
-        })
+        }, by)
         if (!res.ok) return null
         const j = (await res.json()) as { tokens?: unknown[] }
         return j.tokens?.length ?? null
@@ -373,12 +387,12 @@ export class ChatService {
           // Images are replaced by a placeholder for counting; /apply-template only needs text.
           // Tool messages are counted as plain text so templates without tool support still apply.
           const textOnly = messages.map((m) => ({ role: m.role === 'tool' ? 'user' : m.role, content: textOf(m) }))
-          const res = await fetch(`${base}/apply-template`, {
+          const res = await this.instances.fetch(instance, '/apply-template', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ messages: textOnly }),
             signal: AbortSignal.timeout(15000)
-          })
+          }, by)
           if (!res.ok) return null
           const { prompt } = (await res.json()) as { prompt?: string }
           if (typeof prompt !== 'string') return null
@@ -413,22 +427,22 @@ export class ChatService {
   /** Session key → the instance its last request used (least recently used goes first). */
   private sessions = new Map<string, string>()
 
-  async countTokens(modelId: string, messages: WireMessage[], tools: ToolRequest | null = null, instanceId?: string): Promise<number | null> {
+  async countTokens(modelId: string, messages: WireMessage[], tools: ToolRequest | null = null, instanceId?: string, by: UseBy = 'window'): Promise<number | null> {
     const inst = instanceId ? this.instanceFor(modelId, instanceId) : this.instances.readyFor(modelId)
     if (!inst) return null
     const set = this.toolSet(tools)
-    return this.contextApi(inst, set.defs).countConversation(withSystemNote(messages, set.note))
+    return this.contextApi(inst, set.defs, by).countConversation(withSystemNote(messages, set.note))
   }
 
   /** Token count of plain text on the loaded model (cached per instance); null if it can't count. */
-  async countText(modelId: string, text: string, instanceId?: string): Promise<number | null> {
+  async countText(modelId: string, text: string, instanceId?: string, by: UseBy = 'window'): Promise<number | null> {
     const inst = instanceId ? this.instanceFor(modelId, instanceId) : this.instances.readyFor(modelId)
     if (!inst) return null
-    return this.contextApi(inst, []).countText(text)
+    return this.contextApi(inst, [], by).countText(text)
   }
 
   /** `by` says who asked, so a rental can tell its owner what keeps it running. */
-  async start(req: ChatRequest, by: 'window' | 'api' | 'phone' = 'window'): Promise<void> {
+  async start(req: ChatRequest, by: UseBy = 'window'): Promise<void> {
     const { requestId } = req
     const ctrl = new AbortController()
     this.active.set(requestId, ctrl)
@@ -465,7 +479,7 @@ export class ChatService {
       let messages = withSystemNote(req.messages, set.note)
       let trimmed = false
       if (inst.contextLength) {
-        const api = this.contextApi(inst, tools)
+        const api = this.contextApi(inst, tools, by)
         // Tool definitions are resent with every message; if they alone eat most of the context,
         // no amount of trimming the chat helps, so say so plainly.
         const toolTokens = await api.countTools!()
@@ -504,19 +518,24 @@ export class ChatService {
 
       const body = buildRequestBody(inst.modelName, messages, req.sampling, req.disableThinking, requestLora(inst.adapters ?? [], parseChatAdapters(req.adapters)))
       if (tools.length) body.tools = tools
-      const res = await fetch(`${this.instances.baseUrl(inst)}/v1/chat/completions`, {
+      const res = await this.instances.fetch(inst, '/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
         signal: ctrl.signal
-      })
-      if (!res.ok || !res.body) throw new Error(errorFromBody(res.status, await res.text()))
+      }, by)
+      if (!res.ok || !res.body) {
+        const text = await res.text()
+        if (inst.cloud) throw new CloudRequestError(errorFromBody(res.status, text), errorCodeFromBody(text))
+        throw new Error(errorFromBody(res.status, text))
+      }
 
       const parser = new SseParser()
       const toolCalls = new ToolCallAccumulator()
       const decoder = new TextDecoder()
       const reader = res.body.getReader()
       let sawDone = false
+      let usage: ChunkUsage | undefined
       for (;;) {
         const { done, value } = await reader.read()
         if (done) break
@@ -532,7 +551,7 @@ export class ChatService {
             continue
           }
           const c = interpretChunk(json)
-          if (c.error) throw new Error(c.error)
+          if (c.error) throw inst.cloud ? new CloudRequestError(c.error, c.errorCode) : new Error(c.error)
           if (c.progress) {
             deltas.flush()
             this.send({ type: 'progress', requestId, ...c.progress })
@@ -553,6 +572,8 @@ export class ChatService {
           }
           if (c.finishReason) finishReason = c.finishReason
           if (c.timings) stats = statsFromTimings(c.timings, stats)
+          // Only OpenRouter's usage is read: a llama-server's own timings are what its stats come from.
+          if (c.usage && inst.cloud) usage = c.usage
         }
       }
       // A stream that just stops, with no finish reason and no [DONE], is a tunnel that broke mid-answer. On this PC
@@ -560,13 +581,20 @@ export class ChatService {
       if (inst.host && !finishReason && !sawDone && !ctrl.signal.aborted) {
         throw new TransportError(`The connection to ${inst.host.label} broke while the model was answering.`)
       }
+      // A cloud answer that just stops is broken off. Not a transport error (nothing can be retried for free) and not fatal.
+      if (inst.cloud && !finishReason && !sawDone && !ctrl.signal.aborted) throw new CloudRequestError('The answer from OpenRouter broke off.', undefined)
+      if (usage) {
+        const genSeconds = firstTokenAt !== null ? (performance.now() - firstTokenAt) / 1000 : 0
+        stats = statsFromUsage(usage, stats, genSeconds)
+      }
       const calls = toolCalls.result()
       if (req.record && this.recorder) {
         try {
           this.recorder(req.record.conversationId, {
             requestId,
             at: Date.now(),
-            model: inst.modelName,
+            // An OpenRouter model is recorded under its whole id, as the API server does.
+            model: inst.cloud ? inst.modelId : inst.modelName,
             messages,
             tools,
             trimmed,
@@ -600,7 +628,8 @@ export class ChatService {
         const transport = pinnedGone || (!!inst?.host && (isTransportError(err) || !now || !!now.reconnecting))
         const message = (err as Error).message
         const error = transport && inst?.host && !(err instanceof TransportError) && !pinnedGone ? `The connection to ${inst.host.label} was lost (${message}). The model is still loaded there.` : message
-        this.send({ type: 'error', requestId, error, stats: final, ...(transport ? { transport: true } : {}) })
+        const fatal = inst?.cloud && err instanceof CloudRequestError && isFatalCloudError(err.code)
+        this.send({ type: 'error', requestId, error, stats: final, ...(transport ? { transport: true } : {}), ...(fatal ? { fatal: true } : {}) })
       }
     } finally {
       release?.()

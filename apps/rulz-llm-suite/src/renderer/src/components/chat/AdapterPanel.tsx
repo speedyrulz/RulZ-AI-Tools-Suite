@@ -1,5 +1,6 @@
 import { RotateCcw } from 'lucide-react'
 import { MAX_ADAPTER_SCALE, MIN_ADAPTER_SCALE } from '@shared/adapters'
+import { isCloudModelId } from '@shared/cloud'
 import type { LoadAdapter } from '@shared/types'
 import { chatAdapters, formatScale, onScale, withChatScale } from '../../lib/adapters'
 import { useChat } from '../../stores/chat'
@@ -18,6 +19,7 @@ export function AdapterPanel() {
   const inst = instances.find((i) => i.modelId === modelId && i.status === 'ready')
   const loaded = inst?.adapters ?? []
 
+  if (inst?.cloud || (modelId && isCloudModelId(modelId))) return <p className="text-[11px] text-faint">Models at OpenRouter have no adapters.</p>
   if (loaded.length === 0) {
     return (
       <p className="text-[11px] text-faint">

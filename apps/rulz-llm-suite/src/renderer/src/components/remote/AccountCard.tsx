@@ -8,13 +8,14 @@ import { Badge, Button, Field, Input } from '../ui'
 import { ConfirmDialog } from './ConfirmDialog'
 
 /** A secret typed here is sent once and cleared; the window never shows it again, only where it comes from. */
-function SecretField({
+export function SecretField({
   label,
   source,
   placeholder,
   saving,
   onSave,
-  onForget
+  onForget,
+  forgetTitle = 'Forgets the one saved in this app. A key from the environment or a file stays.'
 }: {
   label: string
   source: string
@@ -22,6 +23,7 @@ function SecretField({
   saving: boolean
   onSave: (v: string) => void
   onForget: () => void
+  forgetTitle?: string
 }) {
   const [value, setValue] = useState('')
   return (
@@ -39,7 +41,7 @@ function SecretField({
         <Button type="submit" disabled={!value.trim() || saving}>
           Save
         </Button>
-        <Button type="button" variant="ghost" disabled={saving} onClick={onForget} title="Forgets the one saved in this app. A key from the environment or a file stays.">
+        <Button type="button" variant="ghost" disabled={saving} onClick={onForget} title={forgetTitle}>
           Forget saved
         </Button>
       </form>

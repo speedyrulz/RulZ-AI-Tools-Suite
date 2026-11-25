@@ -86,15 +86,15 @@ media.addEventListener('change', () => {
  */
 export function activeModelId(settings: AppSettings | null, connection: ConnectionInfo): string {
   const chosen = settings?.model ?? ''
-  const c = chooseModel(chosen, settings?.modelRental ?? false, connection.models)
+  const c = chooseModel(chosen, settings?.modelRental ?? false, connection.models, settings?.modelCloud ?? false)
   return c.ok ? c.model : chosen
 }
 
 /** The sentence for a chosen model that ran on a rental and is not in the list now, or that runs on one the owner has not chosen it for; else null. */
 export function chosenRentalGone(settings: AppSettings | null, connection: ConnectionInfo): string | null {
   if (connection.status !== 'connected' || !settings?.model) return null
-  const c = chooseModel(settings.model, settings.modelRental, connection.models)
+  const c = chooseModel(settings.model, settings.modelRental, connection.models, settings.modelCloud)
   if (c.ok) return null
   const listed = connection.models.find((m) => m.id === settings.model)
-  return listed ? (listed.rental ? c.reason : null) : settings.modelRental ? c.reason : null
+  return listed ? (listed.rental || listed.cloud ? c.reason : null) : settings.modelRental || settings.modelCloud ? c.reason : null
 }

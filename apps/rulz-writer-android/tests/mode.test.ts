@@ -1,10 +1,44 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { PhoneModeInfo } from '../src/shared/phone'
-import { applies, canPickModel, LOADING_LIMIT_MS, ModeController, rentalLabel } from '../src/lib/mode'
+import type { PhoneModeInfo, PhoneModel } from '../src/shared/phone'
+import { applies, canPickModel, cloudLabel, isCloudId, LOADING_LIMIT_MS, missingModelLabel, ModeController, rentalLabel } from '../src/lib/mode'
 
 const base = (): PhoneModeInfo => ({ mode: 'writing', modelId: 'm', name: 'Model', loaded: true, ownLoad: true, ownSampling: true, hasPrompt: true, reload: { label: 'Writing settings', blocked: null } })
 const deferred = <T,>() => { let resolve!: (value: T) => void; let reject!: (error: Error) => void; const promise = new Promise<T>((a, b) => { resolve = a; reject = b }); return { promise, resolve, reject } }
+describe('OpenRouter models on the phone', () => {
+  const cloud: PhoneModel = { id: 'openrouter/vendor/m', name: 'Model M', loaded: true, cloud: { free: true } }
+  it('can always be picked, and is labelled as OpenRouter, never as a rental', () => {
+    expect(canPickModel(cloud, null)).toBe(true)
+    expect(canPickModel({ ...cloud, cloud: { free: false } }, 'other')).toBe(true)
+    expect(rentalLabel(cloud)).toBe('OpenRouter, Free')
+    expect(cloudLabel({ cloud: { free: false } })).toBe('OpenRouter, Paid')
+    // Rentals and local models are as before.
+    expect(canPickModel({ id: 'l', name: 'L', loaded: false }, null)).toBe(true)
+    expect(canPickModel({ id: 'r', name: 'R', loaded: false, rental: { label: null, reconnecting: false } }, null)).toBe(false)
+    expect(rentalLabel({ id: 'r', name: 'R', loaded: false, rental: { label: 'GPU', reconnecting: false } })).toBe('GPU')
+  })
+  it('survives hostile values from the computer: anything but free: true is paid', () => {
+    for (const cloudValue of ['x', {}, { free: 'yes' }, { free: 1 }, null, [], { provider: 'other' }]) {
+      expect(cloudLabel({ cloud: cloudValue })).toBe('OpenRouter, Paid')
+    }
+    expect(cloudLabel({ cloud: { free: true } })).toBe('OpenRouter, Free')
+  })
+  it('a chosen model that is no longer listed is named, not replaced: an OpenRouter one says so', () => {
+    expect(isCloudId('openrouter/vendor/m')).toBe(true)
+    expect(isCloudId('Qwen3-8B')).toBe(false)
+    expect(missingModelLabel('openrouter/vendor/m')).toBe('vendor/m (OpenRouter, not available now)')
+    expect(missingModelLabel('Qwen3-8B')).toBe('Qwen3-8B')
+  })
+})
+
 describe('mode information', () => {
+  it('never reloads a cloud model', async () => {
+    const info = { ...base(), cloud: { free: false } }
+    const reload = vi.fn(async () => info)
+    const c = new ModeController('cloud', 'writing', 'm', async () => info, reload, () => {})
+    await c.refresh()
+    await c.reload()
+    expect(reload).not.toHaveBeenCalled()
+  })
   it('shows applicable settings', () => {
     expect(applies(base())).toBe('own load settings, own prompt')
     expect(applies({ ...base(), mode: 'adventure' })).toBe('own load settings, own sampling, own prompt')

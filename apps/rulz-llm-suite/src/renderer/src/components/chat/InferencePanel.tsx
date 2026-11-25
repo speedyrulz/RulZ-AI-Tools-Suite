@@ -4,11 +4,13 @@ import { useState, type ReactNode } from 'react'
 import { useShallow } from 'zustand/react/shallow'
 import { breakersToText, textToBreakers, textToWords } from '@shared/variety'
 import { modeSampling } from '@shared/modes'
+import type { SamplerSupport } from '@shared/cloud'
 import { REASONING_EFFORTS, type ReasoningEffort, type SamplingParams } from '@shared/types'
 import { useApp } from '../../stores/app'
 import { useChat } from '../../stores/chat'
 import { modeDefaultsOf, useModels } from '../../stores/models'
 import { effectiveToolMode, findTool, tokensOf, useMcp } from '../../stores/mcp'
+import { NOT_SUPPORTED, supportsOf } from '../../lib/cloud'
 import { formatCompact } from '../../lib/format'
 import { Button, Dialog, Field, IconButton, Input, NumberInput, Select, Slider, Switch, Textarea } from '../ui'
 import { AdapterPanel } from './AdapterPanel'
@@ -20,7 +22,8 @@ function SliderRow({
   min,
   max,
   step,
-  onChange
+  onChange,
+  off
 }: {
   label: string
   hint?: string
@@ -29,13 +32,15 @@ function SliderRow({
   max: number
   step: number
   onChange: (v: number) => void
+  /** The model does not honour this setting: shown but disabled. */
+  off?: boolean
 }) {
   return (
-    <Field label={label} hint={hint}>
+    <Field label={label} hint={off ? NOT_SUPPORTED : hint}>
       <div className="flex items-center gap-2.5">
-        <Slider value={value} min={min} max={max} step={step} onChange={onChange} />
+        <Slider value={value} min={min} max={max} step={step} onChange={onChange} disabled={off} />
         {/* Typed values keep to the slider's range: a repeat penalty of 0, say, wrecks the output. */}
-        <NumberInput className="w-18" value={value} min={min} max={max} step={step} onChange={(v) => onChange(Math.min(max, Math.max(min, v ?? min)))} />
+        <NumberInput className="w-18" value={value} min={min} max={max} step={step} disabled={off} onChange={(v) => onChange(Math.min(max, Math.max(min, v ?? min)))} />
       </div>
     </Field>
   )
@@ -55,38 +60,43 @@ function Section({ title, children, action }: { title: string; children: ReactNo
 
 /**
  * The core sampling controls of the chat panel; also used for a model's per-mode defaults. `limits` = max tokens, seed
- * and stop strings, which the Adventure and Writing modes set themselves.
+ * and stop strings, which the Adventure and Writing modes set themselves. `supports` (an OpenRouter model) disables what the model
+ * does not honour; undefined = every control is live.
  */
 export function SamplingFields({
   sampling: s,
   onChange: setS,
-  limits = true
+  limits = true,
+  supports
 }: {
   sampling: SamplingParams
   onChange: <K extends keyof SamplingParams>(key: K, value: SamplingParams[K]) => void
   limits?: boolean
+  supports?: SamplerSupport
 }) {
+  const off = (k: keyof SamplerSupport): boolean => !!supports && !supports[k]
   return (
     <>
-      <SliderRow label="Temperature" value={s.temperature} min={0} max={2} step={0.01} onChange={(v) => setS('temperature', v)} />
-      <SliderRow label="Top K" hint="0 = off" value={s.topK} min={0} max={200} step={1} onChange={(v) => setS('topK', Math.round(v))} />
-      <SliderRow label="Top P" value={s.topP} min={0} max={1} step={0.01} onChange={(v) => setS('topP', v)} />
-      <SliderRow label="Min P" value={s.minP} min={0} max={1} step={0.01} onChange={(v) => setS('minP', v)} />
-      <SliderRow label="Repeat penalty" value={s.repeatPenalty} min={0.8} max={2} step={0.01} onChange={(v) => setS('repeatPenalty', v)} />
-      <SliderRow label="Presence penalty" value={s.presencePenalty} min={-2} max={2} step={0.05} onChange={(v) => setS('presencePenalty', v)} />
-      <SliderRow label="Frequency penalty" value={s.frequencyPenalty} min={-2} max={2} step={0.05} onChange={(v) => setS('frequencyPenalty', v)} />
+      <SliderRow label="Temperature" value={s.temperature} min={0} max={2} step={0.01} off={off('temperature')} onChange={(v) => setS('temperature', v)} />
+      <SliderRow label="Top K" hint="0 = off" value={s.topK} min={0} max={200} step={1} off={off('topK')} onChange={(v) => setS('topK', Math.round(v))} />
+      <SliderRow label="Top P" value={s.topP} min={0} max={1} step={0.01} off={off('topP')} onChange={(v) => setS('topP', v)} />
+      <SliderRow label="Min P" value={s.minP} min={0} max={1} step={0.01} off={off('minP')} onChange={(v) => setS('minP', v)} />
+      <SliderRow label="Repeat penalty" value={s.repeatPenalty} min={0.8} max={2} step={0.01} off={off('repeatPenalty')} onChange={(v) => setS('repeatPenalty', v)} />
+      <SliderRow label="Presence penalty" value={s.presencePenalty} min={-2} max={2} step={0.05} off={off('presencePenalty')} onChange={(v) => setS('presencePenalty', v)} />
+      <SliderRow label="Frequency penalty" value={s.frequencyPenalty} min={-2} max={2} step={0.05} off={off('frequencyPenalty')} onChange={(v) => setS('frequencyPenalty', v)} />
       {limits && (
         <>
           <Field inline label="Max response tokens" hint="Empty = no limit">
             <NumberInput value={s.maxTokens} placeholder="∞" min={1} onChange={(v) => setS('maxTokens', v === null ? null : Math.max(1, Math.round(v)))} />
           </Field>
-          <Field inline label="Seed" hint="Empty = random">
-            <NumberInput value={s.seed} placeholder="Random" onChange={(v) => setS('seed', v === null ? null : Math.round(v))} />
+          <Field inline label="Seed" hint={off('seed') ? NOT_SUPPORTED : 'Empty = random'}>
+            <NumberInput value={s.seed} placeholder="Random" disabled={off('seed')} onChange={(v) => setS('seed', v === null ? null : Math.round(v))} />
           </Field>
-          <Field label="Stop strings" hint="One per line">
+          <Field label="Stop strings" hint={off('stop') ? NOT_SUPPORTED : 'One per line'}>
             <Textarea
               rows={2}
-              className="font-mono text-xs"
+              className="font-mono text-xs disabled:pointer-events-none disabled:opacity-45"
+              disabled={off('stop')}
               value={s.stop.join('\n')}
               onChange={(e) => setS('stop', e.target.value.split('\n').filter((x) => x.length > 0))}
             />
@@ -107,27 +117,34 @@ const EFFORT_LABELS: Record<ReasoningEffort, string> = {
   max: 'Max'
 }
 
-/** Thinking-mode controls; also used for the new-chat defaults on the Settings page. */
+/** Thinking-mode controls; also used for the new-chat defaults on the Settings page. `supports` as for SamplingFields. */
 export function ThinkingFields({
   sampling: s,
-  onChange
+  onChange,
+  supports
 }: {
   sampling: SamplingParams
   onChange: <K extends keyof SamplingParams>(key: K, value: SamplingParams[K]) => void
+  supports?: SamplerSupport
 }) {
+  const noThinking = !!supports && !supports.thinking
+  const noEffort = !!supports && !supports.reasoningEffort
+  const noBudget = !!supports && !supports.thinkingBudget
   return (
     <>
-      <Field inline label="Thinking" hint="For reasoning models; Auto keeps the model's own behaviour">
-        <Select className="w-28" value={s.thinking} onChange={(e) => onChange('thinking', e.target.value as SamplingParams['thinking'])}>
+      <Field inline label="Thinking" hint={noThinking ? NOT_SUPPORTED : supports && !supports.thinkingOff ? "This model always thinks, so Off is not available" : "For reasoning models; Auto keeps the model's own behaviour"}>
+        <Select className="w-28" value={s.thinking} disabled={noThinking} onChange={(e) => onChange('thinking', e.target.value as SamplingParams['thinking'])}>
           <option value="auto">Auto</option>
           <option value="on">On</option>
-          <option value="off">Off</option>
+          <option value="off" disabled={!!supports && !supports.thinkingOff}>
+            Off
+          </option>
         </Select>
       </Field>
       {s.thinking !== 'off' && (
         <>
-          <Field inline label="Reasoning effort" hint="Only models whose template takes an effort level (e.g. gpt-oss)">
-            <Select className="w-32" value={s.reasoningEffort} onChange={(e) => onChange('reasoningEffort', e.target.value as ReasoningEffort)}>
+          <Field inline label="Reasoning effort" hint={noEffort ? NOT_SUPPORTED : 'Only models whose template takes an effort level (e.g. gpt-oss)'}>
+            <Select className="w-32" value={s.reasoningEffort} disabled={noEffort} onChange={(e) => onChange('reasoningEffort', e.target.value as ReasoningEffort)}>
               {REASONING_EFFORTS.map((r) => (
                 <option key={r} value={r}>
                   {EFFORT_LABELS[r]}
@@ -135,12 +152,13 @@ export function ThinkingFields({
               ))}
             </Select>
           </Field>
-          <Field inline label="Thinking budget" hint="Tokens before the answer is forced; empty = unlimited">
+          <Field inline label="Thinking budget" hint={noBudget ? NOT_SUPPORTED : 'Tokens before the answer is forced; empty = unlimited'}>
             <NumberInput
               value={s.thinkingBudget}
               placeholder="∞"
               min={0}
               step={256}
+              disabled={noBudget}
               onChange={(v) => onChange('thinkingBudget', v === null ? null : Math.max(0, Math.round(v)))}
             />
           </Field>
@@ -165,13 +183,15 @@ function ListArea({
   parse,
   format,
   placeholder,
-  onChange
+  onChange,
+  disabled
 }: {
   value: string[]
   parse: (text: string) => string[]
   format: (list: string[]) => string
   placeholder?: string
   onChange: (list: string[]) => void
+  disabled?: boolean
 }) {
   const [draft, setDraft] = useState(() => format(value))
   const [seen, setSeen] = useState(value)
@@ -183,8 +203,9 @@ function ListArea({
   return (
     <Textarea
       rows={3}
-      className="font-mono text-xs"
+      className="font-mono text-xs disabled:pointer-events-none disabled:opacity-45"
       placeholder={placeholder}
+      disabled={disabled}
       value={draft}
       onChange={(e) => {
         setDraft(e.target.value)
@@ -197,14 +218,20 @@ function ListArea({
 /** Repetition and variety controls (DRY, XTC, avoid words); also used for the new-chat defaults on the Settings page. */
 export function VarietyFields({
   sampling: s,
-  onChange
+  onChange,
+  supports
 }: {
   sampling: SamplingParams
   onChange: <K extends keyof SamplingParams>(key: K, value: SamplingParams[K]) => void
+  supports?: SamplerSupport
 }) {
+  const noDry = !!supports && !supports.dry
+  const noXtc = !!supports && !supports.xtc
+  const noAvoid = !!supports && !supports.avoidWords
   return (
     <>
       <SliderRow
+        off={noDry}
         label="DRY multiplier"
         hint="0 = off. Penalises text that would repeat an earlier passage; around 0.8 is typical"
         value={s.dryMultiplier}
@@ -213,7 +240,7 @@ export function VarietyFields({
         step={0.05}
         onChange={(v) => onChange('dryMultiplier', v)}
       />
-      {s.dryMultiplier > 0 && (
+      {s.dryMultiplier > 0 && !noDry && (
         <>
           <SliderRow label="DRY base" hint="How fast the penalty grows with the length of the repeat" value={s.dryBase} min={1} max={4} step={0.05} onChange={(v) => onChange('dryBase', v)} />
           <Field inline label="DRY allowed length" hint="Repeats up to this many tokens are not penalised">
@@ -228,6 +255,7 @@ export function VarietyFields({
         </>
       )}
       <SliderRow
+        off={noXtc}
         label="XTC probability"
         hint="0 = off. How often the likeliest tokens are skipped for fresher wording; around 0.5 is typical"
         value={s.xtcProbability}
@@ -236,7 +264,7 @@ export function VarietyFields({
         step={0.05}
         onChange={(v) => onChange('xtcProbability', v)}
       />
-      {s.xtcProbability > 0 && (
+      {s.xtcProbability > 0 && !noXtc && (
         <SliderRow
           label="XTC threshold"
           hint="Only tokens more likely than this can be skipped; above 0.5 turns XTC off"
@@ -249,11 +277,11 @@ export function VarietyFields({
       )}
       <Field
         label="Avoid words"
-        hint="One per line. Works on tokens, so use distinctive words such as tapestry or testament. A phrase made of common words would penalise every word in it"
+        hint={noAvoid ? NOT_SUPPORTED : 'One per line. Works on tokens, so use distinctive words such as tapestry or testament. A phrase made of common words would penalise every word in it'}
       >
-        <ListArea value={s.avoidWords} parse={textToWords} format={(l) => l.join('\n')} onChange={(l) => onChange('avoidWords', l)} />
+        <ListArea value={s.avoidWords} parse={textToWords} format={(l) => l.join('\n')} disabled={noAvoid} onChange={(l) => onChange('avoidWords', l)} />
       </Field>
-      {s.avoidWords.length > 0 && (
+      {s.avoidWords.length > 0 && !noAvoid && (
         <SliderRow
           label="Avoid strength"
           hint="How hard to push these words down; 100 = effectively banned"
@@ -338,7 +366,7 @@ export function InferencePanel() {
   // Only the fields shown here: `current` itself is a new object on every streaming flush, which
   // would re-render all the sliders (and the tool list) about 11 times a second.
   const current = useChat(
-    useShallow((s) => (s.current ? { sampling: s.current.sampling, presetId: s.current.presetId, systemPrompt: s.current.systemPrompt } : null))
+    useShallow((s) => (s.current ? { sampling: s.current.sampling, presetId: s.current.presetId, systemPrompt: s.current.systemPrompt, modelId: s.current.modelId } : null))
   )
   const presets = useChat((s) => s.presets)
   const mutate = useChat((s) => s.mutateCurrent)
@@ -348,6 +376,11 @@ export function InferencePanel() {
   const [saveOpen, setSaveOpen] = useState(false)
   const [presetName, setPresetName] = useState('')
   const [varietyOpen, setVarietyOpen] = useState(false)
+  // An OpenRouter model honours only some settings; the rest are greyed. Undefined for local and rented models.
+  // The entry is picked from the store and the rest worked out here: a selector that makes a new object each time renders forever.
+  // With no active model, the chat's own one is connected by the next message.
+  const activeEntry = useModels((st) => st.models.find((m) => m.id === (st.activeModelId ?? current?.modelId)))
+  const supports = supportsOf(activeEntry)
 
   if (!current || !settings) {
     return <aside className="w-80 shrink-0 border-l border-border bg-panel p-4 text-xs text-faint">Open a chat to edit its settings.</aside>
@@ -420,7 +453,7 @@ export function InferencePanel() {
           </IconButton>
         }
       >
-        <SamplingFields sampling={s} onChange={setS} />
+        <SamplingFields sampling={s} onChange={setS} supports={supports} />
       </Section>
 
       <section className="border-b border-border px-4 py-4">
@@ -431,13 +464,13 @@ export function InferencePanel() {
             {varietyOn > 0 && <span className="font-normal normal-case"> · {varietyOn} on</span>}
           </Collapsible.Trigger>
           <Collapsible.Content className="mt-3 space-y-3">
-            <VarietyFields sampling={s} onChange={setS} />
+            <VarietyFields sampling={s} onChange={setS} supports={supports} />
           </Collapsible.Content>
         </Collapsible.Root>
       </section>
 
       <Section title="Thinking">
-        <ThinkingFields sampling={s} onChange={setS} />
+        <ThinkingFields sampling={s} onChange={setS} supports={supports} />
       </Section>
 
       <Section title="Adapters">
@@ -447,8 +480,9 @@ export function InferencePanel() {
       <ToolsSection />
 
       <Section title="Structured output">
-        <Field inline label="Constrain to a JSON schema">
+        <Field inline label="Constrain to a JSON schema" hint={supports && !supports.jsonSchema ? NOT_SUPPORTED : undefined}>
           <Switch
+            disabled={!!supports && !supports.jsonSchema}
             checked={!!s.jsonSchema}
             onCheckedChange={(on) => setS('jsonSchema', on ? '{\n  "type": "object",\n  "properties": {}\n}' : '')}
           />

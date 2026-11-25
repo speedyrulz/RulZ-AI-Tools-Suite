@@ -4,12 +4,17 @@ import { sep } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { z } from 'zod'
 import { adapterBaseMatch, adapterChoices, clampScale } from '@shared/adapters'
+import { isCloudModelId } from '@shared/cloud'
 import { draftFiles, fileName } from '@shared/draft'
 import { KV_CACHE_TYPES, type AdapterEntry, type DraftKind, type LoadAdapter, type LoadConfig, type ModelEntry, type ModelSampling } from '@shared/types'
 
-/** The id a model is listed under in GET /v1/models: its name, or its path when names collide. */
+/**
+ * The id a model is listed under in GET /v1/models: its name, or its path when names collide. An OpenRouter model is
+ * always listed under its own id (openrouter/<slug>), and its name never makes a local model's name ambiguous.
+ */
 export function publicModelId(model: ModelEntry, all: ModelEntry[]): string {
-  const dupes = all.filter((m) => m.name.toLowerCase() === model.name.toLowerCase())
+  if (model.cloud) return model.id
+  const dupes = all.filter((m) => !m.cloud && m.name.toLowerCase() === model.name.toLowerCase())
   return dupes.length > 1 ? model.id : model.name
 }
 
@@ -17,9 +22,12 @@ export function publicModelId(model: ModelEntry, all: ModelEntry[]): string {
  * Finds the model a request asked for. Accepts the public id, the library path, the file name
  * (with or without .gguf), any of those case-insensitively, and finally a unique substring match.
  */
-export function resolveModel(models: ModelEntry[], requested: string | undefined | null): ModelEntry | undefined {
+export function resolveModel(allModels: ModelEntry[], requested: string | undefined | null): ModelEntry | undefined {
   const q = (requested ?? '').trim()
   if (!q) return undefined
+  // An OpenRouter model is found by its exact id only: a fuzzy match could send text to a paid cloud model by accident.
+  if (isCloudModelId(q)) return allModels.find((m) => !!m.cloud && m.id === q)
+  const models = allModels.filter((m) => !m.cloud)
   const lower = q.toLowerCase()
   const strip = (s: string): string => s.toLowerCase().replace(/\.gguf$/, '')
   const unique = (hits: ModelEntry[]): ModelEntry | undefined => (hits.length === 1 ? hits[0] : undefined)
@@ -50,9 +58,10 @@ export function pickModel(
     if (!settings.unknownModelFallback) return undefined
   }
   const fallback = !!requested
-  const ready = readyModelIds.length === 1 ? models.find((m) => m.id === readyModelIds[0]) : undefined
+  // Never a cloud model: a fallback or a default must not start spending money.
+  const ready = readyModelIds.length === 1 ? models.find((m) => !m.cloud && m.id === readyModelIds[0]) : undefined
   if (ready) return { model: ready, fallback }
-  const def = settings.defaultModelId ? models.find((m) => m.id === settings.defaultModelId) : undefined
+  const def = settings.defaultModelId ? models.find((m) => !m.cloud && m.id === settings.defaultModelId) : undefined
   return def ? { model: def, fallback } : undefined
 }
 
@@ -227,8 +236,8 @@ export function hoistSystemMessages(json: { system?: unknown; messages?: unknown
 }
 
 /** OpenAI-style error body. */
-export function errorBody(message: string, type = 'invalid_request_error'): string {
-  return JSON.stringify({ error: { message, type } })
+export function errorBody(message: string, type = 'invalid_request_error', code?: string): string {
+  return JSON.stringify({ error: { message, type, ...(code ? { code } : {}) } })
 }
 
 /**

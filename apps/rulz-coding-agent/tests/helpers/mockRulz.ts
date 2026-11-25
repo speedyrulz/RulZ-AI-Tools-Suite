@@ -11,6 +11,12 @@ export interface MockTurn {
   /** Answer with this HTTP status and error instead. */
   status?: number
   error?: string
+  /** The `error.code` of that answer (LLM Suite's OpenRouter codes: cloud_limit, cloud_key...). */
+  code?: string
+  /** Start the stream, then send this error chunk (an OpenRouter failure in the middle of a reply). */
+  streamError?: { message: string; code?: string }
+  /** The dollars the answer cost: the final chunk's `usage.cost`. */
+  cost?: number
   /** Wait before answering (ms). */
   delay?: number
   /** Wait between the reasoning and the content (ms), as a model thinking for a while. */
@@ -46,10 +52,14 @@ export interface MockOptions {
     rental?: { label: string | null; reconnecting: boolean }
     /** Overrides the path (LLM Suite 0.29 to 0.34 marked a rental by a `vast/` path). */
     path?: string
+    /** An OpenRouter model, as LLM Suite 0.36 reports it; any value, so hostile ones can be sent. */
+    cloud?: unknown
   }[]
   template?: string
   nCtx?: number
   turns?: MockTurn[] | ((req: MockRequest, index: number) => MockTurn)
+  /** Answer the non-streamed requests (summaries): an error or a cost instead of the plain summary. */
+  complete?: (req: MockRequest, index: number) => { status: number; error: string; code?: string } | { cost: number } | undefined
   /** Report exact token counts like llama.cpp (timings in the last chunk). */
   timings?: (req: MockRequest) => {
     cache_n: number
@@ -88,6 +98,7 @@ export async function startMockRulz(opts: MockOptions = {}) {
   const requests: MockRequest[] = []
   const models = opts.models ?? [{ id: 'Qwen3-Coder-30B-A3B-Instruct-Q5_K_M', state: 'loaded', loaded_context_length: opts.nCtx ?? 65536 }]
   let turnIndex = 0
+  let completeIndex = 0
   const loadConfig = {
     contextLength: 65536,
     gpuLayers: 'auto',
@@ -157,7 +168,8 @@ export async function startMockRulz(opts: MockOptions = {}) {
                 state: m.state ?? 'not-loaded',
                 loaded_context_length: m.loaded_context_length,
                 max_context_length: 262144,
-                ...(m.rental ? { rental: m.rental } : {})
+                ...(m.rental ? { rental: m.rental } : {}),
+                ...(m.cloud !== undefined ? { cloud: m.cloud } : {})
               }
         )
       })
@@ -312,14 +324,27 @@ export async function startMockRulz(opts: MockOptions = {}) {
           }
         }
       }
-      if (!body.stream) return json(200, { choices: [{ message: { role: 'assistant', content: 'Summary: the owner asked for things and they were built.' } }] })
+      if (!body.stream) {
+        const answer = opts.complete?.(record, completeIndex++)
+        if (answer && 'status' in answer) return json(answer.status, { error: { message: answer.error, ...(answer.code ? { code: answer.code } : {}) } })
+        return json(200, {
+          choices: [{ message: { role: 'assistant', content: 'Summary: the owner asked for things and they were built.' } }],
+          ...(answer && 'cost' in answer ? { usage: { prompt_tokens: 10, completion_tokens: 5, cost: answer.cost } } : {})
+        })
+      }
       const turn = nextTurn(record)
       if (turn.delay) await new Promise((r) => setTimeout(r, turn.delay))
-      if (turn.status) return json(turn.status, { error: { message: turn.error ?? 'error' } })
-      res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+      if (turn.status) return json(turn.status, { error: { message: turn.error ?? 'error', ...(turn.code ? { code: turn.code, type: 'cloud_error' } : {}) } })
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', ...(models.find((x) => x.id === body.model)?.cloud !== undefined ? { 'x-rulz-cloud': '1' } : {}) })
+      if (turn.streamError) {
+        res.write(`data: ${JSON.stringify({ error: { message: turn.streamError.message, ...(turn.streamError.code ? { code: turn.streamError.code } : {}) } })}\n\n`)
+        res.end('data: [DONE]\n\n')
+        return
+      }
       const send = (delta: unknown, finish: string | null = null): void => {
         const timings = finish && opts.timings ? { timings: opts.timings(record) } : {}
-        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: finish }], ...timings })}\n\n`)
+        const usage = finish && turn.cost !== undefined ? { usage: { prompt_tokens: 10, completion_tokens: 5, cost: turn.cost } } : {}
+        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: finish }], ...timings, ...usage })}\n\n`)
       }
       const reasoning = turn.reasoning ?? ''
       for (let i = 0; i < reasoning.length; i += 7) send({ reasoning_content: reasoning.slice(i, i + 7) })

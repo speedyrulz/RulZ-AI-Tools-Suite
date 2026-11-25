@@ -25,7 +25,7 @@ import type {
 } from '@shared/types'
 import { DEFAULT_MAX_OUTPUT_TOKENS, MAX_INSTRUCTION_CHARS } from '@shared/defaults'
 import { dropExchange, dropReply, forModel, requestItem, whyNotDelete, whyNotRedo } from '@shared/history'
-import { chooseModel, describeModeUse, modeHeaders, modeOfTask, modePrompt, requestSkipsThinking, taskSamplingFields, withApiOverride } from '@shared/modes'
+import { chooseModel, describeModeUse, isCloudCode, isCloudFatalCode, modeHeaders, modeOfTask, modePrompt, requestSkipsThinking, taskSamplingFields, withApiOverride } from '@shared/modes'
 import { splitThink } from '@shared/think'
 import { attachedLabel, MAX_PDFS_PER_MESSAGE, PDF_ID, type PdfAttachment } from '@shared/pdf'
 import { friendlyServerError, RE_SESSION_HEADER, ServerError, type RulzClient, type TurnResult } from '../rulz/client'
@@ -80,9 +80,12 @@ const LAST_RESORT_REPLY_TOKENS = 256
 const SAVE_DELAY_MS = 1500
 const SAVE_DELAY_RUNNING_MS = 5000
 
-/** Whether a server error says the request didn't fit the model's context. */
+/**
+ * Whether a server error says the request didn't fit the model's context. Never for an OpenRouter error (`cloud_` code):
+ * the answer to that is the server's own sentence, and trying again costs money.
+ */
 export function isContextOverflow(e: unknown): boolean {
-  return e instanceof ServerError && /exceeds? the available context|context (size|length|window)|too many tokens|prompt is too long/i.test(e.message)
+  return e instanceof ServerError && !isCloudCode(e.code) && /exceeds? the available context|context (size|length|window)|too many tokens|prompt is too long/i.test(e.message)
 }
 
 export interface SessionDeps {
@@ -142,6 +145,12 @@ interface TaskMode {
 const isRentalTrouble = (e: unknown): boolean =>
   e instanceof ServerError && (e.status === 409 || (e.status >= 500 && /connection to the rental/i.test(e.message)))
 
+/** An OpenRouter error after which the same request would fail again (see CLOUD_FATAL_CODES): the task ends at once and a batch run stops. */
+const isCloudFatal = (e: unknown): boolean => e instanceof ServerError && isCloudFatalCode(e.code)
+
+/** Any error the owner has to hear in the server's words and that no request of this task may be repeated for. */
+const isModelTrouble = (e: unknown): boolean => isRentalTrouble(e) || isCloudFatal(e)
+
 function cleanContent(text: string): string {
   return splitThink(text).answer
 }
@@ -200,6 +209,8 @@ export class ProjectSession {
   private taskMode: TaskMode | null = null
   /** Set when the server refused the last task's requests for a rental (a batch run stops on it). */
   private refusal: string | null = null
+  /** The refusal was a fatal OpenRouter error (a batch run keeps that task pending, since it never got its try). */
+  private refusalCloud = false
   /** The project's attached PDFs for the running task's system prompt: read once at the start and kept, so the prompt stays stable. */
   private taskPdfs: PdfAttachment[] = []
 
@@ -219,6 +230,11 @@ export class ProjectSession {
   /** Why the last task's requests were refused or cut off for a rental, in the server's words (null when they were not). */
   get modelRefusal(): string | null {
     return this.refusal
+  }
+
+  /** True when `modelRefusal` is a fatal OpenRouter error: the same request would fail again, so a batch run stops and leaves the task pending. */
+  get modelRefusalIsCloud(): boolean {
+    return this.refusal !== null && this.refusalCloud
   }
 
   state(name: string, lastOpened: number): ProjectState {
@@ -344,6 +360,7 @@ export class ProjectSession {
     this.unattended = opts.batch === true
     this.rentalOk = opts.batch === true && opts.rentalOk === true
     this.refusal = null
+    this.refusalCloud = false
     this.taskMode = null
     this.abort = new AbortController()
     this.emit({ type: 'task-start', task, item })
@@ -598,7 +615,7 @@ export class ProjectSession {
       const choice = this.resolveModel()
       const model = choice.model
       // Read before the first request and kept for the whole task, so the system prompt stays stable.
-      this.taskMode = await this.readModes(task, model, choice.rental, signal)
+      this.taskMode = await this.readModes(task, model, choice.rental, !!choice.cloud, signal)
       const nCtx = await this.prepareModel(model, signal)
       this.nCtx = nCtx
       this.extraServers = (await this.deps.toolServers?.configured().catch(() => [])) ?? []
@@ -645,7 +662,10 @@ export class ProjectSession {
       } else {
         task.outcome = 'error'
         const message = e instanceof FriendlyError ? e.message : friendlyServerError(e)
-        if (isRentalTrouble(e) || (e instanceof FriendlyError && e.rental)) this.refusal = message
+        if (isCloudFatal(e)) {
+          this.refusal = message
+          this.refusalCloud = true
+        } else if (isRentalTrouble(e) || (e instanceof FriendlyError && e.rental)) this.refusal = message
         this.notice(message, 'error', task.id)
       }
     } finally {
@@ -693,9 +713,9 @@ export class ProjectSession {
   }
 
   /** The model for this task: the chosen one, or the default pick (never a rental's). Says so when a rental's model is gone. */
-  private resolveModel(): { model: string; rental: boolean } {
+  private resolveModel(): { model: string; rental: boolean; cloud?: true } {
     const s = this.deps.settings()
-    const choice = chooseModel(s.model, s.modelRental, this.deps.models())
+    const choice = chooseModel(s.model, s.modelRental, this.deps.models(), s.modelCloud)
     if (!choice.ok) throw new FriendlyError(choice.reason, true)
     return choice
   }
@@ -705,16 +725,16 @@ export class ProjectSession {
    * everything as before, silently. Any other failure: as before too, with a notice in the conversation.
    * Also decides the headers every request of the task carries.
    */
-  private async readModes(task: TaskRecord, model: string, rentalChosen: boolean, signal: AbortSignal): Promise<TaskMode> {
+  private async readModes(task: TaskRecord, model: string, rentalChosen: boolean, cloud: boolean, signal: AbortSignal): Promise<TaskMode> {
     const mode = modeOfTask(task)
-    // A rental's model is used only when the owner chose it (or, in a batch run, said yes to it).
-    const headers = modeHeaders(mode, this.unattended ? this.rentalOk : rentalChosen)
+    // A rental's model is used only when the owner chose it (or, in a batch run, said yes to it). An OpenRouter model is no rental: no rental header.
+    const headers = modeHeaders(mode, this.unattended ? this.rentalOk : rentalChosen, cloud)
     let modes: ModelModes | null = null
     try {
       modes = await this.deps.client.modelModes(model, signal, headers)
     } catch (e) {
       if (signal.aborted) throw e
-      if (isRentalTrouble(e)) throw e
+      if (isModelTrouble(e)) throw e
       this.notice(`I couldn't read RulZ LLM Suite's settings for this model, so I'm using this app's own. (${friendlyServerError(e)})`, 'warn', task.id)
     }
     const line = describeModeUse(mode, modes, this.deps.settings().modelSampling[model])
@@ -755,7 +775,7 @@ export class ProjectSession {
       if (signal.aborted) throw e
       const status = (e as { status?: number }).status
       // A 503 means loading failed, a 409 that a rental said no; other errors only cost us the extra details.
-      if (status === 503 || isRentalTrouble(e)) throw e
+      if (status === 503 || isModelTrouble(e)) throw e
     }
     this.deps.activity('working')
     this.deps.refreshModels()
@@ -770,12 +790,12 @@ export class ProjectSession {
       // Fetched again: the chat template in them decides the tool-argument fix for this task.
       await this.deps.client.modelProps(model, signal, this.requestHeaders()).catch(() => undefined)
     }
-    const size = fresh?.loadedContext ?? nCtx ?? info?.loadedContext ?? DEFAULT_CTX
+    const size = [fresh?.loadedContext, nCtx, info?.loadedContext].find((n): n is number => typeof n === 'number' && n > 0) ?? DEFAULT_CTX
     if (size <= SMALL_CONTEXT && !this.warnedSmallContext) {
       this.warnedSmallContext = true
       this.notice(
         `The model is loaded with a small working memory (${Math.round(size / 1024)}K tokens), so in bigger projects I'll have to tidy up my notes often and may forget details. ` +
-          'For bigger projects, load the model in RulZ LLM Suite with a larger context length (32K or more).',
+          (info?.cloud ? "For bigger projects, raise the model's context limit on LLM Suite's OpenRouter page." : 'For bigger projects, load the model in RulZ LLM Suite with a larger context length (32K or more).'),
         'warn'
       )
     }
@@ -831,7 +851,9 @@ export class ProjectSession {
             continue
           }
           this.notice(
-            "My replies kept getting cut off before they were finished, so I stopped here. If the model's working memory is nearly full, start a new task or load the model with a larger context length in RulZ LLM Suite.",
+            this.deps.models().find((m) => m.id === model)?.cloud
+              ? "My replies kept getting cut off before they were finished, so I stopped here. Start a new task or raise the model's context limit on LLM Suite's OpenRouter page."
+              : "My replies kept getting cut off before they were finished, so I stopped here. If the model's working memory is nearly full, start a new task or load the model with a larger context length in RulZ LLM Suite.",
             'warn',
             task.id
           )
@@ -1068,15 +1090,17 @@ export class ProjectSession {
         ],
         1500,
         signal,
-        this.requestHeaders()
+        this.requestHeaders(),
+        (dollars) => this.addCost(this.current, dollars)
       )
       // Checked without the thinking: a reply that was all <think> (cut off while thinking) would
       // otherwise replace the summary, and everything folded into it, with nothing.
       summary = cleanContent(reply).trim()
       if (!summary) throw new Error('empty summary')
     } catch (e) {
-      // A rental that said no (or lost its connection) is not a reason to make do with a mechanical summary.
-      if (signal.aborted || isRentalTrouble(e)) throw e
+      // A rental that said no (or lost its connection) is not a reason to make do with a mechanical summary. Nor is an OpenRouter
+      // error: it ends the task, and buildRequest does not ask again.
+      if (signal.aborted || isRentalTrouble(e) || (e instanceof ServerError && isCloudCode(e.code))) throw e
       summary = `${this.data.summary ? `${this.data.summary}\n` : ''}${mechanicalSummary(part)}`
     }
     this.data.summary = summary
@@ -1166,7 +1190,9 @@ export class ProjectSession {
         }
       }, reHeaders)
     } catch (e) {
-      if (!this.notes.endTurn() || signal.aborted) throw e
+      const cutByNote = this.notes.endTurn()
+      // An OpenRouter error is never hidden by a note arriving at the same time: the task ends with it.
+      if (!cutByNote || signal.aborted || (e instanceof ServerError && isCloudCode(e.code))) throw e
       // Cut short by a note: half-made tool calls are dropped, the text and thinking so far are kept.
       const partial = item as Extract<TimelineItem, { kind: 'assistant' }> | null
       result = { content: partial?.text ?? '', toolCalls: [], finishReason: 'interrupted', cut: { thinking: '' } }
@@ -1188,6 +1214,7 @@ export class ProjectSession {
     }
     this.measure(result, estimated, nCtx)
     this.countDrafts(task, model, result)
+    if (result.cost) this.addCost(task, result.cost)
     return { ...result, itemId: finished?.id }
   }
 
@@ -1206,9 +1233,18 @@ export class ProjectSession {
     this.scheduleSave()
   }
 
+  /** Adds what an OpenRouter request cost (dollars, from the server's `usage.cost`) to the task. */
+  private addCost(task: TaskRecord | null, dollars: number): void {
+    if (!task || !(dollars > 0) || !Number.isFinite(dollars)) return
+    task.cost = Math.round(((task.cost ?? 0) + dollars) * 1e8) / 1e8
+    this.emit({ type: 'cost', taskId: task.id, cost: task.cost })
+    this.scheduleSave()
+  }
+
   /** Adds the turn's speculative-decoding numbers to the task's draft stats. */
   private countDrafts(task: TaskRecord, model: string, result: TurnResult): void {
     if (!result.gen) return
+    if (this.deps.models().find((m) => m.id === model)?.cloud) return
     const draft = addDraft(task.draft, result.gen, this.deps.client.noDraftBaseline(model))
     if (!draft || draft === task.draft) return
     task.draft = draft
