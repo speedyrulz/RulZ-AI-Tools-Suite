@@ -215,12 +215,13 @@ describe('RE overview', () => {
         { id: 'c2', title: 'Clone: a', updatedAt: 30, re: re({ clone: { scope: 'full', details: '', language: 'C', outputDir: 'D:\\o' } }) }
       ],
       traces: [
-        { conversationId: 'c1', responses: 4, toolRounds: 3, trimmed: false, bytes: 1, updatedAt: 12 },
+        { conversationId: 'c1', responses: 4, toolRounds: 3, trimmed: false, models: ['m'], bytes: 1, updatedAt: 12 },
         {
           conversationId: 'api-agent-1',
           responses: 2,
           toolRounds: 1,
           trimmed: false,
+          models: ['m'],
           bytes: 1,
           updatedAt: 20,
           api: { client: 'RulZ Coding Agent', title: 'x', target: 't', goal: 'g', outcome: 'failed', createdAt: 1, practice: { taskId: 'xor-1', family: 'xor', tier: 't1' } }

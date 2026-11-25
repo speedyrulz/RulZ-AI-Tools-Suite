@@ -267,6 +267,8 @@ export interface ReTraceInfo {
   toolRounds: number
   /** Context was trimmed at some point, so the sample lacks part of the session. */
   trimmed: boolean
+  /** Names of the models that replied in the session; empty when nothing was recorded. */
+  models: string[]
   bytes: number
   updatedAt: number
   /** Set for a session another app ran through the API server (it has no chat here). */
@@ -352,6 +354,8 @@ export interface ReExportOptions {
   skipTrimmed: boolean
   /** Practice tasks: keep at most this many sessions per task (fewest tool rounds first). */
   maxPerTask: number
+  /** Models to leave out: a session in which one of them replied is not exported. */
+  skipModels?: string[]
 }
 
 export interface ReExportResult {

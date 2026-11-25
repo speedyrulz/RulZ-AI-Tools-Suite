@@ -219,11 +219,15 @@ Discover/downloads, RAG and a CLI are planned.
   - **Practice tasks**: reads `build/tasks.jsonl` from the RE training kit (`C:\coding\Trainers\re-training-kit`),
     copies a task's binary to a fresh work folder, and checks the final `ANSWER:` line automatically (a port of the
     kit's `verify.py`).
+  - **Results per model** (0.34.0): the practice tiles show what the model chosen under New session has solved and
+    failed; click a family to see each task. **Start next task** and a batch run's **Only unsolved** go by that model
+    too, so a new model gets every task. A model on this PC and its copy on a rental count as one (same name), and
+    batch results count even when their chats were deleted.
   - **Batch runs**: **Start batch run** under the practice tasks runs them without you and keeps a
     score, so two models (or one model before and after fine-tuning) can be compared on the same tasks. Options: at
     most N tasks (taken family by family in turn, so a short run still covers every family), tries per task, a time
-    limit per task (counted from the task's first reply, so loading the model is not counted), only tasks no earlier
-    session solved, and a label. A run records the adapters the model had loaded and their strengths, shown next to
+    limit per task (counted from the task's first reply, so loading the model is not counted), only tasks this model has
+    not solved, and a label. A run records the adapters the model had loaded and their strengths, shown next to
     the model name, so a base model and its fine-tune can be told apart. Each task is a normal recorded practice session in its own chat. A tool call that
     would ask for approval is refused instead of waiting (the model is told why and carries on); the form warns when a
     tool every session starts with, such as `rea__open_binary`, still asks, with an **Always allow** button. A task
@@ -241,7 +245,8 @@ Discover/downloads, RAG and a CLI are planned.
     instead of counting as failed.
   - **Export**: writes `train.jsonl` in the kit's format (OpenAI / Hugging Face chat: `messages`, `tools`, `meta`;
     thinking in `reasoning_content`) plus `manifest.json`, from solved sessions by default, at most N per practice task
-    (fewest tool rounds first), leaving out sessions whose context was trimmed. Email addresses are replaced.
+    (fewest tool rounds first), leaving out sessions whose context was trimmed. Email addresses are replaced. When
+    several models practised, **Models** picks whose sessions go in (0.34.0).
   - **Clone**: the New session card switches between **Analyse** and **Clone**. A clone session rebuilds either
     **specific pieces** of the target (presets for a file format, network protocol, algorithm, license logic, config and
     command line, or one function, or your own description) or **the whole program**, as new readable source code in

@@ -23,7 +23,10 @@ export interface ResponseLine {
 export interface RequestFile {
   requestId: string
   at: number
+  /** The model of the latest round. */
   model: string
+  /** Every model that replied in the session; missing in data recorded before 0.34.0. */
+  models?: string[]
   messages: WireMessage[]
   tools: unknown[]
   /** Any round of the session was trimmed to fit the context. */
@@ -47,7 +50,14 @@ interface RecordState {
   trimmedEver: boolean
   /** Messages in the previous request; null when there was none. */
   messages: number | null
+  models: string[]
   tools: Record<string, unknown>
+}
+
+/** Every model that replied in the session. */
+function modelsOf(req: RequestFile | null): string[] {
+  if (Array.isArray(req?.models)) return req.models
+  return req?.model ? [req.model] : []
 }
 
 /**
@@ -108,6 +118,7 @@ export class TraceStore {
         st = {
           trimmedEver: !!old?.trimmedEver,
           messages: Array.isArray(old?.messages) ? old.messages.length : null,
+          models: modelsOf(old),
           tools: await readJsonFile<Record<string, unknown>>(join(dir, 'tools.json'), {})
         }
       }
@@ -115,6 +126,7 @@ export class TraceStore {
         requestId: round.requestId,
         at: round.at,
         model: round.model,
+        models: [...new Set([...st.models, round.model])],
         messages: round.messages,
         tools: round.tools,
         trimmedEver:
@@ -136,7 +148,7 @@ export class TraceStore {
       if (toolsChanged) await writeTextAtomic(join(dir, 'tools.json'), JSON.stringify(tools))
       // Most recently recorded last; the oldest go past STATE_LIMIT (a miss just reads the files again).
       this.state.delete(conversationId)
-      this.state.set(conversationId, { trimmedEver: req.trimmedEver, messages: round.messages.length, tools })
+      this.state.set(conversationId, { trimmedEver: req.trimmedEver, messages: round.messages.length, models: modelsOf(req), tools })
       for (const old of this.state.keys()) {
         if (this.state.size <= STATE_LIMIT) break
         this.state.delete(old)
@@ -201,6 +213,7 @@ export class TraceStore {
       responses: lines.length,
       toolRounds: lines.filter((l) => l.toolCalls?.length).length,
       trimmed: !!req?.trimmedEver,
+      models: modelsOf(req),
       bytes: stats.slice(0, 3).reduce((sum, s) => sum + (s?.size ?? 0), 0),
       updatedAt: req?.at ?? lines.at(-1)?.at ?? 0
     }
@@ -387,8 +400,14 @@ export async function exportDataset(
       drop('context was trimmed')
       continue
     }
+    const models = modelsOf(data.request)
+    if (opts.skipModels?.some((m) => models.includes(m))) {
+      drop('model not selected')
+      continue
+    }
     const meta: Record<string, unknown> = {
       conversation: c.id,
+      ...(models.length > 1 ? { models } : {}),
       ...(c.source ? { source: c.source } : {}),
       outcome: re.outcome,
       graded: re.autoGraded ? 'auto' : 'user',
@@ -424,6 +443,9 @@ export async function exportDataset(
     kept.push(cand.sample)
   }
 
+  const byModel: Record<string, number> = {}
+  for (const s of kept) byModel[String(s.meta.model)] = (byModel[String(s.meta.model)] ?? 0) + 1
+
   await fs.mkdir(opts.outDir, { recursive: true })
   const trainPath = join(opts.outDir, 'train.jsonl')
   const manifestPath = join(opts.outDir, 'manifest.json')
@@ -438,6 +460,8 @@ export async function exportDataset(
         outcomes: opts.outcomes,
         skipTrimmed: opts.skipTrimmed,
         maxPerTask: opts.maxPerTask,
+        skipModels: opts.skipModels ?? [],
+        models: byModel,
         dropped
       },
       null,

@@ -22,7 +22,7 @@ import { useModels } from '../../stores/models'
 import { useNow } from '../remote/useNow'
 import { useHostChoices, useTargetState } from '../remote/TargetPicker'
 import { useBatch } from '../../stores/batch'
-import { practiceRecords, solvedTasks, useReTraces } from '../../stores/reTraces'
+import { practiceOf, solvedTasks, useReTraces } from '../../stores/reTraces'
 import { isChatBusy, useChat } from '../../stores/chat'
 import { availableTools, useMcp } from '../../stores/mcp'
 import { Badge, Button, Dialog, IconButton, Input, NumberInput, ProgressBar, Switch, Tooltip } from '../ui'
@@ -69,7 +69,10 @@ export function BatchStart({ tasks, family, kitDir }: { tasks: RePracticeTask[];
   const options = useMemo(() => ({ ...opts, family }), [opts, family])
   const traces = useReTraces((s) => s.traces)
   useEffect(() => useReTraces.getState().init(), [])
-  const planned = useMemo(() => planBatch(tasks, options, solvedTasks(practiceRecords(summaries, traces))), [tasks, options, summaries, traces])
+  const planned = useMemo(
+    () => planBatch(tasks, options, solvedTasks(practiceOf(runModelId, { summaries, traces, runs, models }))),
+    [tasks, options, summaries, traces, runs, models, runModelId]
+  )
   const taskCount = options.attempts > 0 ? planned.length / options.attempts : 0
   const set = <K extends keyof BatchOptions>(key: K, value: BatchOptions[K]): void => setOpts((o) => ({ ...o, [key]: value }))
 
@@ -111,7 +114,7 @@ export function BatchStart({ tasks, family, kitDir }: { tasks: RePracticeTask[];
             <NumberInput className="w-16" value={opts.minutesPerTask || null} placeholder="none" min={0} max={1440} onChange={(v) => set('minutesPerTask', Math.min(1440, Math.max(0, v ?? 0)))} />
           </span>
         </Tooltip>
-        <Tooltip content="Leaves out tasks an earlier session solved. Good for collecting training data; leave it off to compare models on the same tasks.">
+        <Tooltip content="Leaves out tasks this model has solved before; tasks it failed or never tried are run. Good for collecting training data; leave it off to compare models on the same tasks.">
           <label className="flex items-center gap-1.5">
             <Switch checked={opts.onlyUnsolved} onCheckedChange={(v) => set('onlyUnsolved', v)} /> Only unsolved
           </label>
