@@ -28,6 +28,11 @@ Discover/downloads, RAG and a CLI are planned.
   on the GPU) and custom tensor overrides (`--override-tensor`), single-GPU or split across GPUs, flash attention, KV cache quantization, threads, batch sizes, mmap/mlock, chat template override and
   extra arguments; per-model saved defaults; memory estimate with a fits/partial/likely-OOM verdict; load progress;
   live server log; several models loaded at once.
+  - **Settings per mode** (0.33.0): each model can have its own load settings, sampling and system prompt for Chat,
+    Reverse engineering, Adventure and Writing (**My Models**, pick a model, **Settings for**). Anything a mode leaves
+    out stays as it is without it. The load dialog has **Load for**. When a model is loaded with other settings than the
+    mode wants, a bar offers to reload it; it never reloads by itself. Existing chats, sessions and Writing projects keep
+    their settings.
   - **Speculative decoding**: a draft-head sidecar next to the model (`mtp-*.gguf`, or eagle3/dflash/dspark) is
     detected and used automatically (`--spec-type draft-<kind>`), with a per-model switch and draft length.
     MTP layers built into the model file (Qwen3.5+ "MTP" GGUFs) are detected too and preferred. A **Draft model**
@@ -214,11 +219,15 @@ Discover/downloads, RAG and a CLI are planned.
   - **Practice tasks**: reads `build/tasks.jsonl` from the RE training kit (`C:\coding\Trainers\re-training-kit`),
     copies a task's binary to a fresh work folder, and checks the final `ANSWER:` line automatically (a port of the
     kit's `verify.py`).
+  - **Results per model** (0.34.0): the practice tiles show what the model chosen under New session has solved and
+    failed; click a family to see each task. **Start next task** and a batch run's **Only unsolved** go by that model
+    too, so a new model gets every task. A model on this PC and its copy on a rental count as one (same name), and
+    batch results count even when their chats were deleted.
   - **Batch runs**: **Start batch run** under the practice tasks runs them without you and keeps a
     score, so two models (or one model before and after fine-tuning) can be compared on the same tasks. Options: at
     most N tasks (taken family by family in turn, so a short run still covers every family), tries per task, a time
-    limit per task (counted from the task's first reply, so loading the model is not counted), only tasks no earlier
-    session solved, and a label. A run records the adapters the model had loaded and their strengths, shown next to
+    limit per task (counted from the task's first reply, so loading the model is not counted), only tasks this model has
+    not solved, and a label. A run records the adapters the model had loaded and their strengths, shown next to
     the model name, so a base model and its fine-tune can be told apart. Each task is a normal recorded practice session in its own chat. A tool call that
     would ask for approval is refused instead of waiting (the model is told why and carries on); the form warns when a
     tool every session starts with, such as `rea__open_binary`, still asks, with an **Always allow** button. A task
@@ -236,7 +245,8 @@ Discover/downloads, RAG and a CLI are planned.
     instead of counting as failed.
   - **Export**: writes `train.jsonl` in the kit's format (OpenAI / Hugging Face chat: `messages`, `tools`, `meta`;
     thinking in `reasoning_content`) plus `manifest.json`, from solved sessions by default, at most N per practice task
-    (fewest tool rounds first), leaving out sessions whose context was trimmed. Email addresses are replaced.
+    (fewest tool rounds first), leaving out sessions whose context was trimmed. Email addresses are replaced. When
+    several models practised, **Models** picks whose sessions go in (0.34.0).
   - **Clone**: the New session card switches between **Analyse** and **Clone**. A clone session rebuilds either
     **specific pieces** of the target (presets for a file format, network protocol, algorithm, license logic, config and
     command line, or one function, or your own description) or **the whole program**, as new readable source code in

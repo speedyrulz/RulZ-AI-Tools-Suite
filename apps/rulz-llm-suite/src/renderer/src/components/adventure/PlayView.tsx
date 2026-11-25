@@ -4,6 +4,8 @@ import { childForChoice, pathTo, type Adventure, type AdventureNode } from '@sha
 import { isRunning, jobStatusText, liveView, stepLine } from '../../lib/adventure'
 import { cn } from '../../lib/format'
 import { useAdventure } from '../../stores/adventure'
+import { useModels } from '../../stores/models'
+import { ModeReloadBar } from '../models/ModeReloadBar'
 import { Markdown } from '../chat/Markdown'
 import { Button, DropdownMenu, IconButton, Kbd, ProgressBar, Textarea } from '../ui'
 import { ConfirmDialog } from '../writing/common'
@@ -30,6 +32,7 @@ export function PlayView() {
   const job = useAdventure((s) => s.job)
   const remoteNodeId = useAdventure((s) => s.remoteNodeId)
   const panelOpen = useAdventure((s) => s.panelOpen)
+  const activeModelId = useModels((s) => s.activeModelId)
   const store = useAdventure.getState()
   const [editId, setEditId] = useState<string | null>(null)
   const [confirm, setConfirm] = useState<{ kind: 'choices' | 'delete'; id: string } | null>(null)
@@ -112,6 +115,7 @@ export function PlayView() {
           {panelOpen ? <PanelRightClose size={17} /> : <PanelRightOpen size={17} />}
         </IconButton>
       </header>
+      <ModeReloadBar modelId={adv.setup.modelId ?? activeModelId} mode="adventure" />
 
       <div className="flex min-h-0 flex-1">
         <div className="min-w-0 flex-1 overflow-y-auto">

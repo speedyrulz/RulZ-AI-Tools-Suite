@@ -3,9 +3,10 @@ import { useEffect, useRef, useState } from 'react'
 import { useFileDrop } from '../../hooks/useFileDrop'
 import { cn, formatCompact, formatTokens } from '../../lib/format'
 import { useApp } from '../../stores/app'
-import { useChat } from '../../stores/chat'
+import { isPoolChat, useChat } from '../../stores/chat'
 import { useModels } from '../../stores/models'
 import { LogoWordmark } from '../Logo'
+import { ModeReloadBar } from '../models/ModeReloadBar'
 import { IconButton, Tooltip } from '../ui'
 import { Composer, type ComposerHandle } from './Composer'
 import { HandoffDialogs, useHandoffTrigger } from './Handoff'
@@ -18,6 +19,8 @@ export function ChatView() {
   const rename = useChat((s) => s.rename)
   const setHandoffConfirm = useChat((s) => s.setHandoffConfirm)
   const handoffBusy = useChat((s) => s.handoff)
+  const poolOwned = useChat((s) => isPoolChat(s, s.current?.id))
+  const activeModelId = useModels((s) => s.activeModelId)
   useHandoffTrigger()
   const panelOpen = useApp((s) => s.settings?.rightPanelOpen ?? true)
   const updateSettings = useApp((s) => s.updateSettings)
@@ -103,6 +106,7 @@ export function ChatView() {
 
       <ReBanner conv={current} />
       <PoolBanner id={current.id} />
+      {!poolOwned && <ModeReloadBar modelId={activeModelId ?? current.modelId} mode={current.re ? 're' : 'chat'} />}
 
       <div
         ref={scroller}

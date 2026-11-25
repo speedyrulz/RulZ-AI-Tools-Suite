@@ -1353,3 +1353,38 @@ describe('nothing is left running', () => {
     expect(o.runs[1].text).toContain(' 20 0 >"$R/boot"')
   })
 })
+
+describe('loads in different modes with different draft files', () => {
+  const draftA = 'C:\\LLM\\a\\draft.gguf'
+  const draftB = 'C:\\LLM\\b\\draft.gguf'
+  const base = { ...DEFAULT_LOAD_CONFIG, useDraft: true, draftFile: draftA }
+  const modeB = { ...DEFAULT_LOAD_CONFIG, useDraft: true, draftFile: draftB }
+  // Both drafts have the same file name, so the full list names the second one apart.
+  const complete: Array<[string, number]> = [
+    ['m.gguf', 1000],
+    ['draft.gguf', 10],
+    ['draft-draft.gguf', 10]
+  ]
+
+  async function startWith(config: typeof base) {
+    const h = harness({
+      getDefaults: () => base,
+      getModeLoads: () => [modeB],
+      draftFor: (_m, cfg) => ({ path: cfg.draftFile ?? '', sizeBytes: 10, kind: 'eagle3' })
+    })
+    h.reply.check = { code: 0, stdout: checkOut({ complete }) }
+    const handle = await createRemoteLauncher(h.deps).start(7, { ...h.launch, config })
+    await tick(10)
+    handle.detachSync()
+    return h.seen[1].text
+  }
+
+  it('each load uses the draft file its own settings name', async () => {
+    const a = await startWith(base)
+    expect(a).toContain(`'${ROOT}/models/m/draft.gguf'`)
+    expect(a).not.toContain('draft-draft.gguf')
+    const b = await startWith(modeB)
+    expect(b).toContain(`'${ROOT}/models/m/draft-draft.gguf'`)
+    expect(b).not.toContain(`'${ROOT}/models/m/draft.gguf'`)
+  })
+})

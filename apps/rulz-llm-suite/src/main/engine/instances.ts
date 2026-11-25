@@ -1,6 +1,7 @@
 import type { ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { adapterPathUsable } from '@shared/adapters'
+import type { AppMode } from '@shared/modes'
 import type { RemoteHost } from '@shared/remote'
 import type { AdapterEntry, InstanceAdapter, InstanceErrorEvent, LoadAdapter, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry, SidecarFile } from '@shared/types'
 import { buildServerArgs } from './args'
@@ -50,7 +51,8 @@ export interface InstanceManagerDeps {
   getModel: (id: string) => ModelEntry | undefined
   /** The draft this load uses (the chosen one, or the model's own); undefined = none. */
   draftFor: (model: ModelEntry, cfg: LoadConfig) => SidecarFile | undefined
-  getDefaults: (id: string) => LoadConfig
+  /** The load settings of a model, for a mode when given (that mode's own, else the model's defaults). */
+  getDefaults: (id: string, mode?: AppMode) => LoadConfig
   unloadPreviousOnLoad: () => boolean
   estimate: (model: ModelEntry, config: LoadConfig) => MemoryEstimate | null
   /** An adapter file by id, for the adapters a load config names. */
@@ -173,10 +175,10 @@ export class InstanceManager {
    * The model's running or loading instance whatever its settings, or else a new one with its saved
    * defaults; `started` says whether this call started it. It takes its turn in the load queue, so
    * a load the UI has already queued is found rather than replaced. A remote model with no instance is an
-   * error: only a click on the vast.ai page starts one.
+   * error: only a click on the vast.ai page starts one. A new instance gets the settings of `mode` when it has some.
    */
-  ensure(modelId: string): Promise<{ instance: LoadedInstance; started: boolean }> {
-    return this.queueLoad(modelId, null, true)
+  ensure(modelId: string, mode?: AppMode): Promise<{ instance: LoadedInstance; started: boolean }> {
+    return this.queueLoad(modelId, null, true, undefined, mode)
   }
 
   /** The host a load goes to: this PC (undefined) or a rental. Throws the sentence for a request that cannot be placed. */
@@ -200,7 +202,8 @@ export class InstanceManager {
     modelId: string,
     config: LoadConfig | null,
     reuseAny: boolean,
-    host?: RemoteHost
+    host?: RemoteHost,
+    mode?: AppMode
   ): Promise<{ instance: LoadedInstance; started: boolean }> {
     let target: RemoteHost | undefined
     try {
@@ -211,7 +214,7 @@ export class InstanceManager {
     const key = hostKey(target)
     const entry = { modelId, host: target }
     this.pending.push(entry)
-    const started = (this.loadQueues.get(key) ?? Promise.resolve()).then(() => this.startLoad(modelId, config, reuseAny, target))
+    const started = (this.loadQueues.get(key) ?? Promise.resolve()).then(() => this.startLoad(modelId, config, reuseAny, target, mode))
     // The queue only waits for the start; a failed start must not block the next load.
     this.loadQueues.set(key, started.catch(() => undefined))
     const done = (): void => {
@@ -271,7 +274,8 @@ export class InstanceManager {
     modelId: string,
     config: LoadConfig | null,
     reuseAny: boolean,
-    host: RemoteHost | undefined
+    host: RemoteHost | undefined,
+    mode?: AppMode
   ): Promise<{ ready: Promise<LoadedInstance>; started: boolean }> {
     this.checkDisposed()
     const found = this.deps.getModel(modelId)
@@ -279,7 +283,7 @@ export class InstanceManager {
     // Refused before anything is unloaded: a request that cannot be placed must not cost a running model.
     if (found.remote && !host) throw new Error(`Load ${found.name} on a rental first (vast.ai page).`)
     if (!found.remote && host) throw new Error(`${found.name} runs on this PC, not on a rental.`)
-    const cfg = config ?? this.deps.getDefaults(modelId)
+    const cfg = config ?? this.deps.getDefaults(modelId, mode)
     const model = { ...found, draft: this.deps.draftFor(found, cfg) }
     const key = hostKey(host)
 

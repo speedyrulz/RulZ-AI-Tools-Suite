@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { itemResult, REMOTE_DENIAL, sessionStats, UNATTENDED_DENIAL } from '@shared/batch'
 import { DEFAULT_SAMPLING } from '@shared/defaults'
+import type { ModelModeDefaults } from '@shared/modes'
 import { extractAnswer, RE_SYSTEM_PROMPT, reFirstMessage, reSampling } from '@shared/re'
 import { META_LOAD, META_SEARCH, META_UNLOAD } from '@shared/tools'
 import type { ChatRequest, Conversation, McpServerStatus, StreamEvent, ToolResult } from '@shared/types'
@@ -585,5 +586,39 @@ describe('a practice session', () => {
       expect(h.live.length).toBeLessThan(10)
       expect(assistants(h.live.at(-1)!)[0].content).toContain('ANSWER: 42')
     })
+  })
+})
+
+describe("the model's own Reverse engineering settings", () => {
+  const own: ModelModeDefaults = { re: { load: null, sampling: { ...DEFAULT_SAMPLING, temperature: 0.2, topK: 5, jsonSchema: 'x' }, systemPrompt: ' Prefer short answers. ' } }
+
+  it("uses the model's sampling and adds its prompt text after the built-in prompt", async () => {
+    const h = harness([{ content: 'ANSWER: 42' }])
+    const asked: string[] = []
+    h.deps.modeDefaults = (id) => (asked.push(id), own)
+    const r = await runSession(h.deps, h.spec)
+    expect(asked).toEqual(['m/model.gguf'])
+    expect(r.conversation.systemPrompt).toBe(`${RE_SYSTEM_PROMPT}\n\nPrefer short answers.`)
+    expect(r.conversation.sampling).toMatchObject({ temperature: 0.2, topK: 5, jsonSchema: '' })
+    expect(h.requests[0].sampling).toMatchObject({ temperature: 0.2, topK: 5 })
+    expect(String(h.requests[0].messages[0].content)).toContain('Prefer short answers.')
+  })
+
+  it('keeps the practice sampling and prompt without own settings', async () => {
+    for (const modeDefaults of [undefined, () => undefined, () => ({})] as SessionDeps['modeDefaults'][]) {
+      const h = harness([{ content: 'ANSWER: 42' }])
+      h.deps.modeDefaults = modeDefaults
+      const r = await runSession(h.deps, h.spec)
+      expect(r.conversation.systemPrompt).toBe(RE_SYSTEM_PROMPT)
+      expect(r.conversation.sampling).toEqual(reSampling(DEFAULT_SAMPLING))
+    }
+  })
+
+  it("other modes' settings of the model do not count", async () => {
+    const h = harness([{ content: 'ANSWER: 42' }])
+    h.deps.modeDefaults = () => ({ chat: { load: null, sampling: { ...DEFAULT_SAMPLING, topK: 1 }, systemPrompt: 'chatty' } })
+    const r = await runSession(h.deps, h.spec)
+    expect(r.conversation.systemPrompt).toBe(RE_SYSTEM_PROMPT)
+    expect(r.conversation.sampling).toEqual(reSampling(DEFAULT_SAMPLING))
   })
 })

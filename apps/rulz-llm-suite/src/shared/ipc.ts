@@ -1,4 +1,5 @@
 // Single source of truth for IPC channels between the renderer and the main process.
+import type { AllModeDefaults, AppMode, ModeDefaults } from './modes'
 import type { AdventureDesktopInvoke, AdventureIpcEvents, AdventureIpcInvoke } from './adventure'
 import type { BatchOptions, BatchRun } from './batch'
 import type { BenchmarkRequest, BenchmarkRun } from './benchmark'
@@ -52,7 +53,7 @@ export interface BatchStartRequest {
   label: string
   kitDir: string
   modelId: string
-  /** Tasks an earlier session solved (for `onlyUnsolved`). */
+  /** Tasks the model solved before (for `onlyUnsolved`). */
   solved: string[]
   target: BatchTarget
 }
@@ -80,6 +81,10 @@ export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke, PhoneI
   'models:trash': (modelId: string) => void
   'models:getDefaults': (modelId: string) => { config: LoadConfig; custom: boolean }
   'models:setDefaults': (modelId: string, config: LoadConfig | null) => void
+  /** Every model's settings per mode (changes arrive as models:modeDefaults events). */
+  'models:modeDefaults': () => AllModeDefaults
+  /** Saves one model's settings for one mode; null (or an entry that sets nothing) forgets them. */
+  'models:setModeDefaults': (modelId: string, mode: AppMode, defaults: ModeDefaults | null) => void
   'models:estimate': (modelId: string, config: LoadConfig) => MemoryEstimate
 
   /** LoRA adapter GGUFs in the models folder (filled by the same scan as models:list). */
@@ -104,8 +109,8 @@ export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke, PhoneI
 
   'instances:list': () => LoadedInstance[]
   'instances:load': (modelId: string, config: LoadConfig | null) => LoadedInstance
-  /** The model's running or loading instance whatever its settings, or else a new one with its defaults. */
-  'instances:ensure': (modelId: string) => LoadedInstance
+  /** The model's running or loading instance whatever its settings, or else a new one with its defaults for the mode. */
+  'instances:ensure': (modelId: string, mode?: AppMode) => LoadedInstance
   'instances:unload': (instanceId: string) => void
   'instances:unloadAll': () => void
   'instances:log': (instanceId: string) => string[]
@@ -187,6 +192,7 @@ export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke, PhoneI
 /** Push channels (webContents.send → ipcRenderer.on). */
 export interface IpcEvents extends NovelIpcEvents, PhoneIpcEvents, WritingIpcEvents, AdventureIpcEvents, RemoteIpcEvents {
   'models:changed': ModelEntry[]
+  'models:modeDefaults': AllModeDefaults
   'adapters:changed': AdapterEntry[]
   /** One output line of the running adapter conversion. */
   'adapters:convertLog': string

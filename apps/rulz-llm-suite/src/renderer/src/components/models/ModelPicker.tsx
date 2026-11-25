@@ -2,16 +2,19 @@ import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { Cloud, Eye, RotateCcw, Search, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
+import { APP_MODES, MODE_LABELS, modeDefaultsEmpty } from '@shared/modes'
 import type { LoadConfig, ModelEntry } from '@shared/types'
 import { toast } from 'sonner'
 import { errorMessage, invoke } from '../../lib/api'
 import { cn, formatBytes } from '../../lib/format'
+import { modesFor, pickerScope, scopeFromValue, scopeLoad, scopeValue, startLoad, startScope, withModeLoad, type PickerScope } from '../../lib/modes'
 import { loadPlan, rentalLabel } from '../../lib/remote'
 import { WBENCH_BUSY, wbenchRunning } from '../../lib/wbenchFlag'
 import { useApp } from '../../stores/app'
-import { useModels } from '../../stores/models'
+import { useChat } from '../../stores/chat'
+import { modeDefaultsOf, useModels } from '../../stores/models'
 import { loadRemoteModel, useRemote } from '../../stores/remote'
-import { Badge, Button, Switch, Tooltip } from '../ui'
+import { Badge, Button, Field, Select, Switch, Tooltip } from '../ui'
 import { EstimateView, useEstimate } from './EstimateView'
 import { LoadSettingsForm } from './LoadSettingsForm'
 
@@ -176,9 +179,18 @@ function LoadPanel({ model, onDone }: { model: ModelEntry; onDone: () => void })
   const unload = useModels((s) => s.unload)
   const settings = useApp((s) => s.settings)
   const rentals = useRemote((s) => s.state?.rentals)
+  const allModes = useModels((s) => s.modeDefaults)
+  const modes = modesFor(allModes, model.id)
   const [config, setConfig] = useState<LoadConfig | null>(null)
   const [remember, setRemember] = useState(false)
-  const [hasCustom, setHasCustom] = useState(false)
+  // The model's default load settings (what a mode without its own falls back to).
+  const [base, setBase] = useState<{ config: LoadConfig; custom: boolean } | null>(null)
+  // Where the user is decides what the load settings are for; they can pick another.
+  const [scope, setScope] = useState<PickerScope>(() => startScope(pickerScope(useApp.getState().page, !!useChat.getState().current?.re), modeDefaultsOf(model.id)))
+  const scopeRef = useRef(scope)
+  scopeRef.current = scope
+  const hasOwnMode = (s: PickerScope): boolean => !!s && !!modeDefaultsOf(model.id)?.[s]?.load
+  const hasCustom = scope ? !!modes?.[scope]?.load : !!base?.custom
   const inst = instances.find((i) => i.modelId === model.id && i.status !== 'stopping')
   // A remote model loads on the one running rental that has it set up, or is not loaded from here at all.
   const plan = model.remote ? (inst?.host ? ({ kind: 'load', rentalId: inst.host.rentalId } as const) : loadPlan(model.id, rentals ?? [])) : null
@@ -187,24 +199,38 @@ function LoadPanel({ model, onDone }: { model: ModelEntry; onDone: () => void })
   useEffect(() => {
     invoke('models:getDefaults', model.id)
       .then(({ config, custom }) => {
-        setConfig(inst?.config ?? config)
-        setRemember(custom)
-        setHasCustom(custom)
+        setBase({ config, custom })
+        const s = scopeRef.current
+        setConfig(startLoad(config, modeDefaultsOf(model.id), s, inst?.config))
+        setRemember(s ? hasOwnMode(s) : custom)
       })
       .catch((e) => {
         // Without this the panel stays blank; fall back to the app defaults.
         toast.error(`Could not read this model's saved settings: ${errorMessage(e)}`)
-        setConfig(inst?.config ?? useApp.getState().settings?.defaultLoadConfig ?? DEFAULT_LOAD_CONFIG)
+        const fallback = useApp.getState().settings?.defaultLoadConfig ?? DEFAULT_LOAD_CONFIG
+        setBase({ config: fallback, custom: false })
+        setConfig(startLoad(fallback, modeDefaultsOf(model.id), scopeRef.current, inst?.config))
       })
   }, [model.id])
+
+  // A new choice shows that scope's own settings, else the model's default ones, whatever was edited before.
+  const pickScope = (next: PickerScope): void => {
+    setScope(next)
+    if (!base) return
+    setConfig(scopeLoad(base.config, modeDefaultsOf(model.id), next))
+    setRemember(next ? hasOwnMode(next) : base.custom)
+  }
 
   if (!config) return <div className="flex-1" />
 
   const doLoad = async (): Promise<void> => {
     if (wbenchRunning()) return void toast(WBENCH_BUSY)
     if (remember) {
-      // Not remembering them is no reason not to load.
-      await invoke('models:setDefaults', model.id, config).catch((e) => toast.error(`Could not save the settings: ${errorMessage(e)}`))
+      // Not remembering them is no reason not to load. A mode keeps its sampling and prompt.
+      const save = scope
+        ? invoke('models:setModeDefaults', model.id, scope, withModeLoad(modeDefaultsOf(model.id)?.[scope], config))
+        : invoke('models:setDefaults', model.id, config)
+      await save.catch((e) => toast.error(`Could not save the settings: ${errorMessage(e)}`))
     }
     onDone()
     if (plan?.kind === 'go') {
@@ -213,7 +239,8 @@ function LoadPanel({ model, onDone }: { model: ModelEntry; onDone: () => void })
       toast(plan.sentence, { duration: 12000 })
       return
     }
-    useApp.getState().setPage('chat')
+    // Loading for a mode from that mode's own page stays there.
+    if (!scope || scope === 'chat' || useApp.getState().page !== scope) useApp.getState().setPage('chat')
     if (plan?.kind === 'load') await loadRemoteModel(plan.rentalId, model.id, config)
     else await load(model.id, config)
   }
@@ -233,28 +260,48 @@ function LoadPanel({ model, onDone }: { model: ModelEntry; onDone: () => void })
             Loads on {rentalLabel(rentals?.find((r) => r.id === plan.rentalId) ?? { id: plan.rentalId, gpuName: 'instance', numGpus: 1 })}.
           </div>
         )}
+        <Field label="Load for">
+          <Select value={scopeValue(scope)} onChange={(e) => pickScope(scopeFromValue(e.target.value))} aria-label="Load for">
+            <option value="all">All modes (default)</option>
+            {APP_MODES.map((m) => (
+              <option key={m} value={m}>
+                {MODE_LABELS[m]}
+                {modeDefaultsEmpty(modes?.[m]) ? '' : ' · own settings'}
+              </option>
+            ))}
+          </Select>
+        </Field>
         <LoadSettingsForm model={model} config={config} onChange={setConfig} estimate={estimate} remote={model.remote} />
         <EstimateView estimate={estimate} />
       </div>
       <div className="flex items-center gap-3 border-t border-border px-5 py-3">
         <label className="flex items-center gap-2 text-xs text-muted">
           <Switch checked={remember} onCheckedChange={setRemember} />
-          Remember settings for this model
+          {scope ? `Remember ${MODE_LABELS[scope]} settings for this model` : 'Remember settings for this model'}
         </label>
         {hasCustom && (
-          <Tooltip content="Forget this model's saved settings and use the app defaults">
+          <Tooltip content={scope ? `Forget this model's own ${MODE_LABELS[scope]} load settings and use its default ones` : "Forget this model's saved settings and use the app defaults"}>
             <button
               className="flex items-center gap-1 text-xs text-muted hover:text-text"
               onClick={async () => {
+                // Only the chosen scope's load settings go; a mode keeps its sampling and prompt.
+                const target = scope
                 try {
-                  await invoke('models:setDefaults', model.id, null)
+                  if (target) await invoke('models:setModeDefaults', model.id, target, withModeLoad(modeDefaultsOf(model.id)?.[target], null))
+                  else await invoke('models:setDefaults', model.id, null)
                 } catch (e) {
                   toast.error(`Could not reset the settings: ${errorMessage(e)}`)
                   return
                 }
-                setHasCustom(false)
+                // The answer came after the user may have picked another scope: that one's form stays.
+                if (scopeRef.current !== target) return
                 setRemember(false)
-                if (settings) setConfig(settings.defaultLoadConfig)
+                if (target) {
+                  if (base) setConfig(base.config)
+                } else if (settings) {
+                  setBase({ config: settings.defaultLoadConfig, custom: false })
+                  setConfig(settings.defaultLoadConfig)
+                }
               }}
             >
               <RotateCcw size={12} /> Reset

@@ -8,6 +8,8 @@ import { LeftColumn, Welcome } from '../components/writing/LeftColumn'
 import { SceneEditor } from '../components/writing/SceneEditor'
 import { SidePanel } from '../components/writing/SidePanel'
 import { StatusBar } from '../components/writing/StatusBar'
+import { ModeReloadBar } from '../components/models/ModeReloadBar'
+import { useModels } from '../stores/models'
 import { lastProjectFolder, useNovel } from '../stores/novel'
 
 let triedReopen = false
@@ -18,6 +20,8 @@ export function WritingPage() {
   const target = useNovel((s) => s.target)
   const panelOpen = useNovel((s) => s.panelOpen)
   const opening = useNovel((s) => s.opening)
+  const projectModelId = useNovel((s) => s.state?.project.modelId ?? null)
+  const activeModelId = useModels((s) => s.activeModelId)
   // The benchmark view stays up while you visit another page and come back.
   const [benchOpen, setBenchOpenState] = useState(benchWasOpen)
   const setBenchOpen = (v: boolean): void => {
@@ -55,6 +59,7 @@ export function WritingPage() {
       <div className="flex min-h-0 flex-1">
         <LeftColumn />
         <div className="flex min-w-0 flex-1 flex-col">
+          <ModeReloadBar modelId={projectModelId ?? activeModelId} mode="writing" />
           <div className="min-h-0 flex-1">
             {target?.kind === 'scene' && <SceneEditor key={target.id} sceneId={target.id} />}
             {target?.kind === 'entry' && <EntryEditor key={target.id} entryId={target.id} />}

@@ -105,7 +105,8 @@ import {
   type RunContext,
   type StateCardItem
 } from '../lib/novelRun'
-import { readyInstance, useModels } from './models'
+import { modePromptExtra } from '@shared/modes'
+import { modeDefaultsOf, readyInstance, useModels } from './models'
 
 export type PanelTab = 'scene' | 'context' | 'checks' | 'state' | 'interview' | 'project'
 export type Target = { kind: 'scene'; id: string } | { kind: 'entry'; id: string } | null
@@ -873,7 +874,7 @@ export const useNovel = create<NovelState>((set, get) => {
         toast.error('The active model is not ready. Wait for it to finish loading, or load one (Ctrl+L).')
         return null
       }
-      inst = (await useModels.getState().ensure(modelId)) ?? undefined
+      inst = (await useModels.getState().ensure(modelId, 'writing')) ?? undefined
       if (!inst) return null
     }
     return { modelId: inst.modelId, contextLength: inst.contextLength ?? 8192, instanceId: inst.instanceId }
@@ -932,6 +933,8 @@ export const useNovel = create<NovelState>((set, get) => {
       note: '',
       contextLength: model.contextLength,
       templateOverhead: overhead,
+      // The text the model that writes adds after the built-in prompt: read now, so it applies to every request.
+      promptExtra: modePromptExtra(modeDefaultsOf(model.modelId), 'writing'),
       ...over
     }
     return { ctx, count }
@@ -2215,7 +2218,15 @@ export const useNovel = create<NovelState>((set, get) => {
         if (!cur) return false
         const buf = get().buffers[entryPath(characterId)]
         const body = buf ? parseEntry(characterId, buf.text).body : entry.body
-        const system = buildInterviewSystem({ entry, body, facts: factsNow(), sceneId, outline: cur.outline, bible: cur.bible })
+        const system = buildInterviewSystem({
+          entry,
+          body,
+          facts: factsNow(),
+          sceneId,
+          outline: cur.outline,
+          bible: cur.bible,
+          promptExtra: modePromptExtra(modeDefaultsOf(model.modelId), 'writing')
+        })
         const project = cur.project
         const limit = model.contextLength - project.budget.replyTokens - Math.max(256, Math.ceil(model.contextLength * 0.03))
         const fit = await fitInterview(system, get().interviews[key] ?? [], q, countWhole(model.modelId), limit)

@@ -1,15 +1,17 @@
 import * as Collapsible from '@radix-ui/react-collapsible'
-import { ChevronRight, Download, History as HistoryIcon, ListTree, Trash2 } from 'lucide-react'
+import { ChevronRight, Download, History as HistoryIcon, ListTree, RotateCcw, Trash2 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import type { NovelBudget, RecordsInfo } from '@shared/novel'
 import { MAX_ADAPTER_SCALE, MIN_ADAPTER_SCALE, adapterBaseMatch } from '@shared/adapters'
+import { modeSampling } from '@shared/modes'
 import type { LoadAdapter, SamplingParams } from '@shared/types'
 import { chatAdapters, formatScale, onScale, withChatScale } from '../../lib/adapters'
 import { errorMessage, invoke } from '../../lib/api'
 import { formatBytes } from '../../lib/format'
 import { STYLE_PATH, useNovel } from '../../stores/novel'
-import { useModels } from '../../stores/models'
+import { useApp } from '../../stores/app'
+import { modeDefaultsOf, useModels } from '../../stores/models'
 import { VarietyFields } from '../chat/InferencePanel'
 import { Badge, Button, Field, IconButton, NumberInput, Select, Slider, Switch } from '../ui'
 import { BufferBanners } from './Banners'
@@ -45,6 +47,8 @@ export function ProjectPanel() {
   const [sampling, setSampling] = useState<SamplingParams | null>(null)
   const [budget, setBudget] = useState<NovelBudget | null>(null)
   const timers = useRef<{ s?: ReturnType<typeof setTimeout>; b?: ReturnType<typeof setTimeout> }>({})
+  // Counts the sampling edits, so a save that ends after a newer edit leaves the newer values on screen.
+  const edits = useRef(0)
 
   useEffect(() => {
     setSampling(null)
@@ -81,9 +85,20 @@ export function ProjectPanel() {
   const bg = budget ?? project.budget
   const setS = <K extends keyof SamplingParams>(key: K, value: SamplingParams[K]): void => {
     const next = { ...sp, [key]: value }
+    const mine = ++edits.current
     setSampling(next)
     if (timers.current.s) clearTimeout(timers.current.s)
-    timers.current.s = setTimeout(() => void store.patchProject({ sampling: next }).then(() => setSampling(null)), 500)
+    timers.current.s = setTimeout(() => void store.patchProject({ sampling: next }).then(() => edits.current === mine && setSampling(null)), 500)
+  }
+  /** The writing model's Writing sampling (or the built-in fiction sampling) replaces the project's. */
+  const resetSampling = (): void => {
+    const writer = project.modelId ?? activeModelId
+    const next = modeSampling('writing', modeDefaultsOf(writer), useApp.getState().settings?.defaultSampling ?? project.sampling)
+    const mine = ++edits.current
+    // A save still waiting for its pause would put the old values back.
+    if (timers.current.s) clearTimeout(timers.current.s)
+    setSampling(next)
+    void store.patchProject({ sampling: next }).then(() => edits.current === mine && setSampling(null))
   }
   const setB = (patch: Partial<NovelBudget>): void => {
     const next = { ...bg, ...patch }
@@ -170,7 +185,14 @@ export function ProjectPanel() {
         </p>
       </PanelSection>
 
-      <PanelSection title="Sampling">
+      <PanelSection
+        title="Sampling"
+        action={
+          <IconButton size="sm" label="Reset to this model's Writing defaults" onClick={resetSampling}>
+            <RotateCcw size={13} />
+          </IconButton>
+        }
+      >
         <SliderRow label="Temperature" value={sp.temperature} min={0} max={2} step={0.01} onChange={(v) => setS('temperature', v)} />
         <SliderRow label="Min P" value={sp.minP} min={0} max={1} step={0.01} onChange={(v) => setS('minP', v)} />
         <SliderRow label="Top P" value={sp.topP} min={0} max={1} step={0.01} onChange={(v) => setS('topP', v)} />

@@ -4,7 +4,9 @@ import { homedir } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { app, BrowserWindow, dialog, Menu, nativeTheme, safeStorage, shell, Tray } from 'electron'
 import { batchAdapters } from '@shared/batch'
+import { DEFAULT_SAMPLING } from '@shared/defaults'
 import { resolveDraft } from '@shared/draft'
+import { APP_MODES, modeSampling, type AppMode } from '@shared/modes'
 import type { RemoteIpcInvoke } from '@shared/remote'
 import { META_TOOL_DEFS, toolCatalogNote } from '@shared/tools'
 import type { LoadConfig, LoadedInstance, McpServerConfig, ModelEntry, Theme } from '@shared/types'
@@ -198,7 +200,18 @@ async function main(): Promise<void> {
   const estimate = (model: ModelEntry, cfg: LoadConfig) =>
     estimateMemory({ ...model, draft: draftFor(model, cfg) }, cfg, freeMemory(cfg), adapterBytes(cfg))
 
-  const getDefaults = (id: string): LoadConfig => settings.getModelDefaults(id).config
+  // The model's default load settings, or the ones of a mode that has its own.
+  const getDefaults = (id: string, mode?: AppMode): LoadConfig => settings.loadFor(id, mode)
+  const isMode = (m: unknown): m is AppMode => typeof m === 'string' && (APP_MODES as string[]).includes(m)
+  const sendModeDefaults = (): void => broadcast('models:modeDefaults', settings.allModeDefaults())
+  // A deleted model takes its default load settings and all its modes with it; the pages hear about the modes.
+  const forgetModel = async (modelId: string): Promise<void> => {
+    try {
+      await settings.forgetModel(modelId)
+    } finally {
+      sendModeDefaults()
+    }
+  }
   // Models on rented vast.ai instances (docs/vast-design.md).
   const remote = createRemoteService({
     userData,
@@ -208,6 +221,11 @@ async function main(): Promise<void> {
     getLocalModel: (id) => library.get(id),
     getAdapter: (id) => library.getAdapter(id),
     getDefaults,
+    // Files of every mode's load settings go to a rental with the model, so a load in any mode finds its draft and adapters.
+    getModeLoads: (id) => {
+      const modes = settings.modeDefaults(id)
+      return APP_MODES.flatMap((m) => modes[m]?.load ?? [])
+    },
     draftFor,
     adapterBytes,
     localEngineBuild: async () => {
@@ -216,7 +234,7 @@ async function main(): Promise<void> {
     },
     loadOn: (host, modelId, config) => instances.load(modelId, config, host),
     isLoaded: (modelId) => instances.list().some((i) => i.modelId === modelId),
-    forgetDefaults: (modelId) => settings.setModelDefaults(modelId, null),
+    forgetDefaults: (modelId) => forgetModel(modelId),
     // A batch run's tasks there go back to pending once its instance is gone.
     onStopping: async (rentalId) => {
       const there = instances.list().filter((i) => i.host?.rentalId === rentalId)
@@ -430,7 +448,7 @@ async function main(): Promise<void> {
     if (model.remote) throw new Error('This model is defined on the vast.ai page; delete it there.')
     if (instances.list().some((i) => i.modelId === modelId)) throw new Error('Eject the model before deleting it.')
     for (const f of model.files) await shell.trashItem(f)
-    await settings.setModelDefaults(modelId, null)
+    await forgetModel(modelId)
     await library.scan()
   })
   handle('adapters:list', () => library.listAdapters())
@@ -447,6 +465,13 @@ async function main(): Promise<void> {
   handle('adapters:cancelConvert', () => converter.cancel())
   handle('models:getDefaults', (modelId) => settings.getModelDefaults(modelId))
   handle('models:setDefaults', (modelId, config) => settings.setModelDefaults(modelId, config))
+  handle('models:modeDefaults', () => settings.allModeDefaults())
+  handle('models:setModeDefaults', async (modelId, mode, defaults) => {
+    if (typeof modelId !== 'string' || !modelId) throw new Error('Model not found')
+    if (!isMode(mode)) throw new Error('Unknown mode')
+    await settings.setModeDefaults(modelId, mode, defaults ?? null)
+    sendModeDefaults()
+  })
   handle('models:estimate', (modelId, config) => {
     const model = catalog.get(modelId)
     if (!model) throw new Error('Model not found')
@@ -463,8 +488,8 @@ async function main(): Promise<void> {
   })
   // A chat that needs its model: an instance already loading (from the picker, with other settings)
   // is waited for rather than replaced by one with the saved defaults.
-  handle('instances:ensure', async (modelId) => {
-    const { instance } = await instances.ensure(modelId)
+  handle('instances:ensure', async (modelId, mode) => {
+    const { instance } = await instances.ensure(modelId, isMode(mode) ? mode : undefined)
     apiServer.forget(instance.instanceId)
     return instance
   })
@@ -622,8 +647,8 @@ async function main(): Promise<void> {
           if (h.kind === 'local') {
             if (model.remote) throw new Error(`${model.name} runs on a vast.ai rental, not on this PC.`)
             const inst = load
-              ? await instances.load(modelId, { ...getDefaults(modelId), ...load })
-              : (instances.readyFor(modelId) ?? (await instances.ensure(modelId)).instance)
+              ? await instances.load(modelId, { ...getDefaults(modelId, 're'), ...load })
+              : (instances.readyFor(modelId) ?? (await instances.ensure(modelId, 're')).instance)
             return poolHost(inst, 0)
           }
           if (!model.remote) throw new Error(`${model.name} runs on this PC. Choose a vast.ai model to run on a rental.`)
@@ -631,7 +656,7 @@ async function main(): Promise<void> {
           const release = remote.rentals.use(h.rentalId, 'loading a model', 'window')
           try {
             const there = instances.list().find((i) => i.modelId === modelId && i.host?.rentalId === h.rentalId && i.status === 'ready')
-            const inst = load ? await instances.load(modelId, { ...getDefaults(modelId), ...load }, host) : (there ?? (await instances.load(modelId, null, host)))
+            const inst = load ? await instances.load(modelId, { ...getDefaults(modelId, 're'), ...load }, host) : (there ?? (await instances.load(modelId, getDefaults(modelId, 're'), host)))
             return poolHost(inst, remote.rentals.info(h.rentalId)?.dollarsPerHour ?? 0)
           } finally {
             release()
@@ -664,6 +689,7 @@ async function main(): Promise<void> {
     },
     prepare: practicePrepare,
     grade: practiceGrade,
+    modeDefaults: (id) => settings.modeDefaults(id),
     onEnded: (_run, rentalIds) => {
       if (rentalIds.length) remote.rentals.stopAfterRun(rentalIds)
     },
@@ -700,7 +726,17 @@ async function main(): Promise<void> {
       if (origin !== WINDOW_OWNER) broadcast('novel:changed', change)
       phone.emit('novel:changed', change)
     },
-    appVersion: () => app.getVersion()
+    appVersion: () => app.getVersion(),
+    // A new project starts with the Writing sampling of the model that would write it (the newest loaded one), when it has
+    // some of its own; otherwise with the built-in fiction preset.
+    newProjectSampling: () => {
+      const newest = instances
+        .list()
+        .filter((i) => i.status === 'ready')
+        .sort((a, b) => b.startedAt - a.startedAt)[0]
+      const modes = newest ? settings.modeDefaults(newest.modelId) : undefined
+      return modes?.writing?.sampling ? modeSampling('writing', modes, DEFAULT_SAMPLING) : null
+    }
   })
   // The close-time handshake (data safety rule 4): the renderer saves or journals its dirty buffers and answers.
   let flushTimeoutMs = 3000
@@ -752,6 +788,7 @@ async function main(): Promise<void> {
     gate: modelGate,
     // A phone may use a project's jobs while it holds the project open (a reconnected phone has a new id).
     holds: (owner, folder) => novel.ownersOf(folder).includes(owner),
+    modeDefaults: (id) => settings.modeDefaults(id),
     emit: writingEvents.emit
   })
   writingEvents.subscribe((job) => phone.emit('writing:job', job))
@@ -776,6 +813,7 @@ async function main(): Promise<void> {
     models: modelsAdapter(catalog, instances),
     gate: modelGate,
     busyReason,
+    modeDefaults: (id) => settings.modeDefaults(id),
     emit: (job) => {
       broadcast('adventure:job', job)
       phone.emit('adventure:job', job)

@@ -25,6 +25,7 @@ import {
   parseSummary,
   parseUpdateStateReplyResult
 } from '@shared/novelPrompts'
+import { modePromptExtra, type AppMode, type ModelModeDefaults } from '@shared/modes'
 import { findChapter, findScene } from '@shared/novelOutline'
 import { stateBefore } from '@shared/novelState'
 import { sceneHashKey } from '@shared/novelText'
@@ -91,7 +92,7 @@ export interface WritingModels {
   /** The ready instance of a model; with null, any ready instance (the desktop's "active model"). */
   ready(modelId: string | null): WritingModel | undefined
   /** Loads the model as the desktop does (instances:ensure) and resolves when it is ready. */
-  ensure(modelId: string): Promise<WritingModel>
+  ensure(modelId: string, mode?: AppMode): Promise<WritingModel>
 }
 
 export interface WritingRunsDeps {
@@ -113,6 +114,8 @@ export interface WritingRunsDeps {
   /** Whether an owner ('phone:<clientId>') currently holds a project open. A phone that reconnects has a new owner id, so
    *  holding the job's folder is what gives it its jobs back. Without it only the starting owner may use a job. */
   holds?: (owner: string, folder: string) => boolean
+  /** The model's own settings per mode, read for each request (the Writing prompt text); none = the built-in prompts. */
+  modeDefaults?: (modelId: string) => ModelModeDefaults | undefined
 }
 
 const PROSE_ALT_MAX = 4
@@ -404,7 +407,7 @@ export class WritingRuns {
     if (!inst) {
       if (project.modelId === null) throw new Error('No model is loaded. Load one in LLM Suite, or choose the project\'s model.')
       try {
-        inst = await models.ensure(project.modelId)
+        inst = await models.ensure(project.modelId, 'writing')
       } catch (e) {
         throw new Error(`The project's model could not be loaded: ${errorMessage(e)} Load it in LLM Suite first.`)
       }
@@ -539,11 +542,13 @@ export class WritingRuns {
     const countWhole = (messages: { role: string; content: string }[]): Promise<number | null> => countTokens(model.modelId, messages as WireMessage[])
     const project = st.project
     const sampling = project.sampling
+    // The model's own Writing prompt goes after the built-in one, through the system text, so it is counted and fitted with it.
+    const promptExtra = modePromptExtra(this.deps.modeDefaults?.(model.modelId), 'writing')
 
     // ---- the interview is its own request: no scene buffer, no assembler
     if (interview) {
       const sceneId = scene!.scene.id
-      const system = buildInterviewSystem({ entry: interview.entry, body: interview.entry.body, facts: st.state?.facts ?? [], sceneId, outline: st.outline, bible: st.bible })
+      const system = buildInterviewSystem({ entry: interview.entry, body: interview.entry.body, facts: st.state?.facts ?? [], sceneId, outline: st.outline, bible: st.bible, promptExtra })
       const limit = model.contextLength - project.budget.replyTokens - Math.max(256, Math.ceil(model.contextLength * 0.03))
       const fit = await fitInterview(system, interview.history, interview.question, countWhole, limit)
       this.checkStop(rec)
@@ -594,6 +599,7 @@ export class WritingRuns {
       previousText: action === 'draftScene' && scene && !text.trim() ? this.previousText(loaded, scene.scene.id) : '',
       contextLength: model.contextLength,
       templateOverhead: overhead,
+      promptExtra,
       ...over
     }
     const fit = await fitRequest(ctx, count, countWhole, estimated)

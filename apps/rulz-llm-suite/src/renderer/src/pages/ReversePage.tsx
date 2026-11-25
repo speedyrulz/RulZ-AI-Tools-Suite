@@ -4,14 +4,16 @@ import { toast } from 'sonner'
 import { CLONE_LANGUAGES, CLONE_PIECES, outputInsideTarget, RE_DEFAULT_MODEL_ID, RE_GOALS } from '@shared/re'
 import type { ReClone, ReOutcome, RePracticeInfo, ReSettings, ReTraceInfo } from '@shared/types'
 import { OutcomeButtons } from '../components/chat/ReBanner'
+import { ModeReloadBar } from '../components/models/ModeReloadBar'
 import { BatchResults, BatchStart } from '../components/re/BatchRuns'
 import { Badge, Button, Field, IconButton, Input, NumberInput, Select, Switch, Textarea, Tooltip } from '../components/ui'
 import { errorMessage, invoke, on } from '../lib/api'
 import { cn, formatBytes, relativeTime } from '../lib/format'
+import { batchModelId } from '../lib/remote'
 import { useApp } from '../stores/app'
 import { useBatch } from '../stores/batch'
 import { isChatBusy, useChat } from '../stores/chat'
-import { practiceRecords, useReTraces } from '../stores/reTraces'
+import { practiceOf, taskRecords, useReTraces, type TaskRecord } from '../stores/reTraces'
 import { useMcp } from '../stores/mcp'
 import { useModels } from '../stores/models'
 
@@ -35,12 +37,18 @@ const baseName = (p: string): string => p.split(/[\\/]/).filter(Boolean).at(-1) 
 export function ReversePage() {
   const settings = useApp((s) => s.settings)
   const update = useApp((s) => s.updateSettings)
+  const models = useModels((s) => s.models)
+  const activeModelId = useModels((s) => s.activeModelId)
   if (!settings) return null
   const re = settings.re
+  // Sessions start with the model chosen here when it is in the library, else with the active one.
+  const sessionModelId = re.modelId && models.some((m) => m.id === re.modelId) ? re.modelId : activeModelId
   const setRe = <K extends keyof ReSettings>(key: K, value: ReSettings[K]): void => void update({ re: { ...re, [key]: value } })
 
   return (
-    <div className="h-full overflow-y-auto">
+    <div className="flex h-full flex-col">
+    <ModeReloadBar modelId={sessionModelId} mode="re" />
+    <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto max-w-5xl space-y-4 px-6 py-5">
         <div>
           <h1 className="font-[family-name:var(--font-display)] text-base font-semibold">Reverse Engineering</h1>
@@ -89,6 +97,7 @@ export function ReversePage() {
           </Field>
         </Card>
       </div>
+    </div>
     </div>
   )
 }
@@ -345,6 +354,13 @@ function Practice({ re, setRe }: { re: ReSettings; setRe: <K extends keyof ReSet
   const startRe = useChat((s) => s.startRe)
   const busy = useChat((s) => isChatBusy(s))
   const batchActive = useBatch((s) => !!s.activeId || s.starting)
+  const runs = useBatch((s) => s.runs)
+  useEffect(() => void useBatch.getState().init(), [])
+  const models = useModels((s) => s.models)
+  const activeModelId = useModels((s) => s.activeModelId)
+  // The model a task would start with: its results are the ones shown.
+  const modelId = batchModelId(re.modelId, models, activeModelId)
+  const modelName = models.find((m) => m.id === modelId)?.name ?? modelId
   const [info, setInfo] = useState<RePracticeInfo | null>(null)
   const [family, setFamily] = useState('')
   const [starting, setStarting] = useState(false)
@@ -362,26 +378,18 @@ function Practice({ re, setRe }: { re: ReSettings; setRe: <K extends keyof ReSet
   const traces = useReTraces((s) => s.traces)
   useEffect(() => useReTraces.getState().init(), [])
 
-  // Per task: how many sessions, and whether one solved it.
-  const byTask = useMemo(() => {
-    const m = new Map<string, { attempts: number; solved: boolean }>()
-    for (const r of practiceRecords(summaries, traces)) {
-      const e = m.get(r.taskId) ?? { attempts: 0, solved: false }
-      e.attempts++
-      if (r.outcome === 'solved') e.solved = true
-      m.set(r.taskId, e)
-    }
-    return m
-  }, [summaries, traces])
+  const byTask = useMemo(
+    () => taskRecords(practiceOf(modelId, { summaries, traces, runs, models })),
+    [modelId, summaries, traces, runs, models]
+  )
 
   const families = useMemo(() => {
-    const out = new Map<string, { total: number; tried: number; solved: number }>()
+    const out = new Map<string, { total: number } & Record<TaskRecord['status'], number>>()
     for (const t of info?.tasks ?? []) {
-      const f = out.get(t.family) ?? { total: 0, tried: 0, solved: 0 }
+      const f = out.get(t.family) ?? { total: 0, solved: 0, failed: 0, tried: 0 }
       f.total++
       const r = byTask.get(t.id)
-      if (r) f.tried++
-      if (r?.solved) f.solved++
+      if (r) f[r.status]++
       out.set(t.family, f)
     }
     return [...out.entries()].sort((a, b) => a[0].localeCompare(b[0]))
@@ -391,9 +399,9 @@ function Practice({ re, setRe }: { re: ReSettings; setRe: <K extends keyof ReSet
     const tasks = (info?.tasks ?? []).filter((t) => !family || t.family === family)
     // Unsolved tasks, fewest attempts first, so each task gets tried before any is retried.
     const next = tasks
-      .filter((t) => !byTask.get(t.id)?.solved)
+      .filter((t) => byTask.get(t.id)?.status !== 'solved')
       .sort((a, b) => (byTask.get(a.id)?.attempts ?? 0) - (byTask.get(b.id)?.attempts ?? 0))[0]
-    if (!next) return void toast.success('Every practice task in this selection is solved. Generate a new seed in the kit.')
+    if (!next) return void toast.success(`${modelName ? `${modelName} has solved every` : 'Every'} practice task in this selection${modelName ? '' : ' is solved'}. Generate a new seed in the kit.`)
     setStarting(true)
     try {
       const p = await invoke('re:practicePrepare', re.kitDir, next.id)
@@ -458,15 +466,18 @@ function Practice({ re, setRe }: { re: ReSettings; setRe: <K extends keyof ReSet
               >
                 <div className="text-[13px] font-medium">{f}</div>
                 <div className="text-[11px] text-faint tabular-nums">
-                  {c.solved}/{c.total} solved · {c.tried} tried
+                  {c.solved}/{c.total} solved · {c.failed} failed
+                  {c.tried > 0 && ` · ${c.tried} not graded`}
                 </div>
               </button>
             ))}
           </div>
+          {family && <TaskChips tasks={(info?.tasks ?? []).filter((t) => t.family === family)} byTask={byTask} />}
           <div className="flex items-center justify-between gap-2">
             <div className="text-xs text-faint">
               {info ? `${info.tasks.length} tasks` : 'Reading tasks…'}
               {family && ` · only ${family}`}
+              {modelName ? ` · results of ${modelName}` : ' · results of all models'}
             </div>
             <Button variant="primary" disabled={!info?.tasks.length || busy || starting || batchActive} onClick={() => void startNext()}>
               {starting ? <LoaderCircle size={14} className="animate-spin" /> : <Play size={14} />} Start next task
@@ -476,6 +487,33 @@ function Practice({ re, setRe }: { re: ReSettings; setRe: <K extends keyof ReSet
         </>
       )}
     </Card>
+  )
+}
+
+const TASK_STATUS: Record<TaskRecord['status'] | 'new', { label: string; className: string }> = {
+  solved: { label: 'Solved', className: 'border-ok/30 text-ok' },
+  failed: { label: 'Failed', className: 'border-danger/40 text-danger' },
+  tried: { label: 'Tried, not graded', className: 'border-warn/40 text-warn' },
+  new: { label: 'Not tried', className: 'border-border text-faint' }
+}
+
+/** Every task of a family, colored by what came of it. */
+function TaskChips({ tasks, byTask }: { tasks: RePracticeInfo['tasks']; byTask: Map<string, TaskRecord> }) {
+  return (
+    <div className="flex max-h-40 flex-wrap gap-1 overflow-y-auto rounded-lg border border-border bg-panel-2/50 p-2">
+      {tasks.map((t) => {
+        const r = byTask.get(t.id)
+        const st = TASK_STATUS[r?.status ?? 'new']
+        return (
+          <Tooltip key={t.id} content={r ? `${st.label}, ${r.attempts} session${r.attempts === 1 ? '' : 's'}` : st.label}>
+            <span className={cn('rounded-md border px-1.5 py-0.5 font-mono text-[10.5px]', st.className)}>
+              {t.id}
+              <span className="sr-only">: {st.label}</span>
+            </span>
+          </Tooltip>
+        )
+      })}
+    </div>
   )
 }
 
@@ -501,6 +539,7 @@ function Sessions() {
   const [outcomes, setOutcomes] = useState<ReOutcome[]>(['solved'])
   const [skipTrimmed, setSkipTrimmed] = useState(true)
   const [maxPerTask, setMaxPerTask] = useState(2)
+  const [skipModels, setSkipModels] = useState<string[]>([])
   const [exporting, setExporting] = useState(false)
 
   const refresh = useCallback(() => {
@@ -524,7 +563,12 @@ function Sessions() {
   ]
   const sessions = all.filter((s) => filter === 'all' || s.outcome === filter)
   const count = (o: ReOutcome): number => all.filter((s) => s.outcome === o).length
-  const exportable = all.filter((s) => outcomes.includes(s.outcome) && s.trace).length
+  const graded = all.filter((s) => outcomes.includes(s.outcome) && s.trace)
+  // The models of the sessions that could be exported, with how many sessions each one replied in.
+  const models = new Map<string, number>()
+  for (const s of graded) for (const m of s.trace!.models) models.set(m, (models.get(m) ?? 0) + 1)
+  const skip = skipModels.filter((m) => models.has(m))
+  const exportable = graded.filter((s) => !s.trace!.models.some((m) => skip.includes(m))).length
   const gradeApi = (id: string, outcome: ReOutcome): void => {
     void invoke('re:setApiOutcome', id, outcome)
       .then(refresh)
@@ -536,7 +580,7 @@ function Sessions() {
     if (!dir) return
     setExporting(true)
     try {
-      const r = await invoke('re:export', { outDir: dir, outcomes, skipTrimmed, maxPerTask })
+      const r = await invoke('re:export', { outDir: dir, outcomes, skipTrimmed, maxPerTask, skipModels: skip })
       const dropped = Object.entries(r.dropped)
         .map(([why, n]) => `${n} × ${why}`)
         .join('\n')
@@ -679,6 +723,28 @@ function Sessions() {
               <NumberInput value={maxPerTask} min={0} max={100} onChange={(v) => setMaxPerTask(v ?? 0)} />
             </span>
           </span>
+          {(models.size > 1 || skip.length > 0) && (
+            <span className="flex w-full flex-wrap items-center gap-x-3 gap-y-1">
+              <Tooltip content="A session in which several models replied is exported only when all of them are ticked.">
+                <span>Models</span>
+              </Tooltip>
+              {[...models]
+                .sort((a, b) => a[0].localeCompare(b[0]))
+                .map(([m, n]) => (
+                  <label key={m} className="flex max-w-full min-w-0 items-center gap-1">
+                    <input
+                      type="checkbox"
+                      checked={!skip.includes(m)}
+                      onChange={(e) => setSkipModels(e.target.checked ? skipModels.filter((x) => x !== m) : [...skipModels, m])}
+                    />
+                    <span className="truncate" title={m}>
+                      {m}
+                    </span>
+                    <span className="text-faint">({n})</span>
+                  </label>
+                ))}
+            </span>
+          )}
           <div className="flex-1" />
           <Button variant="primary" disabled={!outcomes.length || exporting || !exportable} onClick={() => void doExport()}>
             {exporting ? <LoaderCircle size={14} className="animate-spin" /> : <Download size={14} />} Export {exportable} session

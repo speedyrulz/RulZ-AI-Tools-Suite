@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { clampScale } from '@shared/adapters'
 import { DEFAULT_LOAD_CONFIG, DEFAULT_SAMPLING, DEFAULT_SETTINGS } from '@shared/defaults'
+import { APP_MODES, modeDefaultsEmpty, type AllModeDefaults, type ModeDefaults, type ModelModeDefaults } from '@shared/modes'
 import { KV_CACHE_TYPES, REASONING_EFFORTS, type AppSettings, type LoadAdapter, type LoadConfig, type Preset, type SamplingParams } from '@shared/types'
 
 // Every field falls back to its default on its own, so one bad value never resets the rest.
@@ -181,6 +182,39 @@ export function parseLoadConfig(raw: unknown): LoadConfig {
 
 export function parseSampling(raw: unknown): SamplingParams {
   return samplingSchema.parse(raw ?? {}) as SamplingParams
+}
+
+/** One mode's entry: load settings or null, sampling (never with a JSON schema) or null, a prompt text. Never throws. */
+export function parseModeEntry(raw: unknown): ModeDefaults {
+  const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+  const load = r.load && typeof r.load === 'object' && !Array.isArray(r.load) ? parseLoadConfig(r.load) : null
+  const sampling = r.sampling && typeof r.sampling === 'object' && !Array.isArray(r.sampling) ? { ...parseSampling(r.sampling), jsonSchema: '' } : null
+  return { load, sampling, systemPrompt: typeof r.systemPrompt === 'string' ? r.systemPrompt : '' }
+}
+
+/** One model's modes: unknown modes and entries that set nothing are dropped. */
+export function parseModelModes(raw: unknown): ModelModeDefaults {
+  const out: ModelModeDefaults = {}
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out
+  const own = raw as Record<string, unknown>
+  for (const mode of APP_MODES) {
+    if (!Object.prototype.hasOwnProperty.call(own, mode)) continue
+    const entry = parseModeEntry(own[mode])
+    if (!modeDefaultsEmpty(entry)) out[mode] = entry
+  }
+  return out
+}
+
+/** The whole model-mode-defaults file. A bad entry never costs the others; a model with no modes left is dropped. */
+export function parseModeDefaults(raw: unknown): AllModeDefaults {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  const entries: [string, ModelModeDefaults][] = []
+  for (const [id, modes] of Object.entries(raw)) {
+    const parsed = parseModelModes(modes)
+    if (Object.keys(parsed).length) entries.push([id, parsed])
+  }
+  // fromEntries makes '__proto__' an ordinary key instead of setting a prototype.
+  return Object.fromEntries(entries)
 }
 
 export function parsePresets(raw: unknown): Preset[] {
