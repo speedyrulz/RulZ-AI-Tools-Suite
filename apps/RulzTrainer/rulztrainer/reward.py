@@ -129,3 +129,68 @@ def sample_group(model, sigmas: torch.Tensor, pos_e, pos_m, neg_e, neg_m, *, cfg
         if progress:
             progress(i + 1, len(sig) - 1)
     return xs, stds
+
+
+# ------------------------------------------------------------ the change readout (reward_probe_every)
+def probe_snapshot(rec) -> dict:
+    """What the change readout keeps of a likeness probe (a likeness.ProbeRecord): its combined score and its face and
+    body parts on the scale the probes show (normalized when likeness_normalize is on, raw percent otherwise), each
+    None when the probe did not measure it, and the pictures it rendered."""
+    return {"combined": getattr(rec, "combined", None), "face": getattr(rec, "face_norm", None),
+            "body": getattr(rec, "body_norm", None), "images": list(getattr(rec, "images", None) or [])}
+
+
+def likeness_change(base: dict, now: dict) -> dict:
+    """The likeness gained since the baseline, in points on the probes' scale: {"combined", "face", "body"}, each
+    now - base, or None when either probe lacks that part."""
+    out = {}
+    for key in ("combined", "face", "body"):
+        a, b = base.get(key), now.get(key)
+        out[key] = None if a is None or b is None else float(b) - float(a)
+    return out
+
+
+def picture_key(path) -> str:
+    """The name a probe picture pairs by: its file name without the step number, so the same prompt and seed of two
+    probes (face_0 and body_1 and the prompt checks', each seed fixed) get the same key. A name without the pattern is
+    its own key."""
+    import re
+    from pathlib import Path
+
+    return re.sub(r"step\d+", "step", Path(str(path)).name)
+
+
+def image_change_pct(base_images, images) -> float | None:
+    """How much the probe pictures changed since the baseline: the mean absolute pixel difference between each picture
+    and the baseline picture of the same prompt and seed, as a percentage of the 0-255 range, averaged over the pairs.
+    Pairs whose sizes differ, and pictures that are missing or unreadable, are skipped. None when nothing pairs."""
+    import numpy as np
+    from PIL import Image
+
+    base = {picture_key(p): p for p in base_images}
+    diffs = []
+    for p in images:
+        q = base.get(picture_key(p))
+        if q is None:
+            continue
+        try:
+            with Image.open(p) as a, Image.open(q) as b:
+                if a.size != b.size:
+                    continue
+                x = np.asarray(a.convert("RGB"), dtype=np.float32)
+                y = np.asarray(b.convert("RGB"), dtype=np.float32)
+        except (OSError, ValueError):
+            continue
+        diffs.append(float(np.abs(x - y).mean()) / 255.0 * 100.0)
+    return sum(diffs) / len(diffs) if diffs else None
+
+
+def describe_change(step: int, change: dict, pct: float | None) -> str:
+    """The log line of one probe of the reward stage."""
+    def signed(v):
+        return "n/a" if v is None else f"{v:+.1f}"
+
+    parts = ", ".join(f"{k} {signed(change.get(k))}" for k in ("face", "body") if change.get(k) is not None)
+    return (f"Reward probe step {step}: likeness {signed(change.get('combined'))} points since the stage began"
+            + (f" ({parts})" if parts else "") + ", pictures changed "
+            + ("n/a" if pct is None else f"{pct:.1f}%"))

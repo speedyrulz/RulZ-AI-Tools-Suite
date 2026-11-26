@@ -202,3 +202,144 @@ def test_clothed_bodies_against_unclothed_references_leave_the_ranking_to_the_fa
     assert rewards == sorted(rewards, reverse=True)  # the face decides
     assert min(rewards) > -1.0
     assert any("far below a stranger" in r.getMessage() for r in records)
+
+
+# ------------------------------------------------------------ reward_probe_every: own cadence and change readout
+def test_reward_probe_every_config_checks():
+    TrainConfig(reward_probe_every=0).validate()
+    TrainConfig(reward_steps=50, face_refs=["x"], reward_probe_every=1).validate()
+    TrainConfig(reward_steps=50, steps=0, resume_from="a.safetensors", body_refs=["x"], probe_every=0,
+                reward_probe_every=5).validate()
+    with pytest.raises(ValueError, match="reward_probe_every"):
+        TrainConfig(reward_probe_every=-1).validate()
+    with pytest.raises(ValueError, match="reward_probe_every"):  # probes need references, like probe_every
+        TrainConfig(reward_probe_every=2).validate()
+
+
+def _picture(path, value, size=(8, 8)):
+    from PIL import Image
+
+    Image.new("RGB", size, (value, value, value)).save(path)
+    return str(path)
+
+
+def test_likeness_change_is_now_minus_base_per_part():
+    base = {"combined": 40.0, "face": 50.0, "body": None}
+    now = {"combined": 42.5, "face": 49.0, "body": 30.0}
+    out = RW.likeness_change(base, now)
+    assert out["combined"] == pytest.approx(2.5) and out["face"] == pytest.approx(-1.0) and out["body"] is None
+    assert RW.likeness_change({"combined": None}, {"combined": 3.0})["combined"] is None
+
+
+def test_image_change_pairs_by_prompt_and_seed_and_skips_other_sizes(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    base = [_picture(a / "step000000_face_0.png", 100), _picture(a / "step000000_body_0.png", 0),
+            _picture(a / "step000000_face_1.png", 10, size=(8, 8))]
+    # face_0 differs by 51 of 255 (20 %), body_0 by 0, face_1 has another size (skipped), face_2 has no partner
+    now = [_picture(b / "step000010_face_0.png", 151), _picture(b / "step000010_body_0.png", 0),
+           _picture(b / "step000010_face_1.png", 200, size=(4, 4)), _picture(b / "step000010_face_2.png", 9)]
+    assert RW.picture_key(base[0]) == RW.picture_key(now[0]) == "step_face_0.png"
+    assert RW.image_change_pct(base, now) == pytest.approx(10.0)  # (20 + 0) / 2
+    assert RW.image_change_pct(base, [now[2], now[3]]) is None  # nothing pairs
+    assert RW.image_change_pct(base, [str(tmp_path / "gone" / "step000010_face_0.png")]) is None
+
+
+def test_the_change_line_reads_like_the_log_example():
+    line = RW.describe_change(120, {"combined": 2.3, "face": 3.1, "body": -0.4}, 4.2)
+    assert line == ("Reward probe step 120: likeness +2.3 points since the stage began (face +3.1, body -0.4), "
+                    "pictures changed 4.2%")
+    assert "n/a" in RW.describe_change(1, {"combined": None}, None)
+
+
+class _Rec:
+    def __init__(self, combined, face, body, images):
+        self.combined, self.face_norm, self.body_norm, self.images = combined, face, body, images
+
+
+def _stage_trainer(tmp_path, monkeypatch, stops, **cfg_kw):
+    """A Trainer with just enough around it to run _reward_stage on a toy model: the renders are faked (every picture
+    scores alike, so no update runs) and run_probe records its steps and returns its next scripted stop."""
+    from types import SimpleNamespace
+
+    from rulztrainer import trainer as TR
+
+    cfg = TrainConfig(reward_steps=6, face_refs=["x"], reward_prompts=["a photo of t"], reward_group=2,
+                      probe_steps=2, save_every=0, **cfg_kw)
+    t = TR.Trainer.__new__(TR.Trainer)
+    t.cfg, t.ema, t.dp, t.devices, t.device = cfg, None, None, ["cpu"], "cpu"
+    t.face_scorer, t.body_scorer, t.probe_worker = object(), None, None
+    t.stop_file, t.job_dir = tmp_path / "STOP", tmp_path
+    t.last_probe_rec = t.last_probe_step = None
+    data: dict = {}
+    t.status = SimpleNamespace(data=data, update=lambda **kw: data.update(kw))
+    t.controller = SimpleNamespace(normalize=False, n_probes=1, state=lambda: {})
+    t.arch = SimpleNamespace(name="x",
+                             pad_embeds=lambda rows: (torch.zeros(len(rows), 2, 2), torch.ones(len(rows), 2)),
+                             sample_sigmas=lambda *a: torch.tensor([1.0, 0.5, 0.0]),
+                             init_noise_scale=lambda s: 1.0,
+                             decode_latents=lambda vae, x: torch.zeros(1, 3, 8, 8))
+    t._likeness_scale = lambda: None
+    t._home_vae, t._park_vae = lambda: None, lambda: None
+    t.negative_prompt = lambda: "neg"
+    t._reward_of = lambda path, prompt, scale: 0.5
+    t.save = lambda injected, step, final=False: tmp_path / f"{step}.safetensors"
+    calls = []
+    scripted = list(stops)
+
+    def run_probe(model, step, opt, sched, injected):
+        calls.append(step)
+        shot = _picture(tmp_path / f"step{step:06d}_face_0.png", min(255, 5 * len(calls)))
+        t.last_probe_rec, t.last_probe_step = _Rec(40.0 + 2 * len(calls), 10.0, None, [shot]), step
+        return scripted.pop(0) if scripted else False
+
+    t.run_probe = run_probe
+    toy = nn.Module()
+    toy.layers = nn.ModuleList()
+    toy.latent_channels = 2
+    monkeypatch.setattr(TR, "load_text_embeds", lambda cfg, prompt: torch.zeros(1, 2))
+    monkeypatch.setattr(TR.lora_mod, "lora_parameters", lambda injected: [nn.Parameter(torch.zeros(1))])
+    monkeypatch.setattr(RW, "sample_group", lambda *a, **k: ([torch.zeros(2, 2, 1, 1)] * 3, [0.0, 0.0]))
+    return t, toy, calls
+
+
+def test_reward_probes_follow_their_own_cadence_and_only_watch(tmp_path, monkeypatch):
+    t, toy, calls = _stage_trainer(tmp_path, monkeypatch, [False, True, True, True], reward_probe_every=2,
+                                   probe_every=50)
+    t._reward_stage(toy, {}, 100)
+    # a baseline probe at the stage start (nothing taken at step 100), then after reward steps 2, 4 and 6 (the stop
+    # return of the probes at 102 and 104 is ignored: the stage runs on to step 106)
+    assert calls == [100, 102, 104, 106]
+    rows = t.status.data["reward_change"]
+    assert [r[0] for r in rows] == [102, 104, 106]
+    assert rows[0][1] == pytest.approx(2.0) and rows[2][1] == pytest.approx(6.0)  # combined 42 vs 40, 46 vs 40
+    assert rows[0][2] is not None  # the pictures differ from the baseline's
+
+
+def test_reward_probes_reuse_the_probe_taken_at_the_stage_start(tmp_path, monkeypatch):
+    t, toy, calls = _stage_trainer(tmp_path, monkeypatch, [], reward_probe_every=3, probe_every=0)
+    shot = _picture(tmp_path / "step000100_face_0.png", 0)
+    t.last_probe_rec, t.last_probe_step = _Rec(30.0, 10.0, None, [shot]), 100
+    t._reward_stage(toy, {}, 100)
+    assert calls == [103, 106]  # no baseline probe: the last one scored these weights
+    assert [r[0] for r in t.status.data["reward_change"]] == [103, 106]
+
+
+def test_without_reward_probe_every_a_probe_still_ends_the_stage(tmp_path, monkeypatch):
+    t, toy, calls = _stage_trainer(tmp_path, monkeypatch, [False, True], reward_probe_every=0, probe_every=2)
+    t._reward_stage(toy, {}, 100)
+    assert calls == [102, 104]  # the second probe's stop ended the stage at step 4; no baseline, no readout
+    assert "reward_change" not in t.status.data
+
+
+def test_a_reward_probe_every_run_gets_a_controller_without_probe_every():
+    from rulztrainer.trainer import Trainer
+
+    t = Trainer.__new__(Trainer)
+    t.cfg = TrainConfig(reward_steps=10, face_refs=["x"], probe_every=0, reward_probe_every=1)
+    assert t._reward_probes()
+    t.cfg = TrainConfig(reward_steps=10, face_refs=["x"], probe_every=0)
+    assert not t._reward_probes() and t._make_controller([]) is None
+    t.cfg = TrainConfig(reward_steps=0, face_refs=["x"], probe_every=0, reward_probe_every=1)
+    assert not t._reward_probes()

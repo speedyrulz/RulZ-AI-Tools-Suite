@@ -1225,6 +1225,9 @@ class TrainConfig:
     reward_noise: float = 0.7  # the stochastic sampler's noise level (Flow-GRPO's)
     reward_kl: float = 0.04  # KL penalty to the LoRA as the stage started
     reward_size: int = 0  # image size (square; full-body prompts 2:3); 0 = probe_size
+    # likeness probes of the reward stage on their own cadence: 0 = probe_every as before; N = after every N reward
+    # steps (1 = each step), as a watch only (they never end the stage) with the change since the stage began
+    reward_probe_every: int = 0
     # --- likeness-filtered self-training: the LoRA's own best pictures train beside the photos (selftrain.py) ---
     selftrain: bool = False
     selftrain_at: str = "0.5"  # fractions of the steps a round runs at, e.g. "0.5,0.75" (each replaces the last)
@@ -1740,6 +1743,10 @@ class TrainConfig:
             raise ValueError("finetune_anchor must be 0 (off) or more")
         if self.reward_steps < 0:
             raise ValueError("reward_steps must be 0 (off) or more")
+        if self.reward_probe_every < 0:
+            raise ValueError("reward_probe_every must be 0 (probe_every) or more")
+        if self.reward_probe_every > 0 and not (self.face_refs or self.body_refs):
+            raise ValueError("reward_probe_every probes the reward stage's likeness: set face_refs and/or body_refs")
         if self.reward_steps > 0:
             if not (self.face_refs or self.body_refs):
                 raise ValueError("reward_steps scores its pictures against face_refs / body_refs: set references")
