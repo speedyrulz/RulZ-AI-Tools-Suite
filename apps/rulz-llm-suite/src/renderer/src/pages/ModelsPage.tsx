@@ -2,6 +2,7 @@ import { Cloud, Ellipsis, Eye, FolderOpen, FolderSearch, Gauge, Globe, Play, Ref
 import { Fragment, useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { adapterChoices } from '@shared/adapters'
+import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
 import type { AdapterEntry, LoadConfig, ModelEntry } from '@shared/types'
 import { AdapterConvertDialog } from '../components/models/AdapterConvertDialog'
 import { BenchmarkView } from '../components/models/BenchmarkView'
@@ -342,15 +343,22 @@ function ModelDetails({ model, onClose, onBenchmark }: { model: ModelEntry; onCl
   const [config, setConfig] = useState<LoadConfig | null>(null)
   const [custom, setCustom] = useState(false)
   const [scope, setScope] = useState<ModeScope>('all')
-  const estimate = useEstimate(model.id, config ?? settings!.defaultLoadConfig)
+  // Settings can be missing when they failed to load at start-up: the built-in defaults stand in.
+  const estimate = useEstimate(model.id, config ?? settings?.defaultLoadConfig ?? DEFAULT_LOAD_CONFIG)
 
   useEffect(() => {
     // An OpenRouter model has no load settings.
     if (model.cloud) return
-    void invoke('models:getDefaults', model.id).then((d) => {
-      setConfig(d.config)
-      setCustom(d.custom)
-    })
+    void invoke('models:getDefaults', model.id).then(
+      (d) => {
+        setConfig(d.config)
+        setCustom(d.custom)
+      },
+      (e) => {
+        toast.error(`Could not read this model's load settings: ${errorMessage(e)}`)
+        if (settings) setConfig(settings.defaultLoadConfig)
+      }
+    )
   }, [model.id])
 
   const i = model.info

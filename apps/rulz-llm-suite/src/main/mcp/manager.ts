@@ -6,6 +6,7 @@ import type { McpConfigState, McpServerConfig, McpServerStatus, McpToolInfo, Too
 import { FILE_TOOL_DEFS, FILE_TOOLS_SERVER, runFileTool } from '../files/fileTools'
 import type { FileToolScope } from '@shared/types'
 import type { PdfReader } from '../pdf/reader'
+import { writeTextAtomic } from '../util/jsonFile'
 import { contentToText, EMPTY_CONFIG, parseMcpConfig, qualifyToolName, qualifyToolNames, readMcpConfigFile } from './config'
 import { killTree, killTreesSync, launcherDirs, McpScope, SCOPED_SERVERS, SCOPES_OPEN_MESSAGE, type ScopedProcess } from './scopes'
 
@@ -29,6 +30,8 @@ export class McpManager {
   private configText = EMPTY_CONFIG
   private configError: string | null = null
   private readFailed = false
+  /** The last mcp.json write; the next one waits for it. */
+  private saveQueue: Promise<void> = Promise.resolve()
   /** Every server name in mcp.json, so tool names can be kept unique across servers. */
   private serverNames: string[] = []
   private disposed = false
@@ -87,7 +90,10 @@ export class McpManager {
   async saveConfig(text: string): Promise<McpServerStatus[]> {
     this.assertNoScopes()
     const servers = this.withAppServers(parseMcpConfig(text))
-    await fs.writeFile(this.configPath, text, 'utf8')
+    // writeTextAtomic uses one temp name per process, so two saves at once must not overlap.
+    const write = this.saveQueue.catch(() => undefined).then(() => writeTextAtomic(this.configPath, text))
+    this.saveQueue = write
+    await write
     this.configText = text
     this.configError = null
     this.readFailed = false

@@ -129,8 +129,31 @@ export function nameMatcher(pattern: string): (name: string) => boolean {
   const p = pattern.trim().toLowerCase()
   if (!p) return () => true
   if (!/[*?]/.test(p)) return (n) => n.toLowerCase().includes(p)
-  const re = new RegExp(`^${p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}$`, 'i')
-  return (n) => re.test(n)
+  return (n) => wildcardMatch(p, n.toLowerCase())
+}
+
+/** Whole-string match of `pattern` (already lower case) against `text`: * is any run, ? exactly one character. Linear backtracking, no RegExp. */
+function wildcardMatch(pattern: string, text: string): boolean {
+  let pi = 0
+  let ti = 0
+  let star = -1
+  let mark = 0
+  while (ti < text.length) {
+    if (pi < pattern.length && pattern[pi] === '*') {
+      star = pi++
+      mark = ti
+    } else if (pi < pattern.length && (pattern[pi] === '?' || pattern[pi] === text[ti])) {
+      pi++
+      ti++
+    } else if (star >= 0) {
+      pi = star + 1
+      ti = ++mark
+    } else {
+      return false
+    }
+  }
+  while (pi < pattern.length && pattern[pi] === '*') pi++
+  return pi === pattern.length
 }
 
 export function formatSize(bytes: number): string {

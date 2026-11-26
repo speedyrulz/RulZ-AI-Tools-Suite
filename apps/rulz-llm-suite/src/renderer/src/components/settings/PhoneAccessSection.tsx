@@ -1,7 +1,8 @@
 import { Eye, EyeOff, RefreshCw, Smartphone, Unplug } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import type { PhonePairing, PhoneStatus } from '@shared/phone'
-import { invoke, on } from '../../lib/api'
+import { toast } from 'sonner'
+import { errorMessage, invoke, on } from '../../lib/api'
 import { relativeTime } from '../../lib/format'
 import { useApp } from '../../stores/app'
 import { Button, Field, NumberInput, Switch } from '../ui'
@@ -28,11 +29,12 @@ export function PhoneAccessSection() {
   const [showCode, setShowCode] = useState(false)
   const [busy, setBusy] = useState(false)
   const [confirmNew, setConfirmNew] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
   /** Counts pairing requests, so a slow one can't put an older code back on screen. */
   const pairingRequest = useRef(0)
 
   useEffect(() => {
-    void invoke('phone:status').then(setStatus, () => undefined)
+    void invoke('phone:status').then(setStatus, (e) => setLoadError(errorMessage(e)))
     return on('phone:changed', setStatus)
   }, [])
 
@@ -50,20 +52,26 @@ export function PhoneAccessSection() {
     }
   }, [ready, where])
 
-  if (!status) return <p className="text-[13px] text-faint">Loading...</p>
+  if (!status) return <p className="text-[13px] text-faint">{loadError ? `Could not read phone access: ${loadError}` : 'Loading...'}</p>
 
   const toggle = async (enabled: boolean): Promise<void> => {
     setBusy(true)
     try {
       setStatus(await invoke('phone:setEnabled', enabled))
+    } catch (e) {
+      toast.error(`Could not change phone access: ${errorMessage(e)}`)
     } finally {
       setBusy(false)
     }
   }
   const newCode = async (): Promise<void> => {
     const n = ++pairingRequest.current
-    const p = await invoke('phone:newToken')
-    if (n === pairingRequest.current) setPairing(p)
+    try {
+      const p = await invoke('phone:newToken')
+      if (n === pairingRequest.current) setPairing(p)
+    } catch (e) {
+      toast.error(`Could not make a new pairing code: ${errorMessage(e)}`)
+    }
   }
   const line = phoneStateLine(status)
 
@@ -120,7 +128,7 @@ export function PhoneAccessSection() {
                   <span className="shrink-0 text-faint">
                     {c.address}, connected {relativeTime(c.connectedAt)}
                   </span>
-                  <Button size="sm" variant="ghost" className="ml-auto" onClick={() => void invoke('phone:disconnect', c.id)}>
+                  <Button size="sm" variant="ghost" className="ml-auto" onClick={() => void invoke('phone:disconnect', c.id).catch((e) => toast.error(`Could not disconnect the phone: ${errorMessage(e)}`))}>
                     <Unplug size={12} /> Disconnect
                   </Button>
                 </li>

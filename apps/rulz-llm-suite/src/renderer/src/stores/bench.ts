@@ -6,6 +6,9 @@ import type { BenchmarkRequest, BenchmarkRun } from '@shared/benchmark'
 import { insertRunIfAbsent, mergeRun } from '../lib/bench'
 import { errorMessage, invoke, on } from '../lib/api'
 import { once } from '../lib/once'
+import { aiBusyReason } from '../lib/aiBusy'
+import { isRunning } from '../lib/adventure'
+import { useAdventure } from './adventure'
 import { WBENCH_BUSY, wbenchRunning } from '../lib/wbenchFlag'
 
 interface BenchState {
@@ -47,6 +50,13 @@ export const useBench = create<BenchState>((set, get) => ({
     if (get().starting || activeBenchRun(get().runs)) return null
     if (wbenchRunning()) {
       toast(WBENCH_BUSY)
+      return null
+    }
+    // The benchmark unloads every model on this PC, so it must not cut a reply, batch or Writing action short.
+    // A reply from an OpenRouter model uses nothing here, so it does not count (opts.local).
+    const busy = aiBusyReason(undefined, { local: true }) ?? (isRunning(useAdventure.getState().job) ? 'An adventure passage is being written.' : null)
+    if (busy) {
+      toast(busy)
       return null
     }
     set({ starting: true })

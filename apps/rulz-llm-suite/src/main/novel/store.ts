@@ -33,7 +33,7 @@ import { defaultProject } from '@shared/novelPrompts'
 import { applyOutlineOps, emptyOutline, validSceneFile, findChapter, findScene, newId, removeChapter, removeScene, reinsert, sceneFileName, slugify } from '@shared/novelOutline'
 import { wordCount } from '@shared/novelText'
 import type { SamplingParams } from '@shared/types'
-import { USER_PATH, assertAppPath, assertNoLinks, cleanRelPath, decodeBytes, encodeText, isInside, NEW_FILE_META, readBytes, realInside, serialized, sha256, writeBytesAtomic } from './files'
+import { USER_PATH, assertAppPath, assertNoLinks, cleanRelPath, decodeBytes, drainFolder, encodeText, isInside, NEW_FILE_META, readBytes, realInside, serialized, sha256, writeBytesAtomic } from './files'
 import { listHistory, takeSnapshot } from './history'
 import { deleteJournal, discardJournal, readJournal, writeJournal } from './journal'
 import { listTrash, moveToTrash, readManifest, removeTrashFolder, restoreFiles, returnToTrash, trashRoot, undoTrash, type TrashManifest, type TrashOutline } from './trash'
@@ -76,6 +76,9 @@ export function runAs<T>(owner: string | undefined, fn: () => T): T {
   return originStore.run(owner, fn)
 }
 
+/** Refusal while a project folder is being moved to the Recycle Bin. */
+const DELETING_MESSAGE = 'This project is being deleted.'
+
 interface OpenProject {
   folder: string
   /** Who has the project open (see WINDOW_OWNER); the project is dropped when the last owner closes it. */
@@ -83,6 +86,8 @@ interface OpenProject {
   project: NovelProject
   outline: NovelOutline
   blocked: string | null
+  /** The project folder is being moved to the Recycle Bin: no new file writes are accepted. */
+  deleting?: boolean
   /** Why project.json / outline.json cannot be used, or null. */
   jsonErr: { 'project.json': string | null; 'outline.json': string | null }
   /** Hash of each file as last read or written by the app (lower-case relative path → sha256, '' = absent). */
@@ -460,6 +465,8 @@ export class NovelStore {
   }
 
   private exclusive<T>(p: OpenProject, fn: () => Promise<T>): Promise<T> {
+    // A project being moved to the Recycle Bin takes no new work: it would recreate folders at the old path.
+    if (p.deleting) return Promise.reject(new Error(DELETING_MESSAGE))
     const next = p.chain.catch(() => undefined).then(fn)
     p.chain = next
     return next
@@ -929,7 +936,7 @@ export class NovelStore {
     if (!j) return null
     if (j.text.replace(/\r\n/g, '\n') === diskText) {
       // A blocked project is never written to, so the identical journal just stays.
-      if (!p.blocked) await deleteJournal(p.folder, rel)
+      if (!p.blocked && !p.deleting) await deleteJournal(p.folder, rel)
       return null
     }
     return j
@@ -938,13 +945,15 @@ export class NovelStore {
   async readFile(folder: string, rel: string): Promise<NovelTextFile> {
     const p = this.get(folder)
     const clean = this.userPath(p.folder, rel)
+    // A read can snapshot or delete a journal, which would write into a folder being moved away.
+    if (p.deleting) throw new Error(DELETING_MESSAGE)
     return serialized(join(p.folder, clean), () => this.loadText(p, clean, true))
   }
 
   /** Takes a snapshot; `minGapMs` skips it if one was taken for this path that recently. `strict` throws on failure. False when no snapshot exists (blocked project, failure). */
   private async snapshot(p: OpenProject, rel: string, bytes: Buffer, minGapMs = 0, strict = false): Promise<boolean> {
-    // A blocked project is never written to, not even under .rulz\.
-    if (p.blocked) return false
+    // A blocked project is never written to, not even under .rulz\; nor is one being deleted.
+    if (p.blocked || p.deleting) return false
     const key = lc(rel)
     if (minGapMs && Date.now() - (p.lastSnap.get(key) ?? 0) < minGapMs) return true
     try {
@@ -963,6 +972,7 @@ export class NovelStore {
     const rel = this.userPath(p.folder, req.path)
     if (typeof req.text !== 'string') throw new Error('The text to save is missing.')
     if (p.blocked) return { ok: false, reason: 'blocked' }
+    if (p.deleting) return { ok: false, reason: 'error', error: 'This project is being deleted, so nothing was saved.' }
     const target = join(p.folder, ...rel.split('/'))
     // The desktop editor's crash-recovery journal is the desktop's: a save made by a phone leaves it alone (the
     // recovery offers a journal whose text differs from the disk).
@@ -1038,7 +1048,7 @@ export class NovelStore {
   async journal(folder: string, rel: string, text: string, baseHash: string): Promise<void> {
     const p = this.get(folder)
     const clean = this.userPath(p.folder, rel)
-    if (p.blocked) return
+    if (p.blocked || p.deleting) return
     // Same key as saveFile/readFile: a late journal write cannot land after a save deleted the journal.
     await serialized(join(p.folder, ...clean.split('/')), async () => {
       if (p.blocked) return
@@ -1050,7 +1060,7 @@ export class NovelStore {
   async discardJournal(folder: string, rel: string): Promise<void> {
     const p = this.get(folder)
     const clean = this.userPath(p.folder, rel)
-    if (p.blocked) return
+    if (p.blocked || p.deleting) return
     await serialized(join(p.folder, ...clean.split('/')), async () => {
       if (p.blocked || !(await readJournal(p.folder, clean))) return
       await discardJournal(p.folder, clean)
@@ -1214,11 +1224,14 @@ export class NovelStore {
   async emptyTrash(folder: string): Promise<void> {
     const p = this.get(folder)
     if (p.blocked) throw new Error(`${p.blocked} The project is read-only until that file is fixed.`)
-    const dir = trashRoot(p.folder)
-    await assertAppPath(p.folder, dir)
-    await assertNoLinks(dir)
-    if (!(await fs.stat(dir).catch(() => null))) return
-    await this.opts.trashItem(dir)
+    // On the project chain, like the other trash moves, so it cannot split a chapter's files mid-restore.
+    await this.exclusive(p, async () => {
+      const dir = trashRoot(p.folder)
+      await assertAppPath(p.folder, dir)
+      await assertNoLinks(dir)
+      if (!(await fs.stat(dir).catch(() => null))) return
+      await this.opts.trashItem(dir)
+    })
   }
 
   /** Moves the whole project folder to the Recycle Bin; on failure nothing is deleted and the project stays open. */
@@ -1235,14 +1248,22 @@ export class NovelStore {
     open?.watcher?.stop()
     try {
       if (open) {
+        // New saves, journals and snapshots are refused from here on; the ones already queued are waited for below.
+        open.deleting = true
         open.recordsOff = true
         while (open.recordHold) await open.recordHold
         await Promise.allSettled([...open.records])
       }
       await open?.chain.catch(() => undefined)
+      // Saves in flight (scene saves, journals, snapshots) run on per-path queues, not the chain, and recreate
+      // missing folders: wait for them before the folder is moved.
+      await drainFolder(dir)
       await this.opts.trashItem(dir)
     } catch (err) {
-      if (open) open.recordsOff = false
+      if (open) {
+        open.recordsOff = false
+        open.deleting = false
+      }
       open?.watcher?.start()
       throw new Error(`Could not move the project folder to the Recycle Bin: ${errText(err)} Nothing was deleted.`)
     }

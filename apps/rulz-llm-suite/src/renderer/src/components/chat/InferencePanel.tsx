@@ -11,6 +11,7 @@ import { useChat } from '../../stores/chat'
 import { modeDefaultsOf, useModels } from '../../stores/models'
 import { effectiveToolMode, findTool, tokensOf, useMcp } from '../../stores/mcp'
 import { NOT_SUPPORTED, supportsOf } from '../../lib/cloud'
+import { textToStops } from '../../lib/auditHelpers'
 import { formatCompact } from '../../lib/format'
 import { Button, Dialog, Field, IconButton, Input, NumberInput, Select, Slider, Switch, Textarea } from '../ui'
 import { AdapterPanel } from './AdapterPanel'
@@ -93,13 +94,7 @@ export function SamplingFields({
             <NumberInput value={s.seed} placeholder="Random" disabled={off('seed')} onChange={(v) => setS('seed', v === null ? null : Math.round(v))} />
           </Field>
           <Field label="Stop strings" hint={off('stop') ? NOT_SUPPORTED : 'One per line'}>
-            <Textarea
-              rows={2}
-              className="font-mono text-xs disabled:pointer-events-none disabled:opacity-45"
-              disabled={off('stop')}
-              value={s.stop.join('\n')}
-              onChange={(e) => setS('stop', e.target.value.split('\n').filter((x) => x.length > 0))}
-            />
+            <ListArea value={s.stop} parse={textToStops} format={(l) => l.join('\n')} rows={2} disabled={off('stop')} onChange={(l) => setS('stop', l)} />
           </Field>
         </>
       )}
@@ -183,6 +178,7 @@ function ListArea({
   parse,
   format,
   placeholder,
+  rows = 3,
   onChange,
   disabled
 }: {
@@ -190,6 +186,7 @@ function ListArea({
   parse: (text: string) => string[]
   format: (list: string[]) => string
   placeholder?: string
+  rows?: number
   onChange: (list: string[]) => void
   disabled?: boolean
 }) {
@@ -202,7 +199,7 @@ function ListArea({
   }
   return (
     <Textarea
-      rows={3}
+      rows={rows}
       className="font-mono text-xs disabled:pointer-events-none disabled:opacity-45"
       placeholder={placeholder}
       disabled={disabled}

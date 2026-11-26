@@ -4,7 +4,8 @@ import type { ChatMessage, GenerationStats } from '@shared/types'
 import { costText } from '../../lib/cloud'
 import { cn, formatBytes, formatDuration, formatNumber } from '../../lib/format'
 import { useApp } from '../../stores/app'
-import { isChatBusy, isPoolChat, useChat } from '../../stores/chat'
+import { toast } from 'sonner'
+import { chatBenchRefusal, isChatBusy, isPoolChat, useChat } from '../../stores/chat'
 import { useModels } from '../../stores/models'
 import { Button, IconButton, ProgressBar, Textarea, Tooltip } from '../ui'
 import { Markdown } from './Markdown'
@@ -234,6 +235,9 @@ function EditBox({ message, onClose }: { message: ChatMessage; onClose: () => vo
             variant="primary"
             disabled={busy}
             onClick={() => {
+              // A refused send keeps the editor open with the text, rather than dropping the edit.
+              const refusal = chatBenchRefusal(useModels.getState().activeModelId ?? useChat.getState().current?.modelId)
+              if (refusal) return void toast(refusal)
               void editMessage(message.id, text, true)
               onClose()
             }}

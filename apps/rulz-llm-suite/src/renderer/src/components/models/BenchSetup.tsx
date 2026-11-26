@@ -11,7 +11,10 @@ import {
   type AxisForm,
   type BenchForm
 } from '../../lib/bench'
-import { invoke } from '../../lib/api'
+import { toast } from 'sonner'
+import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
+import { errorMessage, invoke } from '../../lib/api'
+import { useApp } from '../../stores/app'
 import { cn } from '../../lib/format'
 import { activeBenchRun, useBench } from '../../stores/bench'
 import { Button, Field, Input, NumberInput, Select, Switch } from '../ui'
@@ -78,11 +81,20 @@ export function BenchSetup({ model }: { model: ModelEntry }) {
 
   useEffect(() => {
     let live = true
-    void invoke('models:getDefaults', model.id).then((d) => {
-      if (!live) return
-      setBase(d.config)
-      setCustom(d.custom)
-    })
+    void invoke('models:getDefaults', model.id).then(
+      (d) => {
+        if (!live) return
+        setBase(d.config)
+        setCustom(d.custom)
+      },
+      (e) => {
+        if (!live) return
+        // Start from the app defaults instead of leaving the panel waiting for good.
+        toast.error(`Could not read this model's load settings: ${errorMessage(e)}`)
+        setBase(useApp.getState().settings?.defaultLoadConfig ?? DEFAULT_LOAD_CONFIG)
+        setCustom(false)
+      }
+    )
     return () => {
       live = false
     }
