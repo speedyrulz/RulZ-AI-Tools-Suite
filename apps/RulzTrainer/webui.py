@@ -1452,6 +1452,19 @@ def probe_chart_series(probes: list[dict], names: list[str],
     return series, legend
 
 
+def reward_change_chips(rows: list | None) -> list[tuple[str, str, bool]]:
+    """The Monitor's readout chips of the reward stage's change since it began (status `reward_change`, rows of
+    [step, likeness points, picture change %, face points, body points]; reward_probe_every): the last probe's likeness
+    change in points (with the face and body parts when it has them) and how much the probe pictures changed."""
+    if not rows:
+        return []
+    last = list(rows[-1]) + [None] * 5
+    pts = lambda v: "n/a" if v is None else f"{v:+.1f} points"  # noqa: E731
+    parts = ", ".join(f"{k} {last[i]:+.1f}" for k, i in (("face", 3), ("body", 4)) if last[i] is not None)
+    return [("Likeness since reward stage began", pts(last[1]) + (f" ({parts})" if parts else ""), False),
+            ("Pictures changed", "n/a" if last[2] is None else f"{last[2]:.1f}%", False)]
+
+
 SWEEP_COLORS = {"face": "#FF3B30", "hair": "#F59E0B", "skin": "#FB7185", "clothes": "#60A5FA",
                 "background": "#34D399", "subject": "#F4F4F5"}
 
@@ -2409,7 +2422,7 @@ class Form:
             reward_prompts=[p.strip() for p in (v("reward_prompts") or "").splitlines() if p.strip()],
             reward_sample_steps=int(v("reward_sample_steps") or 0), reward_train_steps=int(v("reward_train_steps") or 4),
             reward_noise=float(v("reward_noise") or 0.7), reward_kl=num("reward_kl", float),
-            reward_size=int(v("reward_size") or 0),
+            reward_size=int(v("reward_size") or 0), reward_probe_every=int(v("reward_probe_every") or 0),
             selftrain=bool(v("selftrain")), selftrain_at=s("selftrain_at") or "0.5",
             selftrain_images=int(v("selftrain_images") or 32),
             selftrain_min_likeness=float(v("selftrain_min_likeness") if v("selftrain_min_likeness") is not None
@@ -7574,7 +7587,9 @@ EXPERIMENTS = [
      "short": "A second stage that rewards the most lifelike renders.",
      "what": "After the normal steps, the LoRA renders groups of pictures for new prompts, the probes rate how much "
              "each looks like the person, and the LoRA learns to make the better ones more likely (a Flow-GRPO "
-             "style reinforcement stage). The number is how many reward steps; 0 = off.",
+             "style reinforcement stage). The number is how many reward steps; 0 = off. Probe every (reward "
+             "steps) in its section probes the stage on its own cadence (1 = after each step) and shows how much "
+             "the likeness and the pictures changed since the stage began.",
      "tested": "No visible gain: 150 steps went from 29.0 to 27.9 combined on one seed of one small Krea 2 set, with "
                "one probe after the stage. About 80 to 100 s a reward step on a 48 GB card, 3.5 hours for the stage; "
                "about 77 s on a 16 GB card with nvfp4.",
@@ -17015,7 +17030,10 @@ def build_page(local: bool = True):
                                  "by a KL penalty. It optimizes what you are after directly, but it is slow and can "
                                  "learn what the scorer likes more than the person (keep the probes on and judge by "
                                  "eye). The probes run every Probe every reward steps and once more at the end, so the "
-                                 "final LoRA's likeness is in the chart. A picture's face and body scores are capped "
+                                 "final LoRA's likeness is in the chart. Probe every (reward steps) gives the stage its "
+                                 "own cadence (1 = after each step): those probes only watch, never end the stage, and "
+                                 "report the likeness and picture change since the stage began. A picture's face and "
+                                 "body scores are capped "
                                  "far below a stranger's, so a body that differs from your body references only in "
                                  "clothing or framing can't outweigh the face; reward prompts like your body "
                                  "references (or Body weight 0) let the body count. Files: <job>_reward_<step> and "
@@ -17044,6 +17062,13 @@ def build_page(local: bool = True):
                                     .tooltip("The stochastic sampler's noise level; the pictures vary more above it.")
                                 w["reward_size"] = ui.number("Size (0 = probe size)", value=d.reward_size, min=0,
                                                              step=64, precision=0).classes("w-44")
+                                w["reward_probe_every"] = ui.number("Probe every (reward steps)",
+                                                                    value=d.reward_probe_every, min=0,
+                                                                    precision=0).classes("w-52") \
+                                    .tooltip("0 = Probe every. Otherwise the likeness probes run after every this many "
+                                             "reward steps (1 = each step) and only watch: they never end the stage. "
+                                             "Each one reports the likeness and how much the pictures changed since "
+                                             "the stage began. Needs face or body references.")
                             w["reward_prompts"] = ui.textarea("Reward prompts (one per line; empty = varied "
                                                               "close-up, upper-body and full-body prompts from the "
                                                               "trigger word)").classes("w-full")
@@ -18350,6 +18375,7 @@ def build_page(local: bool = True):
                               ("Face bias", f"{lk.get('face_bias', 0.0):+.2f}", False)]
                     if lk.get("stopped"):
                         chips.append(("Early stop", "stopped", True))
+                    chips += reward_change_chips(st.get("reward_change"))
                     stat_chips(probe_chips, chips, probe_sig)
                     rnames = (rc or {}).get("names") or []
                     by_step = probe_steps(probes, rnames)
@@ -19011,7 +19037,12 @@ that is thrown away. The LoRA file is the same either way. On one small Krea 2 s
 the LoRA renders groups of 4 pictures of new prompts, the probes' scorers rate their likeness, and the better ones are
 made more likely and the worse ones less (Flow-GRPO), held near the first stage's LoRA. It aims straight at likeness
 but is slow and can learn what the scorer likes more than what you see: keep the probes on and look at the pictures.
-The probes also score the stage's final LoRA when it ends, so its likeness shows next to the first stage's. Each
+The probes also score the stage's final LoRA when it ends, so its likeness shows next to the first stage's.
+*Probe every (reward steps)* gives the stage its own probe cadence (0 = *Probe every*, 1 = after each step, even
+with *Probe every* 0). Those probes only watch: they never end the stage. A baseline probe at the stage's start (the
+last probe is reused when it scored the same weights) lets the Monitor and the log show, after each probe, how many
+points the likeness has moved since the stage began and how much the pictures changed (mean pixel difference, in %
+of the 0-255 range). Each
 picture's face and body scores are capped far below a stranger's: a body that differs from your body references only
 in clothing (a coat against unclothed references) can't outweigh the face. Reward prompts like your body references,
 or Body weight 0, let the body count.

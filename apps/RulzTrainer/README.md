@@ -2938,6 +2938,18 @@ most like the person. Each reward step:
   a probe that beats the best of both stages saves `<job>_reward_best.safetensors`, and early stop ends the stage.
   When the stage's last step was not probed (`probe_every` not dividing `reward_steps`, or larger than it), a closing
   probe scores the final LoRA, so the stage always ends with its likeness on the run's scale.
+- **Its own probe cadence and change readout (`reward_probe_every`, since 4.6.0):** 0 (default) leaves the stage on
+  `probe_every` as above. N > 0 probes after every N reward steps (1 = each step), even when `probe_every` is 0 (it
+  needs `face_refs` and/or `body_refs`), and those probes only watch: they never end the stage (the best checkpoint is
+  still kept, and the closing probe still runs when the last step was not probed). The stage takes a baseline as it
+  starts: the last probe is reused when it scored these very weights (taken at the step the stage starts from, such as
+  the first stage's closing probe or the step-0 probe of a `steps: 0` run), otherwise one probe runs after the weight
+  average went into the LoRA. After every probe the log gives one line, for example `Reward probe step 120: likeness
+  +2.3 points since the stage began (face +3.1, body -0.4), pictures changed 4.2%`: the likeness change in points on
+  the probes' scale, and the mean absolute pixel difference between each probe picture and the baseline picture of the
+  same prompt and seed, as a percentage of the 0-255 range (pairs of different size are skipped). The Monitor's
+  likeness section shows the last values as two readouts, and `status.json` keeps them as `reward_change`
+  (`[[step, points, picture %, face points, body points], ...]`).
 - **Measured cost:** Krea 2 (nvfp4, 16 GB RTX 4060 Ti), 4 pictures of 512 px at 4 denoising steps with guidance 5.5,
   2 trained moves per update: about 77 s per reward step (with a turbo LoRA at guidance 1 the guidance passes go).
 - **Alone:** `steps: 0` with a LoRA in `resume_from` runs only this stage, for example on a race winner's file (it
