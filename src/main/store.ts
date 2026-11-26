@@ -17,22 +17,25 @@ async function readJson<T>(path: string, fallback: T): Promise<T> {
   }
 }
 
-/** Reads settings.json. One that exists but is not a JSON object is moved to .damaged, so the next save does not erase it. */
-async function readSettings(path: string): Promise<Partial<Settings>> {
+/**
+ * Reads settings.json. One that exists but is not a JSON object is moved to .damaged, so the next save does not erase it.
+ * One that cannot be read (locked by an antivirus or sync tool) gives `locked: true`: the caller must not overwrite it.
+ */
+async function readSettings(path: string): Promise<{ settings: Partial<Settings>; locked: boolean }> {
   let text: string
   try {
-    text = await readFile(path, 'utf8')
-  } catch {
-    return {}
+    text = await readLocked(path)
+  } catch (e) {
+    return { settings: {}, locked: (e as NodeJS.ErrnoException).code !== 'ENOENT' }
   }
   try {
     const parsed: unknown = JSON.parse(text)
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Partial<Settings>
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return { settings: parsed as Partial<Settings>, locked: false }
   } catch {
     // falls through to the damaged-file handling
   }
   await rename(path, `${path}.damaged`).catch(() => undefined)
-  return {}
+  return { settings: {}, locked: false }
 }
 
 const writes = new Map<string, Promise<void>>()
@@ -83,29 +86,40 @@ async function readLocked(path: string): Promise<string> {
  * forgetting the list would leave every app installed but unknown to the launcher.
  */
 export async function readInstalled(path: string): Promise<Record<string, InstalledInfo>> {
+  return (await readInstalledState(path)).list
+}
+
+/** As readInstalled, and says whether the list is the stale .bak used because installed.json could not be read. */
+async function readInstalledState(path: string): Promise<{ list: Record<string, InstalledInfo>; fromBackup: boolean }> {
   const backup = `${path}.bak`
   let text: string
   try {
     text = await readLocked(path)
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return {}
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { list: {}, fromBackup: false }
     // Locked or unreadable (an antivirus or sync tool): not "nothing installed". The backup is only read, never
     // copied over or renamed, so the file that could not be read is left alone for the next launch.
     const saved = await readFile(backup, 'utf8').then(
-      (t) => JSON.parse(t) as unknown,
+      (t) => {
+        try {
+          return JSON.parse(t) as unknown
+        } catch {
+          return null // a truncated .bak is as unusable as a missing one
+        }
+      },
       () => null
     )
-    if (saved && typeof saved === 'object' && !Array.isArray(saved)) return saved as Record<string, InstalledInfo>
+    if (saved && typeof saved === 'object' && !Array.isArray(saved)) return { list: saved as Record<string, InstalledInfo>, fromBackup: true }
     throw new Error(`installed.json can't be read: ${e instanceof Error ? e.message : String(e)}`)
   }
   try {
     const list: unknown = JSON.parse(text)
     if (!list || typeof list !== 'object' || Array.isArray(list)) throw new Error('not a list of apps')
     await copyFile(path, backup).catch(() => undefined)
-    return list as Record<string, InstalledInfo>
+    return { list: list as Record<string, InstalledInfo>, fromBackup: false }
   } catch {
     await rename(path, `${path}.damaged`).catch(() => undefined)
-    return readJson(backup, {})
+    return { list: await readJson(backup, {}), fromBackup: false }
   }
 }
 
@@ -116,13 +130,25 @@ export class Store {
   /** Apps whose found install the user removed from the launcher. */
   private detectHidden: string[] = []
 
+  /**
+   * Set while settings.json could not be read at startup: the defaults in memory are not what the file holds, so the
+   * changes made meanwhile are kept here and applied on top of the file once it can be read. Nothing is written before.
+   */
+  private settingsPending: Partial<Settings> | null = null
+  /** Set while the installed list in memory is the stale .bak (installed.json was locked): changes wait here likewise. */
+  private installedPending: Map<string, InstalledInfo | null> | null = null
+
   constructor(private readonly dir: string) {}
 
   async init(): Promise<void> {
     await mkdir(this.dir, { recursive: true })
-    this.settings = { ...defaultSettings(), ...(await readSettings(join(this.dir, 'settings.json'))) }
+    const read = await readSettings(join(this.dir, 'settings.json'))
+    this.settings = { ...defaultSettings(), ...read.settings }
+    this.settingsPending = read.locked ? {} : null
     this.cleanOrder()
-    this.installed = await readInstalled(join(this.dir, 'installed.json'))
+    const state = await readInstalledState(join(this.dir, 'installed.json'))
+    this.installed = state.list
+    this.installedPending = state.fromBackup ? new Map() : null
     this.detectHidden = await readJson(join(this.dir, 'detect-hidden.json'), [])
   }
 
@@ -131,9 +157,19 @@ export class Store {
   }
 
   async updateSettings(patch: Partial<Settings>): Promise<Settings> {
+    const file = join(this.dir, 'settings.json')
+    if (this.settingsPending) {
+      Object.assign(this.settingsPending, patch)
+      const read = await readSettings(file)
+      if (!read.locked) {
+        this.settings = { ...defaultSettings(), ...read.settings, ...this.settingsPending }
+        this.settingsPending = null
+      }
+    }
     this.settings = { ...this.settings, ...patch }
     this.cleanOrder()
-    await writeJson(join(this.dir, 'settings.json'), this.settings)
+    // Still locked: the change stays in memory, and the file is not overwritten with defaults.
+    if (!this.settingsPending) await writeJson(file, this.settings)
     return this.settings
   }
 
@@ -156,9 +192,26 @@ export class Store {
   }
 
   async setInstalled(id: string, info: InstalledInfo | null): Promise<void> {
+    const file = join(this.dir, 'installed.json')
+    const pending = this.installedPending
+    if (pending) {
+      pending.set(id, info)
+      // The list in memory is the stale .bak: the real file is the base again once it can be read.
+      const state = await readInstalledState(file).catch(() => null)
+      // Calls made at once (the startup search saves several apps) all wait here: only the first to get back rebases.
+      if (state && !state.fromBackup && this.installedPending === pending) {
+        this.installed = state.list
+        for (const [pid, pinfo] of pending) {
+          if (pinfo) this.installed[pid] = pinfo
+          else delete this.installed[pid]
+        }
+        this.installedPending = null
+      }
+    }
     if (info) this.installed[id] = info
     else delete this.installed[id]
-    await writeJson(join(this.dir, 'installed.json'), this.installed)
+    // Still unreadable: the change stays in memory only, so the real file is never overwritten with the stale copy.
+    if (!this.installedPending) await writeJson(file, this.installed)
   }
 
   /** Small cached JSON (GitHub answers) kept next to the settings. */

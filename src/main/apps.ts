@@ -121,9 +121,12 @@ export function readLatestCache(cache: LatestCache | null): Map<string, LatestEn
   if (!cache?.entries) return out
   for (const [id, e] of Object.entries(cache.entries)) {
     // A hand-edited or damaged file may hold anything: only objects are entries.
-    if (!e || typeof e !== 'object') continue
+    if (!e || typeof e !== 'object' || Array.isArray(e)) continue
     const entry = 'info' in e ? e : { info: e, at: cache.at ?? 0 }
-    if (entry.info) out.set(id, { info: entry.info, error: null, release: null, at: entry.at ?? 0 })
+    // An entry without a version string would make every version comparison throw.
+    if (entry.info && typeof entry.info === 'object' && typeof entry.info.version === 'string') {
+      out.set(id, { info: entry.info, error: null, release: null, at: entry.at ?? 0 })
+    }
   }
   return out
 }
@@ -167,6 +170,12 @@ async function waitUntil(done: () => boolean, ms: number, signal: AbortSignal): 
 /** Stops a job whose Cancel was clicked; the job runner ends it as cancelled. */
 function throwIfCancelled(signal: AbortSignal): void {
   if (signal.aborted) throw new Error('Cancelled')
+}
+
+/** As throwIfCancelled, first removing the extracted copy a cancelled install would leave behind. */
+async function dropStagedIfCancelled(signal: AbortSignal, staged: string): Promise<void> {
+  if (signal.aborted) await rm(staged, { recursive: true, force: true }).catch(() => undefined)
+  throwIfCancelled(signal)
 }
 
 /** Runs an NSIS setup or uninstaller silently, retrying the occasional startup crash. */
@@ -490,18 +499,23 @@ export class AppManager {
       const e = this.latest.get(a.id)
       return force || !e?.info || !e.at || now - e.at >= LATEST_TTL_MS
     })
+    let failed = false
     if (due.length) {
       await Promise.all(
         due.map(async (app) => {
           const prev = this.latest.get(app.id)
-          this.latest.set(app.id, mergeLatest(prev, await this.fetchLatest(app, prev)))
+          const entry = mergeLatest(prev, await this.fetchLatest(app, prev))
+          // An app not on GitHub yet always has an error; that is no reason to ask again.
+          if (entry.error && app.repo) failed = true
+          this.latest.set(app.id, entry)
         })
       )
       await this.saveLatestCache()
     }
     await this.relabelInstalled()
     await catalog
-    if (force) this.lastForcedAt = Date.now()
+    // Only a check whose answers all came back counts: after a failed one (offline, rate limit) a retry asks again.
+    if (force && !failed) this.lastForcedAt = Date.now()
     this.changed()
   }
 
@@ -985,7 +999,7 @@ export class AppManager {
       await flattenSingleFolder(staged)
       const rel = relative(staged, await this.resolveLaunch(app, staged))
       // Extracting can't be stopped, so a Cancel clicked meanwhile is honoured here, before the old files are replaced.
-      throwIfCancelled(ctx.signal)
+      await dropStagedIfCancelled(ctx.signal, staged)
       ctx.set({ phase: 'installing', label: 'Installing…', progress: null })
       await mkdir(dirname(dir), { recursive: true })
       await swapInto(staged, dir)
@@ -1146,7 +1160,7 @@ export class AppManager {
     await extractZip(zip, staged, (f) => ctx.set({ progress: f }))
     await flattenSingleFolder(staged)
     // As for a zip: a Cancel during extraction stops before the installed files are touched.
-    throwIfCancelled(ctx.signal)
+    await dropStagedIfCancelled(ctx.signal, staged)
     ctx.set({ phase: 'installing', label: 'Copying files…', progress: null })
     if (prev) {
       // Keep what the app made in its folder (venv, models, outputs); replace the source files.
@@ -1184,7 +1198,6 @@ export class AppManager {
       throwIfCancelled(ctx.signal)
       await extractZip(zip, join(dir, c.dest), (f) => ctx.set({ progress: f }))
       await rm(zip, { force: true })
-      throwIfCancelled(ctx.signal)
     }
   }
 

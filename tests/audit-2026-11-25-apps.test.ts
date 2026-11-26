@@ -19,6 +19,12 @@ vi.mock('../src/main/archive', async (orig) => ({
   }
 }))
 
+// The update checks cover one app, so a check's outcome depends on one scripted answer.
+vi.mock('@shared/catalog', async (orig) => {
+  const actual = await orig<typeof import('@shared/catalog')>()
+  return { ...actual, CATALOG: actual.CATALOG.filter((a) => a.id === 'image-organizer') }
+})
+
 // winget's answer is scripted; every other program is asked for real.
 const winget = vi.hoisted(() => ({ answers: [] as (string | null)[] }))
 vi.mock('../src/main/process', async (orig) => {
@@ -111,15 +117,26 @@ describe('B2: Cancel during extraction is honoured', () => {
     expect(job.phase).toBe('cancelled')
     expect(store.getInstalled('image-organizer')).toBeNull()
     expect(existsSync(join(target, 'RulZ Image Organizer.exe'))).toBe(false)
+    expect(existsSync(`${target}.rulz-new`)).toBe(false)
   }, 30_000)
 })
 
 describe('B7: forced checks one after another', () => {
   it('reuses the release pages the first forced check fetched', async () => {
     const urls: string[] = []
+    // The one app the checks ask about gets a good answer, so the first check succeeds as a whole.
+    const release = {
+      tag_name: 'image-organizer-v2.0.0',
+      name: 'v2.0.0',
+      published_at: '2026-11-25T00:00:00Z',
+      prerelease: false,
+      draft: false,
+      html_url: 'https://example.test/release',
+      assets: [{ name: 'RulZ-Image-Organizer-v2.0.0-win64.zip', size: 1, browser_download_url: 'https://dl.test/o.zip' }]
+    }
     setFetch(async (url) => {
       urls.push(url)
-      return url.includes('/releases?per_page=100') ? new Response('[]', { status: 200 }) : new Response('', { status: 404 })
+      return url.includes('/releases?per_page=100') ? new Response(JSON.stringify([release]), { status: 200 }) : new Response('', { status: 404 })
     })
     const { m } = await manager()
     await m.refreshLatest(true)
@@ -133,7 +150,46 @@ describe('B7: forced checks one after another', () => {
   }, 30_000)
 })
 
+describe('Q1: a failed forced check', () => {
+  it('does not stop a retry within a minute from asking GitHub again', async () => {
+    const urls: string[] = []
+    const release = {
+      tag_name: 'image-organizer-v2.0.0',
+      name: 'v2.0.0',
+      published_at: '2026-11-25T00:00:00Z',
+      prerelease: false,
+      draft: false,
+      html_url: 'https://example.test/release',
+      assets: [{ name: 'RulZ-Image-Organizer-v2.0.0-win64.zip', size: 1, browser_download_url: 'https://dl.test/o.zip' }]
+    }
+    let offline = false
+    setFetch(async (url) => {
+      urls.push(url)
+      if (offline) return new Response('', { status: 500, statusText: 'Server Error' })
+      return url.includes('/releases?per_page=100') ? new Response(JSON.stringify([release]), { status: 200 }) : new Response('', { status: 404 })
+    })
+    const { m } = await manager()
+    const pages = () => urls.filter((u) => u.includes('/releases?per_page=100')).length
+    const later = () => new Promise((r) => setTimeout(r, 20))
+    // The app has a known version, so a failed check keeps it (and its time) and leaves it not due.
+    await m.refreshLatest(false)
+    await later()
+    offline = true
+    await m.refreshLatest(true)
+    expect(pages()).toBe(2)
+    await later()
+    // The click that retries, right after the failure, asks again.
+    await m.refreshLatest(true)
+    expect(pages()).toBe(3)
+  }, 30_000)
+})
+
 describe('B4b: a damaged latest-cache.json', () => {
+  it('skips entries without an object holding a version string', () => {
+    const cache = { entries: { a: [], b: {}, c: { info: {} }, d: { info: { version: 7 } }, e: { info: 'x' } } }
+    expect(readLatestCache(cache as never).size).toBe(0)
+  })
+
   it('skips entries that are not objects instead of throwing', () => {
     const cache = { entries: { x: 's', y: 5, z: { info: { version: 'v1', label: 'v1', date: null, downloadSize: null, url: null }, at: 3 } } }
     const m = readLatestCache(cache as never)

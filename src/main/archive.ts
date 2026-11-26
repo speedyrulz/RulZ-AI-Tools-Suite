@@ -23,11 +23,19 @@ export async function installFolder(raw: string): Promise<string> {
     entries = await readdir(dir)
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code
-    if (code === 'ENOENT') return dir
+    if (code === 'ENOENT') return withoutLeftoverBackup(dir)
     if (code === 'ENOTDIR') throw new Error(`${dir} is a file. Choose a folder.`)
     throw new Error(`Can't use ${dir}: ${e instanceof Error ? e.message : String(e)}`)
   }
   if (entries.length) throw new Error(`Choose an empty folder: ${dir} already has files in it.`)
+  return withoutLeftoverBackup(dir)
+}
+
+/** A leftover backup next to a fresh install folder would be restored into it by swapInto, then deleted if the install fails. */
+async function withoutLeftoverBackup(dir: string): Promise<string> {
+  if (await exists(backupDir(dir))) {
+    throw new Error(`A previous version of an app is kept in ${backupDir(dir)}. Rename or delete it, or choose another folder.`)
+  }
   return dir
 }
 
@@ -114,8 +122,17 @@ export async function exists(path: string): Promise<boolean> {
  */
 export async function swapInto(staged: string, dir: string): Promise<void> {
   const old = backupDir(dir)
-  const hadOld = await exists(dir)
-  if (!hadOld && (await exists(old))) {
+  // Strict: a stat that fails for another reason than "not there" must not look like "no backup" (it would be deleted).
+  const present = (p: string) =>
+    stat(p).then(
+      () => true,
+      (e: NodeJS.ErrnoException) => {
+        if (e.code === 'ENOENT') return false
+        throw e
+      }
+    )
+  const hadOld = await present(dir)
+  if (!hadOld && (await present(old))) {
     // An earlier update died between its two renames: the backup is the only copy of the app, so it is put back, never deleted.
     try {
       await renameRetrying(old, dir)
