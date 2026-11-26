@@ -243,6 +243,22 @@ describe('R3 locked-file recovery is serialised', () => {
     store.dispose()
   })
 
+  it('keeps retrying when the file reads again but the first write fails', async () => {
+    const file = join(dir, 'settings.json')
+    await writeFile(file, JSON.stringify({ theme: 'dark' }))
+    fail.readFrom.add(file)
+    const store = new Store(dir, 20)
+    await store.init()
+    await store.updateSettings({ liveReadme: false })
+    fail.readFrom.clear()
+    // Readable again, but saving it fails for a while (the timer's tries in this window all fail).
+    fail.renameTo.add(file)
+    await new Promise((r) => setTimeout(r, 150))
+    fail.renameTo.clear()
+    await vi.waitFor(async () => expect(await json(file)).toMatchObject({ theme: 'dark', liveReadme: false }), { timeout: 3000, interval: 25 })
+    store.dispose()
+  })
+
   it('installFolder refuses when the backup folder cannot be checked', async () => {
     const app = join(dir, 'App')
     await folder(backupDir(app), 'v.txt', 'old')

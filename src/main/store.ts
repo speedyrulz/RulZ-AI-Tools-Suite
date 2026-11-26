@@ -170,10 +170,16 @@ export class Store {
   /** While a file is in locked mode, tries again now and then, so the changes are saved even if no other change comes. */
   private startRetrying(): void {
     if (this.retryTimer || (!this.settingsOps && !this.installedOps)) return
+    let busy = false
     this.retryTimer = setInterval(() => {
-      if (this.settingsOps) void this.saveSettings().catch(() => undefined)
-      if (this.installedOps) void this.saveInstalled().catch(() => undefined)
-      if (!this.settingsOps && !this.installedOps) this.dispose()
+      if (!this.settingsOps && !this.installedOps) return this.dispose()
+      // A slow disk: the last try is still running, so don't queue another behind it.
+      if (busy) return
+      busy = true
+      void Promise.allSettled([
+        this.settingsOps ? this.saveSettings() : null,
+        this.installedOps ? this.saveInstalled() : null
+      ]).finally(() => (busy = false))
     }, this.retryMs)
     this.retryTimer.unref()
   }
@@ -189,9 +195,10 @@ export class Store {
         this.settings = { ...defaultSettings(), ...read.settings }
         for (const op of ops) this.settings = { ...this.settings, ...op(this.settings) }
         this.cleanOrder()
-        this.settingsOps = null
       }
       await writeJson(file, this.settings)
+      // Only once written: if the write fails, the retry replays the same changes on the file again.
+      if (ops && this.settingsOps === ops) this.settingsOps = null
     })
     this.settingsChain = next
     return next
@@ -210,9 +217,10 @@ export class Store {
           if (info) this.installed[id] = info
           else delete this.installed[id]
         }
-        this.installedOps = null
       }
       await writeJson(file, this.installed)
+      // Only once written: if the write fails, the retry replays the same changes on the file again.
+      if (ops && this.installedOps === ops) this.installedOps = null
     })
     this.installedChain = next
     return next
