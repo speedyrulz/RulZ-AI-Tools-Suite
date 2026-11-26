@@ -330,7 +330,7 @@ export interface ReOverview {
   /** Newest first. */
   sessions: ReSessionSummary[]
   /** `model`: the model key the counts are for (see modelKey); present only when the overview was asked for one model. */
-  practice: { kitDir: string; error?: string; model?: string; tasks: RePracticeTaskStats[] }
+  practice: { kitDir: string; error?: string; warning?: string; model?: string; sets: RePracticeSet[]; tasks: RePracticeTaskStats[] }
   /** Prompt templates; {target} is replaced by the target path. */
   goals: { label: string; text: string }[]
   clonePieces: { label: string; text: string }[]
@@ -344,12 +344,44 @@ export interface RePracticeTask {
   binary: string
   /** Prompt with {exe} filled in for the task's work folder. */
   prompt: string
+  /** Id of the task set (folder of generated tasks) the task belongs to; 'original' is <kit>/build. */
+  set: string
+}
+
+/** A folder of generated tasks: the original (<kit>/build) or one under <kit>/sets/<id>. */
+export interface RePracticeSet {
+  id: string
+  label: string
+  count: number
+  created?: string
+  families: string[]
+  seed?: number
 }
 
 export interface RePracticeInfo {
   kitDir: string
   error?: string
+  /** Set when something is odd but the list is usable (a task id in two sets). */
+  warning?: string
   tasks: RePracticeTask[]
+  /** Task sets, the original first. */
+  sets: RePracticeSet[]
+}
+
+/** What re:generateSet takes (the main process checks every field again). */
+export interface ReGenerateRequest {
+  label: string
+  perFamily: number
+  families: string[]
+  /** Integer 0..2^31-1; random when left out. */
+  seed?: number
+}
+
+/** Progress of the running set generation (re:generateProgress). */
+export interface ReGenerateProgress {
+  done: number
+  total: number
+  line: string
 }
 
 export interface ReExportOptions {

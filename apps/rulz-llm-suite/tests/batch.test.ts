@@ -26,7 +26,7 @@ import { argsStayInside, remoteRoots, runsWithoutAsking, starterToolsThatAsk } f
 import type { ChatMessage, Conversation, RePracticeTask, ReSession } from '@shared/types'
 import { BatchStore, MAX_BATCH_RUNS } from '../src/main/re/batches'
 
-const task = (id: string, family: string, tier = 'easy'): RePracticeTask => ({ id, family, tier, binary: `${id}.exe`, prompt: `Solve {exe}` })
+const task = (id: string, family: string, tier = 'easy'): RePracticeTask => ({ id, family, tier, binary: `${id}.exe`, prompt: `Solve {exe}`, set: 'original' })
 const opts = (o: Partial<BatchOptions> = {}): BatchOptions => ({ ...DEFAULT_BATCH_OPTIONS, ...o })
 const TASKS = [task('xor-2', 'xor'), task('xor-10', 'xor'), task('xor-1', 'xor'), task('hash-1', 'hash'), task('hash-2', 'hash'), task('cfg-1', 'config')]
 

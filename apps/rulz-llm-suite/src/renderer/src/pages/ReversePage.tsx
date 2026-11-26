@@ -6,6 +6,7 @@ import type { ReClone, ReOutcome, RePracticeInfo, ReSettings, ReTraceInfo } from
 import { OutcomeButtons } from '../components/chat/ReBanner'
 import { ModeReloadBar } from '../components/models/ModeReloadBar'
 import { BatchResults, BatchStart } from '../components/re/BatchRuns'
+import { PracticeSets, readSavedSet, saveSet } from '../components/re/PracticeSets'
 import { Badge, Button, Field, IconButton, Input, NumberInput, Select, Switch, Textarea, Tooltip } from '../components/ui'
 import { errorMessage, invoke, on } from '../lib/api'
 import { cn, formatBytes, relativeTime } from '../lib/format'
@@ -363,6 +364,7 @@ function Practice({ re, setRe }: { re: ReSettings; setRe: <K extends keyof ReSet
   const modelName = models.find((m) => m.id === modelId)?.name ?? modelId
   const [info, setInfo] = useState<RePracticeInfo | null>(null)
   const [family, setFamily] = useState('')
+  const [chosenSet, setChosenSet] = useState(readSavedSet)
   const [starting, setStarting] = useState(false)
   const [kitDraft, setKitDraft] = useState(re.kitDir)
   useEffect(() => setKitDraft(re.kitDir), [re.kitDir])
@@ -370,9 +372,18 @@ function Practice({ re, setRe }: { re: ReSettings; setRe: <K extends keyof ReSet
   const refresh = useCallback(() => {
     void invoke('re:practiceList', re.kitDir)
       .then(setInfo)
-      .catch((e) => setInfo({ kitDir: re.kitDir, tasks: [], error: errorMessage(e) }))
+      .catch((e) => setInfo({ kitDir: re.kitDir, tasks: [], sets: [], error: errorMessage(e) }))
   }, [re.kitDir])
   useEffect(refresh, [refresh])
+
+  // The chosen set, or the first one when it is gone (removed, or another kit folder).
+  const setId = info?.sets.find((s) => s.id === chosenSet)?.id ?? info?.sets[0]?.id ?? ''
+  const setTasks = useMemo(() => (info?.tasks ?? []).filter((t) => t.set === setId), [info, setId])
+  const chooseSet = (id: string): void => {
+    setChosenSet(id)
+    saveSet(id)
+    setFamily('')
+  }
 
   // Other apps' practice sessions have no chat here; they come from the recorded sessions.
   const traces = useReTraces((s) => s.traces)
@@ -385,7 +396,7 @@ function Practice({ re, setRe }: { re: ReSettings; setRe: <K extends keyof ReSet
 
   const families = useMemo(() => {
     const out = new Map<string, { total: number } & Record<TaskRecord['status'], number>>()
-    for (const t of info?.tasks ?? []) {
+    for (const t of setTasks) {
       const f = out.get(t.family) ?? { total: 0, solved: 0, failed: 0, tried: 0 }
       f.total++
       const r = byTask.get(t.id)
@@ -393,15 +404,15 @@ function Practice({ re, setRe }: { re: ReSettings; setRe: <K extends keyof ReSet
       out.set(t.family, f)
     }
     return [...out.entries()].sort((a, b) => a[0].localeCompare(b[0]))
-  }, [info, byTask])
+  }, [setTasks, byTask])
 
   const startNext = async (): Promise<void> => {
-    const tasks = (info?.tasks ?? []).filter((t) => !family || t.family === family)
+    const tasks = setTasks.filter((t) => !family || t.family === family)
     // Unsolved tasks, fewest attempts first, so each task gets tried before any is retried.
     const next = tasks
       .filter((t) => byTask.get(t.id)?.status !== 'solved')
       .sort((a, b) => (byTask.get(a.id)?.attempts ?? 0) - (byTask.get(b.id)?.attempts ?? 0))[0]
-    if (!next) return void toast.success(`${modelName ? `${modelName} has solved every` : 'Every'} practice task in this selection${modelName ? '' : ' is solved'}. Generate a new seed in the kit.`)
+    if (!next) return void toast.success(`${modelName ? `${modelName} has solved every` : 'Every'} practice task in this selection${modelName ? '' : ' is solved'}. Generate a new set.`)
     setStarting(true)
     try {
       const p = await invoke('re:practicePrepare', re.kitDir, next.id)
@@ -450,10 +461,13 @@ function Practice({ re, setRe }: { re: ReSettings; setRe: <K extends keyof ReSet
           </Button>
         </div>
       </Field>
+      {/* Shown with the error too: a kit with no tasks yet gets its first set from here. */}
+      {info && <PracticeSets info={info} setId={setId} onSet={chooseSet} onInfo={setInfo} />}
       {info?.error ? (
         <div className="rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-warn">{info.error}</div>
       ) : (
         <>
+          {info?.warning && <div className="rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-warn">{info.warning}</div>}
           <div className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-2">
             {families.map(([f, c]) => (
               <button
@@ -472,18 +486,18 @@ function Practice({ re, setRe }: { re: ReSettings; setRe: <K extends keyof ReSet
               </button>
             ))}
           </div>
-          {family && <TaskChips tasks={(info?.tasks ?? []).filter((t) => t.family === family)} byTask={byTask} />}
+          {family && <TaskChips tasks={setTasks.filter((t) => t.family === family)} byTask={byTask} />}
           <div className="flex items-center justify-between gap-2">
             <div className="text-xs text-faint">
-              {info ? `${info.tasks.length} tasks` : 'Reading tasks…'}
+              {info ? `${setTasks.length} tasks` : 'Reading tasks…'}
               {family && ` · only ${family}`}
               {modelName ? ` · results of ${modelName}` : ' · results of all models'}
             </div>
-            <Button variant="primary" disabled={!info?.tasks.length || busy || starting || batchActive} onClick={() => void startNext()}>
+            <Button variant="primary" disabled={!setTasks.length || busy || starting || batchActive} onClick={() => void startNext()}>
               {starting ? <LoaderCircle size={14} className="animate-spin" /> : <Play size={14} />} Start next task
             </Button>
           </div>
-          {!!info?.tasks.length && <BatchStart tasks={info.tasks} family={family} kitDir={re.kitDir} />}
+          {!!setTasks.length && <BatchStart tasks={setTasks} family={family} kitDir={re.kitDir} />}
         </>
       )}
     </Card>

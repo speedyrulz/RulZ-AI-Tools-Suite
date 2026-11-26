@@ -18,7 +18,7 @@ function cleanTask(raw: unknown): RePracticeTask | null {
   const t = raw as Record<string, unknown>
   const id = str(t.id, 80)
   if (!id || !TASK_ID.test(id)) return null
-  return { id, family: str(t.family, 80) ?? '', tier: str(t.tier, 80) ?? '', binary: str(t.binary, 300) ?? '', prompt: str(t.prompt, 20000) ?? '' }
+  return { id, family: str(t.family, 80) ?? '', tier: str(t.tier, 80) ?? '', binary: str(t.binary, 300) ?? '', prompt: str(t.prompt, 20000) ?? '', set: str(t.set, 40) ?? 'original' }
 }
 
 /** A start request from the window with anything unusable refused (a sentence) or replaced. */
