@@ -857,6 +857,7 @@ class Trainer(RaceParallelMixin):
         self.resumed_dp_counts = None  # its split from a resumed training state
         self.race = None  # race.RaceRun while a configuration race runs (and after, for its report)
         self.last_probe = None  # (face, body, images, per-seed scores) of the last probe
+        self.last_probe_rec = self.last_probe_step = None  # its controller record and the step it scored
         self.probe_worker = None  # probeworker.ProbeProcess: probes render on a second GPU (probe_async)
         self.analysis_worker = None  # the same process when it reads sweeps and maps (maps_async, sweep_async)
         self.sample_worker = None  # ... and when the in-loop samples render on it (sample_async)
@@ -1150,7 +1151,7 @@ class Trainer(RaceParallelMixin):
         cfg = self.cfg
         prompts = [render_prompt(self, p, "sample") for p in cfg.sample_prompts] \
             + ([render_negative(self, "sample")] if cfg.sample_prompts else [])
-        if cfg.probe_every > 0:
+        if cfg.probe_every > 0 or self._reward_probes():
             from . import promptcheck
 
             prompts += [render_prompt(self, p, "probe") for p in (cfg.probe_face_prompt, cfg.probe_body_prompt) if p]
@@ -2271,8 +2272,8 @@ class Trainer(RaceParallelMixin):
                 lambda: self._probe_async_take(step, optimizer, scheduler, wait=step in rounds))
             if self.remote is not None:  # remote render: pictures the helper brought in, rounds it was too slow for
                 stop = self._remote_poll(model, step, optimizer, scheduler, wait=step in rounds) or stop
-            if self.controller is not None and (step % cfg.probe_every == 0 and (step < cfg.steps or racing
-                                                                                  or final_too) or last):
+            if self.controller is not None and (cfg.probe_every > 0 and step % cfg.probe_every == 0
+                                                and (step < cfg.steps or racing or final_too) or last):
                 if self.probe_worker is not None and not last:
                     stop = probe_safely(lambda: self._probe_async_take(step, optimizer, scheduler, wait=True)) or stop
                 if self.probe_worker is not None and not last:  # queued on the probe GPU; training goes on
@@ -4516,9 +4517,14 @@ class Trainer(RaceParallelMixin):
         self.batcher.set_weights(weights)
 
     # ------------------------------------------------------------ likeness probes
+    def _reward_probes(self) -> bool:
+        """The reward stage probes on its own cadence (reward_probe_every > 0 with a stage to run): the controller then
+        exists even with probe_every 0, and the probe prompts are cached."""
+        return self.cfg.reward_probe_every > 0 and self.cfg.reward_steps > 0
+
     def _make_controller(self, items):
         cfg = self.cfg
-        if cfg.probe_every <= 0:
+        if cfg.probe_every <= 0 and not self._reward_probes():
             return None
         if self.face_scorer is None and self.body_scorer is None:
             log.warning("Likeness probes need face_refs and/or body_refs (with the scoring packages); probes disabled")
@@ -4540,8 +4546,11 @@ class Trainer(RaceParallelMixin):
                     progress=lambda i, n: self.status.update(step=i, total=n), recache=cfg.recache)
                 nf, nb = classify_counts(self.item_face_frac)
                 log.info("Curriculum: %d face-heavy and %d body/other images in the dataset", nf, nb)
-        log.info("Likeness controller on: probe every %d steps (%s), best=%s patience=%d lr_control=%s curriculum=%s",
-                 cfg.probe_every, "+".join(k for k, p in (("face", cfg.probe_face_prompt), ("body", cfg.probe_body_prompt)) if p),
+        every = (f"probe every {cfg.probe_every} steps" if cfg.probe_every > 0
+                 else "no probes during the steps but the last") \
+            + (f", every {cfg.reward_probe_every} reward steps" if self._reward_probes() else "")
+        log.info("Likeness controller on: %s (%s), best=%s patience=%d lr_control=%s curriculum=%s",
+                 every, "+".join(k for k, p in (("face", cfg.probe_face_prompt), ("body", cfg.probe_body_prompt)) if p),
                  cfg.likeness_track_best, cfg.likeness_patience, cfg.likeness_lr_control, cfg.likeness_curriculum)
         return ctrl
 
@@ -4931,10 +4940,17 @@ class Trainer(RaceParallelMixin):
         kept = ckpt.kept_blocks(model)  # measured for one training image; an update's guidance pass needs more:
         ckpt.set_kept_blocks(model, [])  # every block recomputes during the stage
         history = self.status.data.get("rewards", [])
+        # reward_probe_every: the probes on the stage's own cadence, a watch only, with the change since the stage began
+        watch = cfg.reward_probe_every > 0 and self.controller is not None
+        every = cfg.reward_probe_every if watch else cfg.probe_every
+        change_hist = self.status.data.get("reward_change", [])
+        base = None
         self._reward_body_seen = self._reward_body_low = 0  # for the clothing / framing mismatch warning
         s = probed = 0
         t0 = time.time()
         try:
+            if watch:
+                base = self._reward_baseline(model, step0, opt, sched, injected)
             for s in range(1, cfg.reward_steps + 1):
                 if self.stop_file.exists():
                     log.info("Reward stage stopped at step %d", s - 1)
@@ -5012,13 +5028,15 @@ class Trainer(RaceParallelMixin):
                                    stage=f"reward fine-tuning {s}/{cfg.reward_steps}")
                 if cfg.save_every > 0 and s % cfg.save_every == 0 and s < cfg.reward_steps:
                     self.save(injected, step0 + s)
-                if self.controller is not None and cfg.probe_every > 0 and s % cfg.probe_every == 0:
+                if self.controller is not None and every > 0 and s % every == 0:
                     lora_mod.set_extras_enabled(model, False)
                     stop = self.run_probe(model, step0 + s, opt, sched, injected)
                     probed = s
                     model.train()
                     lora_mod.set_extras_enabled(model, True)
-                    if stop:
+                    if watch:  # a watch only: the probes never end the stage (the best checkpoint is still kept)
+                        self._reward_change(step0 + s, base, change_hist)
+                    elif stop:
                         log.info("Reward stage: the likeness probes stopped improving; ending at step %d", s)
                         break
         finally:
@@ -5028,10 +5046,62 @@ class Trainer(RaceParallelMixin):
                 m.dropout = dropouts[name]
         if s > probed and not self.stop_file.exists():
             self._reward_final_probe(model, step0 + s, opt, sched, injected)
+            if watch:
+                self._reward_change(step0 + s, base, change_hist)
         path = self.save(injected, step0 + s, final=True)
         self.stage_tag = ""
         log.info("Reward stage done: %s (the first stage's LoRA is %s.safetensors)", path.name, cfg.job_name)
         return path
+
+    def _reward_baseline(self, model, step0: int, opt, sched, injected) -> dict | None:
+        """The LoRA as the reward stage starts (reward.probe_snapshot of a probe: combined / face / body likeness and
+        the pictures), the point the change readout counts from. The last probe is reused when it scored these very
+        weights: it was taken at step0 (the first stage's closing probe, or the step-0 probe of a steps 0 + resume_from
+        run) and rendered here (probes score the weight average, and that average is what the stage was just handed;
+        an asynchronous probe's weights are not known to be the same). Otherwise one probe runs now, after the
+        average went into the weights, so it scores exactly what the stage starts from. None when there is no
+        controller record to take (the readout is then off)."""
+        from . import reward as RW
+
+        rec = getattr(self, "last_probe_rec", None)
+        if (rec is not None and getattr(self, "last_probe_step", None) == step0 and self.probe_worker is None
+                and getattr(rec, "images", None)):
+            log.info("Reward stage: the likeness probe of step %d is the baseline for the change readout", step0)
+            return RW.probe_snapshot(rec)
+        if step0 == 0 and getattr(self.controller, "normalize", False) and not getattr(self.controller, "n_probes", 1):
+            log.warning("Reward stage: the baseline probe is the controller's first (step 0), so a normalized scale "
+                        "takes its zero from this LoRA's pictures, not from the base model's")
+        log.info("Reward stage: probing the LoRA as the stage starts (step %d), the baseline for the change readout",
+                 step0)
+        self.status.update(stage="reward fine-tuning: baseline likeness probe")
+        lora_mod.set_extras_enabled(model, False)
+        self.run_probe(model, step0, opt, sched, injected)
+        model.train()
+        lora_mod.set_extras_enabled(model, True)
+        rec = getattr(self, "last_probe_rec", None)
+        return RW.probe_snapshot(rec) if rec is not None else None
+
+    def _reward_change(self, step: int, base: dict | None, history: list) -> None:
+        """After a probe of the reward stage: how much the LoRA has changed since the stage began, as a log line and as
+        reward_change ([[step, likeness points, picture change %], ...] with the face and body points as well)
+        for the Monitor. Never raises: a probe's readout must not end the stage."""
+        from . import reward as RW
+
+        rec = getattr(self, "last_probe_rec", None)
+        if base is None or rec is None or getattr(self, "last_probe_step", None) != step:
+            return
+        try:
+            now = RW.probe_snapshot(rec)
+            change = RW.likeness_change(base, now)
+            pct = RW.image_change_pct(base["images"], now["images"])
+        except Exception as e:  # noqa: BLE001
+            log.warning("Reward stage: could not work out the change since the stage began (%s: %s)",
+                        type(e).__name__, e)
+            return
+        log.info("%s", RW.describe_change(step, change, pct))
+        rnd = lambda v: None if v is None else round(v, 2)  # noqa: E731
+        history.append([step, rnd(change["combined"]), rnd(pct), rnd(change["face"]), rnd(change["body"])])
+        self.status.update(reward_change=history[-2000:])
 
     def _reward_final_probe(self, model, step: int, opt, sched, injected) -> None:
         """Probe the reward stage's final LoRA when its last step wasn't probed (probe_every not dividing reward_steps,
@@ -5714,6 +5784,7 @@ class Trainer(RaceParallelMixin):
         now = step if now is None else now
         self.last_probe = (face, body, images, seeds)
         rec, actions = self.controller.update(step, face, body, images, seeds)
+        self.last_probe_rec, self.last_probe_step = rec, step  # (the reward stage's baseline may reuse them)
         if self.remote is not None:  # where these pictures were rendered (a line in the log when that changes)
             rec.rendered_on = self.probe_rendered_on
             self.remote.switch(rec.rendered_on)
