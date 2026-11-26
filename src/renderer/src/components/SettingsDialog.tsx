@@ -1,5 +1,5 @@
 import { FolderOpen } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { AppInfo } from '@shared/ipc'
 import { invoke } from '../lib/api'
 import { act, useApps } from '../stores/apps'
@@ -14,12 +14,26 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const setTheme = useApps((s) => s.setTheme)
   const [info, setInfo] = useState<AppInfo | null>(null)
   const [root, setRoot] = useState(settings?.installRoot ?? '')
+  const pendingRoot = useRef<string | null>(null)
 
   useEffect(() => void invoke('app:info').then(setInfo), [])
   if (!settings) return null
 
+  const saveRoot = () => {
+    const trimmed = root.trim()
+    if (!trimmed || trimmed === useApps.getState().settings?.installRoot || trimmed === pendingRoot.current) return
+    pendingRoot.current = trimmed
+    void act(() => update({ installRoot: trimmed })).finally(() => {
+      if (pendingRoot.current === trimmed) pendingRoot.current = null
+    })
+  }
+  const close = () => {
+    saveRoot()
+    onClose()
+  }
+
   return (
-    <Dialog open onOpenChange={(o) => !o && onClose()} title="Settings" className="w-[600px]" footer={<Button onClick={onClose}>Done</Button>}>
+    <Dialog open onOpenChange={(o) => !o && close()} title="Settings" className="w-[600px]" footer={<Button onClick={close}>Done</Button>}>
       <div className="space-y-6">
         <section>
           <div className="mb-2 text-xs font-medium tracking-wide text-faint uppercase">Appearance</div>
@@ -35,7 +49,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             <input
               value={root}
               onChange={(e) => setRoot(e.target.value)}
-              onBlur={() => root.trim() && root !== settings.installRoot && void act(() => update({ installRoot: root.trim() }))}
+              onBlur={saveRoot}
               spellCheck={false}
               className="h-9 min-w-0 flex-1 rounded-lg border border-border bg-panel-2 px-3 text-[13px] outline-none focus:border-accent"
             />

@@ -57,6 +57,8 @@ const LOG_LIMIT = 3000
 /** A log is cut back to LOG_LIMIT lines once it is this many longer, not on every line (each cut moves every line). */
 const LOG_SLACK = 500
 const LATEST_TTL_MS = 30 * 60_000
+/** A forced check this soon after the last one finished reuses its answers (GitHub allows 60 requests an hour). */
+const FORCED_CHECK_GAP_MS = 60_000
 /** GitHub is asked about newer READMEs and screenshots at most this often, unless the user asks for a check. */
 const CATALOG_TTL_MS = 30 * 60_000
 /** ...or this often while files from the last check are still to be fetched. */
@@ -118,9 +120,13 @@ export function readLatestCache(cache: LatestCache | null): Map<string, LatestEn
   const out = new Map<string, LatestEntry>()
   if (!cache?.entries) return out
   for (const [id, e] of Object.entries(cache.entries)) {
-    if (!e) continue
+    // A hand-edited or damaged file may hold anything: only objects are entries.
+    if (!e || typeof e !== 'object' || Array.isArray(e)) continue
     const entry = 'info' in e ? e : { info: e, at: cache.at ?? 0 }
-    if (entry.info) out.set(id, { info: entry.info, error: null, release: null, at: entry.at ?? 0 })
+    // An entry without a version string would make every version comparison throw.
+    if (entry.info && typeof entry.info === 'object' && typeof entry.info.version === 'string') {
+      out.set(id, { info: entry.info, error: null, release: null, at: entry.at ?? 0 })
+    }
   }
   return out
 }
@@ -159,6 +165,17 @@ async function waitUntil(done: () => boolean, ms: number, signal: AbortSignal): 
     await new Promise((r) => setTimeout(r, 500))
   }
   if (signal.aborted) throw new Error('Cancelled')
+}
+
+/** Stops a job whose Cancel was clicked; the job runner ends it as cancelled. */
+function throwIfCancelled(signal: AbortSignal): void {
+  if (signal.aborted) throw new Error('Cancelled')
+}
+
+/** As throwIfCancelled, first removing the extracted copy a cancelled install would leave behind. */
+async function dropStagedIfCancelled(signal: AbortSignal, staged: string): Promise<void> {
+  if (signal.aborted) await rm(staged, { recursive: true, force: true }).catch(() => undefined)
+  throwIfCancelled(signal)
 }
 
 /** Runs an NSIS setup or uninstaller silently, retrying the occasional startup crash. */
@@ -240,6 +257,8 @@ export class AppManager {
   private logTimer: ReturnType<typeof setTimeout> | null = null
   /** The GitHub check in progress, shared by calls made while it runs. */
   private refreshing: { force: boolean; done: Promise<void> } | null = null
+  /** When the last forced check finished successfully. */
+  private lastForcedAt = 0
   /** Set once quitting has begun: no new jobs. */
   private closing = false
   /** Apps between the first check of an action and its job's start (the checks wait for PowerShell, say). */
@@ -465,7 +484,9 @@ export class AppManager {
     return done
   }
 
-  private async checkLatest(force: boolean): Promise<void> {
+  private async checkLatest(asked: boolean): Promise<void> {
+    // A forced check costs about ten of GitHub's 60 requests an hour: one right after another reuses its answers.
+    const force = asked && Date.now() - this.lastForcedAt >= FORCED_CHECK_GAP_MS
     // Asked for: the release pages and branch heads the apps share are fetched again, not taken from the last minute.
     if (force) dropSharedLists()
     // Newer READMEs and screenshots, alongside the version checks.
@@ -478,17 +499,23 @@ export class AppManager {
       const e = this.latest.get(a.id)
       return force || !e?.info || !e.at || now - e.at >= LATEST_TTL_MS
     })
+    let failed = false
     if (due.length) {
       await Promise.all(
         due.map(async (app) => {
           const prev = this.latest.get(app.id)
-          this.latest.set(app.id, mergeLatest(prev, await this.fetchLatest(app, prev)))
+          const entry = mergeLatest(prev, await this.fetchLatest(app, prev))
+          // An app not on GitHub yet always has an error; that is no reason to ask again.
+          if (entry.error && app.repo) failed = true
+          this.latest.set(app.id, entry)
         })
       )
       await this.saveLatestCache()
     }
     await this.relabelInstalled()
     await catalog
+    // Only a check whose answers all came back counts: after a failed one (offline, rate limit) a retry asks again.
+    if (force && !failed) this.lastForcedAt = Date.now()
     this.changed()
   }
 
@@ -971,6 +998,8 @@ export class AppManager {
       await extractZip(zip, staged, (f) => ctx.set({ progress: f }))
       await flattenSingleFolder(staged)
       const rel = relative(staged, await this.resolveLaunch(app, staged))
+      // Extracting can't be stopped, so a Cancel clicked meanwhile is honoured here, before the old files are replaced.
+      await dropStagedIfCancelled(ctx.signal, staged)
       ctx.set({ phase: 'installing', label: 'Installing…', progress: null })
       await mkdir(dirname(dir), { recursive: true })
       await swapInto(staged, dir)
@@ -1130,6 +1159,8 @@ export class AppManager {
     ctx.set({ phase: 'extracting', label: 'Extracting…', progress: 0 })
     await extractZip(zip, staged, (f) => ctx.set({ progress: f }))
     await flattenSingleFolder(staged)
+    // As for a zip: a Cancel during extraction stops before the installed files are touched.
+    await dropStagedIfCancelled(ctx.signal, staged)
     ctx.set({ phase: 'installing', label: 'Copying files…', progress: null })
     if (prev) {
       // Keep what the app made in its folder (venv, models, outputs); replace the source files.
@@ -1163,6 +1194,8 @@ export class AppManager {
       const asset = findAsset(release, pattern)!
       const zip = await this.fetchFile(ctx, asset.url, asset.name, asset.size, `Downloading ${c.label} ${release.tag}`)
       ctx.set({ phase: 'extracting', label: `Extracting ${asset.name}…`, progress: 0 })
+      // Extracting goes straight into the app's folder, so a Cancel that came before it must stop it from starting.
+      throwIfCancelled(ctx.signal)
       await extractZip(zip, join(dir, c.dest), (f) => ctx.set({ progress: f }))
       await rm(zip, { force: true })
     }

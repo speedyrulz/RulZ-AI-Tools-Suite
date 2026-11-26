@@ -243,4 +243,10 @@ async function main(): Promise<void> {
   app.on('window-all-closed', () => app.quit())
 }
 
-if (primary) void main()
+if (primary) {
+  main().catch((e) => {
+    // Without this no window opens and the process keeps the single-instance lock, so every later launch quits silently.
+    dialog.showErrorBox("RulZ AI Tools Suite couldn't start", e instanceof Error ? e.message : String(e))
+    app.exit(1)
+  })
+}

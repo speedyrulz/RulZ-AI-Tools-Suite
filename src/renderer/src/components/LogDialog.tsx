@@ -12,9 +12,11 @@ export function LogDialog({ appId, title, onClose }: { appId: string; title: str
   // After a restart the renderer has no log; the main process keeps the last one.
   useEffect(() => {
     if (useApps.getState().logs[appId]?.length) return
-    void invoke('apps:log', appId).then((log) =>
-      useApps.setState((s) => ({ logs: { ...s.logs, [appId]: log } }))
-    )
+    void invoke('apps:log', appId).then((log) => {
+      if (!useApps.getState().logs[appId]?.length) {
+        useApps.setState((s) => ({ logs: { ...s.logs, [appId]: log } }))
+      }
+    }).catch(() => {})
   }, [appId])
 
   useEffect(() => {
