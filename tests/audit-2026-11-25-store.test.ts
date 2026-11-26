@@ -187,3 +187,66 @@ describe('B5 Store.init keeps a settings.json it cannot parse', () => {
     expect(await readdir(dir)).not.toContain('settings.json.damaged')
   })
 })
+
+describe('R3 locked-file recovery is serialised', () => {
+  const info = (version: string) => ({ dir: 'C:\\a', launchPath: 'C:\\a\\a.exe', launchArgs: [], version }) as never
+  const json = async (file: string) => JSON.parse(await readFile(file, 'utf8'))
+
+  it('keeps both patches of two parallel updateSettings calls', async () => {
+    const file = join(dir, 'settings.json')
+    await writeFile(file, JSON.stringify({ theme: 'dark' }))
+    fail.readFrom.add(file)
+    const store = new Store(dir)
+    await store.init()
+    fail.readFrom.clear()
+    await Promise.all([store.updateSettings({ liveReadme: false }), store.updateSettings({ closeOnLaunch: true })])
+    store.dispose()
+    expect(await json(file)).toMatchObject({ theme: 'dark', liveReadme: false, closeOnLaunch: true })
+  })
+
+  it('ends with the later of two parallel setInstalled calls for one app', async () => {
+    const file = join(dir, 'installed.json')
+    await writeFile(file, JSON.stringify({ x: info('1') }))
+    await writeFile(`${file}.bak`, JSON.stringify({}))
+    fail.readFrom.add(file)
+    const store = new Store(dir)
+    await store.init()
+    fail.readFrom.clear()
+    await Promise.all([store.setInstalled('a', info('v1')), store.setInstalled('a', info('v2'))])
+    store.dispose()
+    const saved = await json(file)
+    expect(saved.a.version).toBe('v2')
+    expect(saved.x.version).toBe('1')
+  })
+
+  it('keeps other apps launch options when setLaunchOption is called while settings.json was locked', async () => {
+    const file = join(dir, 'settings.json')
+    await writeFile(file, JSON.stringify({ launchOptions: { other: ['x'] } }))
+    fail.readFrom.add(file)
+    const store = new Store(dir)
+    await store.init()
+    fail.readFrom.clear()
+    await store.setLaunchOption('app', 'y', true)
+    store.dispose()
+    expect((await json(file)).launchOptions).toEqual({ other: ['x'], app: ['y'] })
+  })
+
+  it('saves a locked change by itself once the lock clears, without another change', async () => {
+    const file = join(dir, 'settings.json')
+    await writeFile(file, JSON.stringify({ theme: 'dark' }))
+    fail.readFrom.add(file)
+    const store = new Store(dir, 20)
+    await store.init()
+    await store.updateSettings({ liveReadme: false })
+    fail.readFrom.clear()
+    await vi.waitFor(async () => expect(await json(file)).toMatchObject({ theme: 'dark', liveReadme: false }), { timeout: 3000, interval: 25 })
+    store.dispose()
+  })
+
+  it('installFolder refuses when the backup folder cannot be checked', async () => {
+    const app = join(dir, 'App')
+    await folder(backupDir(app), 'v.txt', 'old')
+    fail.statOf.add(backupDir(app))
+    await expect(installFolder(app)).rejects.toThrow()
+  })
+})

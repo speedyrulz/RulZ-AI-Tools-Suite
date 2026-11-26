@@ -31,9 +31,23 @@ export async function installFolder(raw: string): Promise<string> {
   return withoutLeftoverBackup(dir)
 }
 
+/**
+ * Strict existence check: a stat that fails for another reason than "not there" (a lock, say) throws, so it is never
+ * taken for "absent" where that would lead to deleting a backup. exists() below is the lenient one.
+ */
+export async function present(path: string): Promise<boolean> {
+  try {
+    await stat(path)
+    return true
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw e
+  }
+}
+
 /** A leftover backup next to a fresh install folder would be restored into it by swapInto, then deleted if the install fails. */
 async function withoutLeftoverBackup(dir: string): Promise<string> {
-  if (await exists(backupDir(dir))) {
+  if (await present(backupDir(dir))) {
     throw new Error(`A previous version of an app is kept in ${backupDir(dir)}. Rename or delete it, or choose another folder.`)
   }
   return dir
@@ -122,15 +136,6 @@ export async function exists(path: string): Promise<boolean> {
  */
 export async function swapInto(staged: string, dir: string): Promise<void> {
   const old = backupDir(dir)
-  // Strict: a stat that fails for another reason than "not there" must not look like "no backup" (it would be deleted).
-  const present = (p: string) =>
-    stat(p).then(
-      () => true,
-      (e: NodeJS.ErrnoException) => {
-        if (e.code === 'ENOENT') return false
-        throw e
-      }
-    )
   const hadOld = await present(dir)
   if (!hadOld && (await present(old))) {
     // An earlier update died between its two renames: the backup is the only copy of the app, so it is put back, never deleted.

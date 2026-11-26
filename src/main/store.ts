@@ -131,45 +131,107 @@ export class Store {
   private detectHidden: string[] = []
 
   /**
-   * Set while settings.json could not be read at startup: the defaults in memory are not what the file holds, so the
-   * changes made meanwhile are kept here and applied on top of the file once it can be read. Nothing is written before.
+   * "Locked mode": set while settings.json could not be read at startup. The defaults in memory are not what the file
+   * holds, so every change is also recorded here, in call order, and replayed on top of the real file once it can be
+   * read. Nothing is written before that.
    */
-  private settingsPending: Partial<Settings> | null = null
-  /** Set while the installed list in memory is the stale .bak (installed.json was locked): changes wait here likewise. */
-  private installedPending: Map<string, InstalledInfo | null> | null = null
+  private settingsOps: Array<(s: Settings) => Partial<Settings>> | null = null
+  /** Likewise while the installed list in memory is the stale .bak (installed.json was locked). */
+  private installedOps: Array<{ id: string; info: InstalledInfo | null }> | null = null
+  /** One chain per file, so only one re-read, rebase or write runs at a time. */
+  private settingsChain: Promise<void> = Promise.resolve()
+  private installedChain: Promise<void> = Promise.resolve()
+  private retryTimer: NodeJS.Timeout | null = null
 
-  constructor(private readonly dir: string) {}
+  constructor(
+    private readonly dir: string,
+    private readonly retryMs = 10_000
+  ) {}
 
   async init(): Promise<void> {
     await mkdir(this.dir, { recursive: true })
     const read = await readSettings(join(this.dir, 'settings.json'))
     this.settings = { ...defaultSettings(), ...read.settings }
-    this.settingsPending = read.locked ? {} : null
+    this.settingsOps = read.locked ? [] : null
     this.cleanOrder()
     const state = await readInstalledState(join(this.dir, 'installed.json'))
     this.installed = state.list
-    this.installedPending = state.fromBackup ? new Map() : null
+    this.installedOps = state.fromBackup ? [] : null
     this.detectHidden = await readJson(join(this.dir, 'detect-hidden.json'), [])
+    this.startRetrying()
+  }
+
+  /** Stops the retry timer. */
+  dispose(): void {
+    if (this.retryTimer) clearInterval(this.retryTimer)
+    this.retryTimer = null
+  }
+
+  /** While a file is in locked mode, tries again now and then, so the changes are saved even if no other change comes. */
+  private startRetrying(): void {
+    if (this.retryTimer || (!this.settingsOps && !this.installedOps)) return
+    this.retryTimer = setInterval(() => {
+      if (this.settingsOps) void this.saveSettings().catch(() => undefined)
+      if (this.installedOps) void this.saveInstalled().catch(() => undefined)
+      if (!this.settingsOps && !this.installedOps) this.dispose()
+    }, this.retryMs)
+    this.retryTimer.unref()
+  }
+
+  private saveSettings(): Promise<void> {
+    const next = this.settingsChain.catch(() => undefined).then(async () => {
+      const file = join(this.dir, 'settings.json')
+      const ops = this.settingsOps
+      if (ops) {
+        const read = await readSettings(file)
+        // Still unreadable: the changes stay in memory, and the real file is not overwritten with defaults.
+        if (read.locked) return
+        this.settings = { ...defaultSettings(), ...read.settings }
+        for (const op of ops) this.settings = { ...this.settings, ...op(this.settings) }
+        this.cleanOrder()
+        this.settingsOps = null
+      }
+      await writeJson(file, this.settings)
+    })
+    this.settingsChain = next
+    return next
+  }
+
+  private saveInstalled(): Promise<void> {
+    const next = this.installedChain.catch(() => undefined).then(async () => {
+      const file = join(this.dir, 'installed.json')
+      const ops = this.installedOps
+      if (ops) {
+        const state = await readInstalledState(file).catch(() => null)
+        // Still unreadable: the stale .bak copy in memory must not be written over the real file.
+        if (!state || state.fromBackup) return
+        this.installed = state.list
+        for (const { id, info } of ops) {
+          if (info) this.installed[id] = info
+          else delete this.installed[id]
+        }
+        this.installedOps = null
+      }
+      await writeJson(file, this.installed)
+    })
+    this.installedChain = next
+    return next
   }
 
   getSettings(): Settings {
     return this.settings
   }
 
-  async updateSettings(patch: Partial<Settings>): Promise<Settings> {
-    const file = join(this.dir, 'settings.json')
-    if (this.settingsPending) {
-      Object.assign(this.settingsPending, patch)
-      const read = await readSettings(file)
-      if (!read.locked) {
-        this.settings = { ...defaultSettings(), ...read.settings, ...this.settingsPending }
-        this.settingsPending = null
-      }
-    }
-    this.settings = { ...this.settings, ...patch }
+  updateSettings(patch: Partial<Settings>): Promise<Settings> {
+    return this.changeSettings(() => patch)
+  }
+
+  /** Applies a change to memory at once; `change` gets the settings it is applied to, and is replayed on the real file in locked mode. */
+  private async changeSettings(change: (s: Settings) => Partial<Settings>): Promise<Settings> {
+    this.settings = { ...this.settings, ...change(this.settings) }
     this.cleanOrder()
-    // Still locked: the change stays in memory, and the file is not overwritten with defaults.
-    if (!this.settingsPending) await writeJson(file, this.settings)
+    this.settingsOps?.push(change)
+    await this.saveSettings()
     return this.settings
   }
 
@@ -182,9 +244,11 @@ export class Store {
 
   /** Turns one launch option of an app on or off. Other apps' options and this app's others are kept. */
   setLaunchOption(appId: string, optionId: string, on: boolean): Promise<Settings> {
-    const all = this.settings.launchOptions ?? {}
-    const current = Array.isArray(all[appId]) ? all[appId].filter((o) => o !== optionId) : []
-    return this.updateSettings({ launchOptions: { ...all, [appId]: on ? [...current, optionId] : current } })
+    return this.changeSettings((s) => {
+      const all = s.launchOptions ?? {}
+      const current = Array.isArray(all[appId]) ? all[appId].filter((o) => o !== optionId) : []
+      return { launchOptions: { ...all, [appId]: on ? [...current, optionId] : current } }
+    })
   }
 
   getInstalled(id: string): InstalledInfo | null {
@@ -192,26 +256,10 @@ export class Store {
   }
 
   async setInstalled(id: string, info: InstalledInfo | null): Promise<void> {
-    const file = join(this.dir, 'installed.json')
-    const pending = this.installedPending
-    if (pending) {
-      pending.set(id, info)
-      // The list in memory is the stale .bak: the real file is the base again once it can be read.
-      const state = await readInstalledState(file).catch(() => null)
-      // Calls made at once (the startup search saves several apps) all wait here: only the first to get back rebases.
-      if (state && !state.fromBackup && this.installedPending === pending) {
-        this.installed = state.list
-        for (const [pid, pinfo] of pending) {
-          if (pinfo) this.installed[pid] = pinfo
-          else delete this.installed[pid]
-        }
-        this.installedPending = null
-      }
-    }
     if (info) this.installed[id] = info
     else delete this.installed[id]
-    // Still unreadable: the change stays in memory only, so the real file is never overwritten with the stale copy.
-    if (!this.installedPending) await writeJson(file, this.installed)
+    this.installedOps?.push({ id, info })
+    await this.saveInstalled()
   }
 
   /** Small cached JSON (GitHub answers) kept next to the settings. */
