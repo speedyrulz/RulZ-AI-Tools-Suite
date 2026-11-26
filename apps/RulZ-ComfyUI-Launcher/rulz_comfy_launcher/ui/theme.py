@@ -15,7 +15,7 @@ from pathlib import Path
 from PySide6.QtCore import QByteArray, QEvent, QObject, QStandardPaths, Qt
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import QAbstractButton, QApplication, QDialogButtonBox, QWidget
+from PySide6.QtWidgets import QAbstractButton, QApplication, QDialog, QDialogButtonBox, QWidget
 
 from ..instance import State
 
@@ -340,7 +340,21 @@ class _TabFocusOnly(QObject):
             if isinstance(box, QDialogButtonBox) and obj.property("primary") is None                     and obj.property("danger") is None                     and box.buttonRole(obj) in (QDialogButtonBox.ButtonRole.AcceptRole,
                                                 QDialogButtonBox.ButtonRole.YesRole):
                 set_role(obj, primary=True)   # the one primary button of a dialog
+        elif event.type() == QEvent.Type.Show and isinstance(obj, QDialog):
+            fit_dialog_buttons(obj)
         return False
+
+
+def fit_dialog_buttons(dialog) -> None:
+    """A QMessageBox fixes its width from its buttons' minimum widths, which Qt sets narrower than the
+    text needs with the style sheet's padding and the bold primary font: long labels were clipped.
+    Every button of the dialog's button box gets at least the width its text needs."""
+    for box in dialog.findChildren(QDialogButtonBox):
+        for button in box.buttons():
+            button.ensurePolished()
+            need = button.sizeHint().width()
+            if button.minimumWidth() < need:
+                button.setMinimumWidth(need)
 
 
 def _set_color_scheme(app: QApplication, dark: bool) -> None:

@@ -339,3 +339,24 @@ def test_window_shows_at_minimum_and_1280_without_horizontal_overflow(app, windo
     app.processEvents()
     scroll = window.editor.findChild(QScrollArea)
     assert scroll.widget().minimumSizeHint().width() <= scroll.viewport().width()
+
+
+def test_message_box_buttons_fit_their_labels(app, real_fonts):
+    """QMessageBox fixed its width from Qt's narrow button minimums: "Keep running in the tray" and
+    "Stop all and exit" were clipped in the quit question (1.1.0)."""
+    from PySide6.QtWidgets import QMessageBox
+    theme.apply_theme(app, THEME_DARK)
+    box = QMessageBox()
+    box.setText("1 ComfyUI instance is still running.")
+    stop = box.addButton("Stop all and exit", QMessageBox.ButtonRole.DestructiveRole)
+    theme.set_role(stop, primary=False, danger=True)
+    keep = box.addButton("Keep running in the tray", QMessageBox.ButtonRole.AcceptRole)
+    box.addButton(QMessageBox.StandardButton.Cancel)
+    box.show()
+    QCoreApplication.processEvents()
+    try:
+        for button in box.buttons():
+            assert button.width() >= button.sizeHint().width(), button.text()
+        assert keep.property("primary") is True
+    finally:
+        box.close()
