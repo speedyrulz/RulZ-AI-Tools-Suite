@@ -17,6 +17,24 @@ async function readJson<T>(path: string, fallback: T): Promise<T> {
   }
 }
 
+/** Reads settings.json. One that exists but is not a JSON object is moved to .damaged, so the next save does not erase it. */
+async function readSettings(path: string): Promise<Partial<Settings>> {
+  let text: string
+  try {
+    text = await readFile(path, 'utf8')
+  } catch {
+    return {}
+  }
+  try {
+    const parsed: unknown = JSON.parse(text)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Partial<Settings>
+  } catch {
+    // falls through to the damaged-file handling
+  }
+  await rename(path, `${path}.damaged`).catch(() => undefined)
+  return {}
+}
+
 const writes = new Map<string, Promise<void>>()
 let tmpSeq = 0
 
@@ -47,6 +65,18 @@ export function writeJson(path: string, data: unknown): Promise<void> {
   return next
 }
 
+/** Reads a file, trying a few times when another program holds it open; a missing file fails at once. */
+async function readLocked(path: string): Promise<string> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await readFile(path, 'utf8')
+    } catch (e) {
+      if (attempt >= 5 || (e as NodeJS.ErrnoException).code === 'ENOENT') throw e
+      await new Promise((r) => setTimeout(r, 50 * attempt))
+    }
+  }
+}
+
 /**
  * Reads the list of installed apps. Each launch that reads it keeps a copy (.bak). A damaged file (a save cut short by
  * a power cut, say) is moved aside instead of being overwritten by the next save, and that copy is used instead:
@@ -54,8 +84,20 @@ export function writeJson(path: string, data: unknown): Promise<void> {
  */
 export async function readInstalled(path: string): Promise<Record<string, InstalledInfo>> {
   const backup = `${path}.bak`
-  const text = await readFile(path, 'utf8').catch(() => null)
-  if (text === null) return {}
+  let text: string
+  try {
+    text = await readLocked(path)
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return {}
+    // Locked or unreadable (an antivirus or sync tool): not "nothing installed". The backup is only read, never
+    // copied over or renamed, so the file that could not be read is left alone for the next launch.
+    const saved = await readFile(backup, 'utf8').then(
+      (t) => JSON.parse(t) as unknown,
+      () => null
+    )
+    if (saved && typeof saved === 'object' && !Array.isArray(saved)) return saved as Record<string, InstalledInfo>
+    throw new Error(`installed.json can't be read: ${e instanceof Error ? e.message : String(e)}`)
+  }
   try {
     const list: unknown = JSON.parse(text)
     if (!list || typeof list !== 'object' || Array.isArray(list)) throw new Error('not a list of apps')
@@ -78,7 +120,7 @@ export class Store {
 
   async init(): Promise<void> {
     await mkdir(this.dir, { recursive: true })
-    this.settings = { ...defaultSettings(), ...(await readJson<Partial<Settings>>(join(this.dir, 'settings.json'), {})) }
+    this.settings = { ...defaultSettings(), ...(await readSettings(join(this.dir, 'settings.json'))) }
     this.cleanOrder()
     this.installed = await readInstalled(join(this.dir, 'installed.json'))
     this.detectHidden = await readJson(join(this.dir, 'detect-hidden.json'), [])

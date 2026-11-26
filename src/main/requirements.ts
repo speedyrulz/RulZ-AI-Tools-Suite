@@ -166,7 +166,15 @@ export async function checkRequirements(reloadPath = false): Promise<Requirement
 }
 
 async function runChecks(): Promise<RequirementStatus[]> {
-  wingetAvailable ??= capture('winget', ['--version']).then((v) => !!v)
+  if (!wingetAvailable) {
+    const asked = capture('winget', ['--version']).then((v) => !!v)
+    wingetAvailable = asked
+    // Only a yes is kept: a cold winget can time out once, and that must not stick for the whole session.
+    const forget = (): void => {
+      if (wingetAvailable === asked) wingetAvailable = null
+    }
+    asked.then((ok) => ok || forget(), forget)
+  }
   const hasWinget = await wingetAvailable
   const ids = Object.keys(DEFS) as RequirementId[]
   return Promise.all(

@@ -114,8 +114,17 @@ export async function exists(path: string): Promise<boolean> {
  */
 export async function swapInto(staged: string, dir: string): Promise<void> {
   const old = backupDir(dir)
-  await rm(old, { recursive: true, force: true })
   const hadOld = await exists(dir)
+  if (!hadOld && (await exists(old))) {
+    // An earlier update died between its two renames: the backup is the only copy of the app, so it is put back, never deleted.
+    try {
+      await renameRetrying(old, dir)
+    } catch (e) {
+      throw new Error(`The previous version is kept in ${old} and could not be put back (${e instanceof Error ? e.message : String(e)}). Rename that folder to ${dir} and try again.`)
+    }
+    return swapInto(staged, dir)
+  }
+  await rm(old, { recursive: true, force: true })
   if (hadOld) {
     try {
       await renameRetrying(dir, old)
@@ -126,7 +135,14 @@ export async function swapInto(staged: string, dir: string): Promise<void> {
   try {
     await renameRetrying(staged, dir)
   } catch (e) {
-    if (hadOld) await renameRetrying(old, dir).catch(() => undefined)
+    if (hadOld) {
+      try {
+        await renameRetrying(old, dir)
+      } catch {
+        // Swallowing this would leave the only copy in the backup folder for the next update to delete.
+        throw new Error(`The new version could not be put in place (${e instanceof Error ? e.message : String(e)}) and the old version is kept in ${old}. Rename that folder to ${dir} to get it back.`)
+      }
+    }
     throw e
   }
   await rm(old, { recursive: true, force: true }).catch(() => undefined)
