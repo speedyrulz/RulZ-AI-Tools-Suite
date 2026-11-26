@@ -11,7 +11,7 @@ import { APP_MODES, modeSampling, type AppMode } from '@shared/modes'
 import type { RemoteIpcInvoke } from '@shared/remote'
 import { META_TOOL_DEFS, toolCatalogNote } from '@shared/tools'
 import type { LoadConfig, LoadedInstance, McpServerConfig, ModelEntry, Theme } from '@shared/types'
-import { ChatService } from './chat/service'
+import { ChatService, localModelInUse } from './chat/service'
 import { createCloudService } from './cloud/service'
 import { ConversationStore } from './chat/conversations'
 import { EngineService } from './engine/engine'
@@ -38,7 +38,7 @@ import { createRemoteService } from './remote/service'
 import { BenchmarkRunner } from './bench/runner'
 import { BenchStore } from './bench/store'
 import { WritingBenchStore } from './wbench/store'
-import { gradePractice, listPractice, preparePractice } from './re/practice'
+import { gradePractice, listPractice, preparePractice, prunePracticeFolders } from './re/practice'
 import { SetGenerator, setFolder } from './re/generate'
 import { buildOverview, MAX_OVERVIEW_SESSIONS } from './re/overview'
 import { findPython, type PythonCommand } from './re/python'
@@ -322,6 +322,9 @@ async function main(): Promise<void> {
     .finally(() => void mcp.init())
   const traces = new TraceStore(join(userData, 're-data'))
   const practiceRoot = join(userData, 're-practice')
+  // Old attempts' copies of the task binaries pile up; drop those older than 30 days, off the startup path.
+  // Practice starts and grading wait for it, so the sweep never removes a folder one of them is using.
+  const practicePruned = prunePracticeFolders(practiceRoot).catch(() => undefined)
   const batches = new BatchStore(join(userData, 're-batches.json'))
   const apiRe = (id: string): string => API_RE_PREFIX + id
   const benchStore = new BenchStore(join(userData, 'benchmarks.json'))
@@ -399,11 +402,13 @@ async function main(): Promise<void> {
         })
       },
       preparePractice: async (taskId) => {
+        await practicePruned
         const { target, prompt, task } = await preparePractice(settings.get().re.kitDir, practiceRoot, taskId)
         return { target, prompt, family: task.family, tier: task.tier }
       },
       gradePractice: async (taskId, target, text) => {
         const answer = extractAnswer(text)
+        await practicePruned
         const { passed, expected } = await gradePractice(settings.get().re.kitDir, practiceRoot, taskId, target, answer)
         return { answer, passed, expected }
       },
@@ -481,6 +486,9 @@ async function main(): Promise<void> {
   })
   handle('shell:showItem', (path) => shell.showItemInFolder(path))
   handle('shell:openPath', async (path) => {
+    // Every caller opens a folder; opening any other path would run or open a file the window names.
+    const isDir = typeof path === 'string' && (await fs.stat(path).then((s) => s.isDirectory(), () => false))
+    if (!isDir) throw new Error('Only folders can be opened this way.')
     await shell.openPath(path)
   })
 
@@ -650,11 +658,13 @@ async function main(): Promise<void> {
   })
   handle('re:practiceList', (kitDir) => listPractice(kitDir))
   const practicePrepare = async (kitDir: string, taskId: string): Promise<{ target: string; prompt: string; family: string; tier: string }> => {
+    await practicePruned
     const { target, prompt, task } = await preparePractice(kitDir, practiceRoot, taskId)
     return { target, prompt, family: task.family, tier: task.tier }
   }
   const practiceGrade = async (kitDir: string, taskId: string, target: string, finalText: string): Promise<{ answer: string | null; passed: boolean; expected: string }> => {
     const answer = extractAnswer(finalText)
+    await practicePruned
     const { passed, expected } = await gradePractice(kitDir, practiceRoot, taskId, target, answer)
     return { answer, passed, expected }
   }
@@ -803,6 +813,11 @@ async function main(): Promise<void> {
   handle('wbench:savePrompts', (prompts) => writingBenchStore.savePrompts(prompts))
   handle('bench:start', (req) => {
     if (pool.busy) throw new Error('A batch run is in progress. Wait for it or stop it first.')
+    // The benchmark unloads every model on this PC; one that is answering something would be killed mid-reply.
+    // Another app's mode reload holds the gate while it loads or swaps a model.
+    const held = modelGate.busyReason()
+    if (held) throw new Error(held)
+    if (localModelInUse(instances)) throw new Error('A model on this PC is in use (a chat reply, an API request or a Writing job). Wait for it to finish first.')
     return bench.start(req)
   })
   handle('bench:stop', () => bench.stop())
@@ -1109,10 +1124,19 @@ async function main(): Promise<void> {
     // Requests to OpenRouter that are running are aborted (their reservations are settled at the next start).
     cloud.dispose()
     instances.killAllSync()
+    // A running LoRA conversion or set generation would otherwise outlive the app and leave its partial output behind.
+    converter.disposeSync()
+    setGenerator.disposeSync()
     remote.rentals.dispose()
     void mcp.dispose()
     void apiServer.stop()
   })
 }
 
-if (isPrimaryInstance) void main()
+if (isPrimaryInstance) {
+  main().catch((err) => {
+    // Without this no window ever appears while the process keeps the single-instance lock.
+    dialog.showErrorBox('RulZ LLM Suite could not start', err instanceof Error ? err.message : String(err))
+    app.exit(1)
+  })
+}

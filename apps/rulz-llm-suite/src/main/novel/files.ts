@@ -143,6 +143,16 @@ export function serialized<T>(path: string, fn: () => Promise<T>): Promise<T> {
   return next
 }
 
+/** Resolves once no queued or running task remains for a path inside `folder` (the folder itself is not a key). */
+export async function drainFolder(folder: string): Promise<void> {
+  const prefix = keyOf(resolve(folder)).replace(/[\\/]+$/, '') + sep
+  for (;;) {
+    const pending = [...queues.entries()].filter(([key]) => key.startsWith(prefix)).map(([, q]) => q)
+    if (pending.length === 0) return
+    await Promise.allSettled(pending)
+  }
+}
+
 /**
  * Writes bytes via a temp file in `tmpDir` (inside the project's .rulz, never next to the user's files) and
  * a rename over `target`. Throws after about 750 ms of lock retries; the target is then unchanged.

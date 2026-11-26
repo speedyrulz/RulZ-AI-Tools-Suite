@@ -47,8 +47,24 @@ import { modeDefaultsOf, readyInstance, useModels } from './models'
 import { META_TOOLS, resolveTool } from '@shared/tools'
 import { loadToolNames, runLoaderTool } from '@shared/toolSession'
 import { isStaleChatError } from '@shared/batch'
+import { activeBenchRun, useBench } from './bench'
 
 export const NEW_CHAT_TITLE = 'New Chat'
+
+/** Last click wins when chats are opened one after another. */
+let chatOpenSeq = 0
+
+/**
+ * Why a chat reply cannot start now because of a benchmark, or null. A writing benchmark blocks every chat; a hardware
+ * benchmark unloads the models on this PC, so it blocks all but an OpenRouter model (which uses nothing here).
+ * The stores are read at call time only (stores/bench imports lib/aiBusy, which imports this file).
+ */
+export function chatBenchRefusal(modelId?: string | null): string | null {
+  if (wbenchRunning()) return WBENCH_BUSY
+  const b = useBench.getState()
+  if ((b.starting || activeBenchRun(b.runs)) && !(modelId && isCloudModelId(modelId))) return 'A hardware benchmark is running.'
+  return null
+}
 
 interface Generation {
   requestId: string
@@ -395,6 +411,7 @@ export const useChat = create<ChatState>((set, get) => {
 
   /** Opens a new chat with the source chat's settings and sends the handoff message in it. */
   const finishHandoff = async (ho: HandoffState, text: string): Promise<void> => {
+    chatOpenSeq++
     const src = ho.source
     const now = Date.now()
     const conv: Conversation = {
@@ -933,6 +950,8 @@ export const useChat = create<ChatState>((set, get) => {
     }),
 
     newChat: async () => {
+      // A chat still being opened must not replace this one when its read finishes.
+      chatOpenSeq++
       const { current } = get()
       if (current && current.messages.length === 0) {
         followEmptyChat()
@@ -964,10 +983,12 @@ export const useChat = create<ChatState>((set, get) => {
     },
 
     open: async (id) => {
+      // Counted before the early return: going back to the open chat must also cancel a slower open still under way.
+      const seq = ++chatOpenSeq
       if (get().current?.id === id) return
       const gen = get().genConversation
       const conv = gen?.id === id ? gen : await readConversation(id)
-      if (conv === undefined) return
+      if (conv === undefined || seq !== chatOpenSeq) return
       if (!conv) {
         set((s) => ({ summaries: s.summaries.filter((x) => x.id !== id) }))
         return
@@ -987,7 +1008,8 @@ export const useChat = create<ChatState>((set, get) => {
 
     send: async (text, attachments) => {
       if (isChatBusy(get())) return
-      if (wbenchRunning()) return void toast(WBENCH_BUSY)
+      const refusal = chatBenchRefusal(useModels.getState().activeModelId ?? get().current?.modelId)
+      if (refusal) return void toast(refusal)
       const cur = get().current ?? (await get().newChat())
       if (poolBlocked(cur.id)) return
       await appendAndGenerate(cur, text, attachments)
@@ -1030,7 +1052,8 @@ export const useChat = create<ChatState>((set, get) => {
     regenerate: async (messageId) => {
       const cur = get().current
       if (!cur || isChatBusy(get()) || poolBlocked(cur.id)) return
-      if (wbenchRunning()) return void toast(WBENCH_BUSY)
+      const refusal = chatBenchRefusal(useModels.getState().activeModelId ?? cur.modelId)
+      if (refusal) return void toast(refusal)
       const idx = cur.messages.findIndex((m) => m.id === messageId)
       if (idx < 0) return
       const keep = cur.messages[idx].role === 'assistant' ? idx : idx + 1
@@ -1040,7 +1063,8 @@ export const useChat = create<ChatState>((set, get) => {
     continueMessage: async (messageId) => {
       const cur = get().current
       if (!cur || isChatBusy(get()) || poolBlocked(cur.id)) return
-      if (wbenchRunning()) return void toast(WBENCH_BUSY)
+      const refusal = chatBenchRefusal(useModels.getState().activeModelId ?? cur.modelId)
+      if (refusal) return void toast(refusal)
       const last = cur.messages.at(-1)
       if (last?.id !== messageId || last.role !== 'assistant') return
       // A turn that called tools is complete; writing more into it would mix new calls with the
@@ -1054,7 +1078,8 @@ export const useChat = create<ChatState>((set, get) => {
       const target = cur.messages.find((m) => m.id === messageId)
       if (!target) return
       if (resend && target.role === 'user' && !isChatBusy(get())) {
-        if (wbenchRunning()) return void toast(WBENCH_BUSY)
+        const refusal = chatBenchRefusal(useModels.getState().activeModelId ?? cur.modelId)
+        if (refusal) return void toast(refusal)
         await startGeneration({ ...cur, messages: editMessages(cur.messages, messageId, content, true) }, 'new')
       } else {
         get().mutateCurrent((c) => ({ ...c, messages: editMessages(c.messages, messageId, content, false) }))
@@ -1085,6 +1110,7 @@ export const useChat = create<ChatState>((set, get) => {
     branchFrom: async (messageId) => {
       const cur = get().current
       if (!cur) return
+      chatOpenSeq++
       const idx = cur.messages.findIndex((m) => m.id === messageId)
       if (idx < 0) return
       const now = Date.now()
@@ -1232,7 +1258,8 @@ export const useChat = create<ChatState>((set, get) => {
       const conv = get().current
       set({ handoffConfirm: null })
       if (!conv || get().generation || get().handoff || get().autoLoadingModelId || poolBlocked(conv.id)) return
-      if (wbenchRunning()) return void toast(WBENCH_BUSY)
+      const refusal = chatBenchRefusal(useModels.getState().activeModelId ?? conv.modelId)
+      if (refusal) return void toast(refusal)
       if (!conv.messages.length) {
         toast('There is nothing to hand off yet.')
         return
@@ -1277,14 +1304,18 @@ export const useChat = create<ChatState>((set, get) => {
     },
 
     startRe: async (input) => {
-      if (wbenchRunning()) {
-        toast(WBENCH_BUSY)
+      // The session's own model, not whichever is active now: that is the one it loads.
+      const pick = useModels.getState()
+      const refusal = chatBenchRefusal(input.modelId && pick.models.some((m) => m.id === input.modelId) ? input.modelId : pick.activeModelId)
+      if (refusal) {
+        toast(refusal)
         return null
       }
       if (isChatBusy(get()) || get().handoff) {
         toast('Wait for the current reply to finish first.')
         return null
       }
+      chatOpenSeq++
       // Pasted paths may keep their quotes (Explorer's "Copy as path"); the tools need them without.
       const opts = {
         ...input,

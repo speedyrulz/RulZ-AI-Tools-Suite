@@ -6,6 +6,7 @@ import * as TooltipPrimitive from '@radix-ui/react-tooltip'
 import { X } from 'lucide-react'
 import { forwardRef, useEffect, useRef, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes, type TextareaHTMLAttributes } from 'react'
 import { cn } from '../lib/format'
+import { clampTo } from '../lib/auditHelpers'
 import { parseNumberDraft } from '../lib/input'
 
 type Variant = 'primary' | 'secondary' | 'ghost' | 'outline' | 'danger'
@@ -347,15 +348,17 @@ export function NumberInput({
   // null while not editing: the field then shows `value`, so outside changes (sliders, presets) show at once.
   const [draft, setDraft] = useState<string | null>(null)
   // Read by the unmount cleanup, which only sees the first render's values.
-  const latest = useRef({ draft, value, onChange })
-  latest.current = { draft, value, onChange }
+  const latest = useRef({ draft, value, onChange, min, max })
+  latest.current = { draft, value, onChange, min, max }
   const commit = (): void => {
-    const { draft: d, value: v, onChange: apply } = latest.current
+    const { draft: d, value: v, onChange: apply, min: lo, max: hi } = latest.current
     if (d === null) return
     latest.current.draft = null
     setDraft(null)
-    const next = parseNumberDraft(d, v)
-    if (next !== undefined) apply(next)
+    const parsed = parseNumberDraft(d, v)
+    // min and max are only hints to the browser: a typed value outside them is pulled back in.
+    const next = typeof parsed === 'number' ? clampTo(parsed, lo, hi) : parsed
+    if (next !== undefined && next !== v) apply(next)
   }
   // Switching page (Ctrl+1…6) removes the field without a blur; keep what was typed.
   useEffect(() => () => commit(), [])

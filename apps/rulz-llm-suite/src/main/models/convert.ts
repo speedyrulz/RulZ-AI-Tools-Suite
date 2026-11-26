@@ -1,7 +1,7 @@
 // Converts a Hugging Face PEFT LoRA folder to a GGUF adapter with llama.cpp's convert_lora_to_gguf.py.
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { existsSync, promises as fs } from 'node:fs'
+import { existsSync, promises as fs, rmSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { AdapterConvertRequest, AdapterConvertResult, AdapterConverterStatus } from '@shared/types'
 import { killTree } from '../engine/process'
@@ -84,7 +84,7 @@ function lineSplitter(push: (line: string) => void): { feed: (chunk: Buffer | st
 }
 
 export class AdapterConverter {
-  private current: { proc: ChildProcess; cancelled: boolean } | null = null
+  private current: { proc: ChildProcess; cancelled: boolean; tmpPath: string } | null = null
   /** Set from the check for a running conversion until it ends, so two calls can't both pass it. */
   private busy = false
   /** A cancel that came before the process existed. */
@@ -114,6 +114,21 @@ export class AdapterConverter {
     }
     this.current.cancelled = true
     killTree(this.current.proc.pid)
+  }
+
+  /** For app quit: kills the Python process tree now and deletes the temporary file this conversion owns. */
+  disposeSync(): void {
+    if (this.busy) this.cancelPending = true
+    const cur = this.current
+    if (!cur) return
+    cur.cancelled = true
+    killTree(cur.proc.pid, true)
+    try {
+      // The killed process can hold the file for a moment.
+      rmSync(cur.tmpPath, { force: true, maxRetries: 3, retryDelay: 100 })
+    } catch {
+      // still locked; the library ignores .part files
+    }
   }
 
   async convert(req: AdapterConvertRequest): Promise<AdapterConvertResult> {
@@ -174,7 +189,7 @@ export class AdapterConverter {
     } catch (err) {
       return fail(`Could not start Python: ${(err as Error).message}`, tail)
     }
-    const run = { proc, cancelled: false }
+    const run = { proc, cancelled: false, tmpPath }
     this.current = run
 
     const out = lineSplitter(push)
@@ -196,9 +211,23 @@ export class AdapterConverter {
       try {
         await fs.link(tmpPath, outPath)
       } catch (e) {
-        await fs.rm(tmpPath, { force: true }).catch(() => undefined)
         const taken = (e as NodeJS.ErrnoException).code === 'EEXIST'
-        return fail(taken ? `${outName} appeared in the models folder during the conversion; choose another name.` : `Could not move the result into place: ${(e as Error).message}`, tail)
+        // exFAT, FAT and some shares cannot hard-link: rename the file into place instead, unless the name is taken.
+        let moved = false
+        if (!taken && !existsSync(outPath)) {
+          try {
+            await fs.rename(tmpPath, outPath)
+            moved = true
+          } catch {
+            // reported below
+          }
+        }
+        if (!moved) {
+          await fs.rm(tmpPath, { force: true }).catch(() => undefined)
+          return fail(taken ? `${outName} appeared in the models folder during the conversion; choose another name.` : `Could not move the result into place: ${(e as Error).message}`, tail)
+        }
+        this.deps.onConverted()
+        return { ok: true, outPath, logTail: tail }
       }
       await fs.rm(tmpPath, { force: true }).catch(() => undefined)
       this.deps.onConverted()

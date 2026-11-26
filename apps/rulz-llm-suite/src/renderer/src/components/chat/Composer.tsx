@@ -6,7 +6,7 @@ import { isPdfFile } from '@shared/pdf'
 import { cancelPdfRead, filesToAttachments, pdfToAttachment } from '../../lib/attachments'
 import { formatBytes, uid } from '../../lib/format'
 import { useApp } from '../../stores/app'
-import { isPoolChat, useChat } from '../../stores/chat'
+import { chatBenchRefusal, isPoolChat, useChat } from '../../stores/chat'
 import { modelById, useModels } from '../../stores/models'
 import { IconButton, Kbd } from '../ui'
 
@@ -99,7 +99,15 @@ export const Composer = forwardRef<ComposerHandle>(function Composer(_props, ref
   /** While a reply streams here: "now" stops it and sends the note, "later" queues the note for when it ends. */
   const submit = (when: 'now' | 'later' = 'now'): void => {
     if (!canSend) return
-    if (!replyingHere) void send(text.trim(), attachments)
+    if (!replyingHere) {
+      // Refused sends keep the draft (and the PDFs that took time to read).
+      const refusal = chatBenchRefusal(activeModelId ?? conversationModelId)
+      if (refusal) {
+        toast(refusal)
+        return
+      }
+      void send(text.trim(), attachments)
+    }
     else if (when === 'now') sendNow(text.trim(), attachments)
     else queueNote(text.trim(), attachments)
     setText('')

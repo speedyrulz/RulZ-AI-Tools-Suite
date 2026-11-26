@@ -1,7 +1,8 @@
+import { promises as fsp } from 'node:fs'
 import { basename, join } from 'node:path'
 import { APP_MODES, modeDefaultsEmpty, modeLoad, type AllModeDefaults, type AppMode, type ModeDefaults, type ModelModeDefaults } from '@shared/modes'
 import type { AppSettings, LoadConfig, Preset } from '@shared/types'
-import { readJson, writeJsonAtomic } from '../util/jsonFile'
+import { corruptName, readJson, writeJsonAtomic } from '../util/jsonFile'
 import { parseLoadConfig, parseModeDefaults, parseModeEntry, parsePresets, parseSettings } from './schema'
 
 /** App settings, per-model load defaults and presets, each persisted as JSON in userData. */
@@ -11,6 +12,7 @@ export class SettingsStore {
   /** Per model and mode; its own file so older versions keep reading model-defaults.json. A Map, so ids like '__proto__' are plain keys. */
   private modeMap = new Map<string, ModelModeDefaults>()
   private modeChain: Promise<unknown> = Promise.resolve()
+  private updateChain: Promise<unknown> = Promise.resolve()
   private presets: Preset[] = []
   private readonly settingsPath: string
   private readonly modelDefaultsPath: string
@@ -27,17 +29,24 @@ export class SettingsStore {
   }
 
   async init(): Promise<void> {
-    this.settings = parseSettings(await this.load(this.settingsPath, {}))
-    const rawDefaults = await this.load<Record<string, unknown>>(this.modelDefaultsPath, {})
+    this.settings = parseSettings(await this.load(this.settingsPath, {}, 'object'))
+    const rawDefaults = await this.load<Record<string, unknown>>(this.modelDefaultsPath, {}, 'object')
     for (const [id, cfg] of Object.entries(rawDefaults)) this.modelDefaults[id] = parseLoadConfig(cfg)
-    this.presets = parsePresets(await this.load(this.presetsPath, []))
-    this.modeMap = new Map(Object.entries(parseModeDefaults(await this.load(this.modeDefaultsPath, {}))))
+    this.presets = parsePresets(await this.load(this.presetsPath, [], 'array'))
+    this.modeMap = new Map(Object.entries(parseModeDefaults(await this.load(this.modeDefaultsPath, {}, 'object'))))
   }
 
   /** The app still starts on defaults when a file is locked; that file is then left alone. */
-  private async load<T>(path: string, fallback: T): Promise<T> {
+  private async load<T>(path: string, fallback: T, kind: 'object' | 'array'): Promise<T> {
     try {
-      return await readJson(path, fallback)
+      const value = await readJson<unknown>(path, fallback)
+      const ok = kind === 'array' ? Array.isArray(value) : typeof value === 'object' && value !== null && !Array.isArray(value)
+      if (ok) return value as T
+      // Valid JSON of the wrong kind (a bare number, null, a list): treated like a file that does not parse.
+      const aside = corruptName(path)
+      await fsp.rename(path, aside).catch(() => fsp.copyFile(path, aside).catch(() => undefined))
+      console.warn(`${path} did not hold the expected kind of data; kept it as ${aside} and used defaults.`)
+      return fallback
     } catch (err) {
       console.error(`Could not read ${path}:`, err)
       this.unreadable.add(path)
@@ -57,9 +66,16 @@ export class SettingsStore {
   }
 
   async update(patch: Partial<AppSettings>): Promise<AppSettings> {
-    this.settings = parseSettings({ ...this.settings, ...patch })
-    await this.save(this.settingsPath, this.settings)
-    return this.settings
+    // One after another, so each patch starts from what the one before it saved.
+    const run = this.updateChain.then(async () => {
+      const next = parseSettings({ ...this.settings, ...patch })
+      // Memory only changes once the file is written.
+      await this.save(this.settingsPath, next)
+      this.settings = next
+      return next
+    })
+    this.updateChain = run.catch(() => undefined)
+    return run
   }
 
   getModelDefaults(modelId: string): { config: LoadConfig; custom: boolean } {

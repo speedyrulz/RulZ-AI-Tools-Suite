@@ -2,6 +2,7 @@ import { AlertTriangle, CheckCircle2, FolderSearch, Repeat } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import type { AdapterConverterStatus, AdapterConvertRequest, AdapterConvertResult, AdapterEntry } from '@shared/types'
 import { defaultConvertName } from '../../lib/adapters'
+import { appendCapped } from '../../lib/auditHelpers'
 import { errorMessage, invoke, on } from '../../lib/api'
 import { useModels } from '../../stores/models'
 import { Button, Dialog, Field, IconButton, Input, Select } from '../ui'
@@ -52,7 +53,7 @@ export function AdapterConvertDialog({ open, onClose }: { open: boolean; onClose
 
   useEffect(() => {
     if (!open) return
-    return on('adapters:convertLog', (line) => setLines((l) => [...l, line]))
+    return on('adapters:convertLog', (line) => setLines((l) => appendCapped(l, line, 2000)))
   }, [open])
 
   useEffect(() => {

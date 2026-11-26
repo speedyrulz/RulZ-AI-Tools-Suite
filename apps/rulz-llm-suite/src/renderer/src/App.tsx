@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { Toaster } from 'sonner'
+import { useEffect, useRef, useState } from 'react'
+import { Toaster, toast } from 'sonner'
 import { TooltipProvider } from './components/ui'
 import { NavRail } from './components/shell/NavRail'
 import { TopBar } from './components/shell/TopBar'
@@ -33,28 +33,48 @@ export function App() {
   const page = useApp((s) => s.page)
   const theme = useApp((s) => s.settings?.theme)
   const [ready, setReady] = useState(false)
+  const startFailures = useRef<string[]>([])
   useShortcuts()
 
   useEffect(() => {
     // Each init runs once even though StrictMode runs this effect twice in development.
     let cancelled = false
+    // A failing init must not leave the window on "Starting..." for good: report it and go on.
+    const step = async (name: string, init: () => Promise<void>): Promise<void> => {
+      try {
+        await init()
+      } catch (e) {
+        console.error(`Start-up: ${name} failed`, e)
+        // The Toaster mounts only once the window is ready, so the message waits until then.
+        startFailures.current.push(`Could not start ${name}: ${e instanceof Error ? e.message : String(e)}`)
+      }
+    }
     void (async () => {
-      await useApp.getState().init()
-      await useModels.getState().init()
-      await useMcp.getState().init()
-      await useServer.getState().init()
-      await useChat.getState().init()
-      await useNovel.getState().init()
-      await useAdventure.getState().init()
-      // Not awaited: a slow or failing vast.ai read must not hold up the start (it reports its own error).
-      void useRemote.getState().init()
-      void useCloud.getState().init()
-      if (!cancelled) setReady(true)
+      try {
+        await step('settings', () => useApp.getState().init())
+        await step('models', () => useModels.getState().init())
+        await step('tools', () => useMcp.getState().init())
+        await step('server', () => useServer.getState().init())
+        await step('chats', () => useChat.getState().init())
+        await step('Writing', () => useNovel.getState().init())
+        await step('Adventure', () => useAdventure.getState().init())
+        // Not awaited: a slow or failing vast.ai read must not hold up the start (it reports its own error).
+        void useRemote.getState().init()
+        void useCloud.getState().init()
+      } finally {
+        if (!cancelled) setReady(true)
+      }
     })()
     return () => {
       cancelled = true
     }
   }, [])
+
+  // A parent's effect runs after its children's, so the Toaster is listening by now.
+  useEffect(() => {
+    if (!ready) return
+    for (const msg of startFailures.current.splice(0)) toast.error(msg)
+  }, [ready])
 
   if (!ready) {
     return <div className="flex h-full items-center justify-center text-sm text-faint">Starting RulZ LLM Suite…</div>

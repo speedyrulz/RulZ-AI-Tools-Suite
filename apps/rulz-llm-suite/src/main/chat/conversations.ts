@@ -56,6 +56,7 @@ export class StaleConversationError extends Error {
  */
 export class ConversationStore {
   private summaries: Map<string, ConversationSummary> | null = null
+  private loading: Promise<void> | null = null
   private index: Record<string, IndexEntry> = {}
   private indexTimer: ReturnType<typeof setTimeout> | null = null
   /** Chats deleted this session; a reply that finishes afterwards must not write them back. */
@@ -80,7 +81,18 @@ export class ConversationStore {
 
   async list(): Promise<ConversationSummary[]> {
     if (!this.summaries) {
-      this.summaries = new Map()
+      // One load shared by callers that arrive while it runs; a failed load is forgotten so the next call retries.
+      this.loading ??= this.loadSummaries().finally(() => {
+        this.loading = null
+      })
+      await this.loading
+    }
+    return [...this.summaries!.values()].sort((a, b) => b.updatedAt - a.updatedAt)
+  }
+
+  private async loadSummaries(): Promise<void> {
+    {
+      const summaries = new Map<string, ConversationSummary>()
       await fs.mkdir(this.dir, { recursive: true })
       // Only a cache: if it can't be read, every chat file is read instead.
       const saved = await readJson<IndexFile | null>(this.indexPath, null).catch(() => null)
@@ -95,7 +107,7 @@ export class ConversationStore {
         const hit = known[name]
         if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs) {
           next[name] = hit
-          this.summaries.set(hit.summary.id, hit.summary)
+          summaries.set(hit.summary.id, hit.summary)
           continue
         }
         changed = true
@@ -107,13 +119,13 @@ export class ConversationStore {
         if (!c?.id || !Array.isArray(c.messages)) continue
         const summary = summarize(c)
         next[name] = { summary, size: st.size, mtimeMs: st.mtimeMs }
-        this.summaries.set(c.id, summary)
+        summaries.set(c.id, summary)
       }
       if (Object.keys(known).some((name) => !next[name])) changed = true
       this.index = next
+      this.summaries = summaries
       if (changed) this.saveIndexSoon()
     }
-    return [...this.summaries.values()].sort((a, b) => b.updatedAt - a.updatedAt)
   }
 
   /** The index is only a cache (checked against size and mtime), so it is written lazily. */

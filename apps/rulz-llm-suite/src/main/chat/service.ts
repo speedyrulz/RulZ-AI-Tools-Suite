@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { requestLora } from '@shared/adapters'
-import { isFatalCloudError } from '@shared/cloud'
+import { isFatalCloudError, isLocalInstance } from '@shared/cloud'
 import type {
   ChatRequest,
   GenerationStats,
@@ -18,6 +18,11 @@ import { errorCodeFromBody, errorFromBody, interpretChunk, SseParser, statsFromT
 import { jsonifyToolCallArgs, templateStringifiesArgs } from './toolArgs'
 
 type UseBy = 'window' | 'api' | 'phone'
+
+/** True while any model running on this PC is answering something (a chat reply, an API request, a tool turn, a Writing job). */
+export function localModelInUse(instances: Pick<InstanceManager, 'list' | 'usersOf'>): boolean {
+  return instances.list().some((i) => isLocalInstance(i) && instances.usersOf(i.instanceId) > 0)
+}
 
 /** Streamed text is sent to the renderer at most this often (one IPC message per token is wasteful). */
 const DELTA_FLUSH_MS = 30
@@ -309,9 +314,18 @@ export class ChatService {
     if (!p) {
       // OpenRouter has no chat template to ask about; the adapter takes JSON arguments as they are.
       if (instance.cloud) return Promise.resolve(false)
-      p = fetch(`${this.instances.baseUrl(instance)}/props`, { signal: AbortSignal.timeout(10000) })
-        .then(async (r) => (r.ok ? templateStringifiesArgs(((await r.json()) as { chat_template?: string }).chat_template) : false))
-        .catch(() => false)
+      const mine: Promise<boolean> = fetch(`${this.instances.baseUrl(instance)}/props`, { signal: AbortSignal.timeout(10000) })
+        .then(async (r) => {
+          if (r.ok) return templateStringifiesArgs(((await r.json()) as { chat_template?: string }).chat_template)
+          // A failed lookup is not remembered, so the next round asks again.
+          if (this.argQuirk.get(instance.instanceId) === mine) this.argQuirk.delete(instance.instanceId)
+          return false
+        })
+        .catch(() => {
+          if (this.argQuirk.get(instance.instanceId) === mine) this.argQuirk.delete(instance.instanceId)
+          return false
+        })
+      p = mine
       this.argQuirk.set(instance.instanceId, p)
     }
     return p

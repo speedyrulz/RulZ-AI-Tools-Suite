@@ -2,9 +2,10 @@
 // (`python -m kit.generate --out <kit>/sets/<id> ...`, run from the kit folder).
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes, randomInt } from 'node:crypto'
-import { promises as fs } from 'node:fs'
+import { promises as fs, rmSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import type { ReGenerateProgress, ReGenerateRequest } from '@shared/types'
+import { killTree as killTreeSync } from '../engine/process'
 import type { PythonCommand } from './python'
 import { ORIGINAL_SET, SET_ID_RE } from './practice'
 
@@ -125,8 +126,25 @@ export class SetGenerator {
   private child: ChildProcess | null = null
   private cancelled = false
   private busy = false
+  /** The set folder this job reserved and so owns; null when none. */
+  private ownedDir: string | null = null
 
   constructor(private readonly deps: GeneratorDeps) {}
+
+  /** For app quit: kills the generator tree now and removes the partial set folder this job created. */
+  disposeSync(): void {
+    if (!this.busy) return
+    this.cancelled = true
+    if (this.child) killTreeSync(this.child.pid, true)
+    if (this.ownedDir) {
+      try {
+        // The killed compiler or Python can hold a file for a moment.
+        rmSync(this.ownedDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+      } catch {
+        // locked; nothing more to do while quitting
+      }
+    }
+  }
 
   get running(): boolean {
     return this.busy
@@ -191,6 +209,7 @@ export class SetGenerator {
           await fs.mkdir(dir)
           id = candidate
           out = dir
+          this.ownedDir = dir
         } catch (e) {
           if ((e as NodeJS.ErrnoException).code !== 'EEXIST' || attempt >= 20) throw e
           existing.add(candidate)
@@ -248,6 +267,7 @@ export class SetGenerator {
       throw err
     } finally {
       this.child = null
+      this.ownedDir = null
       this.busy = false
     }
   }

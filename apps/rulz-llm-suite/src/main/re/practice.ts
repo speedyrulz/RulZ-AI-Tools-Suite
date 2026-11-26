@@ -190,15 +190,75 @@ export async function listPractice(kitDir: string): Promise<RePracticeInfo> {
 export async function preparePractice(kitDir: string, workRoot: string, taskId: string): Promise<{ target: string; prompt: string; task: KitTask }> {
   const task = (await readKitTasks(kitDir)).find((t) => t.id === taskId)
   if (!task) throw new Error(`Practice task ${taskId} is not in ${kitDir}.`)
-  const binDir = join(task.setDir ?? join(kitDir, 'build'), 'bin', task.id)
   const work = join(workRoot, task.id, String(Date.now()))
+  await copyTaskBin(kitDir, task, work)
+  const target = join(work, task.binary)
+  return { target, prompt: task.prompt.replaceAll('{exe}', target), task }
+}
+
+/** Copies the files of a task's bin folder into `work` (created when missing). */
+async function copyTaskBin(kitDir: string, task: KitTask, work: string): Promise<void> {
+  const binDir = join(task.setDir ?? join(kitDir, 'build'), 'bin', task.id)
   await fs.mkdir(work, { recursive: true })
   for (const name of await fs.readdir(binDir)) {
     const src = join(binDir, name)
     if ((await fs.stat(src)).isFile()) await fs.copyFile(src, join(work, name))
   }
-  const target = join(work, task.binary)
-  return { target, prompt: task.prompt.replaceAll('{exe}', target), task }
+}
+
+/** True when `workRoot` and every folder from it down to `dir` that exists is a real folder, not a link. */
+async function noLinksBelow(workRoot: string, dir: string): Promise<boolean> {
+  const root = resolve(workRoot)
+  const parts = relative(root, resolve(dir)).split(/[/\\]/).filter(Boolean)
+  let at = root
+  for (const p of ['', ...parts]) {
+    at = p ? join(at, p) : at
+    const st = await fs.lstat(at).catch(() => null)
+    if (!st) return true // the rest does not exist yet and is made as real folders
+    if (!st.isDirectory()) return false
+  }
+  return true
+}
+
+/** How long a practice work folder is kept. */
+export const PRACTICE_KEEP_MS = 30 * 24 * 60 * 60 * 1000
+
+/**
+ * Deletes practice work folders (<workRoot>/<task>/<13-digit timestamp>) older than `maxAgeMs`, then a task
+ * folder left empty. Anything else (files, links, other names) is left alone; errors per folder are ignored.
+ */
+export async function prunePracticeFolders(workRoot: string, now = Date.now(), maxAgeMs = PRACTICE_KEEP_MS): Promise<void> {
+  const cutoff = now - maxAgeMs
+  let tasks: string[]
+  try {
+    // A linked root (junction or symlink) is never followed: what it points at is not ours.
+    if (!(await fs.lstat(workRoot)).isDirectory()) return
+    tasks = await fs.readdir(workRoot)
+  } catch {
+    return
+  }
+  for (const task of tasks) {
+    const taskDir = join(workRoot, task)
+    try {
+      if (!(await fs.lstat(taskDir)).isDirectory()) continue
+      let removedAny = false
+      for (const name of await fs.readdir(taskDir)) {
+        if (!/^\d{13}$/.test(name) || Number(name) >= cutoff) continue
+        const dir = join(taskDir, name)
+        try {
+          if (!(await fs.lstat(dir)).isDirectory()) continue
+          await fs.rm(dir, { recursive: true, force: true })
+          removedAny = true
+        } catch {
+          // locked by antivirus or already gone
+        }
+      }
+      // Only a task folder this sweep emptied goes; any other empty folder is left as it is.
+      if (removedAny && !(await fs.readdir(taskDir)).length) await fs.rmdir(taskDir)
+    } catch {
+      // not ours to worry about
+    }
+  }
 }
 
 const norm = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, '')
@@ -328,6 +388,12 @@ export async function gradePractice(
   // One folder (the timestamp) below <workRoot>/<task>, and the task's own binary name.
   if (!rel || isAbsolute(rel) || rel.includes('..') || /[/\\]/.test(rel) || basename(exe) !== task.binary) {
     throw new Error('This practice session’s target is not a work-folder copy of the task binary.')
+  }
+  // An old chat whose work folder was pruned can still be graded: the copy is made again.
+  // Only a folder this app names (a 13-digit time) is made again, and never through a link: a junction there
+  // would put the copy, and the run that checks it, somewhere else.
+  if (!(await fs.stat(exe).then((s) => s.isFile(), () => false)) && /^\d{13}$/.test(rel) && (await noLinksBelow(workRoot, dirname(exe)))) {
+    await copyTaskBin(kitDir, task, dirname(exe))
   }
   return { passed: await checkAnswer(task, answer, exe), expected: task.answer }
 }
