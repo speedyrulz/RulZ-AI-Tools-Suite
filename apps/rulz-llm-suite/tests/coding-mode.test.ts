@@ -219,7 +219,7 @@ describe('the practice helpers in src/shared/practice.ts', () => {
 describe('buildOverview for one model', () => {
   const re = (extra: Partial<ReSession> = {}): ReSession => ({ target: 'C:\\a.exe', goal: 'g', collect: true, outcome: 'unrated', ...extra })
   const prac = (taskId: string) => ({ taskId, family: 'f', tier: 't1' })
-  const task = (id: string) => ({ id, family: 'f', tier: 't1', binary: `${id}.exe`, prompt: 'p' })
+  const task = (id: string) => ({ id, family: 'f', tier: 't1', binary: `${id}.exe`, prompt: 'p', set: 'original' })
   const apiTrace = (id: string, taskId: string, outcome: 'solved' | 'failed', models: string[]): ReTraceInfo => ({
     conversationId: id,
     responses: 1,
@@ -240,7 +240,7 @@ describe('buildOverview for one model', () => {
       { id: 'c2', title: 'two', updatedAt: 11, modelId: 'B/other.gguf', re: re({ outcome: 'failed', practice: { ...prac('t-1'), answer: '2', expected: '1' } }) }
     ],
     traces: [apiTrace('api-1', 't-2', 'failed', ['Orn']), apiTrace('api-2', 't-2', 'solved', ['Other'])],
-    practice: { kitDir: 'k', tasks: [task('t-1'), task('t-2'), task('t-3')] },
+    practice: { kitDir: 'k', tasks: [task('t-1'), task('t-2'), task('t-3')], sets: [] },
     recording: true,
     summaries: [
       { id: 'c1', rePracticeTask: 't-1', reOutcome: 'solved' as const, modelId: 'A/orn.gguf' },

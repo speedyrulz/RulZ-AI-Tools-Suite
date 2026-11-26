@@ -108,6 +108,8 @@ export function buildOverview(input: {
     practice: {
       kitDir: input.practice.kitDir,
       ...(input.practice.error ? { error: input.practice.error } : {}),
+      ...(input.practice.warning ? { warning: input.practice.warning } : {}),
+      sets: input.practice.sets,
       ...(modelKeyUsed !== undefined ? { model: modelKeyUsed } : {}),
       tasks: input.practice.tasks.map((t) => ({
         ...t,

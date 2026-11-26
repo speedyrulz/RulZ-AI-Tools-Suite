@@ -110,13 +110,13 @@ describe('recording RE sessions from the API server', () => {
         record: (id: string, round: RecordedRound) => void recorded.push(traces.record(API_RE_PREFIX + id, round, { shrinkIsTrim: true })),
         session: (id: string) => traces.apiSession(API_RE_PREFIX + id),
         update: (id: string, patch) => traces.updateApiSession(API_RE_PREFIX + id, patch),
-        overview: async () => buildOverview({ chats: [], traces: await traces.list(), practice: { kitDir: 'k', tasks: [] }, recording: enabled }),
+        overview: async () => buildOverview({ chats: [], traces: await traces.list(), practice: { kitDir: 'k', tasks: [], sets: [] }, recording: enabled }),
         preparePractice: async (taskId: string) => {
           if (taskId !== 'xor-1') throw new Error('No such task.')
           return { target: 'C:\\w\\xor.exe', prompt: 'Find the key in C:\\w\\xor.exe', family: 'xor', tier: 't1' }
         },
         gradePractice: async (_taskId: string, _target: string, text: string) => ({ answer: text.includes('ANSWER: 7') ? '7' : null, passed: text.includes('ANSWER: 7'), expected: '7' }),
-        setKit: async (kitDir: string) => ({ kitDir, tasks: [] })
+        setKit: async (kitDir: string) => ({ kitDir, tasks: [], sets: [] })
       }
     })
     await server.start()
@@ -227,7 +227,7 @@ describe('RE overview', () => {
           api: { client: 'RulZ Coding Agent', title: 'x', target: 't', goal: 'g', outcome: 'failed', createdAt: 1, practice: { taskId: 'xor-1', family: 'xor', tier: 't1' } }
         }
       ],
-      practice: { kitDir: 'k', tasks: [{ id: 'xor-1', family: 'xor', tier: 't1', binary: 'xor.exe', prompt: 'p' }, { id: 'xor-2', family: 'xor', tier: 't2', binary: 'b.exe', prompt: 'q' }] },
+      practice: { kitDir: 'k', tasks: [{ id: 'xor-1', family: 'xor', tier: 't1', binary: 'xor.exe', prompt: 'p', set: 'original' }, { id: 'xor-2', family: 'xor', tier: 't2', binary: 'b.exe', prompt: 'q', set: 'original' }], sets: [] },
       recording: true
     })
     expect(o.sessions.map((s) => [s.id, s.kind, s.source])).toEqual([
@@ -279,7 +279,7 @@ describe('POST /v1/re/kit', () => {
         update: async () => {
           throw new Error('unused')
         },
-        overview: async () => buildOverview({ chats: [], traces: [], practice: { kitDir: 'k', tasks: [] }, recording: false }),
+        overview: async () => buildOverview({ chats: [], traces: [], practice: { kitDir: 'k', tasks: [], sets: [] }, recording: false }),
         preparePractice: async () => {
           throw new Error('unused')
         },
@@ -288,7 +288,7 @@ describe('POST /v1/re/kit', () => {
         },
         setKit: async (kitDir: string) => {
           seen.push(kitDir)
-          return { kitDir, tasks: [], error: `No build/tasks.jsonl in ${kitDir}.` }
+          return { kitDir, tasks: [], sets: [], error: `No build/tasks.jsonl in ${kitDir}.` }
         }
       }
     })
@@ -305,7 +305,7 @@ describe('POST /v1/re/kit', () => {
   it('gives the trimmed path to the dependency and returns its practice info', async () => {
     const res = await post({ kitDir: `  ${dir}  ` })
     expect(res.status).toBe(200)
-    expect(await res.json()).toEqual({ kitDir: dir, tasks: [], error: `No build/tasks.jsonl in ${dir}.` })
+    expect(await res.json()).toEqual({ kitDir: dir, tasks: [], sets: [], error: `No build/tasks.jsonl in ${dir}.` })
     expect(seen).toEqual([dir])
   }, 20_000)
 

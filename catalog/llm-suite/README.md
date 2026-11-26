@@ -249,7 +249,21 @@ Discover/downloads, RAG and a CLI are planned.
   - **Grading**: Solved / Partial / Failed in the chat's RE strip or on the Reverse Engineering page.
   - **Practice tasks**: reads `build/tasks.jsonl` from the RE training kit (`C:\coding\Trainers\re-training-kit`),
     copies a task's binary to a fresh work folder, and checks the final `ANSWER:` line automatically (a port of the
-    kit's `verify.py`).
+    kit's `verify.py`). The check types are `run`, `config`, `exact`, `keyword`, `env` (the answer is `NAME=value`; the
+    program runs with a minimal environment plus that variable) and `file` (the answer is hex bytes, written to a file
+    the program is run on).
+  - **Task sets**: a set is a folder of generated tasks with a label. The kit's `build/` folder is the set
+    `original`; every finished folder under `<kit>/sets/<id>/` (one with `set.json` and `tasks.jsonl`) is another.
+    The **Set** dropdown on the practice card picks the set that the family tiles, the task list, **Start next task**
+    and batch runs use; the choice is remembered. If two sets hold the same task id the first set's copy is used and
+    the card shows a warning. The API (`/v1/re/overview`, `/v1/re/practice/{id}/prepare|grade`) finds a task in any
+    set; the overview adds `sets` and a `set` on each task.
+  - **Generate a new set**: **New set...** asks for a label, tasks per family (1 to 50), the families to include
+    (read from `python -m kit.generate --list-families`) and a seed, then runs the kit's generator
+    (`python -m kit.generate --out <kit>/sets/<id> ...`) with progress and a Cancel button. The id is the label's slug
+    plus four random characters. It needs Python 3 and Visual Studio Build Tools (the C compiler); a failed or
+    cancelled run removes its partial folder. **Remove set** moves a generated set to the Recycle Bin (never the
+    original); results recorded for its tasks stay.
   - **Results per model** (0.34.0): the practice tiles show what the model chosen under New session has solved and
     failed; click a family to see each task. **Start next task** and a batch run's **Only unsolved** go by that model
     too, so a new model gets every task. A model on this PC and its copy on a rental count as one (same name), and

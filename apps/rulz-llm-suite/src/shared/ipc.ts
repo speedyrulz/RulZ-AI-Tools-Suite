@@ -34,6 +34,8 @@ import type {
   ReOutcome,
   FileToolScope,
   ReExportResult,
+  ReGenerateProgress,
+  ReGenerateRequest,
   RePracticeInfo,
   RePracticeTask,
   ReTraceInfo,
@@ -169,6 +171,17 @@ export interface IpcInvoke extends NovelIpcInvoke, WritingBenchIpcInvoke, PhoneI
     target: string,
     finalText: string
   ) => { answer: string | null; passed: boolean; expected: string }
+  /** Family names the saved kit folder's generator can make (python -m kit.generate --list-families). These three channels always use the kit folder saved in the settings, never one the window names, because the generator is code that runs from that folder. Throws with the reason when it cannot run. */
+  're:kitFamilies': () => string[]
+  /**
+   * Generates a new task set in <kit>/sets/<id> (one at a time; progress arrives as re:generateProgress). Throws with
+   * the reason on failure or cancel; the partial folder is removed. Replies with the refreshed list and the new id.
+   */
+  're:generateSet': (req: ReGenerateRequest) => { info: RePracticeInfo; setId: string }
+  /** Stops the running generation. */
+  're:generateCancel': () => void
+  /** Moves a generated set (never the original) to the Recycle Bin and replies with the refreshed list. */
+  're:removeSet': (setId: string) => RePracticeInfo
   /** Saved practice batch runs, newest first. */
   're:batches': () => BatchRun[]
   /** Starts a batch run (one at a time); refused with a sentence. Progress arrives as re:batchChanged. */
@@ -213,6 +226,8 @@ export interface IpcEvents extends NovelIpcEvents, PhoneIpcEvents, WritingIpcEve
   're:changed': undefined
   /** A batch run changed; `active` = it is running. */
   're:batchChanged': { run: BatchRun; active: boolean; stopping: 'after' | 'now' | null }
+  /** A task of the running set generation finished (done of total). */
+  're:generateProgress': ReGenerateProgress
   /** The chats the pool owns changed. */
   're:poolChats': string[]
   /** The chat being watched (re:watch), as it is now. */

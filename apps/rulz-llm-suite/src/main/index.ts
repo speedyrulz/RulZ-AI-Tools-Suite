@@ -39,6 +39,7 @@ import { BenchmarkRunner } from './bench/runner'
 import { BenchStore } from './bench/store'
 import { WritingBenchStore } from './wbench/store'
 import { gradePractice, listPractice, preparePractice } from './re/practice'
+import { SetGenerator, setFolder } from './re/generate'
 import { buildOverview, MAX_OVERVIEW_SESSIONS } from './re/overview'
 import { findPython, type PythonCommand } from './re/python'
 import { exportDataset, TraceStore, type ExportSession } from './re/traces'
@@ -659,6 +660,26 @@ async function main(): Promise<void> {
   }
   handle('re:practicePrepare', practicePrepare)
   handle('re:practiceGrade', practiceGrade)
+
+  // New task sets from the kit's generator. These always use the saved kit folder (never one the window names): the
+  // generator is Python code that runs from that folder.
+  const setGenerator = new SetGenerator({ findPython })
+  handle('re:kitFamilies', () => setGenerator.listFamilies(settings.get().re.kitDir))
+  handle('re:generateSet', async (req) => {
+    const kitDir = settings.get().re.kitDir
+    const { setId } = await setGenerator.generate(kitDir, req, (p) => broadcast('re:generateProgress', p))
+    broadcast('re:changed', undefined)
+    return { info: await listPractice(kitDir), setId }
+  })
+  handle('re:generateCancel', () => setGenerator.cancel())
+  handle('re:removeSet', async (setId) => {
+    const kitDir = settings.get().re.kitDir
+    if (setGenerator.running) throw new Error('A set is being generated; wait for it to finish or cancel it first.')
+    // Results recorded for the set's tasks stay: they are keyed by task id.
+    await shell.trashItem(setFolder(kitDir, setId))
+    broadcast('re:changed', undefined)
+    return listPractice(kitDir)
+  })
 
   // ---- Practice batch runs: several sessions at once, here or on rentals (docs/vast-design.md, section 8) ----
   const poolHost = (i: LoadedInstance, dollarsPerHour: number): PoolHost => ({

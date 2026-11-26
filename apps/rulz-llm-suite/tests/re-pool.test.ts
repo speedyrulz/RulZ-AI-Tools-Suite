@@ -9,7 +9,7 @@ import { LANE_STAGGER_MS, PracticePool, type PoolDeps, type PoolHost, type PoolS
 import { poolHandlers } from '../src/main/re/poolIpc'
 import type { SessionDeps, SessionResult, SessionSpec } from '../src/main/re/session'
 
-const task = (id: string, family = 'xor'): RePracticeTask => ({ id, family, tier: 'easy', binary: `${id}.exe`, prompt: `Solve {exe}` })
+const task = (id: string, family = 'xor'): RePracticeTask => ({ id, family, tier: 'easy', binary: `${id}.exe`, prompt: `Solve {exe}`, set: 'original' })
 const tasks = (n: number): RePracticeTask[] => Array.from({ length: n }, (_, i) => task(`t${String(i + 1).padStart(2, '0')}`))
 
 const host = (n: number, o: Partial<PoolHost> = {}): PoolHost => ({

@@ -181,7 +181,7 @@ async function setup(opts: { fallback?: boolean } = {}) {
     re: {
       overview: async (m?: string) => {
         state.overviewModel.push(m)
-        return buildOverview({ chats: [], traces: [], practice: { kitDir: 'k', tasks: [] }, recording: false, model: m })
+        return buildOverview({ chats: [], traces: [], practice: { kitDir: 'k', tasks: [], sets: [] }, recording: false, model: m })
       }
     } as never
   })
