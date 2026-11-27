@@ -4,8 +4,8 @@ A Windows app for merging image models with ComfyUI: checkpoint with checkpoint,
 checkpoint, with sample grids at different mixes so you can compare the results before you save one. Part of the
 RulZ AI Tools family.
 
-**Version 0.3 merges checkpoints and diffusion models and bakes LoRAs into them.** LoRA+LoRA merges and sample grids
-come in the next versions.
+**Version 0.4 merges checkpoints and diffusion models, bakes LoRAs into them, and merges LoRAs with LoRAs.** Sample
+grids come in the next version.
 
 **[Download](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/releases)** (or install it from the [RulZ AI Tools Suite](https://github.com/speedyrulz/RulZ-AI-Tools-Suite) launcher, under **ComfyUI**) · **[Wiki](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/Model-Merger)**
 
@@ -77,6 +77,33 @@ text-encoder strength.
   On a server reached by URL this check is not possible, and the app says so.
 - The LoRA files and their header hashes are stored in the recipe with the saved file.
 
+## Merging LoRAs
+
+The **LoRA merge** page combines two to ten LoRAs into one new LoRA. The app computes it itself, on the CPU in a
+background thread; ComfyUI does not need to run. It reads the LoRAs from the own server's models folder
+(`models/loras`) and saves the result to `models/loras/merged/`, where ComfyUI lists it.
+
+Each LoRA gets a weight (the slider covers −2 to 2, the number box takes −10 to 10; negative weights subtract a LoRA).
+
+| Result | What it computes |
+| --- | --- |
+| Keep every rank (exact) | Stacks the LoRAs along the rank. The result equals the weighted sum of their changes exactly (up to the saved precision); its rank is the sum of the inputs' ranks, so the file is as large as the inputs together. |
+| Shrink to a smaller rank | Reduces each layer of that exact result to the chosen rank (8 to 512) with an SVD of the small factors, never the full weight matrix. The app reports how much of each layer it kept (mean and lowest). |
+
+- **Check before merging.** The app reads each LoRA's header and blocks the merge when a file cannot be merged (LoKr,
+  LoHa, DoRA, LoCon mid weights, full diffs), when the LoRAs use different layer names (different trainers or model
+  types), when they share no layer, or when a shared layer has different shapes. It warns when they share less than
+  half their layers, name different base models, or add up to more than 8 GiB (the app holds them in memory).
+- **Check after saving.** The app reads the saved file back and compares 16 of its layers with the weighted sum of the
+  inputs. For an exact merge they must agree within the rounding of the saved precision.
+- **Saving.** The result and its `.recipe.json` (inputs, weights, mode, rank, app version, the inputs' header hashes)
+  are written in a staging folder under the own server's base folder, then moved into `models/loras/merged/`. An
+  existing file is never overwritten; the new one gets `-2`, `-3`... instead. **Cancel** stops the merge and removes
+  only its own partial file.
+- **Speed** (CPU, two MOSS LoRAs of rank 32 with 252 layers): exact merge 11 s, shrink to rank 32 about 25 s.
+- LoRA files reached through a symbolic link with an absolute target cannot be read from Windows over
+  `\\wsl.localhost\`; use a hard link or a copy in the models folder.
+
 ## Requirements
 
 - Windows 10 or 11 with WSL 2 and a distro that has ComfyUI installed. The defaults are `Ubuntu-24.04` and
@@ -146,7 +173,7 @@ npm test
 
 ## Limits of this version
 
-- No LoRA+LoRA merges and no sample grids yet.
+- No sample grids yet.
 - Merging and baking have been run on the CPU only; neither has been tried on a GPU yet.
 - **Load my custom nodes** has not been tried with a real set of node packs yet.
 - The own server runs bash without a login shell, so variables set in `~/.bashrc` (for example CUDA paths) are not

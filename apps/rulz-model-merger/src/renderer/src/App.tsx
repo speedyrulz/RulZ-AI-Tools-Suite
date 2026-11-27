@@ -4,10 +4,12 @@ import { NavRail } from './components/shell/NavRail'
 import { TopBar } from './components/shell/TopBar'
 import { TooltipProvider } from './components/ui'
 import { EmptyPage } from './pages/EmptyPage'
+import { LoraMergePage } from './pages/LoraMergePage'
 import { MergePage } from './pages/MergePage'
 import { ServerPage } from './pages/ServerPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { useApp, type Page } from './stores/app'
+import { useLoraMerge } from './stores/loraMerge'
 import { useMerge } from './stores/merge'
 
 const EMPTY: Partial<Record<Page, { title: string; text: string }>> = {
@@ -18,6 +20,7 @@ const EMPTY: Partial<Record<Page, { title: string; text: string }>> = {
 
 function CurrentPage({ page }: { page: Page }) {
   if (page === 'merge') return <MergePage />
+  if (page === 'loras') return <LoraMergePage />
   if (page === 'server') return <ServerPage />
   if (page === 'settings') return <SettingsPage />
   const e = EMPTY[page]
@@ -34,6 +37,7 @@ export function App() {
   useEffect(() => init(), [init])
   // Merge jobs are followed for the whole session, also while another page is open.
   useEffect(() => useMerge.getState().init(), [])
+  useEffect(() => useLoraMerge.getState().init(), [])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
