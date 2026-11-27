@@ -264,9 +264,10 @@ export function outsidePaths(command: string, root: string): string[] {
   for (const m of command.matchAll(BARE_DRIVE)) found.push(m[1])
   // On the whole command: a quoted `"/Program Files/x"` was taken out of `rest` above only when it starts with a drive.
   // Quoted ones are checked whole (they may contain spaces) and then left out of the unquoted check.
-  const unquoted = command.replace(QUOTED_SLASH_ROOT, (_m, _q: string, p: string) => {
+  const unquoted = command.replace(QUOTED_SLASH_ROOT, (whole, _q: string, p: string) => {
     if (!isInside(root, resolve(root, p)) && (rootFolderExists(root, p) || KNOWN_ROOT_START.test(p))) found.push(p)
-    return ' '
+    // A string that runs code (`"/x$(Remove-Item /Users/y)"`) stays in, so what it runs is checked too.
+    return /\$[({]|`/.test(p) ? whole : ' '
   })
   for (const m of unquoted.matchAll(SLASH_ROOT)) {
     if (!isInside(root, resolve(root, m[1])) && rootFolderExists(root, m[1])) found.push(m[1])

@@ -80,7 +80,9 @@ describe('deleting outside the project, written so the old filter missed it', ()
       'Remove-Item -Recurse "$pwd\\.."',
       'cd src; Remove-Item -Recurse "$pwd\\dist\\..\\cache"',
       'Remove-Item -Recurse /Users/other',
-      'Remove-Item -Recurse "/Program Files/x y"'
+      'Remove-Item -Recurse "/Program Files/x y"',
+      // Code inside a quoted slash path is checked too.
+      'Write-Output "/x$(Remove-Item -Recurse /Users/other)"'
     ])
       expect(verdict(cmd, 'C:\\Users\\me\\app'), cmd).toMatchObject({ verdict: 'refuse' })
   })
@@ -89,6 +91,7 @@ describe('deleting outside the project, written so the old filter missed it', ()
     for (const cmd of [
       'Remove-Item -Recurse "/Users/me/app/dist"',
       'Remove-Item -Recurse /Users/me/app/dist',
+      'Remove-Item -Recurse "/Users/me/app/my dist"',
       'Remove-Item -Recurse -Force "$pwd\\dist\\..\\cache"',
       'Remove-Item (Split-Path ($f) -Leaf)',
       'Get-ChildItem -Recurse -Directory | Where-Object { $_.Name -eq "bin" -and $_.Parent.Name -eq "src" } | Remove-Item -Recurse -Force',
