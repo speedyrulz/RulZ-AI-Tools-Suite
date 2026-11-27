@@ -101,11 +101,26 @@ export function completeBlocks(recipe: MergeRecipe, blockInputs: string[]): Merg
   return { ...recipe, blocks }
 }
 
-export function buildMergeGraph(recipe: MergeRecipe): BuiltGraph {
+export interface MergeSubgraph {
+  nodes: Record<string, unknown>
+  model: [string, number]
+  clip: [string, number] | null
+  vae: [string, number] | null
+}
+
+/** The loaders, merge nodes and LoRA chain of a recipe, without a save node. Node ids are `${idPrefix}1`, `${idPrefix}2`, ... */
+export function buildMergeModelSubgraph(recipe: MergeRecipe, idPrefix: string): MergeSubgraph {
+  return buildSubgraph(recipe, idPrefix).graph
+}
+
+function buildSubgraph(
+  recipe: MergeRecipe,
+  idPrefix: string
+): { graph: MergeSubgraph; add: (c: string, i: Record<string, unknown>) => string } {
   const prompt: Record<string, unknown> = {}
   let next = 1
   const add = (class_type: string, inputs: Record<string, unknown>): string => {
-    const id = String(next++)
+    const id = `${idPrefix}${next++}`
     prompt[id] = { class_type, inputs }
     return id
   }
@@ -164,13 +179,9 @@ export function buildMergeGraph(recipe: MergeRecipe): BuiltGraph {
     merged = [add('ModelMergeSimple', { model1: model(a), model2: model(b), ratio }), 0]
   }
 
-  const name = sanitizeOutputName(recipe.outputName)
   if (!isCkpt) {
-    const subfolder = 'diffusion_models'
-    const filenamePrefix = `${subfolder}/${name}`
     const out = applyLoras(merged, null)
-    add('ModelSave', { model: out.model, filename_prefix: filenamePrefix })
-    return { prompt, saveNode: 'ModelSave', outputSubfolder: subfolder, filenamePrefix }
+    return { graph: { nodes: prompt, model: out.model, clip: null, vae: null }, add }
   }
 
   let clip: Link
@@ -183,9 +194,21 @@ export function buildMergeGraph(recipe: MergeRecipe): BuiltGraph {
     clip = [add('CLIPMergeSimple', { clip1: clipOf(a), clip2: clipOf(b), ratio }), 0]
   }
   const vae = !bake && b && recipe.vae === 'b' ? vaeOf(b) : vaeOf(a)
+  const out = applyLoras(merged, clip)
+  return { graph: { nodes: prompt, model: out.model, clip: out.clip, vae }, add }
+}
+
+export function buildMergeGraph(recipe: MergeRecipe): BuiltGraph {
+  const { graph, add } = buildSubgraph(recipe, '')
+  const name = sanitizeOutputName(recipe.outputName)
+  if (recipe.kind !== 'checkpoint') {
+    const subfolder = 'diffusion_models'
+    const filenamePrefix = `${subfolder}/${name}`
+    add('ModelSave', { model: graph.model, filename_prefix: filenamePrefix })
+    return { prompt: graph.nodes, saveNode: 'ModelSave', outputSubfolder: subfolder, filenamePrefix }
+  }
   const subfolder = 'checkpoints'
   const filenamePrefix = `${subfolder}/${name}`
-  const out = applyLoras(merged, clip)
-  add('CheckpointSave', { model: out.model, clip: out.clip, vae, filename_prefix: filenamePrefix })
-  return { prompt, saveNode: 'CheckpointSave', outputSubfolder: subfolder, filenamePrefix }
+  add('CheckpointSave', { model: graph.model, clip: graph.clip, vae: graph.vae, filename_prefix: filenamePrefix })
+  return { prompt: graph.nodes, saveNode: 'CheckpointSave', outputSubfolder: subfolder, filenamePrefix }
 }
