@@ -2,13 +2,19 @@ import { GitMerge } from 'lucide-react'
 import { useEffect } from 'react'
 import { CheckPanel } from '../components/merge/CheckPanel'
 import { JobsCard } from '../components/merge/JobsCard'
-import { MixCard, SourcesCard } from '../components/merge/RecipeCards'
+import { LorasCard } from '../components/merge/LorasCard'
+import { BakeOutputCard, MixCard, SourcesCard } from '../components/merge/RecipeCards'
 import { Button, Card, PageTitle, Tooltip } from '../components/ui'
 import { jobIsActive, validOutputName } from '../lib/merge'
 import { useApp } from '../stores/app'
 import { useMerge } from '../stores/merge'
 
-const NODES_BY_MODE = { weighted: ['ModelMergeSimple'], addDifference: ['ModelMergeSubtract', 'ModelMergeAdd'], blocks: [] } as const
+const NODES_BY_MODE = {
+  weighted: ['ModelMergeSimple'],
+  addDifference: ['ModelMergeSubtract', 'ModelMergeAdd'],
+  blocks: [],
+  bake: []
+} as const
 
 export function MergePage() {
   const status = useApp((s) => s.status)
@@ -41,7 +47,7 @@ export function MergePage() {
               ? 'Merges run in the queue of the connected ComfyUI. This server was not started by this app, so you need to agree to share its queue on the Server page.'
               : status?.reachable
                 ? 'Loading the models of the server.'
-                : 'Merges are run by ComfyUI, so they need a connection. Start the app\'s own server or connect to a URL on the Server page.'}
+                : "Merges are run by ComfyUI, so they need a connection. Start the app's own server or connect to a URL on the Server page."}
           </p>
           <div className="mt-4">
             <Button variant="primary" onClick={() => setPage('server')}>
@@ -58,7 +64,9 @@ export function MergePage() {
   const missingNodes = [...NODES_BY_MODE[recipe.mode]].filter((n) => caps.nodes[n] === false)
   let reason: string | null = null
   if (busy) reason = 'A merge of this app is still running. Wait for it or cancel it.'
-  else if (!recipe.a || !recipe.b) reason = 'Choose A and B.'
+  else if (recipe.mode === 'bake' ? !recipe.a : !recipe.a || !recipe.b) reason = recipe.mode === 'bake' ? 'Choose A.' : 'Choose A and B.'
+  else if (recipe.mode === 'bake' && !recipe.loras.some((l) => l.name)) reason = 'Add at least one LoRA to bake.'
+  else if (recipe.loras.some((l) => !l.name)) reason = 'Pick a LoRA in every row or remove the empty ones.'
   else if (recipe.mode === 'addDifference' && !recipe.c) reason = 'Choose C.'
   else if (recipe.mode === 'blocks' && !recipe.blockNode) reason = 'Choose a block node.'
   else if (!validOutputName(recipe.outputName)) reason = 'Give the output a valid name.'
@@ -69,7 +77,7 @@ export function MergePage() {
   else if (check.problems.length > 0) reason = 'Fix the problems in the check first.'
   else if (starting) reason = 'Starting.'
 
-  const ready = !!recipe.a && !!recipe.b && (recipe.mode !== 'addDifference' || !!recipe.c)
+  const ready = !!recipe.a && (recipe.mode === 'bake' || !!recipe.b) && (recipe.mode !== 'addDifference' || !!recipe.c)
   const button = (
     <Button variant="primary" size="lg" disabled={reason !== null} onClick={() => void start()}>
       <GitMerge size={18} />
@@ -79,10 +87,13 @@ export function MergePage() {
 
   return (
     <div className="space-y-6">
-      <PageTitle title="Merge">Mix two or three models into one new file. ComfyUI does the work and saves it in its output folder.</PageTitle>
+      <PageTitle title="Merge">
+        Mix two or three models into one new file, or bake LoRAs into one. ComfyUI does the work and saves it in its output folder.
+      </PageTitle>
       <SourcesCard caps={caps} />
-      <MixCard check={check} />
-      <CheckPanel check={check} checking={checking} ready={ready} />
+      {recipe.mode === 'bake' ? <BakeOutputCard /> : <MixCard check={check} />}
+      <LorasCard caps={caps} />
+      <CheckPanel check={check} checking={checking} ready={ready} kind={recipe.kind} />
       <div className="flex items-center gap-4">
         {reason ? (
           <Tooltip content={reason}>

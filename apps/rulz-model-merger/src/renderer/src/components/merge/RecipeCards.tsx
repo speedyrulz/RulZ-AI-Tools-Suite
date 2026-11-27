@@ -15,10 +15,18 @@ export function SourcesCard({ caps }: { caps: ServerCapabilities }) {
   const recipe = useMerge((s) => s.recipe)
   const setRecipe = useMerge((s) => s.setRecipe)
   const list = recipe.kind === 'diffusion' ? caps.diffusionModels : caps.checkpoints
+  const bake = recipe.mode === 'bake'
   const loaderMissing = caps.nodes[recipe.kind === 'diffusion' ? 'UNETLoader' : 'CheckpointLoaderSimple'] === false
 
   return (
-    <Card title="Sources" description="The files to mix. A is the base. Every file comes from the server's model folders.">
+    <Card
+      title="Sources"
+      description={
+        bake
+          ? "The model the LoRAs are baked into. The file comes from the server's model folders."
+          : "The files to mix. A is the base. Every file comes from the server's model folders."
+      }
+    >
       <div className="space-y-4">
         <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
           <Field label="Type of file">
@@ -40,7 +48,8 @@ export function SourcesCard({ caps }: { caps: ServerCapabilities }) {
               options={[
                 { value: 'weighted', label: 'Weighted' },
                 { value: 'addDifference', label: 'Add difference' },
-                { value: 'blocks', label: 'Per block' }
+                { value: 'blocks', label: 'Per block' },
+                { value: 'bake', label: 'Bake LoRAs' }
               ]}
             />
           </Field>
@@ -50,16 +59,16 @@ export function SourcesCard({ caps }: { caps: ServerCapabilities }) {
             ? 'A diffusion model is the image network alone (models/diffusion_models).'
             : 'A full checkpoint holds the image network, the text encoder and the VAE (models/checkpoints).'}
         </p>
-        {loaderMissing && (
-          <p className="text-[13px] text-danger-text">This server has no loader node for this type of file, so it cannot be merged here.</p>
-        )}
-        <div className={cn('grid gap-4', recipe.mode === 'addDifference' ? 'lg:grid-cols-3' : 'lg:grid-cols-2')}>
-          <Field label="A (base)">
+        {loaderMissing && <p className="text-[13px] text-danger-text">This server has no loader node for this type of file, so it cannot be merged here.</p>}
+        <div className={cn('grid gap-4', bake ? 'lg:grid-cols-1' : recipe.mode === 'addDifference' ? 'lg:grid-cols-3' : 'lg:grid-cols-2')}>
+          <Field label={bake ? 'A (model to bake into)' : 'A (base)'}>
             <ModelSelect label="Model A" value={recipe.a} options={list} placeholder="Choose model A" onChange={(a) => setRecipe({ a })} />
           </Field>
-          <Field label="B">
-            <ModelSelect label="Model B" value={recipe.b} options={list} placeholder="Choose model B" onChange={(b) => setRecipe({ b })} />
-          </Field>
+          {!bake && (
+            <Field label="B">
+              <ModelSelect label="Model B" value={recipe.b} options={list} placeholder="Choose model B" onChange={(b) => setRecipe({ b })} />
+            </Field>
+          )}
           {recipe.mode === 'addDifference' && (
             <Field label="C" hint="Subtracted from B. Usually the base model B was trained from.">
               <ModelSelect label="Model C" value={recipe.c ?? ''} options={list} placeholder="Choose model C" onChange={(c) => setRecipe({ c })} />
@@ -184,10 +193,75 @@ function BlockControls({ check, recipe }: { check: MergeCheck | null; recipe: Me
   )
 }
 
-export function MixCard({ check }: { check: MergeCheck | null }) {
+function PrecisionField() {
+  const recipe = useMerge((s) => s.recipe)
+  const setRecipe = useMerge((s) => s.setRecipe)
+  if (recipe.kind !== 'diffusion') return null
+  return (
+    <div className="max-w-xs">
+      <Field label="Precision" hint="fp8 halves the file size and loses some detail.">
+        <select
+          aria-label="Precision"
+          className={SELECT_CLASS}
+          value={recipe.weightDtype}
+          onChange={(e) => setRecipe({ weightDtype: e.target.value as UnetDtype })}
+        >
+          {DTYPES.map((d) => (
+            <option key={d.value} value={d.value}>
+              {d.label}
+            </option>
+          ))}
+        </select>
+      </Field>
+    </div>
+  )
+}
+
+function OutputNameField() {
   const recipe = useMerge((s) => s.recipe)
   const setRecipe = useMerge((s) => s.setRecipe)
   const nameBad = !validOutputName(recipe.outputName)
+  return (
+    <div className="max-w-md">
+      <Field
+        label="Output name"
+        hint={
+          nameBad ? (
+            <span className="text-danger-text">Use letters, digits, spaces and - _ . only.</span>
+          ) : (
+            <>Saved as {recipe.outputName.trim()}_00001_.safetensors in the server&apos;s output folder.</>
+          )
+        }
+      >
+        <DebouncedInput
+          aria-label="Output name"
+          value={recipe.outputName}
+          delay={250}
+          onCommit={(outputName) => setRecipe({ outputName })}
+          onDraft={(outputName) => {
+            if (outputName !== useMerge.getState().recipe.outputName) setRecipe({ outputName })
+          }}
+        />
+      </Field>
+    </div>
+  )
+}
+
+/** Bake mode has no Mix card; this keeps the precision and the output name. */
+export function BakeOutputCard() {
+  return (
+    <Card title="Output" description="How the baked file is saved.">
+      <div className="space-y-5">
+        <PrecisionField />
+        <OutputNameField />
+      </div>
+    </Card>
+  )
+}
+
+export function MixCard({ check }: { check: MergeCheck | null }) {
+  const recipe = useMerge((s) => s.recipe)
+  const setRecipe = useMerge((s) => s.setRecipe)
 
   return (
     <Card title="Mix" description="How much of each source goes into the result.">
@@ -251,47 +325,8 @@ export function MixCard({ check }: { check: MergeCheck | null }) {
           </div>
         )}
 
-        {recipe.kind === 'diffusion' && (
-          <div className="max-w-xs">
-            <Field label="Precision" hint="fp8 halves the file size and loses some detail.">
-              <select
-                aria-label="Precision"
-                className={SELECT_CLASS}
-                value={recipe.weightDtype}
-                onChange={(e) => setRecipe({ weightDtype: e.target.value as UnetDtype })}
-              >
-                {DTYPES.map((d) => (
-                  <option key={d.value} value={d.value}>
-                    {d.label}
-                  </option>
-                ))}
-              </select>
-            </Field>
-          </div>
-        )}
-
-        <div className="max-w-md">
-          <Field
-            label="Output name"
-            hint={
-              nameBad ? (
-                <span className="text-danger-text">Use letters, digits, spaces and - _ . only.</span>
-              ) : (
-                <>Saved as {recipe.outputName.trim()}_00001_.safetensors in the server&apos;s output folder.</>
-              )
-            }
-          >
-            <DebouncedInput
-              aria-label="Output name"
-              value={recipe.outputName}
-              delay={250}
-              onCommit={(outputName) => setRecipe({ outputName })}
-              onDraft={(outputName) => {
-                if (outputName !== useMerge.getState().recipe.outputName) setRecipe({ outputName })
-              }}
-            />
-          </Field>
-        </div>
+        <PrecisionField />
+        <OutputNameField />
       </div>
     </Card>
   )

@@ -39,6 +39,7 @@ describe('toUncPath / sourcePath', () => {
   it('joins kind folder and name, sub-folders allowed', () => {
     expect(sourcePath('/m', 'checkpoint', 'x/y.safetensors')).toBe('/m/checkpoints/x/y.safetensors')
     expect(sourcePath('/m/', 'diffusion', 'a b.safetensors')).toBe('/m/diffusion_models/a b.safetensors')
+    expect(sourcePath('/m', 'lora', 'sub/x.safetensors')).toBe('/m/loras/sub/x.safetensors')
   })
   it('rejects .. and absolute names', () => {
     expect(() => sourcePath('/m', 'diffusion', '../x.safetensors')).toThrow()
@@ -46,6 +47,8 @@ describe('toUncPath / sourcePath', () => {
     expect(() => sourcePath('/m', 'diffusion', '/etc/passwd')).toThrow()
     expect(() => sourcePath('/m', 'diffusion', 'C:\\x')).toThrow()
     expect(() => sourcePath('/m', 'diffusion', '')).toThrow()
+    expect(() => sourcePath('/m', 'lora', '../x.safetensors')).toThrow()
+    expect(() => sourcePath('/m', 'lora', '/etc/passwd')).toThrow()
   })
 })
 

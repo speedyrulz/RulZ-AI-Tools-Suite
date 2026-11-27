@@ -225,6 +225,12 @@ async function main(): Promise<void> {
     getConnection: () => connectionStatus(),
     getOwnRecord: () => ownServer.record(),
     ownSettings: () => settings.get().ownServer,
+    onServerLog: (listener) => {
+      ownServer.on('log', listener)
+      return () => {
+        ownServer.off('log', listener)
+      }
+    },
     appVersion: app.getVersion()
   })
   mergeRunner.on('job', (job: MergeJob) => broadcast('merge:job', job))

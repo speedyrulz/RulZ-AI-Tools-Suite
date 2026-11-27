@@ -4,7 +4,8 @@ A Windows app for merging image models with ComfyUI: checkpoint with checkpoint,
 checkpoint, with sample grids at different mixes so you can compare the results before you save one. Part of the
 RulZ AI Tools family.
 
-**Version 0.2 merges checkpoints and diffusion models.** LoRA merges and sample grids come in the next versions.
+**Version 0.3 merges checkpoints and diffusion models and bakes LoRAs into them.** LoRA+LoRA merges and sample grids
+come in the next versions.
 
 **[Download](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/releases)** (or install it from the [RulZ AI Tools Suite](https://github.com/speedyrulz/RulZ-AI-Tools-Suite) launcher, under **ComfyUI**) · **[Wiki](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/Model-Merger)**
 
@@ -58,6 +59,23 @@ folder, with text encoder and VAE).
   `-3`... instead.
 - **Cancel** removes only this merge from the queue or stops it while it runs, also on a server you share.
 - One merge runs at a time. On the CPU a merge of two 5 GB models takes about three minutes.
+
+## Baking LoRAs
+
+**Bake LoRAs** applies one or more LoRAs to model A and saves the result as a new model. LoRAs can also be added in the
+other modes; they are then applied to the merge result. Up to 10 LoRAs, applied in the order of the list, each with its
+own strength (the slider covers −2 to 2, the number box takes −10 to 10). For a full checkpoint each LoRA also has a
+text-encoder strength.
+
+- **Fit check before baking.** The app reads each LoRA's header: its format (LoRA, LoKr, LoHa, DoRA), rank, and how many
+  of its layers are in model A, also when A stores q, k and v as one fused layer. A LoRA none of whose layers are in A
+  (made for another model type) blocks the bake; one that fits only partly gives a warning. LoRAs with diffusers layer
+  names (`transformer.…`) are mapped by ComfyUI itself, so the app cannot check them beforehand and says so.
+- **Check after baking** (own server). ComfyUI logs every LoRA weight it could not place (`lora key not loaded`). The
+  app counts these lines for the job and marks the result as failed if any were skipped, with a few of the key names.
+  Text-encoder weights in a diffusion-model bake are counted apart, because a diffusion-model file has no text encoder.
+  On a server reached by URL this check is not possible, and the app says so.
+- The LoRA files and their header hashes are stored in the recipe with the saved file.
 
 ## Requirements
 
@@ -128,8 +146,8 @@ npm test
 
 ## Limits of this version
 
-- No LoRA merges and no sample grids yet.
-- Merging has been run on the CPU only; a merge on a GPU has not been tried yet.
+- No LoRA+LoRA merges and no sample grids yet.
+- Merging and baking have been run on the CPU only; neither has been tried on a GPU yet.
 - **Load my custom nodes** has not been tried with a real set of node packs yet.
 - The own server runs bash without a login shell, so variables set in `~/.bashrc` (for example CUDA paths) are not
   read. ComfyUI on the CPU and on a GPU with the venv's own CUDA libraries does not need them.

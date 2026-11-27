@@ -206,7 +206,7 @@ describe('blockNodeOptions', () => {
 })
 
 describe('checkMerge', () => {
-  const base = { kind: 'diffusion' as const, objectInfo, ramFreeBytes: null }
+  const base = { kind: 'diffusion' as const, objectInfo, ramFreeBytes: null, loras: [] }
 
   it('passes for two matching files and suggests the block node', () => {
     const a = header(layers('double_blocks.0.x.', 10, [4, 4]))

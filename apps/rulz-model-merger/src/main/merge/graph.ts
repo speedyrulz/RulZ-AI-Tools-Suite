@@ -1,5 +1,5 @@
 // Builds the ComfyUI API-format prompt for a merge recipe. Pure; ids are stable strings so output is deterministic.
-import type { MergeRecipe } from '@shared/merge'
+import { MAX_LORAS, type LoraEntry, type MergeRecipe } from '@shared/merge'
 import type { ServerCapabilities } from '@shared/types'
 
 export interface BuiltGraph {
@@ -34,9 +34,10 @@ export function validateRecipe(recipe: MergeRecipe, caps: ServerCapabilities, bl
     if (!name) problems.push(`Choose model ${label}.`)
     else if (!list.includes(name)) problems.push(`Model ${label} "${name}" is not in the server's ${listName} list.`)
   }
+  const bake = recipe.mode === 'bake'
   checkName('A', recipe.a)
-  checkName('B', recipe.b)
-  if (recipe.a && recipe.a === recipe.b) problems.push('A and B are the same file. Choose two different models.')
+  if (!bake) checkName('B', recipe.b)
+  if (!bake && recipe.a && recipe.a === recipe.b) problems.push('A and B are the same file. Choose two different models.')
   if (recipe.mode === 'addDifference') {
     checkName('C', recipe.c)
     if (recipe.c && recipe.c === recipe.a) problems.push('C is the same file as A. Choose a different model C.')
@@ -48,7 +49,25 @@ export function validateRecipe(recipe: MergeRecipe, caps: ServerCapabilities, bl
     need('ModelMergeSubtract')
     need('ModelMergeAdd')
   }
-  if (isCkpt && recipe.clip === 'merge' && recipe.mode !== 'addDifference') need('CLIPMergeSimple')
+  if (isCkpt && recipe.clip === 'merge' && (recipe.mode === 'weighted' || recipe.mode === 'blocks')) need('CLIPMergeSimple')
+
+  const loras = recipe.loras ?? []
+  if (bake && loras.length === 0) problems.push('Add at least one LoRA to bake.')
+  if (loras.length > MAX_LORAS) problems.push(`At most ${MAX_LORAS} LoRAs can be baked at once.`)
+  loras.forEach((l, i) => {
+    const label = l.name ? `LoRA "${l.name}"` : `LoRA ${i + 1}`
+    if (!l.name || l.name.trim() === '') problems.push(`Choose a file for LoRA ${i + 1}.`)
+    else if (caps.loras.length > 0 && !caps.loras.includes(l.name)) {
+      problems.push(`${label} is not in the server's loras list.`)
+    }
+    if (!Number.isFinite(l.strength) || l.strength < -10 || l.strength > 10) {
+      problems.push(`The strength of ${label} must be between -10 and 10.`)
+    }
+    if (!Number.isFinite(l.clipStrength) || l.clipStrength < -10 || l.clipStrength > 10) {
+      problems.push(`The text encoder strength of ${label} must be between -10 and 10.`)
+    }
+  })
+  if (loras.length > 0) need(isCkpt ? 'LoraLoader' : 'LoraLoaderModelOnly')
   // CLIPMergeSubtract / CLIPMergeAdd are not in caps.nodes: accepted here, the server reports them if missing.
 
   if (recipe.mode === 'blocks') {
@@ -65,8 +84,10 @@ export function validateRecipe(recipe: MergeRecipe, caps: ServerCapabilities, bl
       if (!Number.isFinite(v) || v < 0 || v > 1) problems.push(`Block "${k}" must be between 0 and 1.`)
     }
   }
-  if (!Number.isFinite(recipe.ratio) || recipe.ratio < 0 || recipe.ratio > 1) problems.push('The ratio must be between 0 and 1.')
-  if (!Number.isFinite(recipe.multiplier) || recipe.multiplier < 0 || recipe.multiplier > 2) {
+  if (!bake && (!Number.isFinite(recipe.ratio) || recipe.ratio < 0 || recipe.ratio > 1)) {
+    problems.push('The ratio must be between 0 and 1.')
+  }
+  if (!bake && (!Number.isFinite(recipe.multiplier) || recipe.multiplier < 0 || recipe.multiplier > 2)) {
     problems.push('The multiplier must be between 0 and 2.')
   }
   if (!recipe.outputName || recipe.outputName.trim() === '') problems.push('Enter a name for the merged file.')
@@ -97,15 +118,42 @@ export function buildMergeGraph(recipe: MergeRecipe): BuiltGraph {
     isCkpt
       ? add('CheckpointLoaderSimple', { ckpt_name: name })
       : add('UNETLoader', { unet_name: name, weight_dtype: recipe.weightDtype })
+  const bake = recipe.mode === 'bake'
+  const loras: LoraEntry[] = recipe.loras ?? []
   const a = load(recipe.a)
-  const b = load(recipe.b)
-  const c = needC ? load(recipe.c as string) : null
+  const b = bake ? null : load(recipe.b)
+  const c = needC && !bake ? load(recipe.c as string) : null
   const model = (id: string): Link => [id, 0]
   const clipOf = (id: string): Link => [id, 1]
   const vaeOf = (id: string): Link => [id, 2]
 
+  /** Chains the LoRAs (in order) onto the final model (and clip, for checkpoints). */
+  const applyLoras = (m: Link, cl: Link | null): { model: Link; clip: Link | null } => {
+    let curM = m
+    let curC = cl
+    for (const l of loras) {
+      const strength = r4(clamp(l.strength, -10, 10))
+      if (isCkpt && curC) {
+        const id = add('LoraLoader', {
+          model: curM,
+          clip: curC,
+          lora_name: l.name,
+          strength_model: strength,
+          strength_clip: r4(clamp(l.clipStrength, -10, 10))
+        })
+        curM = [id, 0]
+        curC = [id, 1]
+      } else {
+        curM = [add('LoraLoaderModelOnly', { model: curM, lora_name: l.name, strength_model: strength }), 0]
+      }
+    }
+    return { model: curM, clip: curC }
+  }
+
   let merged: Link
-  if (recipe.mode === 'addDifference' && c) {
+  if (bake || !b) {
+    merged = model(a)
+  } else if (recipe.mode === 'addDifference' && c) {
     const diff = add('ModelMergeSubtract', { model1: model(b), model2: model(c), multiplier })
     merged = [add('ModelMergeAdd', { model1: model(a), model2: [diff, 0] }), 0]
   } else if (recipe.mode === 'blocks') {
@@ -120,12 +168,13 @@ export function buildMergeGraph(recipe: MergeRecipe): BuiltGraph {
   if (!isCkpt) {
     const subfolder = 'diffusion_models'
     const filenamePrefix = `${subfolder}/${name}`
-    add('ModelSave', { model: merged, filename_prefix: filenamePrefix })
+    const out = applyLoras(merged, null)
+    add('ModelSave', { model: out.model, filename_prefix: filenamePrefix })
     return { prompt, saveNode: 'ModelSave', outputSubfolder: subfolder, filenamePrefix }
   }
 
   let clip: Link
-  if (recipe.clip === 'a') clip = clipOf(a)
+  if (bake || !b || recipe.clip === 'a') clip = clipOf(a)
   else if (recipe.clip === 'b') clip = clipOf(b)
   else if (recipe.mode === 'addDifference' && c) {
     const diff = add('CLIPMergeSubtract', { clip1: clipOf(b), clip2: clipOf(c), multiplier })
@@ -133,9 +182,10 @@ export function buildMergeGraph(recipe: MergeRecipe): BuiltGraph {
   } else {
     clip = [add('CLIPMergeSimple', { clip1: clipOf(a), clip2: clipOf(b), ratio }), 0]
   }
-  const vae = recipe.vae === 'b' ? vaeOf(b) : vaeOf(a)
+  const vae = !bake && b && recipe.vae === 'b' ? vaeOf(b) : vaeOf(a)
   const subfolder = 'checkpoints'
   const filenamePrefix = `${subfolder}/${name}`
-  add('CheckpointSave', { model: merged, clip, vae, filename_prefix: filenamePrefix })
+  const out = applyLoras(merged, clip)
+  add('CheckpointSave', { model: out.model, clip: out.clip, vae, filename_prefix: filenamePrefix })
   return { prompt, saveNode: 'CheckpointSave', outputSubfolder: subfolder, filenamePrefix }
 }

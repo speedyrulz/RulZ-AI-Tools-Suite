@@ -1,5 +1,5 @@
 import { AlertTriangle, Loader2, XCircle } from 'lucide-react'
-import type { MergeCheck, ModelFileInfo } from '@shared/merge'
+import type { LoraFileInfo, MergeCheck, MergeRecipe, ModelFileInfo } from '@shared/merge'
 import { formatBytesGiB, splitName } from '../../lib/merge'
 import { Badge, Card } from '../ui'
 
@@ -23,7 +23,41 @@ function SourceLine({ letter, info }: { letter: string; info: ModelFileInfo }) {
   )
 }
 
-export function CheckPanel({ check, checking, ready }: { check: MergeCheck | null; checking: boolean; ready: boolean }) {
+function loraFormat(l: LoraFileInfo): string {
+  return l.rank !== null ? `${l.format} r${l.rank}` : l.format
+}
+
+function LoraLine({ info, kind }: { info: LoraFileInfo; kind: MergeRecipe['kind'] }) {
+  return (
+    <li className="space-y-0.5 text-[13px]">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="min-w-0 truncate" title={info.name}>
+          {splitName(info.name).file}
+        </span>
+        {info.readable ? (
+          <>
+            <Badge tone="neutral">{loraFormat(info)}</Badge>
+            {info.match !== null ? (
+              <Badge tone={info.match >= 0.9 ? 'ok' : 'warn'}>fits A: {Math.round(info.match * 100)}%</Badge>
+            ) : (
+              (info.keyStyle === 'diffusers' || info.keyStyle === 'unknown') && <span className="text-xs text-faint">fit checked after the bake</span>
+            )}
+            {info.baseModelHint && <span className="text-xs text-faint">made for {info.baseModelHint}</span>}
+          </>
+        ) : (
+          <span className="text-muted">could not be read: {info.error ?? 'unknown reason'}</span>
+        )}
+      </div>
+      {info.readable && info.textEncoderModules > 0 && kind === 'diffusion' && (
+        <p className="text-xs text-faint">
+          {info.textEncoderModules.toLocaleString('en-US')} text encoder modules in this LoRA are left out: a diffusion model file has no text encoder.
+        </p>
+      )}
+    </li>
+  )
+}
+
+export function CheckPanel({ check, checking, ready, kind }: { check: MergeCheck | null; checking: boolean; ready: boolean; kind: MergeRecipe['kind'] }) {
   return (
     <Card title="Check" description="Looks at the files before anything is loaded.">
       {!ready && !checking && <p className="text-[13px] text-muted">Choose the sources to check them.</p>}
@@ -40,6 +74,16 @@ export function CheckPanel({ check, checking, ready }: { check: MergeCheck | nul
             {check.b && <SourceLine letter="B" info={check.b} />}
             {check.c && <SourceLine letter="C" info={check.c} />}
           </ul>
+          {check.loras.length > 0 && (
+            <div>
+              <h3 className="mb-1.5 text-xs font-medium text-muted">LoRAs</h3>
+              <ul className="space-y-2">
+                {check.loras.map((l, i) => (
+                  <LoraLine key={`${i}-${l.name}`} info={l} kind={kind} />
+                ))}
+              </ul>
+            </div>
+          )}
           {check.ramNeededBytes !== null && (
             <p className="text-[13px] text-muted">
               Needs about {formatBytesGiB(check.ramNeededBytes)} of memory

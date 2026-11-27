@@ -3,7 +3,19 @@ import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import type { MergeJob } from '@shared/merge'
 import { cn } from '../../lib/format'
-import { JOB_STATUS, formatBytesGiB, formatElapsed, formulaText, jobElapsed, jobIsActive, progressFraction, splitName, verifyText } from '../../lib/merge'
+import {
+  JOB_STATUS,
+  formatBytesGiB,
+  formatElapsed,
+  formulaText,
+  jobElapsed,
+  jobIsActive,
+  loraSummary,
+  loraVerifyText,
+  progressFraction,
+  splitName,
+  verifyText
+} from '../../lib/merge'
 import { useMerge } from '../../stores/merge'
 import { Button, Card, IconButton, StatusChip } from '../ui'
 
@@ -28,7 +40,26 @@ function copyText(text: string): void {
 
 function summary(job: MergeJob): string {
   const r = job.recipe
-  return `${splitName(r.a).file} and ${splitName(r.b).file}${r.c ? ` and ${splitName(r.c).file}` : ''}`
+  const sources = r.mode === 'bake' ? splitName(r.a).file : `${splitName(r.a).file} and ${splitName(r.b).file}${r.c ? ` and ${splitName(r.c).file}` : ''}`
+  const loras = loraSummary(r.loras ?? [], r.kind)
+  return loras ? `${sources} + LoRAs: ${loras}` : sources
+}
+
+function LoraResult({ verify, hasLoras }: { verify: NonNullable<NonNullable<MergeJob['output']>['verify']>; hasLoras: boolean }) {
+  const res = loraVerifyText(verify, hasLoras)
+  const sample = (verify.loraKeysNotLoadedSample ?? []).join('\n')
+  return (
+    <>
+      {res && (
+        <p className={cn('text-[13px]', res.tone === 'ok' ? 'text-ok' : 'text-warn-text')} title={res.tone === 'warn' && sample ? sample : undefined}>
+          {res.text}
+        </p>
+      )}
+      {verify.loraTextEncoderKeysSkipped > 0 && (
+        <p className="text-[13px] text-muted">{verify.loraTextEncoderKeysSkipped.toLocaleString('en-US')} text-encoder weights left out</p>
+      )}
+    </>
+  )
 }
 
 function JobRow({ job, now }: { job: MergeJob; now: number }) {
@@ -69,8 +100,17 @@ function JobRow({ job, now }: { job: MergeJob; now: number }) {
               </span>
             )}
           </div>
-          <div className="h-1.5 overflow-hidden rounded-full bg-border" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={frac === null ? undefined : Math.round(frac * 100)}>
-            <div className={cn('h-full bg-accent transition-[width]', frac === null && 'w-1/3 animate-pulse')} style={frac === null ? undefined : { width: `${frac * 100}%` }} />
+          <div
+            className="h-1.5 overflow-hidden rounded-full bg-border"
+            role="progressbar"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={frac === null ? undefined : Math.round(frac * 100)}
+          >
+            <div
+              className={cn('h-full bg-accent transition-[width]', frac === null && 'w-1/3 animate-pulse')}
+              style={frac === null ? undefined : { width: `${frac * 100}%` }}
+            />
           </div>
         </div>
       )}
@@ -80,13 +120,19 @@ function JobRow({ job, now }: { job: MergeJob; now: number }) {
       {out && (
         <div className="mt-3 space-y-2">
           <div className="flex items-center gap-1">
-            <code className="min-w-0 flex-1 rounded-md border border-border bg-panel px-2 py-1 font-mono text-xs break-all select-text">{out.wslPath ?? out.relPath}</code>
+            <code className="min-w-0 flex-1 rounded-md border border-border bg-panel px-2 py-1 font-mono text-xs break-all select-text">
+              {out.wslPath ?? out.relPath}
+            </code>
             <IconButton label="Copy path" onClick={() => copyText(out.wslPath ?? out.relPath)}>
               <Copy size={14} />
             </IconButton>
           </div>
           {out.sizeBytes !== null && <p className="text-xs text-faint">{formatBytesGiB(out.sizeBytes)}</p>}
           {out.verify && <p className={cn('text-[13px]', out.verify.ok ? 'text-ok' : 'text-danger-text')}>{verifyText(out.verify)}</p>}
+          {out.verify && <LoraResult verify={out.verify} hasLoras={(job.recipe.loras ?? []).some((l) => l.name)} />}
+          {!job.own && job.status === 'done' && (job.recipe.loras ?? []).some((l) => l.name) && (
+            <p className="text-[13px] text-muted">Whether every LoRA weight was applied is only known on the app's own server.</p>
+          )}
           {out.movedTo ? (
             <p className="text-[13px] text-muted">
               Now in models: <code className="font-mono text-xs break-all select-text">{out.movedTo}</code>

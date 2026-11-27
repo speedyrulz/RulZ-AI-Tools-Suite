@@ -14,6 +14,7 @@ import type {
   MergeJob,
   MergeOutput,
   MergeRecipe,
+  LoraFileInfo,
   MergeVerify,
   ModelFileInfo,
   RecipeRecord
@@ -23,7 +24,7 @@ import { parseCapabilities } from '../comfy/parse'
 import type { WslRunner } from '../server/wsl'
 import { readSafetensorsHeader, type SafetensorsHeader } from '../models/safetensors'
 import { buildMergeGraph, completeBlocks, validateRecipe, type BuiltGraph } from './graph'
-import { blockNodeOptions, checkMerge, describeModelFile, normalizeKeys } from './inspect'
+import { blockNodeOptions, checkMerge, describeLoraFile, describeModelFile, isTextEncoderLoraKey, normalizeKeys } from './inspect'
 import {
   freeMemoryBytes,
   listOutputCandidates,
@@ -62,6 +63,8 @@ export interface MergeRunnerDeps {
   /** The running own server's launch record (frozen distro and absolute base directory), or null. */
   getOwnRecord: () => { distro: string; baseDir: string } | null
   ownSettings: () => OwnServerSettings
+  /** Subscribes to the own server's log text; returns the unsubscribe function. Used to find LoRA weights ComfyUI skipped. */
+  onServerLog?: (listener: (text: string) => void) => () => void
   appVersion: string
   now?: () => number
   newId?: () => string
@@ -72,6 +75,22 @@ export interface MergeRunnerDeps {
   /** Wait between looks for the saved file after success. Default 500 ms, 6 looks. */
   findRetryMs?: number
   objectInfoTtlMs?: number
+}
+
+/**
+ * Keys ComfyUI reports as skipped while applying a LoRA: lines "lora key not loaded: <key>" or "NOT LOADED <key>".
+ * Windows line endings are accepted; keys are returned once each, in order of appearance.
+ */
+export function parseLoraNotLoaded(text: string): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const line of text.split(/\r?\n/)) {
+    const m = /lora key not loaded:\s*(\S+)/i.exec(line) ?? /\bNOT LOADED\s+(\S+)/.exec(line)
+    if (!m || seen.has(m[1])) continue
+    seen.add(m[1])
+    out.push(m[1])
+  }
+  return out
 }
 
 export const URL_MODE_MESSAGE = 'Files of a server the app did not start cannot be read; ComfyUI checks them when the merge runs.'
@@ -93,6 +112,11 @@ interface Ctx {
   early: Array<{ promptId: string; run: () => void }>
   /** Polls in a row where history had no entry and the queue did not list the prompt. */
   missing: number
+  /** Own-server log collection for a job with LoRAs (null when not collecting). */
+  logUnsub: (() => void) | null
+  /** The unfinished last log line. */
+  logPartial: string
+  notLoaded: Set<string>
 }
 
 const TERMINAL = new Set(['done', 'error', 'cancelled'])
@@ -157,19 +181,31 @@ export class MergeRunner extends EventEmitter {
     }
   }
 
+  private async readLora(modelsAbs: string, distro: string, name: string, aHeader: SafetensorsHeader | null): Promise<{ info: LoraFileInfo; header: SafetensorsHeader | null }> {
+    try {
+      const header = await readSafetensorsHeader(this.unc(distro, sourcePath(modelsAbs, 'lora', name)))
+      return { info: describeLoraFile(name, header, aHeader, null), header }
+    } catch (e) {
+      return { info: describeLoraFile(name, null, null, (e as Error).message), header: null }
+    }
+  }
+
   async inspect(req: MergeInspectRequest): Promise<MergeCheck> {
     const conn = await this.d.getConnection()
     if (!conn.url || !conn.reachable) throw new Error('No ComfyUI server is connected.')
     const client = this.d.client(conn.url)
     const objectInfo = await this.objectInfo(conn.url, client)
     const record = conn.own ? this.d.getOwnRecord() : null
+    const bake = req.mode === 'bake'
+    const loraNames = req.loras ?? []
     const names: Array<[string | null, 'a' | 'b' | 'c']> = [
       [req.a || null, 'a'],
-      [req.b || null, 'b'],
+      [bake ? null : req.b || null, 'b'],
       [req.mode === 'addDifference' ? req.c || null : null, 'c']
     ]
     const sides: Record<'a' | 'b' | 'c', { info: ModelFileInfo; header: SafetensorsHeader | null } | null> = { a: null, b: null, c: null }
     let ramFreeBytes: number | null = null
+    let loras: LoraFileInfo[]
     if (record) {
       const modelsAbs = await resolveModelsDir(this.d.wsl, record.distro, this.d.ownSettings())
       const [read, ram] = await Promise.all([
@@ -178,10 +214,12 @@ export class MergeRunner extends EventEmitter {
       ])
       for (const r of read) if (r) sides[r[0]] = r[1]
       ramFreeBytes = ram
+      loras = (await Promise.all(loraNames.map((n) => this.readLora(modelsAbs, record.distro, n, sides.a?.header ?? null)))).map((r) => r.info)
     } else {
       for (const [n, k] of names) if (n) sides[k] = { info: describeModelFile(n, null, URL_MODE_MESSAGE), header: null }
+      loras = loraNames.map((n) => describeLoraFile(n, null, null, URL_MODE_MESSAGE))
     }
-    return checkMerge({ kind: req.kind, mode: req.mode, a: sides.a, b: sides.b, c: sides.c, objectInfo, ramFreeBytes })
+    return checkMerge({ kind: req.kind, mode: req.mode, a: sides.a, b: sides.b, c: sides.c, objectInfo, ramFreeBytes, loras })
   }
 
   async start(requested: MergeRecipe): Promise<MergeJob> {
@@ -220,7 +258,9 @@ export class MergeRunner extends EventEmitter {
     const subfolder = slash >= 0 ? graph.filenamePrefix.slice(0, slash) : graph.outputSubfolder
 
     const record = conn.own ? this.d.getOwnRecord() : null
-    const hashes: RecipeRecord['sourceHeaderSha256'] = { a: null, b: null, c: null }
+    const loraList = recipe.loras ?? []
+    const hashes: RecipeRecord['sourceHeaderSha256'] = { a: null, b: null, c: null, loras: loraList.map(() => null) }
+    let loraInfos: LoraFileInfo[] = loraList.map((l) => describeLoraFile(l.name, null, null, URL_MODE_MESSAGE))
     let aHeader: SafetensorsHeader | null = null
     const sides: Record<'a' | 'b' | 'c', { info: ModelFileInfo; header: SafetensorsHeader | null } | null> = { a: null, b: null, c: null }
     const before = new Set<string>()
@@ -229,7 +269,7 @@ export class MergeRunner extends EventEmitter {
       const modelsAbs = await resolveModelsDir(this.d.wsl, record.distro, this.d.ownSettings())
       const names: Array<[string | null, 'a' | 'b' | 'c']> = [
         [recipe.a, 'a'],
-        [recipe.b, 'b'],
+        [recipe.mode === 'bake' ? null : recipe.b, 'b'],
         [recipe.mode === 'addDifference' ? recipe.c : null, 'c']
       ]
       await Promise.all(
@@ -241,7 +281,12 @@ export class MergeRunner extends EventEmitter {
           if (k === 'a') aHeader = r.header
         })
       )
-      const check = checkMerge({ kind: recipe.kind, mode: recipe.mode, a: sides.a, b: sides.b, c: sides.c, objectInfo, ramFreeBytes: null })
+      const loraReads = await Promise.all(loraList.map((l) => this.readLora(modelsAbs, record.distro, l.name, aHeader)))
+      loraInfos = loraReads.map((r) => r.info)
+      loraReads.forEach((r, i) => {
+        if (r.header) hashes.loras[i] = r.header.headerSha256
+      })
+      const check = checkMerge({ kind: recipe.kind, mode: recipe.mode, a: sides.a, b: sides.b, c: sides.c, objectInfo, ramFreeBytes: null, loras: loraInfos })
       if (check.problems.length) throw new Error(check.problems.join(' '))
       for (const c of await listOutputCandidates(this.d.wsl, record.distro, `${record.baseDir}/output`, subfolder, stem)) before.add(c.name)
     }
@@ -268,16 +313,18 @@ export class MergeRunner extends EventEmitter {
       output: null,
       error: null
     }
-    const ctx: Ctx = { job, client, ws: null, timer: null, graph, record, stem, subfolder, before, aHeader, recipeRecord, finalizing: false, early: [], missing: 0 }
+    const ctx: Ctx = { job, client, ws: null, timer: null, graph, record, stem, subfolder, before, aHeader, recipeRecord, finalizing: false, early: [], missing: 0, logUnsub: null, logPartial: '', notLoaded: new Set() }
 
     const clientId = `rulz-model-merger-${job.id}`
     // The socket opens before the prompt is queued, so no event is missed.
     ctx.ws = client.openEvents(clientId, this.handlers(ctx))
+    // ComfyUI logs the LoRA weights it could not map; only the app's own server's log is visible here.
+    if (record && loraList.length && this.d.onServerLog) ctx.logUnsub = this.d.onServerLog((text) => this.feedLog(ctx, text))
     let queued: { promptId: string; number: number }
     try {
       queued = await client.queuePrompt(graph.prompt, clientId, { extra_pnginfo: { modelmerger_recipe: recipeRecord } })
     } catch (e) {
-      ctx.ws.close()
+      this.stop(ctx)
       throw e
     }
     job.promptId = queued.promptId
@@ -361,6 +408,20 @@ export class MergeRunner extends EventEmitter {
     ctx.timer = null
     ctx.ws?.close()
     ctx.ws = null
+    ctx.logUnsub?.()
+    ctx.logUnsub = null
+  }
+
+  /** Server log text arrives in chunks that may split lines: complete lines are parsed, the rest waits for more. */
+  private feedLog(ctx: Ctx, text: string): void {
+    const all = ctx.logPartial + text
+    const cut = all.lastIndexOf('\n')
+    if (cut < 0) {
+      ctx.logPartial = all.length > 20_000 ? all.slice(-20_000) : all
+      return
+    }
+    ctx.logPartial = all.slice(cut + 1)
+    for (const k of parseLoraNotLoaded(all.slice(0, cut))) ctx.notLoaded.add(k)
   }
 
   private fail(ctx: Ctx, message: string): void {
@@ -458,6 +519,32 @@ export class MergeRunner extends EventEmitter {
   }
 
   private verify(ctx: Ctx, header: SafetensorsHeader): MergeVerify {
+    const v = this.verifyKeys(ctx, header)
+    const loras = ctx.job.recipe.loras ?? []
+    // Only the app's own server's log is seen; without LoRAs or without it nothing is known about skipped weights.
+    if (!loras.length || !ctx.record) return v
+    if (!ctx.logUnsub) return v
+    for (const k of parseLoraNotLoaded(ctx.logPartial)) ctx.notLoaded.add(k)
+    const diffusion = ctx.job.recipe.kind === 'diffusion'
+    const lost: string[] = []
+    let te = 0
+    for (const k of ctx.notLoaded) {
+      if (diffusion && isTextEncoderLoraKey(k)) te++
+      else lost.push(k)
+    }
+    v.loraKeysNotLoaded = lost.length
+    v.loraKeysNotLoadedSample = lost.slice(0, 5)
+    v.loraTextEncoderKeysSkipped = te
+    if (lost.length > 0) {
+      v.ok = false
+      v.message += ` ${lost.length} LoRA weights were not applied (for example ${lost.slice(0, 3).join(', ')}); the LoRA may be for another model.`
+    }
+    if (te > 0) v.message += ` ${te} text-encoder weights left out (a diffusion-model file has no text encoder).`
+    if (lost.length === 0 && te === 0) v.message += ' LoRAs applied: all weights.'
+    return v
+  }
+
+  private verifyKeys(ctx: Ctx, header: SafetensorsHeader): MergeVerify {
     const recipeInHeader = Object.prototype.hasOwnProperty.call(header.metadata, 'modelmerger_recipe')
     const tensorCount = Object.keys(header.tensors).length
     if (!ctx.aHeader) {
@@ -467,6 +554,9 @@ export class MergeRunner extends EventEmitter {
         missingKeys: 0,
         extraKeys: 0,
         recipeInHeader,
+        loraKeysNotLoaded: null,
+        loraKeysNotLoadedSample: [],
+        loraTextEncoderKeysSkipped: 0,
         message: `Saved ${tensorCount} tensors. Model A's header could not be read, so the keys were not compared with it.`
       }
     }
@@ -492,7 +582,7 @@ export class MergeRunner extends EventEmitter {
       const names = buffers.slice(0, 3).join(', ') + (buffers.length > 3 ? ', ...' : '')
       message += ` ${buffers.length} buffer${buffers.length === 1 ? '' : 's'} not saved (${names}); ComfyUI rebuilds ${buffers.length === 1 ? 'it' : 'them'} when loading.`
     }
-    return { ok, tensorCount, missingKeys: missing, extraKeys: extra, recipeInHeader, message }
+    return { ok, tensorCount, missingKeys: missing, extraKeys: extra, recipeInHeader, loraKeysNotLoaded: null, loraKeysNotLoadedSample: [], loraTextEncoderKeysSkipped: 0, message }
   }
 
   async cancel(id: string): Promise<MergeJob> {
