@@ -4,8 +4,9 @@ A Windows app for merging image models with ComfyUI: checkpoint with checkpoint,
 checkpoint, with sample grids at different mixes so you can compare the results before you save one. Part of the
 RulZ AI Tools family.
 
-**Version 0.5 merges checkpoints and diffusion models, bakes LoRAs into them, merges LoRAs with LoRAs, and renders
-sample grids of a merge at several values with your own ComfyUI workflow.**
+**Version 0.6 merges checkpoints and diffusion models, bakes LoRAs into them, merges LoRAs with LoRAs, renders
+sweeps of a merge at several values with your own ComfyUI workflow, shows them on a Results page made for comparing,
+and keeps a history of everything you merged or rendered.**
 
 **[Download](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/releases)** (or install it from the [RulZ AI Tools Suite](https://github.com/speedyrulz/RulZ-AI-Tools-Suite) launcher, under **ComfyUI**) · **[Wiki](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/Model-Merger)**
 
@@ -110,11 +111,14 @@ Each LoRA gets a weight (the slider covers −2 to 2, the number box takes −10
 
 ![The LoRA merge page shrinking three LoRAs to rank 32 (made-up files)](docs/screenshots/06-lora-merge-dark.png)
 
-## Sample grids
+## Sweeps
 
-The **Grids** page renders the merge set up on the Merge page at 2 to 8 values of one setting (the columns) for 1 to 4
-prompts (the rows), with the same seed in every image, so you can compare the values side by side. No model file is
-saved: each image builds the merge inside its own ComfyUI job.
+The **Sweep** page renders the merge set up on the Merge page at 2 to 8 values of one setting (the columns) as a grid
+of sample images, so you can compare the values side by side. No model file is saved: each image builds the merge
+inside its own ComfyUI job.
+
+The rows are either **prompts** (1 to 4 prompts, the same seed in every image) or **seeds** (one prompt, 1 to 4 seeds,
+to see whether a difference holds for other seeds).
 
 | Setting to vary | Mode on the Merge page |
 | --- | --- |
@@ -136,16 +140,41 @@ saved: each image builds the merge inside its own ComfyUI job.
 - The images run one at a time, column by column, so the models of one column are loaded once. **Cancel** removes only
   this grid's job from the queue or stops it while it runs (on a server you share, a job that is already running
   finishes and its image is dropped).
-- **Results.** Each grid is kept in the app's data folder with its images, the workflow it used and a `grid.json` with
-  the recipe and values. **Save grid image** saves one PNG with the labels; **Use this value** sets the Merge page to
-  that column's value, keeping your output name. **Earlier grids** lists the saved ones; deleting one moves its folder
-  to the Recycle Bin.
+- Each sweep is kept in the app's data folder with its images, the workflow it used and a `grid.json` with the recipe,
+  values and starred cells. **Use this value** sets the Merge page to that column's value, keeping your output name.
 - **Speed** (RTX 4060 Ti, Krea 2 int8 at 1 megapixel and 8 steps, three LoRA strengths): 60 s for the first image
   with model loading, about 40 s for each of the others.
 
+![The Sweep page with seed rows and a finished 3 × 2 grid (made-up files, drawn sample images)](docs/screenshots/09-sweep-seeds-dark.png)
+
+## Results
+
+The **Results** page shows any finished sweep for a close look.
+
+- **Full size:** click a cell (or press Enter on it). Arrow keys move along the row and the column, Esc closes.
+- **Compare two cells:** pick them with their **A/B** button (or Ctrl+click). **Flip** shows one at a time and swaps on
+  Space or a click; **Side by side** shows both, and the mouse wheel zooms and dragging pans both pictures together.
+- **Stars** mark the cells you like; they are saved with the sweep. **Starred only** shows just those.
+- **Save this mix** sends the picked cell's value to the Merge page. **Save grid image** saves one labelled PNG of the
+  whole grid; **Save image** in the full-size view saves one cell.
+
 | Dark | Light |
 | --- | --- |
-| ![A finished 4 × 2 ratio grid (made-up files, drawn sample images)](docs/screenshots/07-grid-dark.png) | ![The same grid in light mode](docs/screenshots/08-grid-light.png) |
+| ![Results: a 4 × 2 ratio grid with two cells side by side (made-up files, drawn sample images)](docs/screenshots/10-results-dark.png) | ![The same in light mode](docs/screenshots/13-results-light.png) |
+
+## History
+
+The **History** page lists every merge, bake, LoRA merge and sweep, newest first, and keeps them after the app closes
+(merges in `history.json` in the app's data folder, sweeps in their own folders). Filter by kind or search by name.
+
+- **Reopen** fills the entry's page with its recipe. For a sweep this also sets the Merge page to the sweep's merge and
+  loads its workflow again.
+- **Re-run** reopens the entry and starts it, with the same checks as that page's start button; if a check fails it
+  stops and says why. A re-run of a merge or sweep queues work on your ComfyUI server.
+- **Remove from history** forgets a merge entry (the saved file stays). **Delete grid** moves a sweep's folder to the
+  Recycle Bin.
+
+![The History page (made-up files)](docs/screenshots/12-history-dark.png)
 
 ## Requirements
 
@@ -208,7 +237,8 @@ npm test
 | `src/main/settings.ts` | Settings file with defaults and checks. |
 | `src/main/comfy/` | ComfyUI client: HTTP, websocket events, parsing of `/system_stats` and `/object_info`. |
 | `src/main/merge/` | Merges: file checks, ComfyUI graphs, the job runner, moving files in WSL. |
-| `src/main/grid/` | Sample grids: reading and rewriting the workflow template, running the grid, its folder. |
+| `src/main/grid/` | Sweeps: reading and rewriting the workflow template, running the grid, its folder, starred cells. |
+| `src/main/history/` | `history.json`: finished merges, bakes and LoRA merges. |
 | `src/main/models/` | Reads the header of a `.safetensors` file. |
 | `src/main/server/` | The own server: WSL scripts, start and stop, checks before starting, GPUs, ports. |
 | `src/shared/` | Types and IPC channels shared by both sides. |
@@ -217,9 +247,10 @@ npm test
 
 ## Limits of this version
 
-- Merging and baking have been run on the CPU only. A sample grid with a baked LoRA has run on a GPU (RTX 4060 Ti);
-  grids of ratio and multiplier sweeps have not been tried on a GPU yet.
-- The Grids page has been tested with 12 real workflows (Krea 2, Qwen-Image 2.1, FLUX.2 Klein); other workflow shapes
+- Merging and baking have been run on the CPU only. A sweep of one LoRA's strength has run on a GPU (RTX 4060 Ti);
+  ratio and multiplier sweeps and seed rows have not been tried on a GPU yet.
+- The Sweep page has been tested with 12 real workflows (Krea 2, Qwen-Image 2.1, FLUX.2 Klein); other workflow shapes
   may not be read correctly, and the app then says what it could not find.
+- The Results and History pages have been tried with made-up data in the built window, not yet with real renders.
 - The own server runs bash without a login shell, so variables set in `~/.bashrc` (for example CUDA paths) are not
   read. ComfyUI on the CPU and on a GPU with the venv's own CUDA libraries does not need them.

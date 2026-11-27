@@ -1,13 +1,15 @@
 import { create } from 'zustand'
 import { toast } from 'sonner'
-import type { GridJob, GridRequest, GridTemplateInfo } from '@shared/grid'
+import type { GridJob, GridRequest, GridRowKind, GridTemplateInfo } from '@shared/grid'
 import { GRID_MAX_PROMPTS } from '@shared/grid'
 import { call, errText, invoke } from '../lib/api'
 import {
   AXIS_DEFAULT,
-  activePrompts,
+  addSeed,
+  buildGridRequest,
   clampSteps,
   dropGridImages,
+  formFromRequest,
   formatValues,
   generateValues,
   imageKey,
@@ -15,12 +17,16 @@ import {
   parseValues,
   pruneImages,
   randomSeed,
+  randomSeeds,
   recalledTemplatePath,
   rememberTemplatePath,
   removeGrid,
+  removeSeed,
   resolveAxisOption,
+  setSeedAt,
   upsertGrid
 } from '../lib/grid'
+import { mergePageWillChange } from '../lib/history'
 import { useMerge } from './merge'
 
 interface GridStore {
@@ -32,8 +38,12 @@ interface GridStore {
   to: number
   steps: number
   valuesText: string
+  /** What the rows are. Seed rows use the first prompt only. */
+  rowKind: GridRowKind
   prompts: string[]
   seed: number
+  /** Seed rows: 1..GRID_MAX_SEEDS distinct seeds. */
+  seeds: number[]
   grids: GridJob[]
   selectedId: string | null
   /** data: URLs of cell images, by "<gridId>/<file>". */
@@ -50,6 +60,16 @@ interface GridStore {
   removePrompt: (i: number) => void
   setSeed: (seed: number) => void
   rollSeed: () => void
+  setRowKind: (kind: GridRowKind) => void
+  setSeedAt: (i: number, seed: number) => void
+  addSeedRow: () => void
+  removeSeedRow: (i: number) => void
+  /** Gives every seed row a new random seed (all different). */
+  rollSeeds: () => void
+  /** Fills the Sweep form from a finished grid's request (Reopen): the recipe goes to the Merge store, the rest to this
+   *  store, and the workflow is loaded again from its path. Resolves true when the workflow loaded without error; on
+   *  failure a toast says so, the workflow is cleared and the rest stays filled. */
+  loadRequest: (req: GridRequest) => Promise<boolean>
   select: (id: string) => void
   loadList: () => Promise<void>
   ensureImage: (gridId: string, file: string) => Promise<void>
@@ -73,8 +93,10 @@ export const useGrid = create<GridStore>((set, get) => ({
   to: AXIS_DEFAULT.ratio.to,
   steps: 5,
   valuesText: formatValues(generateValues(AXIS_DEFAULT.ratio.from, AXIS_DEFAULT.ratio.to, 5)),
+  rowKind: 'prompts',
   prompts: [''],
   seed: randomSeed(),
+  seeds: randomSeeds(2),
   grids: [],
   selectedId: null,
   images: {},
@@ -143,6 +165,56 @@ export const useGrid = create<GridStore>((set, get) => ({
   setSeed: (seed) => set({ seed }),
   rollSeed: () => set({ seed: randomSeed() }),
 
+  setRowKind: (rowKind) => {
+    if (rowKind === get().rowKind) return
+    set({ rowKind })
+    if (get().seeds.length === 0) set({ seeds: randomSeeds(2) })
+  },
+  setSeedAt: (i, seed) => set({ seeds: setSeedAt(get().seeds, i, seed) }),
+  addSeedRow: () => set({ seeds: addSeed(get().seeds) }),
+  removeSeedRow: (i) => set({ seeds: removeSeed(get().seeds, i) }),
+  rollSeeds: () => set({ seeds: randomSeeds(Math.max(1, get().seeds.length)) }),
+
+  loadRequest: async (req) => {
+    const f = formFromRequest(req)
+    // As "Use this value" does: the recipe goes to the Merge page, which keeps its own output name.
+    const current = useMerge.getState().recipe
+    if (mergePageWillChange(current, req.recipe)) toast.info("The Merge page now holds this grid's merge.")
+    useMerge.getState().replaceRecipe({ ...req.recipe, outputName: current.outputName })
+    set({
+      axisKey: f.axisKey,
+      from: f.from,
+      to: f.to,
+      steps: f.steps,
+      valuesText: f.valuesText,
+      rowKind: f.rowKind,
+      prompts: f.prompts,
+      seed: f.seed,
+      ...(f.seeds ? { seeds: f.seeds } : {})
+    })
+    const seq = ++templateSeq
+    set({ loadingTemplate: true })
+    try {
+      const info = await invoke('grid:loadTemplate', req.templatePath)
+      if (seq !== templateSeq) return false
+      if (!info) throw new Error('The file was not found.')
+      set({ template: info })
+      if (info.error) {
+        toast.error(`The workflow ${info.name} has a problem: ${info.error}`)
+        return false
+      }
+      rememberTemplatePath(info.path)
+      return true
+    } catch (e) {
+      if (seq !== templateSeq) return false
+      set({ template: null })
+      toast.error(`The workflow of this grid could not be loaded (${req.templatePath}): ${errText(e)} Choose a workflow again.`)
+      return false
+    } finally {
+      if (seq === templateSeq) set({ loadingTemplate: false })
+    }
+  },
+
   select: (selectedId) => set({ selectedId }),
 
   loadList: async () => {
@@ -185,13 +257,16 @@ export const useGrid = create<GridStore>((set, get) => ({
     const recipe = useMerge.getState().recipe
     const opt = resolveAxisOption(recipe, s.axisKey)
     if (!opt || !s.template) return
-    const req: GridRequest = {
+    const req: GridRequest = buildGridRequest({
       recipe,
-      axis: { ...opt.axis, values: parseValues(s.valuesText).values },
-      prompts: activePrompts(s.prompts),
+      axis: opt,
+      valuesText: s.valuesText,
+      rowKind: s.rowKind,
+      prompts: s.prompts,
+      seeds: s.seeds,
       seed: s.seed,
       templatePath: s.template.path
-    }
+    })
     set({ starting: true })
     try {
       const job = await invoke('grid:start', req)

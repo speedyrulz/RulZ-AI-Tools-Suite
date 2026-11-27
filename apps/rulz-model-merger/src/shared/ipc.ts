@@ -10,7 +10,8 @@ import type {
 } from './types'
 import type { MergeCheck, MergeInspectRequest, MergeJob, MergeRecipe } from './merge'
 import type { LoraMergeCheck, LoraMergeInspectRequest, LoraMergeJob, LoraMergeRecipe } from './loraMerge'
-import type { GridJob, GridRequest, GridTemplateInfo } from './grid'
+import type { GridCellRef, GridJob, GridRequest, GridTemplateInfo } from './grid'
+import type { HistoryEntry } from './history'
 
 /** Request/response channels (renderer -> main). */
 export interface IpcInvoke {
@@ -68,6 +69,15 @@ export interface IpcInvoke {
   'grid:openFolder': (gridId: string) => void
   /** Deletes a grid folder (moves it to the Recycle Bin). */
   'grid:delete': (gridId: string) => void
+  /** Saves the starred cells of a finished (or stopped) grid in its grid.json; returns the updated job. Cells outside
+   *  the grid are dropped, duplicates removed. Rejects for a running grid. */
+  'grid:setFavourites': (gridId: string, cells: GridCellRef[]) => GridJob
+  /** Every finished merge, bake and LoRA merge (history.json) plus every grid (grid folders), newest first by
+   *  createdAt. Jobs still running are not listed. */
+  'history:list': () => HistoryEntry[]
+  /** Removes a merge or LoRA merge entry from history.json (the saved file is not touched). For a grid use
+   *  grid:delete. */
+  'history:remove': (kind: 'merge' | 'loraMerge', jobId: string) => void
 }
 
 /** Push channels (main -> renderer). */
@@ -78,6 +88,8 @@ export interface IpcEvents {
   'merge:job': MergeJob
   'loraMerge:job': LoraMergeJob
   'grid:job': GridJob
+  /** A merge or LoRA merge reached a final status and was added to history.json (grids: use grid:job). */
+  'history:changed': null
 }
 
 export type InvokeChannel = keyof IpcInvoke

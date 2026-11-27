@@ -3,31 +3,36 @@ import { Toaster } from 'sonner'
 import { NavRail } from './components/shell/NavRail'
 import { TopBar } from './components/shell/TopBar'
 import { TooltipProvider } from './components/ui'
-import { EmptyPage } from './pages/EmptyPage'
-import { GridPage } from './pages/GridPage'
+import { HistoryPage } from './pages/HistoryPage'
 import { LoraMergePage } from './pages/LoraMergePage'
 import { MergePage } from './pages/MergePage'
+import { ResultsPage } from './pages/ResultsPage'
 import { ServerPage } from './pages/ServerPage'
 import { SettingsPage } from './pages/SettingsPage'
+import { SweepPage } from './pages/SweepPage'
 import { useApp, type Page } from './stores/app'
 import { useGrid } from './stores/grid'
+import { useHistory } from './stores/history'
 import { useLoraMerge } from './stores/loraMerge'
 import { useMerge } from './stores/merge'
 
-const EMPTY: Partial<Record<Page, { title: string; text: string }>> = {
-  sweep: { title: 'Sweep', text: 'Sweeps come in a later version. Set up the ComfyUI connection on the Server page first.' },
-  results: { title: 'Results', text: 'Results come in a later version. Nothing has been rendered yet.' },
-  history: { title: 'History', text: 'History comes in a later version. Nothing has been merged yet.' }
-}
-
 function CurrentPage({ page }: { page: Page }) {
-  if (page === 'merge') return <MergePage />
-  if (page === 'loras') return <LoraMergePage />
-  if (page === 'grids') return <GridPage />
-  if (page === 'server') return <ServerPage />
-  if (page === 'settings') return <SettingsPage />
-  const e = EMPTY[page]
-  return e ? <EmptyPage title={e.title} text={e.text} /> : null
+  switch (page) {
+    case 'merge':
+      return <MergePage />
+    case 'loras':
+      return <LoraMergePage />
+    case 'sweep':
+      return <SweepPage />
+    case 'results':
+      return <ResultsPage />
+    case 'history':
+      return <HistoryPage />
+    case 'server':
+      return <ServerPage />
+    case 'settings':
+      return <SettingsPage />
+  }
 }
 
 export function App() {
@@ -42,6 +47,7 @@ export function App() {
   useEffect(() => useMerge.getState().init(), [])
   useEffect(() => useLoraMerge.getState().init(), [])
   useEffect(() => useGrid.getState().init(), [])
+  useEffect(() => useHistory.getState().init(), [])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {

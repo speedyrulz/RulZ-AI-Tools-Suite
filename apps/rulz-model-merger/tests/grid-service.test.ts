@@ -263,8 +263,9 @@ describe('start validation', () => {
     await bad({}, /Pick model B/)
     validate.mockImplementation(() => [])
     const svc = service()
-    await svc.start(req({ recipe: { ...recipe, outputName: '' } }))
+    const job = await svc.start(req({ recipe: { ...recipe, outputName: '' } }))
     expect((validate.mock.calls.at(-1)?.[0] as MergeRecipe).outputName).toBe('grid')
+    await waitDone(svc, job.id)
   })
   it('ignores the missing ModelSave / CheckpointSave problem, since grids save no model', async () => {
     validate.mockImplementation(() => ['The server has no ModelSave node.', 'The server has no CheckpointSave node.'])
@@ -752,6 +753,41 @@ describe('list', () => {
     expect(j.finishedAt).not.toBeNull()
   })
 
+  it('skips records that lack the shape the pages rely on', async () => {
+    const good = record('good', 'done', 10)
+    await put('good', JSON.stringify(good))
+    const variants: Record<string, (j: Record<string, unknown>) => void> = {
+      norecipe: (j) => {
+        delete (j.request as Record<string, unknown>).recipe
+      },
+      noaxis: (j) => {
+        delete (j.request as Record<string, unknown>).axis
+      },
+      novalues: (j) => {
+        ;((j.request as Record<string, unknown>).axis as Record<string, unknown>).values = 'x'
+      },
+      noprompts: (j) => {
+        delete (j.request as Record<string, unknown>).prompts
+      },
+      norequest: (j) => {
+        delete j.request
+      },
+      notime: (j) => {
+        j.createdAt = 'yesterday'
+      },
+      badcell: (j) => {
+        ;(j.cells as unknown[]).push(7)
+      }
+    }
+    for (const [name, mutate] of Object.entries(variants)) {
+      const rec = structuredClone(record(name, 'done', 20)) as unknown as { job: Record<string, unknown> }
+      mutate(rec.job)
+      await put(name, JSON.stringify(rec))
+    }
+    expect((await service().list()).map((j) => j.id)).toEqual(['good'])
+    await expect(service().setFavourites('norecipe', [])).rejects.toThrow(/not known/)
+  })
+
   it('returns an empty list when the folder does not exist', async () => {
     expect(await service().list()).toEqual([])
   })
@@ -836,5 +872,144 @@ describe('image, saveImage, openFolder, delete', () => {
     await svc.delete(job.id)
     expect(trashed).toEqual([join(gridsDir, job.id)])
     await expect(svc.delete('../x')).rejects.toThrow()
+  })
+})
+
+describe('seed rows', () => {
+  const seedReq = (over: Partial<GridRequest> = {}): GridRequest => req({ rowKind: 'seeds', prompts: ['one'], seeds: [11, 22, 33], ...over })
+  const bad = async (over: Partial<GridRequest>, re: RegExp): Promise<void> => {
+    await expect(service().start(seedReq(over))).rejects.toThrow(re)
+    expect(fake.client.queued).toHaveLength(0)
+  }
+
+  it('validates the prompt and the seeds', async () => {
+    await bad({ prompts: ['a', 'b'] }, /exactly 1 prompt/)
+    await bad({ prompts: [] }, /exactly 1 prompt/)
+    await bad({ prompts: ['  '] }, /needs text/)
+    await bad({ seeds: [] }, /1 to 4 seeds/)
+    await bad({ seeds: undefined }, /1 to 4 seeds/)
+    await bad({ seeds: [1, 2, 3, 4, 5] }, /1 to 4 seeds/)
+    await bad({ seeds: [1, 1] }, /different/)
+    await bad({ seeds: [-1] }, /whole number/)
+    await bad({ seeds: [1.5] }, /whole number/)
+    await bad({ seeds: [2 ** 53] }, /whole number/)
+    await bad({ seeds: [Number.NaN] }, /whole number/)
+    await bad({ rowKind: 'columns' as unknown as 'seeds' }, /Unknown kind of rows/)
+  })
+
+  it('accepts the largest seed and ignores the single seed field', async () => {
+    const svc = service()
+    const job = await svc.start(seedReq({ seeds: [0, 2 ** 53 - 1], seed: -5 }))
+    await waitDone(svc, job.id)
+  })
+
+  it('makes values x seeds cells, each with its own seed and the one prompt', async () => {
+    const svc = service()
+    const job = await svc.start(seedReq({ axis: { kind: 'ratio', loraIndex: null, values: [0.1, 0.9] } }))
+    expect(job.cells.map((c) => [c.col, c.row])).toEqual([
+      [0, 0], [1, 0],
+      [0, 1], [1, 1],
+      [0, 2], [1, 2]
+    ])
+    const done = await waitDone(svc, job.id)
+    expect(done.status).toBe('done')
+    expect(built.map((b) => [b.recipe.ratio, b.prompt, b.seed])).toEqual([
+      [0.1, 'one', 11], [0.1, 'one', 22], [0.1, 'one', 33],
+      [0.9, 'one', 11], [0.9, 'one', 22], [0.9, 'one', 33]
+    ])
+  })
+
+  it('still runs prompt rows with the one seed when rowKind is prompts or absent', async () => {
+    const svc = service()
+    const job = await svc.start(req({ rowKind: 'prompts', seeds: [9, 8] }))
+    await waitDone(svc, job.id)
+    expect(built.map((b) => [b.prompt, b.seed])).toEqual([['one', 5], ['two', 5], ['one', 5], ['two', 5]])
+  })
+
+  it('lists a grid from 0.5.0 without rowKind', async () => {
+    const old = req()
+    expect('rowKind' in old).toBe(false)
+    const job: GridJob = {
+      id: 'v05',
+      request: old,
+      templateName: 't.json',
+      status: 'done',
+      serverUrl: 'http://x',
+      own: true,
+      createdAt: 5,
+      finishedAt: 6,
+      cells: [0, 1].flatMap((row) => [0, 1].map((col) => ({ col, row, status: 'done' as const, file: `c${col}-r${row}.png`, error: null, seconds: 1 }))),
+      progress: null,
+      error: null
+    }
+    await mkdir(join(gridsDir, 'v05'), { recursive: true })
+    await writeFile(join(gridsDir, 'v05', 'grid.json'), JSON.stringify({ app: 'RulZ Model Merger', appVersion: '0.5.0', serverVersion: null, job }))
+    const [j] = await service().list()
+    expect(j.id).toBe('v05')
+    expect(j.favourites).toBeUndefined()
+    expect(j.cells).toHaveLength(4)
+  })
+})
+
+describe('favourites', () => {
+  it('keeps only cells inside the grid, removes duplicates, sorts, rewrites grid.json and emits the job', async () => {
+    const svc = service()
+    const job = await svc.start(req())
+    await waitDone(svc, job.id)
+    const events: GridJob[] = []
+    svc.on('job', (j: GridJob) => events.push(j))
+    const out = await svc.setFavourites(job.id, [
+      { col: 1, row: 1 },
+      { col: 0, row: 0 },
+      { col: 1, row: 1 },
+      { col: 2, row: 0 },
+      { col: 0, row: 2 },
+      { col: -1, row: 0 },
+      { col: 0.5, row: 0 },
+      { col: 1, row: 0 }
+    ])
+    expect(out.favourites).toEqual([{ col: 0, row: 0 }, { col: 1, row: 0 }, { col: 1, row: 1 }])
+    expect(events.at(-1)?.favourites).toEqual(out.favourites)
+    const rec = JSON.parse(await readFile(join(gridsDir, job.id, 'grid.json'), 'utf8')) as GridRecord
+    expect(rec.job.favourites).toEqual(out.favourites)
+    expect(rec.job.status).toBe('done')
+    expect((await svc.list())[0].favourites).toEqual(out.favourites)
+    const cleared = await svc.setFavourites(job.id, [])
+    expect(cleared.favourites).toEqual([])
+    expect((await readdir(join(gridsDir, job.id))).some((n) => n.endsWith('.tmp'))).toBe(false)
+  })
+
+  it('uses seed rows for the row count', async () => {
+    const svc = service()
+    const job = await svc.start(req({ rowKind: 'seeds', prompts: ['one'], seeds: [1, 2, 3] }))
+    await waitDone(svc, job.id)
+    const out = await svc.setFavourites(job.id, [{ col: 0, row: 2 }, { col: 0, row: 3 }])
+    expect(out.favourites).toEqual([{ col: 0, row: 2 }])
+  })
+
+  it('rejects a running grid and an unknown id', async () => {
+    fake.client.script = () => undefined
+    const svc = service()
+    const job = await svc.start(req())
+    await expect(svc.setFavourites(job.id, [{ col: 0, row: 0 }])).rejects.toThrow(/still running/)
+    await svc.cancel(job.id)
+    await expect(svc.setFavourites('nope', [])).rejects.toThrow(/not known/)
+    await expect(svc.setFavourites('../x', [])).rejects.toThrow(/not known/)
+  })
+
+  it('works on a grid from an earlier session and keeps the rest of the record', async () => {
+    const first = service()
+    const job = await first.start(req())
+    await waitDone(first, job.id)
+    const second = service()
+    const events: GridJob[] = []
+    second.on('job', (j: GridJob) => events.push(j))
+    const out = await second.setFavourites(job.id, [{ col: 1, row: 0 }])
+    expect(out.favourites).toEqual([{ col: 1, row: 0 }])
+    expect(events).toHaveLength(1)
+    const rec = JSON.parse(await readFile(join(gridsDir, job.id, 'grid.json'), 'utf8')) as GridRecord
+    expect(rec).toMatchObject({ app: 'RulZ Model Merger', appVersion: '9.9.9', serverVersion: '0.46' })
+    expect(rec.job.favourites).toEqual([{ col: 1, row: 0 }])
+    expect(rec.job.cells.every((c) => c.status === 'done')).toBe(true)
   })
 })

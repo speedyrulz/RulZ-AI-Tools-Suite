@@ -47,14 +47,28 @@ export interface GridTemplateInfo {
   defaultPrompt: string | null
 }
 
+/**
+ * What the rows are.
+ * - prompts: one row per prompt (1..GRID_MAX_PROMPTS), every cell uses `seed`.
+ * - seeds: one row per seed in `seeds` (1..GRID_MAX_SEEDS), every cell uses `prompts[0]` (exactly one prompt).
+ * Grids saved before 0.6.0 have no `rowKind`: read them as 'prompts'.
+ */
+export type GridRowKind = 'prompts' | 'seeds'
+
+export const GRID_MAX_SEEDS = 4
+
 export interface GridRequest {
   /** The merge (as on the Merge page). mode 'bake' is allowed (A + LoRAs). outputName is ignored. */
   recipe: MergeRecipe
   axis: GridAxis
-  /** 1..GRID_MAX_PROMPTS non-empty prompts, rows in order. */
+  /** Absent means 'prompts' (grids from 0.5.0). */
+  rowKind?: GridRowKind
+  /** rowKind 'prompts': 1..GRID_MAX_PROMPTS non-empty prompts, rows in order. rowKind 'seeds': exactly 1 prompt. */
   prompts: string[]
-  /** Same seed in every cell; 0..2^53-1 (integer). */
+  /** rowKind 'prompts': the seed of every cell. rowKind 'seeds': ignored (kept for display). 0..2^53-1 (integer). */
   seed: number
+  /** rowKind 'seeds' only: 1..GRID_MAX_SEEDS distinct seeds, rows in order (integers 0..2^53-1). */
+  seeds?: number[]
   /** Windows path of the template JSON (must have loaded without error). */
   templatePath: string
 }
@@ -62,7 +76,7 @@ export interface GridRequest {
 export type GridStatus = 'running' | 'done' | 'error' | 'cancelled'
 
 export interface GridCell {
-  /** Column (value index) and row (prompt index). */
+  /** Column (value index) and row (prompt or seed index). */
   col: number
   row: number
   status: 'pending' | 'running' | 'done' | 'error' | 'cancelled'
@@ -83,11 +97,43 @@ export interface GridJob {
   own: boolean
   createdAt: number
   finishedAt: number | null
-  /** values.length * prompts.length cells, row-major (row 0 first). */
+  /** values.length * gridRowCount(request) cells, row-major (row 0 first). */
   cells: GridCell[]
   /** Progress of the running cell from the websocket. */
   progress: { node: string | null; value: number; max: number } | null
   error: string | null
+  /** Cells the user starred on the Results page (absent in grids from 0.5.0 = none). Saved in grid.json. */
+  favourites?: GridCellRef[]
+}
+
+export interface GridCellRef {
+  col: number
+  row: number
+}
+
+/** 'prompts' for requests without rowKind (0.5.0 grids). */
+export function gridRowKind(req: GridRequest): GridRowKind {
+  return req.rowKind === 'seeds' ? 'seeds' : 'prompts'
+}
+
+/** Number of rows: prompts or seeds. */
+export function gridRowCount(req: GridRequest): number {
+  return gridRowKind(req) === 'seeds' ? (req.seeds ?? []).length : req.prompts.length
+}
+
+/** Prompt of a row. */
+export function gridCellPrompt(req: GridRequest, row: number): string {
+  return gridRowKind(req) === 'seeds' ? (req.prompts[0] ?? '') : (req.prompts[row] ?? '')
+}
+
+/** Seed of a row. */
+export function gridCellSeed(req: GridRequest, row: number): number {
+  return gridRowKind(req) === 'seeds' ? (req.seeds?.[row] ?? req.seed) : req.seed
+}
+
+/** Row label for the grid: the prompt, or "Seed 1234". */
+export function gridRowLabel(req: GridRequest, row: number): string {
+  return gridRowKind(req) === 'seeds' ? `Seed ${gridCellSeed(req, row)}` : gridCellPrompt(req, row)
 }
 
 /** grid.json in each grid folder: the finished (or stopped) job, kept across sessions. */

@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import {
+  addSeed,
+  buildGridRequest,
+  formFromRequest,
+  gridDims,
+  randomSeeds,
+  removeSeed,
+  rowCountOf,
+  rowsError,
+  seedText,
+  seedsError,
+  setSeedAt,
   axisKeyOf,
   axisOptions,
   cellCount,
@@ -29,7 +40,7 @@ import {
   valuesError,
   type GridBlockState
 } from '../src/renderer/src/lib/grid'
-import { axisLabel, recipeForValue, type GridJob, type GridTemplateInfo } from '../src/shared/grid'
+import { axisLabel, gridRowCount, gridRowLabel, recipeForValue, type GridJob, type GridTemplateInfo } from '../src/shared/grid'
 import { DEFAULT_RECIPE, type MergeRecipe } from '../src/shared/merge'
 
 const recipe = (over: Partial<MergeRecipe> = {}): MergeRecipe => ({ ...DEFAULT_RECIPE, a: 'a.safetensors', b: 'b.safetensors', ...over })
@@ -267,6 +278,83 @@ describe('layout of the saved picture', () => {
     expect(wide.cellW).toBeLessThan(1024)
     expect(wide.cellH).toBe(wide.cellW)
     expect(wide.height).toBeGreaterThan(wide.cellH * 4)
+  })
+})
+
+describe('seed rows', () => {
+  const ok = (over: Partial<GridBlockState> = {}): GridBlockState => ({
+    connected: true,
+    template: template(),
+    recipe: recipe(),
+    axis: resolveAxisOption(recipe(), 'ratio'),
+    valuesText: '0, 0.5, 1',
+    rowKind: 'seeds',
+    prompts: ['a cat'],
+    seed: -5,
+    seeds: [1, 2],
+    grids: [],
+    starting: false,
+    ...over
+  })
+  it('checks the seed list', () => {
+    expect(seedsError([1, 2])).toBeNull()
+    expect(seedsError([])).toMatch(/at least one/)
+    expect(seedsError([1, 2, 3, 4, 5])).toMatch(/at most 4/)
+    expect(seedsError([1, 1])).toMatch(/different/)
+    expect(seedsError([1, -1])).toMatch(/whole number/)
+    expect(seedsError([1.5])).toMatch(/whole number/)
+  })
+  it('needs one prompt and valid seeds; ignores the single seed', () => {
+    expect(gridBlockReason(ok())).toBeNull()
+    expect(gridBlockReason(ok({ prompts: [' ', 'x'] }))).toMatch(/prompt/)
+    expect(gridBlockReason(ok({ seeds: [3, 3] }))).toMatch(/different/)
+    expect(rowsError('seeds', ['p', 'q'], [1])).toBeNull()
+    expect(rowCountOf('seeds', ['p'], [1, 2, 3])).toBe(3)
+    expect(rowCountOf('prompts', ['p', ' ', 'q'], [1, 2, 3])).toBe(2)
+  })
+  it('adds, removes and sets seeds', () => {
+    let n = 0
+    const rand = () => ((n++ % 6) + 1) / 7 // 6 values, cycling: repeats happen, so distinctness is exercised
+    const added = addSeed([0], rand)
+    expect(added).toHaveLength(2)
+    expect(new Set(added).size).toBe(2)
+    expect(addSeed([1, 2, 3, 4])).toEqual([1, 2, 3, 4])
+    expect(removeSeed([1, 2], 0)).toEqual([2])
+    expect(removeSeed([1], 0)).toEqual([1])
+    expect(setSeedAt([1, 2], 1, 9)).toEqual([1, 9])
+    const r = randomSeeds(4, rand, [0])
+    expect(new Set([...r, 0]).size).toBe(5)
+  })
+  it('builds the request for each row kind', () => {
+    const base = { recipe: recipe(), axis: resolveAxisOption(recipe(), 'ratio')!, valuesText: '0, 1', prompts: [' cat ', 'dog'], seed: 7, seeds: [4, 5], templatePath: 'T' }
+    const s = buildGridRequest({ ...base, rowKind: 'seeds' })
+    expect(s.rowKind).toBe('seeds')
+    expect(s.prompts).toEqual(['cat'])
+    expect(s.seeds).toEqual([4, 5])
+    expect(s.seed).toBe(4)
+    expect(gridRowCount(s)).toBe(2)
+    expect(gridRowLabel(s, 1)).toBe('Seed 5')
+    const p = buildGridRequest({ ...base, rowKind: 'prompts' })
+    expect(p.prompts).toEqual(['cat', 'dog'])
+    expect(p.seed).toBe(7)
+    expect(p.seeds).toBeUndefined()
+    expect(p.axis.values).toEqual([0, 1])
+  })
+  it('reads old grids as prompt rows and counts dimensions', () => {
+    const old = job('g', 'done', 1)
+    expect(old.request.rowKind).toBeUndefined()
+    expect(gridDims(old)).toEqual({ cols: 2, rows: 1 })
+    expect(seedText(old.request)).toBe('seed 1')
+    const sj = job('s', 'done', 1, { request: { ...old.request, rowKind: 'seeds', seeds: [3, 8], prompts: ['x'] } })
+    expect(gridDims(sj)).toEqual({ cols: 2, rows: 2 })
+    expect(seedText(sj.request)).toBe('seeds 3, 8')
+  })
+  it('refills the form from a request', () => {
+    const old = job('g', 'done', 1)
+    const f = formFromRequest(old.request)
+    expect(f).toMatchObject({ axisKey: 'ratio', from: 0, to: 1, steps: 2, valuesText: '0, 1', rowKind: 'prompts', prompts: ['p'], seeds: null, seed: 1 })
+    const s = formFromRequest({ ...old.request, rowKind: 'seeds', seeds: [3, 8], seed: 3, axis: { kind: 'loraStrength', loraIndex: 1, values: [0.2, 0.5, 0.9] } })
+    expect(s).toMatchObject({ axisKey: 'lora:1', from: 0.2, to: 0.9, steps: 3, rowKind: 'seeds', seeds: [3, 8], seed: 3 })
   })
 })
 

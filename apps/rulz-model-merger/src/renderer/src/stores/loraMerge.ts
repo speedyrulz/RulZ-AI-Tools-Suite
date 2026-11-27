@@ -1,7 +1,8 @@
 import { create } from 'zustand'
 import { toast } from 'sonner'
-import type { LoraMergeCheck, LoraMergeDtype, LoraMergeJob, LoraMergeMode } from '@shared/loraMerge'
+import type { LoraMergeCheck, LoraMergeDtype, LoraMergeJob, LoraMergeMode, LoraMergeRecipe } from '@shared/loraMerge'
 import { call, errText, invoke } from '../lib/api'
+import { loraRowsFromRecipe } from '../lib/history'
 import { buildInspectRequest, buildRecipe, emptyRows, namedList, suggestLoraOutputName, upsertLoraJob, type LoraRow } from '../lib/loraMerge'
 
 interface LoraMergeStore {
@@ -23,6 +24,8 @@ interface LoraMergeStore {
   patchRows: (fn: (rows: LoraRow[]) => LoraRow[]) => void
   setOptions: (patch: Partial<{ mode: LoraMergeMode; rank: number; dtype: LoraMergeDtype }>) => void
   setOutputName: (name: string) => void
+  /** Fills the whole form from a saved recipe (History > Reopen); the output name is kept as saved. */
+  replaceRecipe: (recipe: LoraMergeRecipe) => void
   runCheck: () => void
   loadList: () => Promise<void>
   start: () => Promise<void>
@@ -72,6 +75,20 @@ export const useLoraMerge = create<LoraMergeStore>((set, get) => ({
   },
 
   setOutputName: (outputName) => set({ outputName, nameTouched: outputName.trim() !== '' }),
+
+  replaceRecipe: (recipe) => {
+    set({
+      rows: loraRowsFromRecipe(recipe),
+      mode: recipe.mode,
+      rank: recipe.rank,
+      dtype: recipe.dtype,
+      outputName: recipe.outputName,
+      nameTouched: true,
+      check: null,
+      checkError: null
+    })
+    get().runCheck()
+  },
 
   runCheck: () => {
     window.clearTimeout(checkTimer)

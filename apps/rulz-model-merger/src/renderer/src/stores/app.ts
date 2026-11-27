@@ -3,7 +3,7 @@ import { toast } from 'sonner'
 import type { AppSettings, ConnectionStatus, OwnServerSettings, ServerCapabilities, ServerState, Theme } from '@shared/types'
 import { call, errText, invoke } from '../lib/api'
 
-export type Page = 'merge' | 'loras' | 'grids' | 'sweep' | 'results' | 'history' | 'server' | 'settings'
+export type Page = 'merge' | 'loras' | 'sweep' | 'results' | 'history' | 'server' | 'settings'
 
 export function applyTheme(theme: Theme): void {
   document.documentElement.classList.toggle('dark', theme === 'dark')
