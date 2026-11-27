@@ -187,7 +187,7 @@ async def pick_remote_folder(fs: hub.RemoteFS, start: str = '', title: str = 'Ch
                              disabled: set[str] | None = None) -> str | None:
     """Navigate the folders of a repo/bucket and return the chosen folder path ('' = root)."""
     disabled = disabled or set()
-    state = {'folder': start.strip('/'), 'virtual': set()}
+    state = {'folder': start.strip('/'), 'virtual': set(), 'ticket': 0}
 
     with ui.dialog() as dialog, ui.card().classes('rulz-card w-[640px] max-w-[95vw] h-[70vh] p-0 gap-0 column no-wrap'):
         with ui.row().classes('w-full items-center px-4 py-3 gap-2'):
@@ -214,7 +214,10 @@ async def pick_remote_folder(fs: hub.RemoteFS, start: str = '', title: str = 'Ch
             await show(path)
 
     async def show(folder: str) -> None:
+        state['ticket'] += 1
+        ticket = state['ticket']
         state['folder'] = folder
+        choose.disable()
         crumbs.clear()
         with crumbs:
             ui.button(icon='home', on_click=lambda: show('')).props('flat dense round size=sm')
@@ -229,8 +232,12 @@ async def pick_remote_folder(fs: hub.RemoteFS, start: str = '', title: str = 'Ch
         try:
             folders = [] if folder in state['virtual'] else await run.io_bound(fs.list_folders, folder)
         except Exception as e:  # noqa: BLE001
+            if ticket != state['ticket']:
+                return
             folders = []
             notify_error(e)
+        if ticket != state['ticket']:
+            return
         folders += [v for v in state['virtual'] if hub.join(folder, v.rsplit('/', 1)[-1]) == v and v not in folders
                     and v != folder]
         listing.clear()

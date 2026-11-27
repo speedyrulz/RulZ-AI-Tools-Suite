@@ -107,7 +107,7 @@ def in_client(client: Client, fn: Callable[[], Any]) -> None:
 
 def run_job(title: str, fn: Callable[[Job], Any], *, icon: str = 'sync',
             success: str | Callable[[Job], str] | None = None,
-            after: Callable[[Job], Any] | None = None) -> Job:
+            after: Callable[[Job], Any] | None = None, limited: bool = True) -> Job:
     """Submit a background job and notify the current tab when it finishes."""
     client = ui.context.client
     ui.notify(f'Started: {title}', type='ongoing', timeout=2500)
@@ -123,7 +123,7 @@ def run_job(title: str, fn: Callable[[Job], Any], *, icon: str = 'sync',
     def failed(job: Job) -> None:
         in_client(client, lambda: notify_error(job.error, prefix=f'{title} failed: '))
 
-    return manager.submit(title, fn, icon=icon, on_success=ok, on_error=failed)
+    return manager.submit(title, fn, icon=icon, on_success=ok, on_error=failed, limited=limited)
 
 
 # --------------------------------------------------------------------------------------------------

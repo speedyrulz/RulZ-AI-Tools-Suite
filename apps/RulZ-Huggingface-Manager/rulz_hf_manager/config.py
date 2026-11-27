@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 import time
 from dataclasses import asdict, dataclass, field, fields
@@ -95,7 +96,7 @@ def _load() -> Settings:
         try:
             path.replace(path.with_name(f'{path.name}.broken-{time.strftime("%Y%m%d-%H%M%S")}'))
         except OSError:
-            pass
+            _unread = True  # could not move it aside (held open?): save() must keep it before writing
         return Settings()
     known = {f.name: f for f in fields(Settings)}
     defaults = Settings()
@@ -113,10 +114,12 @@ def save() -> None:
     with _lock:
         path.parent.mkdir(parents=True, exist_ok=True)
         if _unread and path.exists():  # never read at start: keep it rather than overwrite it with defaults
+            backup = path.with_name(f'{path.name}.unread-{time.strftime("%Y%m%d-%H%M%S")}')
             try:
-                path.replace(path.with_name(f'{path.name}.unread-{time.strftime("%Y%m%d-%H%M%S")}'))
+                path.replace(backup)
             except OSError:
-                pass
+                shutil.copy2(path, backup)  # replace fails while another process holds the file; if this fails too,
+                # the OSError propagates and nothing is written over the original
         _unread = False
         tmp = path.with_suffix('.tmp')
         text = json.dumps(asdict(settings), indent=2)

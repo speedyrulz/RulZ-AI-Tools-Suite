@@ -144,6 +144,7 @@ async def dashboard_page() -> None:
         kind = kind_toggle.value
         rows = [to_row(r) for r in state['rows'] if kind == 'all' or r.kind == kind]
         table.update_rows(rows)
+        update_vast_btn()
         stats.clear()
         with stats:
             for k in hub.KINDS:
