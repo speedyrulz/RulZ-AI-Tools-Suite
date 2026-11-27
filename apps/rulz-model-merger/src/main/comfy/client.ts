@@ -179,12 +179,17 @@ export class ComfyClient {
     return parseCapabilities(await this.objectInfo())
   }
 
-  /** POST /prompt with `{prompt, client_id}`. HTTP 400 becomes a ComfyError carrying `nodeErrors`. */
-  async queuePrompt(prompt: Record<string, unknown>, clientId: string): Promise<{ promptId: string; number: number }> {
+  /** POST /prompt with `{prompt, client_id}` (plus `extra_data` when given, e.g. extra_pnginfo). HTTP 400 becomes a ComfyError carrying `nodeErrors`. */
+  async queuePrompt(
+    prompt: Record<string, unknown>,
+    clientId: string,
+    extraData?: Record<string, unknown>
+  ): Promise<{ promptId: string; number: number }> {
     const path = '/prompt'
+    const body = extraData ? { prompt, client_id: clientId, extra_data: extraData } : { prompt, client_id: clientId }
     return this.call(
       path,
-      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt, client_id: clientId }) },
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
       async (res) => {
         if (res.status === 400) {
           const text = await res.text()

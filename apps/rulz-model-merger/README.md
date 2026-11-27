@@ -4,7 +4,7 @@ A Windows app for merging image models with ComfyUI: checkpoint with checkpoint,
 checkpoint, with sample grids at different mixes so you can compare the results before you save one. Part of the
 RulZ AI Tools family.
 
-**Version 0.1 sets up the ComfyUI connection.** Merging and sample grids come in the next versions.
+**Version 0.2 merges checkpoints and diffusion models.** LoRA merges and sample grids come in the next versions.
 
 **[Download](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/releases)** (or install it from the [RulZ AI Tools Suite](https://github.com/speedyrulz/RulZ-AI-Tools-Suite) launcher, under **ComfyUI**) · **[Wiki](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/Model-Merger)**
 
@@ -29,6 +29,35 @@ RulZ AI Tools family.
 - **What the server can do:** how many checkpoints, diffusion models, LoRAs, text encoders and VAEs it sees, and
   which merge and save nodes it has, including the per-model block merge nodes.
 - **Dark and light theme.** Black and red by default. Switch with the button at the top right or Ctrl+Shift+L.
+
+## Merging
+
+The **Merge** page merges two models through the connected ComfyUI and saves the result. It works with diffusion-model
+files (the `diffusion_models` folder, loaded with ComfyUI's UNETLoader) and full checkpoints (the `checkpoints`
+folder, with text encoder and VAE).
+
+| Mode | What it computes |
+| --- | --- |
+| Weighted | `A × r + B × (1 − r)`. The slider is the share of A. |
+| Add difference | `A + (B − C) × m`: adds what C changed to make B (for example a fine-tune) onto A. |
+| Per block | A different share of A per block, through ComfyUI's block merge node for that model type (for example `ModelMergeFlux1`). The app picks the node that fits model A and shows only the blocks the model has. |
+
+- **Checks before merging.** On the own server the app reads the headers of the files (a few milliseconds, the weights
+  are not loaded) and blocks the merge when A and B are different model types or have layers of different shapes. It
+  also says when the files are quantized and how much memory the merge needs against what is free in WSL.
+- **Quantized files** (int8, fp8, nvfp4) can be merged: ComfyUI unpacks the weights, merges them and saves the result
+  in A's format again. That adds a little loss; merging the bf16 originals is best when you have them.
+- **Full checkpoints:** the text encoder can be merged with the same share or taken from A or B. The VAE is taken
+  from A or B, never merged.
+- **Saving.** The result goes to the server's output folder as `<name>_00001_.safetensors` (`diffusion_models/` or
+  `checkpoints/`). The recipe (sources, mode, numbers, app version) is stored in the file's header, and on the own
+  server also in a `.recipe.json` file next to it. The app then checks the saved file: that it is this merge's file
+  and has the same layers as A.
+- **Move into models** (own server) moves the file and its recipe into `models/diffusion_models/merged/` or
+  `models/checkpoints/merged/`, so ComfyUI lists it. An existing file is never overwritten; the new one gets `-2`,
+  `-3`... instead.
+- **Cancel** removes only this merge from the queue or stops it while it runs, also on a server you share.
+- One merge runs at a time. On the CPU a merge of two 5 GB models takes about three minutes.
 
 ## Requirements
 
@@ -90,6 +119,8 @@ npm test
 | `src/main/index.ts` | Window, IPC handlers, connection status. |
 | `src/main/settings.ts` | Settings file with defaults and checks. |
 | `src/main/comfy/` | ComfyUI client: HTTP, websocket events, parsing of `/system_stats` and `/object_info`. |
+| `src/main/merge/` | Merges: file checks, ComfyUI graphs, the job runner, moving files in WSL. |
+| `src/main/models/` | Reads the header of a `.safetensors` file. |
 | `src/main/server/` | The own server: WSL scripts, start and stop, checks before starting, GPUs, ports. |
 | `src/shared/` | Types and IPC channels shared by both sides. |
 | `src/renderer/` | The window (React and Tailwind). |
@@ -97,7 +128,8 @@ npm test
 
 ## Limits of this version
 
-- No merging or sample grids yet.
+- No LoRA merges and no sample grids yet.
+- Merging has been run on the CPU only; a merge on a GPU has not been tried yet.
 - **Load my custom nodes** has not been tried with a real set of node packs yet.
 - The own server runs bash without a login shell, so variables set in `~/.bashrc` (for example CUDA paths) are not
   read. ComfyUI on the CPU and on a GPU with the venv's own CUDA libraries does not need them.

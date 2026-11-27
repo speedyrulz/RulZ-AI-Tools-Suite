@@ -84,6 +84,15 @@ describe('ComfyClient HTTP', () => {
     expect(s.seen[0]).toMatchObject({ method: 'POST', url: '/prompt', body: { prompt: { '1': { class_type: 'KSampler', inputs: {} } }, client_id: 'client-1' } })
   })
 
+  it('sends extra_data only when given', async () => {
+    const s = await startServer((_req, res) => json(res, { prompt_id: 'abc', number: 1 }))
+    const c = new ComfyClient(s.url)
+    await c.queuePrompt({}, 'c')
+    await c.queuePrompt({}, 'c', { extra_pnginfo: { modelmerger_recipe: { a: 1 } } })
+    expect(s.seen[0].body).toEqual({ prompt: {}, client_id: 'c' })
+    expect(s.seen[1].body).toEqual({ prompt: {}, client_id: 'c', extra_data: { extra_pnginfo: { modelmerger_recipe: { a: 1 } } } })
+  })
+
   it('turns an HTTP 400 into a ComfyError with node errors and a readable message', async () => {
     const nodeErrors = { '5': { class_type: 'LoraLoader', errors: [{ message: 'Value not in list', details: 'lora_name: nope.safetensors not in []' }] } }
     const s = await startServer((_req, res) =>

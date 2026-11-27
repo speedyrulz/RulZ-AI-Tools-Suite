@@ -8,6 +8,7 @@ import type {
   ServerLogEvent,
   ServerState
 } from './types'
+import type { MergeCheck, MergeInspectRequest, MergeJob, MergeRecipe } from './merge'
 
 /** Request/response channels (renderer -> main). */
 export interface IpcInvoke {
@@ -29,6 +30,16 @@ export interface IpcInvoke {
   'comfy:acceptSharedQueue': (url: string) => ConnectionStatus
   'comfy:capabilities': () => ServerCapabilities
   'shell:openExternal': (url: string) => void
+  /** Reads the source files' headers (own server) and checks they can be merged. Never loads weights. */
+  'merge:inspect': (req: MergeInspectRequest) => MergeCheck
+  /** Queues the merge on the current server. Rejects when the recipe is invalid or the queue was not accepted. */
+  'merge:start': (recipe: MergeRecipe) => MergeJob
+  /** Cancels a queued or running merge of this app (never other prompts). */
+  'merge:cancel': (jobId: string) => MergeJob
+  /** Merges of this session, newest first. */
+  'merge:jobs': () => MergeJob[]
+  /** Own server only: moves the saved file and its sidecar into <models>/<checkpoints|diffusion_models>/merged/ without overwriting. */
+  'merge:moveToModels': (jobId: string) => MergeJob
 }
 
 /** Push channels (main -> renderer). */
@@ -36,6 +47,7 @@ export interface IpcEvents {
   'server:state': ServerState
   'server:log': ServerLogEvent
   'comfy:status': ConnectionStatus
+  'merge:job': MergeJob
 }
 
 export type InvokeChannel = keyof IpcInvoke
