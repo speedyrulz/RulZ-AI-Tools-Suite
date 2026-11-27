@@ -1,0 +1,26 @@
+appId: com.rulz.modelmerger
+productName: RulZ Model Merger
+directories:
+  buildResources: build
+  output: dist
+files:
+  - out/**
+  - package.json
+  - '!**/*.map'
+extraResources:
+  - from: build/icon.ico
+    to: icon.ico
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch: [x64]
+  artifactName: RulZ-Model-Merger-Setup-${version}.${ext}
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: RulZ Model Merger
+  uninstallDisplayName: RulZ Model Merger
+npmRebuild: false

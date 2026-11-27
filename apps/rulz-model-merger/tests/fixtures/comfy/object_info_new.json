@@ -1,0 +1,6 @@
+{
+  "CheckpointLoaderSimple": { "input": { "required": { "ckpt_name": ["COMBO", { "options": ["new-a.safetensors"], "tooltip": "x" }] } } },
+  "UNETLoader": { "input": { "required": { "unet_name": ["COMBO", { "options": ["new-unet.safetensors", "new-unet2.safetensors"] }] } } },
+  "LoraLoader": { "input": { "required": { "lora_name": ["COMBO", { "options": [] }] } } },
+  "CLIPLoader": { "input": { "optional": { "clip_name": ["COMBO", { "options": ["new-te.safetensors"] }] } } }
+}

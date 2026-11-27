@@ -479,6 +479,38 @@ export const CATALOG: CatalogApp[] = [
       'Closing the launcher stops the servers it started, unless you turned on close to tray.'
     ],
     highlights: ['Several servers at once', 'Per-server GPU and arguments', 'Live log and GPU memory', 'RulZFlow page option']
+  },
+  {
+    id: 'model-merger',
+    name: 'RulZ Model Merger',
+    tagline: 'Merges checkpoints and LoRAs with ComfyUI and compares mixes in grids',
+    description:
+      'A Windows app for merging image models through ComfyUI. This first version sets up the connection: it starts ' +
+      'its own ComfyUI inside WSL on a GPU you pick (or on the CPU), so your other ComfyUI servers and their queues ' +
+      'are not touched, or it sends jobs to a ComfyUI that is already running. Before starting it checks free ' +
+      'memory, ports and which GPUs your other servers use. Checkpoint and LoRA merges and sample grids at ' +
+      'different mixes come in the next versions.',
+    category: 'ComfyUI',
+    repo: SUITE_REPO,
+    path: 'apps/rulz-model-merger',
+    tagPrefix: 'model-merger-v',
+    branch: 'main',
+    install: {
+      kind: 'installer',
+      asset: '^RulZ-Model-Merger-Setup-[\\d.]+\\.exe$',
+      uninstallName: 'RulZ Model Merger',
+      shortcutName: 'RulZ Model Merger'
+    },
+    launch: { target: 'RulZ Model Merger.exe' },
+    requirements: [{ id: 'nvidia', optional: true, note: 'To run the own ComfyUI server on a GPU and show GPU memory' }],
+    folderName: 'RulZ Model Merger',
+    notes: [
+      'Needs Windows 10 or 11 with WSL 2 and a distro that already has ComfyUI installed (by default ~/ComfyUI in Ubuntu-24.04). The app does not install either.',
+      'The own server keeps its output, input and user folders in ~/.rulz-model-merger/comfy inside WSL and reads the models of your ComfyUI folder.',
+      'Closing the app stops the server it started. Servers you started yourself are never stopped, cleared or unloaded.',
+      'Installs with its own setup program (silently), and can be removed from Windows Settings too.'
+    ],
+    highlights: ['Own ComfyUI in WSL', 'GPU and memory checks', 'Or any running server', 'Merges and sample grids next']
   }
 ]
 

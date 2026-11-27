@@ -28,6 +28,7 @@ on:
       - 'hf-manager-v*'
       - 'trainer-optimizer-v*'
       - 'comfyui-launcher-v*'
+      - 'model-merger-v*'
       - 'coding-agent-android-v*'
       - 'writer-android-v*'
   pull_request:
@@ -61,6 +62,7 @@ jobs:
             [image-grid]=RulZ-Image-Grid [hf-manager]=RulZ-Huggingface-Manager
             [trainer-optimizer]=RulZ-AI-Trainer-Optimizer
             [comfyui-launcher]=RulZ-ComfyUI-Launcher
+            [model-merger]=rulz-model-merger
             [coding-agent-android]=rulz-coding-agent-android
             [writer-android]=rulz-writer-android
           )
@@ -120,6 +122,7 @@ jobs:
             'hf-manager'         = @{ dir = 'RulZ-Huggingface-Manager'; name = 'RulZ Huggingface Manager'; kind = 'source' }
             'trainer-optimizer'  = @{ dir = 'RulZ-AI-Trainer-Optimizer'; name = 'RulZ AI Trainer Optimizer'; kind = 'source' }
             'comfyui-launcher'   = @{ dir = 'RulZ-ComfyUI-Launcher'; name = 'RulZ ComfyUI Launcher'; kind = 'python' }
+            'model-merger'       = @{ dir = 'rulz-model-merger'; name = 'RulZ Model Merger'; kind = 'electron' }
             'coding-agent-android' = @{ dir = 'rulz-coding-agent-android'; name = 'RulZ Coding Agent for Android'; kind = 'android' }
             'writer-android'     = @{ dir = 'rulz-writer-android'; name = 'RulZ Writer for Android'; kind = 'android' }
           }
@@ -141,7 +144,7 @@ jobs:
             'hf-manager'       { (Select-String -Path "$env:DIR/rulz_hf_manager/__init__.py" -Pattern "__version__\s*=\s*'([^']+)'").Matches[0].Groups[1].Value }
             'trainer-optimizer' { (Select-String -Path "$env:DIR/rulz_optimizer/__init__.py" -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
             'comfyui-launcher' { (Select-String -Path "$env:DIR/rulz_comfy_launcher/__init__.py" -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
-            { $_ -in 'llm-suite', 'coding-agent', 'coding-agent-android', 'writer-android' } { (Get-Content "$env:DIR/package.json" -Raw | ConvertFrom-Json).version }
+            { $_ -in 'llm-suite', 'coding-agent', 'coding-agent-android', 'writer-android', 'model-merger' } { (Get-Content "$env:DIR/package.json" -Raw | ConvertFrom-Json).version }
             default { '' }   # source apps are released from the branch; the tag is the version
           }
           # The phone shows versionName; package.json and build.gradle must agree.

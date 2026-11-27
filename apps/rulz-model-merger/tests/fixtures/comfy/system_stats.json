@@ -1,0 +1,10 @@
+{
+  "system": {
+    "os": "linux", "ram_total": 64000000000, "ram_free": 32000000000, "comfyui_version": "0.46.0",
+    "argv": ["main.py", "--port", "8188", "--cuda-device", "1"]
+  },
+  "devices": [
+    { "name": "cuda:0 NVIDIA GeForce RTX 5060 Ti : cudaMallocAsync", "type": "cuda", "index": 0 },
+    { "name": "cuda:1 NVIDIA GeForce RTX 4060 Ti : cudaMallocAsync", "type": "cuda", "index": 1 }
+  ]
+}
