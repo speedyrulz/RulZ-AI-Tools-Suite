@@ -68,13 +68,17 @@ async def instance_info(force: bool = False) -> dict | None:
 # Remote folder picker
 # --------------------------------------------------------------------------------------------------
 
+def _tail_shell_lines(lines: list[str], limit: int) -> list[str]:
+    return lines[-limit:]
+
+
 def _stamp(ts: float | None) -> str:
     """A modification time from the instance (seconds since 1970), shown in this computer's time zone."""
     return fmt_date(datetime.fromtimestamp(ts, timezone.utc)) if ts else ''
 
 
 async def pick_vast_folder(start: str = '/workspace', title: str = 'Choose a folder on the instance') -> str | None:
-    state = {'path': start or '/workspace', 'hidden': False}
+    state = {'path': start or '/workspace', 'hidden': False, 'ticket': 0}
 
     with ui.dialog() as dialog, ui.card().classes('rulz-card w-[680px] max-w-[95vw] h-[75vh] p-0 gap-0 column no-wrap'):
         with ui.row().classes('w-full items-center px-4 py-3 gap-2 no-wrap'):
@@ -88,7 +92,7 @@ async def pick_vast_folder(start: str = '/workspace', title: str = 'Choose a fol
                 .props('flat round dense').tooltip('Up one folder')
             path_input = ui.input(value=state['path']).props('dense outlined').classes('flex-1 rulz-mono')
             path_input.on('keydown.enter', lambda: go(path_input.value or '/'))
-            ui.checkbox('Hidden', on_change=lambda e: (state.update(hidden=e.value), go(state['path']))) \
+            ui.checkbox('Hidden', on_change=lambda e: on_hidden(e)) \
                 .props('dense')
         listing = ui.column().classes('w-full flex-1 overflow-auto px-2 gap-0')
         ui.separator()
@@ -99,6 +103,10 @@ async def pick_vast_folder(start: str = '/workspace', title: str = 'Choose a fol
             ui.button('Cancel', on_click=lambda: dialog.submit(None)).props('flat')
             choose = ui.button('Choose', icon='check', on_click=lambda: dialog.submit(state['path']))
 
+    async def on_hidden(e) -> None:
+        state['hidden'] = e.value
+        await go(state['path'])
+
     async def new_folder() -> None:
         name = await prompt('New folder', 'Folder name',
                             hint='Created when the first file arrives.',
@@ -108,6 +116,9 @@ async def pick_vast_folder(start: str = '/workspace', title: str = 'Choose a fol
             await go(posixpath.join(state['path'], name))
 
     async def go(path: str) -> None:
+        state['ticket'] += 1
+        ticket = state['ticket']
+        choose.disable()
         path = path.strip() or '/'
         listing.clear()
         with listing:
@@ -115,9 +126,15 @@ async def pick_vast_folder(start: str = '/workspace', title: str = 'Choose a fol
         try:
             r = await run.io_bound(lambda: vast.remote().call('ls', timeout=45, path=path, hidden=state['hidden']))
         except Exception as e:  # noqa: BLE001
-            listing.clear()
-            notify_error(e)
+            if ticket == state['ticket']:
+                listing.clear()
+                path_input.value = state['path']  # Choose still means the last folder that did open
+                choose.enable()
+                notify_error(e)
             return
+        if ticket != state['ticket']:
+            return
+        choose.enable()
         state['path'] = r.get('path') or path
         path_input.value = state['path']
         up_btn.set_enabled(state['path'] != '/')
@@ -269,6 +286,8 @@ async def send_dialog(sources: list[vast.Source], on_started=None) -> None:
             await set_dest(picked)
 
     async def check_space() -> None:
+        state['space_ticket'] = state.get('space_ticket', 0) + 1
+        ticket = state['space_ticket']
         path = (dest.value or '').strip()
         if not path:
             free_label.text = ''
@@ -276,7 +295,10 @@ async def send_dialog(sources: list[vast.Source], on_started=None) -> None:
         try:
             r = await run.io_bound(lambda: vast.Remote(conn).call('df', timeout=30, path=path))
         except Exception as e:  # noqa: BLE001
-            free_label.text = f'Could not check the space there: {e}'
+            if ticket == state['space_ticket'] and path == (dest.value or '').strip():
+                free_label.text = f'Could not check the space there: {e}'
+            return
+        if ticket != state['space_ticket'] or path != (dest.value or '').strip():
             return
         state['free'] = r.get('free')
         free_label.text = (f'{hub.human_size(r["free"])} free there' if r.get('free') is not None else '') + \
@@ -302,7 +324,7 @@ async def send_dialog(sources: list[vast.Source], on_started=None) -> None:
             ui.icon('warning')
             ui.label(' '.join(msgs)).classes('text-sm')
         warn.set_visibility(bool(msgs))
-        start_btn.set_enabled(bool(plan and plan.items) and not clashes)
+        start_btn.set_enabled(bool(plan and plan.items) and not clashes and not state.get('starting', False))
 
     def replan() -> None:
         if len(state['listed']) < len(sources):
@@ -339,17 +361,21 @@ async def send_dialog(sources: list[vast.Source], on_started=None) -> None:
     exclude.on_value_change(replan)
 
     async def start() -> None:
+        if state.get('starting', False):
+            return
         plan = state['plan']
         path = (dest.value or '').strip()
         if not plan or not path:
             return
         title = sources[0].label if len(sources) == 1 else f'{len(sources)} items'
+        state['starting'] = True
         start_btn.disable()
         try:
             st = await run.io_bound(lambda: vast.start_transfer(plan, path, layout.value, title))
         except Exception as e:  # noqa: BLE001
             notify_error(e, prefix='Could not start: ')
-            start_btn.enable()
+            state['starting'] = False
+            update_warning()
             return
         vast.remember_destination(path)
         follow_job(st['id'], f'To vast.ai: {title}', conn)
@@ -408,7 +434,7 @@ def follow_job(job_id: str, title: str, conn: vast.Conn | None = None) -> Job:
         job.set(message='Starting on the instance...')
         return vast.describe_outcome(vast.follow(job_id, job, conn))
 
-    job = run_job(title, work, icon='cloud_upload', success=lambda job: f'Sent: {job.result}')
+    job = run_job(title, work, icon='cloud_upload', success=lambda job: f'Sent: {job.result}', limited=False)
     for k in [k for k, j in _following.items() if not j.active]:
         del _following[k]
     _following[key] = job
@@ -981,7 +1007,7 @@ async def vast_page() -> None:
             elif kind == 'done':
                 finished = True
         if lines:
-            shell_log.push('\n'.join(lines))
+            shell_log.push('\n'.join(_tail_shell_lines(lines, shell_log.max_lines)))
         if progress is not None:
             shell_progress.text = progress
             shell_progress.set_visibility(bool(progress.strip()))

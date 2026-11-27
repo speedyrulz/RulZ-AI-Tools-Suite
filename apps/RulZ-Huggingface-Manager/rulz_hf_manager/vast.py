@@ -702,6 +702,11 @@ class PlanItem:
     dest: str
 
 
+def _identity(i: PlanItem) -> tuple:
+    # The same file only if kind, repo, revision (None is main) and path all match.
+    return i.kind, i.repo, i.rev or 'main', i.path
+
+
 @dataclass
 class Plan:
     items: list[PlanItem]
@@ -715,7 +720,7 @@ class Plan:
         seen: dict[str, PlanItem] = {}
         clashes = []
         for i in self.items:
-            if i.dest in seen and (seen[i.dest].repo, seen[i.dest].path) != (i.repo, i.path):
+            if i.dest in seen and _identity(seen[i.dest]) != _identity(i):
                 clashes.append(i.dest)
             seen[i.dest] = i
         return sorted(set(clashes))
@@ -809,7 +814,10 @@ def build_plan(sources: list[Source], layout: str, include: list[str] | None = N
                 filtered += 1
                 continue
             items.append(PlanItem(src.kind, src.repo_id, src.revision, path, size, layout_dest(src, rel, layout)))
-    return Plan(items, filtered)
+    unique: dict[tuple, PlanItem] = {}  # a repo and one of its folders in the basket list a file twice
+    for i in items:
+        unique.setdefault((*_identity(i), i.dest), i)
+    return Plan(list(unique.values()), filtered)
 
 
 def start_transfer(plan: Plan, dest: str, layout: str, title: str, workers: int = 4) -> dict:

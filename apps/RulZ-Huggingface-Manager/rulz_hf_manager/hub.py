@@ -640,7 +640,7 @@ class RemoteFS:
                     job.set(message='Downloading from bucket...')
                 files = self.expand(entries)
                 self.api.download_bucket_files(self.repo_id, files=[(f.raw or f.path, local_target(Path(tmp), f.path))
-                                                                    for f in files])
+                                                                    for f in files], raise_on_missing_files=True)
                 if job:
                     job.set(message='Committing to repository...')
                 ops = [CommitOperationAdd(join(dest_folder, _rel_to_selection(f, entries)),
@@ -659,22 +659,28 @@ class RemoteFS:
     def download_to_temp(self, entries: list[Entry], job: Job | None = None) -> tuple[Path, str]:
         """Download entries for the browser: a single file as-is, otherwise a .zip. Returns (path, filename)."""
         tmp = Path(tempfile.mkdtemp(prefix='rulz-hf-dl-'))
-        self.download(entries, tmp / 'files', job)
-        root = tmp / 'files'
-        if len(entries) == 1 and not entries[0].is_dir:
-            return root / entries[0].path, entries[0].name
-        base = entries[0].parent if entries else ''
-        name = (entries[0].name if len(entries) == 1 else self.repo_id.split('/')[-1]) + '.zip'
-        zip_path = tmp / name
-        if job:
-            job.set(message='Creating zip...')
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
-            for f in root.rglob('*'):
-                rel = f.relative_to(root).as_posix()
-                if f.is_file() and not rel.startswith('.cache/'):
-                    arc = rel[len(base) + 1:] if base and rel.startswith(base + '/') else rel
-                    zf.write(f, arc, compress_type=zip_method(f))
-        return zip_path, name
+        try:
+            self.download(entries, tmp / 'files', job)
+            root = tmp / 'files'
+            if len(entries) == 1 and not entries[0].is_dir:
+                return root / entries[0].path, entries[0].name
+            base = entries[0].parent if entries else ''
+            name = (entries[0].name if len(entries) == 1 else self.repo_id.split('/')[-1]) + '.zip'
+            zip_path = tmp / name
+            if job:
+                job.set(message='Creating zip...')
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+                for f in root.rglob('*'):
+                    rel = f.relative_to(root).as_posix()
+                    if f.is_file() and not rel.startswith('.cache/'):
+                        arc = rel[len(base) + 1:] if base and rel.startswith(base + '/') else rel
+                        zf.write(f, arc, compress_type=zip_method(f))
+            return zip_path, name
+        except BaseException:
+            # A failed download (a file gone, the network, disk full) leaves a partial folder that nothing else
+            # records: the app only cleans the folders of downloads that came back.
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
 
 
 # Already compressed, or model weights that deflate barely shrinks: stored as they are. Deflating a 10 GB checkpoint
@@ -937,7 +943,7 @@ class BucketFS(RemoteFS):
         if job:
             job.set(message=f'{len(files)} file(s), {human_size(sum(f.size or 0 for f in files))}')
         self.api.download_bucket_files(self.repo_id, files=[(f.raw or f.path, local_target(local_dir, f.path))
-                                                            for f in files])
+                                                            for f in files], raise_on_missing_files=True)
         return local_dir
 
     def read_bytes(self, path):
