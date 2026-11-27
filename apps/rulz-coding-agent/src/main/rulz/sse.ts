@@ -151,7 +151,8 @@ export class ToolCallAccumulator {
     for (const d of deltas) {
       const cur = this.calls.get(d.index) ?? { id: '', name: '', arguments: '' }
       if (d.id) cur.id = d.id
-      if (d.name) cur.name += d.name
+      // Some servers repeat the whole name in every delta; others split it. Append only when it differs.
+      if (d.name && d.name !== cur.name) cur.name += d.name
       if (d.arguments) cur.arguments += d.arguments
       this.calls.set(d.index, cur)
     }

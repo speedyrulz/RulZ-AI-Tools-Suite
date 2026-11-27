@@ -18,6 +18,7 @@ import { broadcast, currentCaller, handle, invokeHandler, onBroadcast } from './
 import { checkPageInWindow } from './project/pageWindow'
 import { AppRunner } from './project/runApp'
 import { CopySnapshots, GitSnapshots, gitInstalled, type Snapshotter } from './project/snapshots'
+import { ProjectSwitcher } from './project/projectSwitch'
 import { ProjectStore } from './project/store'
 import { PhoneAccess } from './remote/access'
 import { findServer, normalizeUrl, RulzClient } from './rulz/client'
@@ -225,12 +226,11 @@ async function main(): Promise<void> {
     broadcast: (state) => broadcast('batch:changed', state)
   })
 
-  const snapshotter = async (kind: 'git' | 'copy' | 'auto'): Promise<Snapshotter> => {
-    if (!session) throw new Error('No project is open.')
+  // Built from the root the calling session passes, never from whichever project is open now: an Undo that was still
+  // running when the project was switched must not restore the old project's files into the new one.
+  const snapshotter = async (kind: 'git' | 'copy' | 'auto', root: string): Promise<Snapshotter> => {
     const useGit = kind === 'git' || (kind === 'auto' && hasGit)
-    return useGit
-      ? new GitSnapshots(store.snapshotDir(session.root), session.root)
-      : new CopySnapshots(store.backupDir(session.root), session.root, trash)
+    return useGit ? new GitSnapshots(store.snapshotDir(root), root) : new CopySnapshots(store.backupDir(root), root, trash)
   }
 
   const requireSession = (path: string): ProjectSession => {
@@ -246,30 +246,45 @@ async function main(): Promise<void> {
     return runner!
   }
 
-  const closeProject = async (): Promise<void> => {
-    batch.assertIdle()
-    if (session?.isRunning) throw new Error('A task is still running. Press Stop first.')
-    // Let go of the project before the awaits below, so nothing (a batch run, a task) can start in it meanwhile.
-    const closing = { session, runner }
+  /** The state of a session (the open one or one that was just closed: then without a recent-list entry). */
+  const stateOf = (s: ProjectSession): ProjectState => (s === session && current ? s.state(current.name, current.lastOpened) : s.state(basename(s.root), Date.now()))
+
+  let shuttingDown = false
+
+  // Opening and closing run one at a time (a double click, or the desktop and the phone together).
+  const switcher = new ProjectSwitcher<ProjectSession, AppRunner, ProjectState>({
+    current: () => ({ session, runner }),
+    release: () => {
+      session = null
+      runner = null
+      current = null
+    },
+    guard: () => batch.assertIdle(),
     // Uploads under way for this project are cancelled (a phone's half-sent PDF).
-    if (session) void attachments.dropProject(session.root).catch(() => undefined)
-    session = null
-    runner = null
-    current = null
-    await closing.runner?.stop()
-    await closing.session?.close()
+    dropUploads: (s) => void attachments.dropProject(s.root).catch(() => undefined),
+    already: (abs) => (session && current && resolve(session.root).toLowerCase() === abs.toLowerCase() ? session.state(current.name, current.lastOpened) : null),
+    create: (abs) => createProject(abs)
+  })
+  /** A switch that failed after the old project was let go: the screens (here and on the phone) are told it is gone. */
+  const afterFailedSwitch = (e: unknown): never => {
+    if (!session) projectChanged()
+    throw e
   }
+  const closeProject = (): Promise<void> => switcher.close().catch(afterFailedSwitch)
 
   const openProject = async (path: string): Promise<ProjectState> => {
     const abs = resolve(path)
     const st = await fs.stat(abs).catch(() => null)
     if (!st?.isDirectory()) throw new Error(`The folder "${abs}" doesn't exist any more.`)
-    if (session && resolve(session.root).toLowerCase() === abs.toLowerCase()) {
-      return session.state(current!.name, current!.lastOpened)
-    }
-    await closeProject()
+    return switcher.open(abs).catch(afterFailedSwitch)
+  }
+
+  /** Builds the session for `abs` and makes it the open one. Runs inside the switcher's queue, after the old one closed. */
+  const createProject = async (abs: string): Promise<ProjectState> => {
+    if (shuttingDown) throw new Error('The app is closing.')
     const data = await store.load(abs)
-    session = new ProjectSession(data, {
+    if (shuttingDown) throw new Error('The app is closing.')
+    const created = new ProjectSession(data, {
       client,
       settings: () => settings.get(),
       store,
@@ -287,15 +302,19 @@ async function main(): Promise<void> {
       pdf: { reader: pdfReader, attachments }
     })
     // PDFs no message uses (never sent, or older than a day) and half-sent uploads are cleared away.
-    void session.sweepPdfs()
+    void created.sweepPdfs()
+    const info = { path: abs, name: basename(abs), lastOpened: Date.now() }
+    session = created
     runner = new AppRunner(abs, (e) => broadcast('run:event', e), async (file) => {
       const err = await shell.openPath(file)
       if (err) throw new Error(err)
     })
-    current = { path: abs, name: basename(abs), lastOpened: Date.now() }
-    await store.touch(current)
+    current = info
+    // The recent list is a convenience: failing to write it must not leave this (already open) project unannounced.
+    await store.touch(info).catch(() => undefined)
     projectChanged()
-    return session.state(current.name, current.lastOpened)
+    // The state of the session this call created, whatever the globals say by now.
+    return created.state(info.name, info.lastOpened)
   }
 
   // ---- IPC ----
@@ -447,25 +466,28 @@ async function main(): Promise<void> {
   handle('task:undo', async (path, taskId) => {
     batch.assertIdle()
     const s = requireSession(path)
-    await runner?.stop()
-    await s.undo(taskId)
-    projectChanged()
-    return s.state(current!.name, current!.lastOpened)
+    const r = runner
+    // The app is stopped inside the session's reservation (see ProjectSession.undo): a project switch while it stops is refused.
+    await s.undo(taskId, async () => void (await r?.stop()))
+    if (s === session) projectChanged()
+    return stateOf(s)
   })
   handle('task:deleteItem', async (path, itemId) => {
     batch.assertIdle()
     const s = requireSession(path)
     await s.deleteItem(itemId)
-    projectChanged()
-    return s.state(current!.name, current!.lastOpened)
+    if (s === session) projectChanged()
+    return stateOf(s)
   })
   handle('task:redo', async (path, taskId, text) => {
     batch.assertIdle()
     const s = requireSession(path)
-    if (s.data.tasks.at(-1)?.files.length && !s.data.tasks.at(-1)?.undone) await runner?.stop()
-    await s.redo(taskId, text)
-    projectChanged()
-    return s.state(current!.name, current!.lastOpened)
+    const r = runner
+    await s.redo(taskId, text, async () => {
+      if (s.data.tasks.at(-1)?.files.length && !s.data.tasks.at(-1)?.undone) await r?.stop()
+    })
+    if (s === session) projectChanged()
+    return stateOf(s)
   })
   handle('files:diff', (path, taskId, rel) => requireSession(path).diff(taskId, rel))
   handle('project:setMemory', async (path, text) => {
@@ -500,6 +522,8 @@ async function main(): Promise<void> {
     const before = r.get()
     // A running app holds its files open.
     if (before.running) await r.stop()
+    // The project may have been switched while the app stopped.
+    if (s !== session || s.isClosed) throw new Error('The project was closed.')
     s.start(fixRunTask(before), { shown: FIX_RUN_SHOWN })
   })
   handle('run:share', async (path) => {
@@ -509,13 +533,19 @@ async function main(): Promise<void> {
     // A running app holds its files open, and packaging rebuilds them.
     const r = requireRunner(path)
     if (r.get().running) await r.stop()
+    if (s !== session || s.isClosed) throw new Error('The project was closed.')
     s.start(SHARE_TASK, { shown: SHARE_SHOWN, share: true })
   })
 
   // ---- Lifecycle ----
   mainWindow = createWindow(settings.get().theme)
   // Quitting can take a few seconds after the window is gone (see before-quit): nothing may use it then.
-  mainWindow.on('closed', () => (mainWindow = null))
+  // Closing the main window quits, even while a hidden page-check window (check_page) is still open: that window
+  // would otherwise keep the app alive, so window-all-closed would not fire. Quitting goes through before-quit.
+  mainWindow.on('closed', () => {
+    mainWindow = null
+    app.quit()
+  })
   void connect()
   void phone.start()
 
@@ -529,7 +559,6 @@ async function main(): Promise<void> {
   // Quitting waits (up to QUIT_WAIT_MS) for the running task to stop and the project to be saved,
   // so its final state (the task marked stopped, its last steps) isn't lost. The first before-quit
   // is held back while that happens; the quit that follows goes through.
-  let shuttingDown = false
   let readyToQuit = false
   const shutDown = async (): Promise<void> => {
     const deadline = Date.now() + QUIT_WAIT_MS
@@ -544,7 +573,8 @@ async function main(): Promise<void> {
       while (s.isRunning && Date.now() < deadline - 500) await new Promise((r) => setTimeout(r, 50))
       await s.close()
     }
-    const work = Promise.allSettled([runner?.stop(), closeSession(), toolServers.dispose(), phone.dispose(), attachments.cancelAll(), batch.idle().then(() => batch.flush())])
+    // switcher.cleanupDone(): a project closed just before (a switch still stopping its app or saving) is waited for too.
+    const work = Promise.allSettled([runner?.stop(), closeSession(), switcher.cleanupDone(), toolServers.dispose(), phone.dispose(), attachments.cancelAll(), batch.idle().then(() => batch.flush())])
     let timer: NodeJS.Timeout | undefined
     await Promise.race([work, new Promise((r) => (timer = setTimeout(r, Math.max(0, deadline - Date.now()))))])
     clearTimeout(timer)

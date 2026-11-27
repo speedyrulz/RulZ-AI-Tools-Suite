@@ -97,7 +97,8 @@ export interface SessionDeps {
   /** Last known model list (to tell whether the model is loaded). */
   models: () => ModelInfo[]
   refreshModels: () => void
-  snapshotter: (kind: 'git' | 'copy' | 'auto') => Promise<Snapshotter>
+  /** The restore-point store of the project at `root`: always the calling session's own root, never "the open project". */
+  snapshotter: (kind: 'git' | 'copy' | 'auto', root: string) => Promise<Snapshotter>
   trash: (abs: string) => Promise<void>
   /** Opens a page in a hidden window (check_page); missing where there is no Electron. */
   checkPage?: (target: PageTarget, waitMs: number, signal: AbortSignal) => Promise<PageReport>
@@ -108,6 +109,11 @@ export interface SessionDeps {
   /** Reads PDFs (read_pdf) and keeps the ones attached to messages; without it there is no read_pdf and no attaching. */
   pdf?: PdfTools
 }
+
+const CLOSED_MESSAGE = 'That project was closed.'
+
+/** What start() takes besides the text. */
+type StartOptions = { howToRun?: boolean; share?: boolean; shown?: string; re?: ReTaskInfo; batch?: boolean; rentalOk?: boolean; attachments?: PdfAttachment[] }
 
 /** Attached PDFs nobody uses any more are swept when a project opens, once they are this old. */
 const PDF_SWEEP_AGE_MS = 24 * 60 * 60 * 1000
@@ -120,6 +126,16 @@ const UNATTENDED_ANSWER = 'Nobody is watching: this task runs unattended as part
 
 /** Ends the task without counting as an error (owner chose Stop in a prompt, or pressed Stop). */
 class StopTask extends Error {}
+
+/** `promise`, or a StopTask as soon as `signal` aborts (the promise is left to finish on its own, its result unused). */
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new StopTask())
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new StopTask())
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
+  })
+}
 
 /** An error whose message is already written for the owner. */
 class FriendlyError extends Error {
@@ -197,6 +213,8 @@ export class ProjectSession {
   private notes = new NoteQueue()
   /** Set while Undo, Redo or Delete change the project or its history, so nothing else starts meanwhile. */
   private busy: string | null = null
+  /** Set by close(): a closed session refuses every operation (its project may already be another one's). */
+  private closed = false
   /** The background-commands note last put into the history (it goes in only when it changes). */
   private lastBackgroundNote = ''
   /** The running task, whose checklist is repeated to the model when the call that held it is tidied away. */
@@ -225,6 +243,21 @@ export class ProjectSession {
 
   get isRunning(): boolean {
     return this.running
+  }
+
+  /** What Undo, Redo or Delete is doing now ("the undo"), or null. A project is not closed while this is set. */
+  get busyWith(): string | null {
+    return this.busy
+  }
+
+  /** True once close() has been called. */
+  get isClosed(): boolean {
+    return this.closed
+  }
+
+  /** From now on every operation is refused; called as soon as the project is let go, before its app has stopped. */
+  markClosed(): void {
+    this.closed = true
   }
 
   /** Why the last task's requests were refused or cut off for a rental, in the server's words (null when they were not). */
@@ -319,6 +352,7 @@ export class ProjectSession {
    * task (from this window or the phone) starting during it would work on files being put back.
    */
   private async exclusive<T>(what: string, fn: () => Promise<T>): Promise<T> {
+    if (this.closed) throw new Error(CLOSED_MESSAGE)
     if (this.busy) throw new Error(`Wait for ${this.busy} to finish first.`)
     this.busy = what
     try {
@@ -329,16 +363,19 @@ export class ProjectSession {
   }
 
   /** `shown` is what the conversation shows when the model gets a longer text (e.g. "Fix this"). */
-  start(
-    text: string,
-    opts: { howToRun?: boolean; share?: boolean; shown?: string; re?: ReTaskInfo; batch?: boolean; rentalOk?: boolean; attachments?: PdfAttachment[] } = {}
-  ): void {
+  start(text: string, opts: StartOptions = {}): void {
+    this.begin(text, opts, false)
+  }
+
+  /** `inExclusive`: called from inside exclusive() (Redo), which holds `busy` itself until the task has started. */
+  private begin(text: string, opts: StartOptions, inExclusive: boolean): void {
     const trimmed = text.trim()
     // PDFs are only ever attached to the message that starts a task (a note sent while a task runs has none).
     const pdfs = opts.attachments?.length ? opts.attachments : []
     if (!trimmed && !pdfs.length) return
+    if (this.closed) throw new Error(CLOSED_MESSAGE)
     if (this.running) throw new Error('A task is already running. Wait for it to finish or press Stop.')
-    if (this.busy) throw new Error(`Wait for ${this.busy} to finish first.`)
+    if (this.busy && !inExclusive) throw new Error(`Wait for ${this.busy} to finish first.`)
     if (pdfs.some((p) => this.removingPdfs.has(p.id))) throw new Error('One of the attached PDFs is being removed. Attach it again.')
     const visible = opts.shown?.trim() || trimmed || attachedLabel(pdfs.length)
     const title = visible.split('\n')[0].slice(0, 80) + (visible.split('\n')[0].length > 80 ? '…' : '')
@@ -463,6 +500,7 @@ export class ProjectSession {
   }
 
   async close(): Promise<void> {
+    this.closed = true
     this.stop()
     await this.background.stopAll()
     await this.saveNow()
@@ -473,8 +511,12 @@ export class ProjectSession {
   }
 
   /** "Undo last task" with no id; History's "Go back to before this" with one (that task and every later one are undone). */
-  undo(taskId?: string): Promise<void> {
-    return this.exclusive('the undo', () => this.undoNow(taskId))
+  undo(taskId?: string, prepare?: () => Promise<void>): Promise<void> {
+    // `prepare` (stopping the running app) runs inside the reservation: a project switch during it is refused.
+    return this.exclusive('the undo', async () => {
+      await prepare?.()
+      await this.undoNow(taskId)
+    })
   }
 
   private async undoNow(taskId?: string): Promise<void> {
@@ -491,8 +533,9 @@ export class ProjectSession {
     if (missing) throw new Error(`There is no restore point from before "${missing.title}", so the project can't go back past it.`)
     // Running programs can hold files open.
     await this.background.stopAll()
+    if (this.closed) throw new Error(CLOSED_MESSAGE)
     for (const t of restores) {
-      const snap = await this.deps.snapshotter(t.snapshot!.kind)
+      const snap = await this.deps.snapshotter(t.snapshot!.kind, this.root)
       await snap.restore(t.snapshot!, t.title)
     }
     for (const t of tasks) t.undone = true
@@ -537,30 +580,44 @@ export class ProjectSession {
    * Runs the latest request again, edited when `text` is given. Its file changes are undone first,
    * then its exchange is replaced by the new run (History keeps the first try, marked undone).
    */
-  async redo(taskId: string, text?: string): Promise<void> {
-    const { task, item, pdfs } = await this.exclusive('the redo', async () => {
+  async redo(taskId: string, text?: string, prepare?: () => Promise<void>): Promise<void> {
+    // The reservation is kept until the new task has started: a project switch in between is refused, and nothing
+    // else can start a task in the gap. `prepare` (stopping the running app) runs inside it too.
+    await this.exclusive('the redo', async () => {
+      await prepare?.()
       const item = requestItem(this.data.timeline, taskId)
       const why = whyNotRedo(this.data.timeline, this.data.tasks, item?.id ?? '', this.running)
       if (why || !item) throw new Error(why ?? 'Only a request can be run again.')
       const task = this.data.tasks.find((t) => t.id === taskId)!
+      const edited = text?.trim()
+      const request: { text: string; opts: StartOptions } =
+        edited && edited !== item.text
+          ? { text: edited, opts: {} }
+          : task.request
+            ? { text: task.request.text, opts: { howToRun: task.request.howToRun, share: task.request.share, shown: item.text, re: task.re } }
+            : { text: item.text, opts: {} }
+      // The request's PDFs are kept: the new run of it uses them again.
+      const pdfs = [...this.pdfsOfTask(task.id)]
+      const attachments = pdfs.length ? pdfs : undefined
+      // Whatever would make the start fail is checked before anything is undone or dropped, so the request is never lost.
+      if (this.closed) throw new Error(CLOSED_MESSAGE)
+      if (pdfs.some((p) => this.removingPdfs.has(p.id))) throw new Error('One of the attached PDFs is being removed. Attach it again.')
       const changed = task.files.length > 0 && !task.undone
       if (changed) {
         await this.undoNow(task.id)
         // The exchange goes too, so the model has nothing left to be told about.
         this.data.notes.pop()
       }
-      // The request's PDFs are kept: the new run of it uses them again.
-      const pdfs = [...this.pdfsOfTask(task.id)]
       this.forgetExchange(task.id, item.text)
       if (changed) this.notice(`Put back the files “${task.title}” changed, then ran your request again.`, 'info')
-      return { task, item, pdfs }
+      try {
+        this.begin(request.text, { ...request.opts, attachments }, true)
+      } catch (e) {
+        // Not expected after the checks above; if it happens anyway the request stays in the conversation as a notice.
+        this.notice(`I couldn't run your request again (${(e as Error).message}). Your request was: ${request.text.slice(0, 2000)}`, 'warn')
+        throw e
+      }
     })
-    const edited = text?.trim()
-    const attachments = pdfs.length ? pdfs : undefined
-    if (edited && edited !== item.text) this.start(edited, { attachments })
-    else if (task.request) {
-      this.start(task.request.text, { howToRun: task.request.howToRun, share: task.request.share, shown: item.text, re: task.re, attachments })
-    } else this.start(item.text, { attachments })
   }
 
   private forgetExchange(taskId: string, text: string): void {
@@ -571,6 +628,7 @@ export class ProjectSession {
   }
 
   async diff(taskId: string, rel: string): Promise<FileDiff> {
+    if (this.closed) throw new Error(CLOSED_MESSAGE)
     const task = this.data.tasks.find((t) => t.id === taskId)
     const target = await resolveInProject(this.root, rel)
     const out: FileDiff = { path: target.rel, before: null, after: null, binary: false, tooLarge: false }
@@ -581,7 +639,7 @@ export class ProjectSession {
       return out.binary || out.tooLarge ? null : buf.toString('utf8')
     }
     if (task?.snapshot) {
-      const snap = await this.deps.snapshotter(task.snapshot.kind)
+      const snap = await this.deps.snapshotter(task.snapshot.kind, this.root)
       out.before = decode(await snap.fileBefore(task.snapshot, target.rel))
     }
     // Size first: a huge file (a video, a model) isn't read into memory just to be refused.
@@ -605,7 +663,7 @@ export class ProjectSession {
     try {
       this.setStatus({ phase: 'working', text: 'Saving a restore point…' })
       try {
-        snap = await this.deps.snapshotter('auto')
+        snap = await this.deps.snapshotter('auto', this.root)
         task.snapshot = await snap.begin(task.id, task.title)
       } catch (e) {
         this.notice(`I couldn't save a restore point, so "Undo last task" won't work for this task. (${(e as Error).message})`, 'warn', task.id)
@@ -650,7 +708,7 @@ export class ProjectSession {
         } else this.notice("I couldn't work out how to run this app.", 'warn', task.id)
       }
       if (share) await this.reportShare(task)
-      if (task.re?.practice) await this.gradePractice(task)
+      if (task.re?.practice) await this.gradePractice(task, signal)
     } catch (e) {
       if (e instanceof StopTask || signal.aborted) {
         task.outcome = 'stopped'
@@ -672,27 +730,39 @@ export class ProjectSession {
       this.taskMode = null
       this.taskPdfs = []
       this.rentalOk = false
-      this.closeOpenCalls()
-      // A checklist note was for this task only.
-      dropPlanNotes(this.data.messages)
-      for (const s of task.steps) if (s.status === 'running' || s.status === 'waiting') this.updateStep(s, { status: 'skipped' })
-      task.endedAt = Date.now()
-      if (snap) await this.refreshFiles(task, snap, { rescan: true }).catch(() => undefined)
-      // Taken last: notes are accepted until `running` goes false, so one written during the final
-      // look at the files would otherwise wait unseen and go into the next task.
-      const unsent = this.notes.take()
-      if (unsent.length) {
-        this.notice(`Not sent, because the task ended first: ${unsent.map((n) => `"${n.text}"`).join(', ')}`, 'warn', task.id)
-        this.emit({ type: 'notes', notes: [] })
+      try {
+        this.closeOpenCalls()
+        // A checklist note was for this task only.
+        dropPlanNotes(this.data.messages)
+        for (const s of task.steps) if (s.status === 'running' || s.status === 'waiting') this.updateStep(s, { status: 'skipped' })
+        task.endedAt = Date.now()
+        if (snap) await this.refreshFiles(task, snap, { rescan: true }).catch(() => undefined)
+        // Taken last: notes are accepted until `running` goes false, so one written during the final
+        // look at the files would otherwise wait unseen and go into the next task.
+        const unsent = this.notes.take()
+        if (unsent.length) {
+          this.notice(`Not sent, because the task ended first: ${unsent.map((n) => `"${n.text}"`).join(', ')}`, 'warn', task.id)
+          this.emit({ type: 'notes', notes: [] })
+        }
+      } catch {
+        // A listener that throws must not leave the project "running" for ever (nothing could start in it again).
+        // Notes not taken above must not go into the next task.
+        this.notes.take()
+      } finally {
+        task.endedAt ??= Date.now()
+        this.running = false
+        this.unattended = false
+        this.abort = null
+        this.current = null
       }
-      this.running = false
-      this.unattended = false
-      this.abort = null
-      this.current = null
-      this.setStatus({ phase: 'idle' })
-      this.deps.activity('idle')
-      this.deps.refreshModels()
-      this.emit({ type: 'task-end', task, runCommand: this.data.runCommand })
+      try {
+        this.setStatus({ phase: 'idle' })
+        this.deps.activity('idle')
+        this.deps.refreshModels()
+        this.emit({ type: 'task-end', task, runCommand: this.data.runCommand })
+      } catch {
+        // Same: the state is already reset; what is left is only telling the screens.
+      }
       await this.saveNow().catch(() => undefined)
     }
   }
@@ -1005,11 +1075,12 @@ export class ProjectSession {
   }
 
   /** Checks a practice task's answer with RulZ LLM Suite and grades the recorded session. */
-  private async gradePractice(task: TaskRecord): Promise<void> {
+  private async gradePractice(task: TaskRecord, signal: AbortSignal): Promise<void> {
     const p = task.re!.practice!
     const last = [...this.data.messages].reverse().find((m) => m.role === 'assistant' && m.content.trim())
     try {
-      const r = await this.deps.client.gradePractice(p.taskId, task.re!.target, last?.content ?? '')
+      // Stop must not wait for the server's answer (up to a minute): the client takes no signal, so the wait is cut here.
+      const r = await abortable(this.deps.client.gradePractice(p.taskId, task.re!.target, last?.content ?? ''), signal)
       Object.assign(p, { answer: r.answer, expected: r.expected, passed: r.passed })
       if (r.passed) this.notice(`✅ Practice solved: **${r.answer}** is right.`, 'ok', task.id)
       else if (!r.answer) this.notice(`❌ No \`ANSWER:\` line in the reply, so the practice task counts as failed. The answer was **${r.expected}**.`, 'warn', task.id)
@@ -1021,6 +1092,7 @@ export class ProjectSession {
         })
       }
     } catch (e) {
+      if (e instanceof StopTask) throw e
       this.notice(`I couldn't check the practice answer with RulZ LLM Suite: ${(e as Error).message}`, 'warn', task.id)
     }
   }

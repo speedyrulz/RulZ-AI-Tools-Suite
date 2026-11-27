@@ -16,6 +16,14 @@ export type LinkState =
 
 const OPEN_TIMEOUT_MS = 8000
 const REQUEST_TIMEOUT_MS = 120_000
+/** Channels that load or restart a model, or finish a big upload: they can take minutes on the computer. */
+const SLOW_REQUEST_TIMEOUT_MS = 600_000
+const SLOW_CHANNELS: ReadonlySet<string> = new Set(['models:reloadMode', 'models:setLoadSettings', 'pdf:uploadEnd'])
+
+/** How long to wait for the computer's answer to a channel. */
+export function requestTimeoutFor(channel: string): number {
+  return SLOW_CHANNELS.has(channel) ? SLOW_REQUEST_TIMEOUT_MS : REQUEST_TIMEOUT_MS
+}
 const MAX_BACKOFF_MS = 15_000
 
 interface Pending {
@@ -91,7 +99,7 @@ export class RemoteLink implements RulzApi {
   }
 
   invoke<K extends InvokeChannel>(channel: K, ...args: Parameters<IpcInvoke[K]>): Promise<Awaited<ReturnType<IpcInvoke[K]>>> {
-    return this.request(channel, args, REQUEST_TIMEOUT_MS) as Promise<Awaited<ReturnType<IpcInvoke[K]>>>
+    return this.request(channel, args, requestTimeoutFor(channel)) as Promise<Awaited<ReturnType<IpcInvoke[K]>>>
   }
 
   on<K extends EventChannel>(channel: K, listener: (payload: IpcEvents[K]) => void): () => void {
@@ -122,7 +130,13 @@ export class RemoteLink implements RulzApi {
         reject(new Error('Your computer took too long to answer.'))
       }, timeoutMs)
       this.pending.set(id, { resolve, reject, timer })
-      ws.send(JSON.stringify({ t: 'invoke', id, channel, args }))
+      try {
+        ws.send(JSON.stringify({ t: 'invoke', id, channel, args }))
+      } catch (e) {
+        clearTimeout(timer)
+        this.pending.delete(id)
+        reject(e instanceof Error ? e : new Error(String(e)))
+      }
     })
   }
 
@@ -195,7 +209,13 @@ export class RemoteLink implements RulzApi {
           break
         }
         case 'event':
-          for (const l of this.listeners.get(String(msg.channel)) ?? []) l(msg.payload)
+          for (const l of [...(this.listeners.get(String(msg.channel)) ?? [])]) {
+            try {
+              l(msg.payload)
+            } catch (e) {
+              console.error(`Listener for ${String(msg.channel)} failed`, e)
+            }
+          }
           break
       }
     }

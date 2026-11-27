@@ -24,9 +24,15 @@ export function parsePairingLink(link: string): Omit<Computer, 'id'> | null {
   const host = q.get('host')?.trim() || q.get('dns')?.trim() || ''
   const token = q.get('token')?.trim() ?? ''
   const port = Number(q.get('port') ?? DEFAULT_PORT)
-  if (!host || !token || !validPort(port)) return null
   const dns = q.get('dns')?.trim() || undefined
+  if (!host || !token || !validPort(port) || !validHost(host) || (dns !== undefined && !validHost(dns))) return null
   return { name: q.get('name')?.trim() || dns?.split('.')[0] || host, host, dns: dns !== host ? dns : undefined, port, token }
+}
+
+/** A hostname (letters, digits, dots, hyphens), an IPv4 address or a bracket-free IPv6 address: nothing that could change where a socket address points (`1.2.3.4@evil`). */
+export function validHost(host: string): boolean {
+  if (/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/i.test(host)) return true
+  return host.includes(':') && /^[0-9a-f:.]+$/i.test(host) && /^[0-9a-f]{0,4}(:[0-9a-f]{0,4}){2,7}(:\d{1,3}(\.\d{1,3}){3})?$/i.test(host)
 }
 
 export function validPort(port: number): boolean {

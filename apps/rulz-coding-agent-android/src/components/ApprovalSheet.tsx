@@ -1,20 +1,64 @@
 import { ChevronDown, ShieldAlert } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { cn } from '../lib/format'
 import { useWorkspace } from '../stores/workspace'
 import { Markdown } from './Markdown'
 import { Button, Sheet } from './ui'
+
+/** The buttons ignore presses this long after a question appears or changes, so a tap meant for something else can't answer it. */
+export const ARM_MS = 600
+
+/**
+ * Wraps `decide` so presses are ignored until ARM_MS after `arm()` (called for every new prompt).
+ * Kept apart from React so it can be tested with fake timers.
+ */
+export function createArming(onArmed: (armed: boolean) => void, ms = ARM_MS): { arm: () => void; cancel: () => void; isArmed: () => boolean } {
+  let armed = false
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const cancel = (): void => {
+    if (timer) clearTimeout(timer)
+    timer = null
+  }
+  return {
+    arm: () => {
+      cancel()
+      armed = false
+      onArmed(false)
+      timer = setTimeout(() => {
+        timer = null
+        armed = true
+        onArmed(true)
+      }, ms)
+    },
+    cancel,
+    isArmed: () => armed
+  }
+}
 
 /** "Is this OK?" before a command or a risky step, answered from the phone. */
 export function ApprovalSheet() {
   const prompt = useWorkspace((s) => s.prompt)
   const answer = useWorkspace((s) => s.answer)
   const [details, setDetails] = useState(false)
-  useEffect(() => setDetails(false), [prompt?.id])
+  const [armed, setArmed] = useState(false)
+  const arming = useRef<ReturnType<typeof createArming> | null>(null)
+  // Which prompt the arming belongs to: until the effect below has re-armed for a new prompt, a press
+  // must not count with the previous prompt's arming.
+  const armedFor = useRef<string | undefined>(undefined)
+  useEffect(() => {
+    setDetails(false)
+    const a = (arming.current = createArming(setArmed))
+    armedFor.current = prompt?.id
+    a.arm()
+    return a.cancel
+  }, [prompt?.id])
 
   const open = prompt?.kind === 'approval'
   const req = open ? prompt : null
-  const decide = (decision: 'allow' | 'allow-task' | 'deny'): void => { if (req) void answer(req.id, { kind: 'approval', decision }) }
+  const decide = (decision: 'allow' | 'allow-task' | 'deny'): void => {
+    if (req && armedFor.current === req.id && arming.current?.isArmed()) void answer(req.id, { kind: 'approval', decision })
+  }
+  const dim = !armed && 'opacity-50'
 
   return (
     <Sheet
@@ -25,9 +69,9 @@ export function ApprovalSheet() {
       title="Is this OK?"
       footer={
         <div className="grid w-full grid-cols-2 gap-2">
-          <Button onClick={() => decide('deny')}>Don’t allow</Button>
-          <Button onClick={() => decide('allow-task')}>Allow for this task</Button>
-          <Button variant="primary" size="lg" className="col-span-2" onClick={() => decide('allow')}>
+          <Button aria-disabled={!armed} className={cn(dim)} onClick={() => decide('deny')}>Don’t allow</Button>
+          <Button aria-disabled={!armed} className={cn(dim)} onClick={() => decide('allow-task')}>Allow for this task</Button>
+          <Button variant="primary" size="lg" aria-disabled={!armed} className={cn('col-span-2', dim)} onClick={() => decide('allow')}>
             Allow
           </Button>
         </div>

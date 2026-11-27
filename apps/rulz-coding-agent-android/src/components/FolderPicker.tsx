@@ -1,5 +1,5 @@
 import { ChevronRight, CornerLeftUp, Folder, HardDrive } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { FolderListing } from '@shared/types'
 import { errorMessage, invoke } from '../lib/api'
 import { Button, Sheet, Spinner } from './ui'
@@ -24,16 +24,24 @@ export function FolderPicker({
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
+  // Only the newest request's answer is used: answers can arrive out of order.
+  const latest = useRef(0)
   const go = async (path: string): Promise<void> => {
+    const mine = ++latest.current
     setLoading(true)
     setError('')
     try {
-      setListing(await invoke('fs:listFolders', path))
+      const next = await invoke('fs:listFolders', path)
+      if (mine === latest.current) setListing(next)
     } catch (e) {
+      if (mine !== latest.current) return
       setError(errorMessage(e))
-      if (!listing) setListing(await invoke('fs:listFolders', '').catch(() => null))
+      if (!listing) {
+        const root = await invoke('fs:listFolders', '').catch(() => null)
+        if (mine === latest.current) setListing(root)
+      }
     } finally {
-      setLoading(false)
+      if (mine === latest.current) setLoading(false)
     }
   }
 

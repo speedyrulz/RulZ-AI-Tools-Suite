@@ -71,18 +71,33 @@ const CLOSED = {
 } satisfies Partial<WorkspaceState>
 
 export const useWorkspace = create<WorkspaceState>((set, get) => {
+  // Streamed text, thoughts and command output are batched (50 ms), then applied in one update.
   const chunks = new Map<string, { text: string; reasoning: string }>()
+  const outputs = new Map<string, string>()
   let chunkTimer: ReturnType<typeof setTimeout> | null = null
   const flushChunks = (): void => {
     if (chunkTimer) clearTimeout(chunkTimer)
     chunkTimer = null
-    if (!chunks.size) return
+    if (!chunks.size && !outputs.size) return
     const pending = new Map(chunks)
+    const output = new Map(outputs)
     chunks.clear()
-    set((s) => ({ timeline: s.timeline.map((x) => {
-      const chunk = pending.get(x.id)
-      return chunk && x.kind === 'assistant' ? { ...x, text: x.text + chunk.text, reasoning: (x.reasoning ?? '') + chunk.reasoning } : x
-    }) }))
+    outputs.clear()
+    set((s) => ({
+      timeline: pending.size
+        ? s.timeline.map((x) => {
+            const chunk = pending.get(x.id)
+            return chunk && x.kind === 'assistant' ? { ...x, text: x.text + chunk.text, reasoning: (x.reasoning ?? '') + chunk.reasoning } : x
+          })
+        : s.timeline,
+      tasks: output.size
+        ? s.tasks.map((t) =>
+            t.steps.some((x) => output.has(x.id))
+              ? { ...t, steps: t.steps.map((x) => (output.has(x.id) ? { ...x, output: ((x.output ?? '') + output.get(x.id)).slice(-MAX_LIVE_OUTPUT) } : x)) }
+              : t
+          )
+        : s.tasks
+    }))
   }
   const apply = (state: ProjectState, same = false): void => {
     flushChunks()
@@ -98,7 +113,8 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       status: same && state.running ? get().status : ({ phase: state.running ? 'working' : 'idle', text: 'Working…' } as AgentStatus),
       selectedTaskId: same ? get().selectedTaskId : null
     })
-    void invoke('run:state', state.project.path).then((run) => set({ run }), () => undefined)
+    const path = state.project.path
+    void invoke('run:state', path).then((run) => { if (isMine(path)) set({ run }) }, () => undefined)
   }
 
   const isMine = (projectPath: string): boolean => get().project?.path.toLowerCase() === projectPath.toLowerCase()
@@ -111,7 +127,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
 
   on('agent:event', (e: AgentEvent) => {
     if (!isMine(e.projectPath)) return
-    if (e.type !== 'delta' && e.type !== 'reasoning') flushChunks()
+    if (e.type !== 'delta' && e.type !== 'reasoning' && e.type !== 'output') flushChunks()
     switch (e.type) {
       case 'task-start':
         set((s) => ({ tasks: [...s.tasks, e.task], timeline: [...s.timeline, e.item], running: true, selectedTaskId: null }))
@@ -153,13 +169,8 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         set((s) => ({ tasks: updateTask(s.tasks, e.taskId, (t) => ({ ...t, plan: e.plan })) }))
         break
       case 'output':
-        set((s) => ({
-          tasks: s.tasks.map((t) =>
-            t.steps.some((x) => x.id === e.stepId)
-              ? { ...t, steps: t.steps.map((x) => (x.id === e.stepId ? { ...x, output: ((x.output ?? '') + e.chunk).slice(-MAX_LIVE_OUTPUT) } : x)) }
-              : t
-          )
-        }))
+        outputs.set(e.stepId, (outputs.get(e.stepId) ?? '') + e.chunk)
+        if (!chunkTimer) chunkTimer = setTimeout(flushChunks, 50)
         break
       case 'files':
         set((s) => ({ tasks: updateTask(s.tasks, e.taskId, (t) => ({ ...t, files: e.files })) }))
@@ -292,8 +303,8 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         toast.success('Undone. Your project is back to how it was.')
       }),
 
-    startRun: () => withProject(async (p) => set({ run: await invoke('run:start', p) })),
-    stopRun: () => withProject(async (p) => set({ run: await invoke('run:stop', p) })),
+    startRun: () => withProject(async (p) => { const run = await invoke('run:start', p); if (isMine(p)) set({ run }) }),
+    stopRun: () => withProject(async (p) => { const run = await invoke('run:stop', p); if (isMine(p)) set({ run }) }),
     askHowToRun: () => withProject((p) => invoke('run:askAgent', p)),
     fixRun: () => withProject((p) => invoke('run:fix', p)),
     share: () => withProject((p) => invoke('run:share', p)),
@@ -312,7 +323,10 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     },
 
     setRunCommand: (command) =>
-      withProject(async (p) => set({ run: await invoke('run:setCommand', p, command), runCommand: command?.trim() || null })),
+      withProject(async (p) => {
+        const run = await invoke('run:setCommand', p, command)
+        if (isMine(p)) set({ run, runCommand: command?.trim() || null })
+      }),
 
     selectTask: (selectedTaskId) => set({ selectedTaskId })
   }

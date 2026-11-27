@@ -16,6 +16,7 @@ import { CostReadout, DraftReadout, FileCount, FileList, PlanList, StepList, Tas
 import { Button, IconButton, Sheet, Textarea, TopBar } from '../components/ui'
 import { cn, formatTokens } from '../lib/format'
 import { activeModelId, chosenRentalGone, useApp } from '../stores/app'
+import { draftOf, selectDraft, useComposer } from '../stores/composer'
 import { useUi, type Tab } from '../stores/ui'
 import { undoableTask, useWorkspace } from '../stores/workspace'
 
@@ -541,6 +542,9 @@ function PromptCard() {
   )
 }
 
+/** A send in progress. Outside the component, so a tab switch (which remounts the composer) keeps it. */
+let sending = false
+
 function Composer() {
   const running = useWorkspace((s) => s.running)
   const prompt = useWorkspace((s) => s.prompt)
@@ -549,7 +553,10 @@ function Composer() {
   const llmReady = useApp((s) => s.connection.status === 'connected')
   // A chosen model that was on a rental and is gone: nothing starts, and no other model takes its place.
   const rentalGone = useApp((s) => chosenRentalGone(s.settings, s.connection) !== null)
-  const [text, setText] = useState('')
+  // The draft lives in a store (per project): this component unmounts when another tab or Settings is shown.
+  const projectPath = useWorkspace((s) => s.project?.path ?? '')
+  const text = useComposer(selectDraft(projectPath))
+  const setText = (value: string): void => useComposer.getState().setDraft(projectPath, value)
   const ref = useRef<HTMLTextAreaElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const answering = prompt?.kind === 'question'
@@ -564,12 +571,12 @@ function Composer() {
 
   useEffect(() => {
     const fill = (e: Event): void => {
-      setText((e as CustomEvent<string>).detail)
+      useComposer.getState().setDraft(projectPath, (e as CustomEvent<string>).detail)
       ref.current?.focus()
     }
     window.addEventListener('rulz:fill', fill)
     return () => window.removeEventListener('rulz:fill', fill)
-  }, [])
+  }, [projectPath])
   // Grows with the text, up to about six lines.
   useLayoutEffect(() => {
     const el = ref.current
@@ -579,14 +586,20 @@ function Composer() {
   }, [text])
 
   const submit = async (): Promise<void> => {
-    if (!canSend) return
+    // A double tap must not start the task twice.
+    if (!canSend || sending) return
     const sent = text
     const ids = answering ? [] : usePdf.getState().ids()
     if (!answering && usePdf.getState().blocked()) return
-    if (await send(sent, answering ? prompt.id : undefined, ids)) {
-      setText((current) => current === sent ? '' : current)
-      // The chips go only after the task started.
-      if (ids.length) usePdf.getState().clearSent(ids)
+    sending = true
+    try {
+      if (await send(sent, answering ? prompt.id : undefined, ids)) {
+        if (draftOf(projectPath) === sent) setText('')
+        // The chips go only after the task started.
+        if (ids.length) usePdf.getState().clearSent(ids)
+      }
+    } finally {
+      sending = false
     }
   }
 

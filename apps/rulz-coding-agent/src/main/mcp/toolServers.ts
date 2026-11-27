@@ -31,6 +31,8 @@ interface Connection {
   instructions?: string
   client?: Client
   starting?: Promise<void>
+  /** Set by dispose(): a connection that finishes after that is closed at once, not kept. */
+  disposed?: boolean
 }
 
 /** Folders where npx-style launchers live but that an app started from Explorer may lack on its PATH. */
@@ -107,6 +109,14 @@ export class ToolServers {
             for (const line of d.toString().split(/\r?\n/)) if (line.trim()) log(line)
           })
           await client.connect(transport)
+        }
+        if (conn.disposed) {
+          // dispose() ran while this was still connecting, so it found no client to close: this one (and a stdio
+          // server's process) would otherwise live on after the app is gone.
+          await client.close().catch(() => undefined)
+          status.state = 'error'
+          status.error = 'The tool server was shut down while it was starting.'
+          return
         }
         conn.client = client
         client.onclose = () => {
@@ -193,6 +203,7 @@ export class ToolServers {
   async dispose(): Promise<void> {
     const all = [...this.connections.values()]
     this.connections.clear()
+    for (const c of all) c.disposed = true
     await Promise.all(all.map((c) => c.client?.close().catch(() => undefined)))
   }
 }

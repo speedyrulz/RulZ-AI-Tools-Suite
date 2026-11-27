@@ -17,7 +17,7 @@ export interface ReTaskText {
 }
 
 const fill = (goal: string, target: string): string => {
-  const t = goal.replaceAll('{target}', target).trim()
+  const t = goal.replaceAll('{target}', () => target).trim()
   return t.includes(target) ? t : `Target: ${target}\n\n${t}`
 }
 

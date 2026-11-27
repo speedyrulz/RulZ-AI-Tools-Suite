@@ -12,7 +12,7 @@ import { useModelModes, useModes } from '../stores/modes'
 import { RentalNote } from './common'
 import { Badge, Button, Field, Input, Select, Switch } from './ui'
 
-/** Number box that allows an empty value (mapped to null). */
+/** Number box that allows an empty value (mapped to null). What is typed stays as typed; it is applied when the box loses focus or Enter is pressed. */
 function NumberBox({
   label,
   value,
@@ -30,22 +30,33 @@ function NumberBox({
   max?: number
   step?: number
 }) {
+  const [draft, setDraft] = useState<string | null>(null)
+  const commit = (): void => {
+    if (draft === null) return
+    const raw = draft.trim()
+    // An out-of-range value is turned down by onChange; the box then shows the saved value again.
+    if (raw === '') onChange(null)
+    else {
+      const n = Number(raw)
+      if (Number.isFinite(n)) onChange(n)
+    }
+    setDraft(null)
+  }
   return (
     <Input
       type="number"
       inputMode="decimal"
       aria-label={label}
       className="h-10 w-28 text-right tabular-nums"
-      value={value ?? ''}
+      value={draft ?? value ?? ''}
       placeholder={placeholder}
       min={min}
       max={max}
       step={step}
-      onChange={(e) => {
-        const raw = e.target.value
-        if (raw === '') return onChange(null)
-        const n = Number(raw)
-        if (Number.isFinite(n)) onChange(n)
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') commit()
       }}
     />
   )
@@ -66,6 +77,8 @@ const SAMPLING_FIELDS: { key: NumericKey; label: string; hint: string; min: numb
 ]
 
 const EMPTY_SAMPLING: Record<string, SamplingSettings> = {}
+/** Sampling edits go out one at a time, each built from what the one before saved. */
+let samplingQueue: Promise<unknown> = Promise.resolve()
 
 /** The request field LLM Suite uses for each of this form's numbers. */
 const REQUEST_FIELD: Partial<Record<NumericKey, string>> = { temperature: 'temperature', topP: 'top_p', topK: 'top_k', repeatPenalty: 'repeat_penalty' }
@@ -89,15 +102,21 @@ function Sampling({ model, modes }: { model: string; modes: ModelModes | null | 
   }
   const overridden = SAMPLING_FIELDS.filter((f) => own[f.key] !== undefined && suiteValue(f.key) !== undefined)
 
-  const set = <K extends keyof SamplingSettings>(key: K, v: SamplingSettings[K] | undefined): void => {
-    const next: SamplingSettings = { ...own }
-    if (v === undefined || v === '') delete next[key]
-    else next[key] = v
-    const rest = { ...all }
-    if (Object.keys(next).length) rest[model] = next
-    else delete rest[model]
-    void update({ modelSampling: rest })
+  // Every change (edits and the reset buttons) is built from the latest saved settings when its request is
+  // sent, one after the other, not from this render, so two quick changes don't overwrite each other.
+  const queueSampling = (change: (latest: Record<string, SamplingSettings>) => Record<string, SamplingSettings>): void => {
+    samplingQueue = samplingQueue.then(() => update({ modelSampling: change(useApp.getState().settings?.modelSampling ?? EMPTY_SAMPLING) }))
   }
+  const set = <K extends keyof SamplingSettings>(key: K, v: SamplingSettings[K] | undefined): void =>
+    queueSampling((latest) => {
+      const next: SamplingSettings = { ...(latest[model] ?? {}) }
+      if (v === undefined || v === '') delete next[key]
+      else next[key] = v
+      const rest = { ...latest }
+      if (Object.keys(next).length) rest[model] = next
+      else delete rest[model]
+      return rest
+    })
   const thinkingOff = own.thinking === 'off'
 
   return (
@@ -187,17 +206,19 @@ function Sampling({ model, modes }: { model: string; modes: ModelModes | null | 
             <Button
               size="sm"
               variant="ghost"
-              onClick={() => {
-                const keep = onlyLength(own)
-                const rest = Object.fromEntries(Object.entries(all).filter(([k]) => k !== model))
-                void update({ modelSampling: Object.keys(keep).length ? { ...rest, [model]: keep } : rest })
-              }}
+              onClick={() =>
+                queueSampling((latest) => {
+                  const keep = onlyLength(latest[model] ?? {})
+                  const rest = Object.fromEntries(Object.entries(latest).filter(([k]) => k !== model))
+                  return Object.keys(keep).length ? { ...rest, [model]: keep } : rest
+                })
+              }
             >
               Use LLM Suite&apos;s Coding values
             </Button>
           )
         ) : (
-          <Button size="sm" variant="ghost" onClick={() => void update({ modelSampling: Object.fromEntries(Object.entries(all).filter(([k]) => k !== model)) })}>
+          <Button size="sm" variant="ghost" onClick={() => queueSampling((latest) => Object.fromEntries(Object.entries(latest).filter(([k]) => k !== model)))}>
             Back to recommended
           </Button>
         ))}

@@ -1,5 +1,6 @@
 // Decides which commands are refused outright, which always need the owner's OK, and which follow
 // the approval level. Regexes are deliberately broad: a needless question is cheap, a missed one isn't.
+import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import type { ApprovalLevel, RiskKind } from '@shared/types'
 import { isInside } from './pathGuard'
@@ -168,6 +169,55 @@ const SLASH_UNC = /(?:^|[\s'"(=,;>])(\/\/[\w.-]+\/[^\s'"`;|&)<>,]*)/g
 const PARENT_PATH = /(?:^|[\s'"(=,;:>])((?:[^\s'"`;|&()<>,]*[\\/])?\.\.(?:[\\/][^\s'"`;|&()<>,]*)?)(?=$|[\s'"`;|&()<>,])/g
 // Drive-only references like "C:" also count.
 const BARE_DRIVE = /(?:^|[\s'"(=,;])([a-z]:)(?=$|[\s'"`;|&)])/gi
+/**
+ * `/Users/me`, `"/Program Files/x"`, `/custom`: PowerShell takes a path with forward slashes from the
+ * root of the drive too. Counted only when its first folder really is there at the root of the drive,
+ * so a web route (`'/api/users'`) or a program's switch (`/s`, `/MIR`) is not taken for one.
+ */
+const SLASH_ROOT = /(?:^|[\s'"(=,;>])(\/(?![\/?])[^\s'"`;|&)<>,/]+(?:\/[^\s'"`;|&)<>,]*)?)/g
+const QUOTED_SLASH_ROOT = /(["'])(\/(?![\/?])[^"'\n]+)\1/g
+/** The drive's own folders, `/Windows`, `/Users`: always outside, whatever drive the project is on. */
+const KNOWN_ROOT_FOLDER = String.raw`(?:users|windows|programdata|perflogs|recovery|boot|program files(?: \(x86\))?|\$recycle\.bin)`
+// The rest of the path is taken too: `/Users/me/app/dist` is inside a project at C:\Users\me\app.
+const SLASH_ROOT_FOLDER = new RegExp(String.raw`(?:^|[\s'"(=,;>])(\/${KNOWN_ROOT_FOLDER}(?:[\\/][^\s'"\x60;|&)<>,]*)?)(?=$|[\s'"\x60;|&),<>])`, 'gi')
+const KNOWN_ROOT_START = new RegExp(String.raw`^\/${KNOWN_ROOT_FOLDER}(?=$|[\\/])`, 'i')
+/** The root of the drive itself, given to a command that goes there or lists, copies, moves or deletes there: `cd \`, `Get-ChildItem /`. */
+const LONE_ROOT = new RegExp(
+  // Switches before it may take a value (`-Filter *.log`, `-Recurse:$true`, `-ErrorAction Stop`); a value never starts with a slash.
+  String.raw`${START}(?:cd|chdir|sl|pushd|set-location|push-location|gci|ls|dir|get-childitem|gi|get-item|remove-item|ri|rm|del|erase|rd|rmdir|copy-item|cp|cpi|copy|move-item|mv|mi|move)\s+(?:-(?!(?:literal)?path\b)\w+(?::[^\s;|&)]+|\s+(?![\\/'"-])[^\s;|&)]+)?\s+)*(?:-(?:literal)?path[\s:]+)?['"]?([\\/])['"]?(?=$|[\s;|&)])`,
+  'gi'
+)
+/** `$pwd\..`, `${root}/..`, `$(Get-Location)\..`: a `..` after a value can lead anywhere. */
+const VALUE_PARENT = /(\$[\w:]+|\$\{[^}\n]+\}|\))([^\s'"`;|&()<>,]*[\\/]\.\.)(?=$|[\\/\s'"`;|&()<>,])([^\s'"`;|&()<>,]*)/g
+/** A parent folder looked up while the command runs (`Split-Path $pwd`, `(Get-Item .).Parent`): it can be outside. */
+const PARENT_LOOKUP =
+  // Split-Path's switches may come after a bracketed argument (`Split-Path ($f) -Leaf`); `.Parent.Name` is only a name.
+  /\bsplit-path\b(?!(?:[^;|\n()]|\([^()\n]*\))*\s-(?:leaf|leafbase|extension|qualifier|noqualifier|isabsolute)\b(?!\s*:\s*\$false))|\.parent\b(?!\.(?:name|basename|exists)\b)|::getdirectoryname\b|::getparent\b/i
+/** `C:Windows`: a drive letter and a name with no slash goes from that drive's current folder. */
+const DRIVE_RELATIVE = /(?:^|[\s'"(=,;])([a-z]):(?![\\/])([\w.$-][^\s'"`;|&)<>,]*)/gi
+/** A command that changes the current folder, after which a drive-relative path can lead anywhere. */
+const MOVES_LOCATION = new RegExp(String.raw`${START}(?:cd|chdir|sl|pushd|popd|set-location|push-location|pop-location)(?=$|[\s;|&)'"])`, 'i')
+
+/** For a path from the root of the drive (`/name/...`): whether its first folder is there. */
+function rootFolderExists(root: string, p: string): boolean {
+  const parts = p.slice(1).split(/[\\/]/)
+  const first = parts[0]
+  // A bare one-letter `/s`, `/q`, `/c` is a program's switch; with a folder after it (`/x/sub`) it is a path.
+  if (!first || (first.length < 2 && !parts[1])) return false
+  try {
+    return existsSync(resolve(root, '/' + first))
+  } catch {
+    return false
+  }
+}
+
+function driveExists(letter: string): boolean {
+  try {
+    return existsSync(`${letter}:\\`)
+  } catch {
+    return false
+  }
+}
 
 /**
  * The command as it is checked (it still runs as written): typographic dashes and quotes become
@@ -212,6 +262,33 @@ export function outsidePaths(command: string, root: string): string[] {
   for (const m of rest.matchAll(SLASH_UNC)) found.push(m[1])
   for (const m of rest.matchAll(PARENT_PATH)) if (!isInside(root, resolve(root, m[1]))) found.push(m[1])
   for (const m of command.matchAll(BARE_DRIVE)) found.push(m[1])
+  // On the whole command: a quoted `"/Program Files/x"` was taken out of `rest` above only when it starts with a drive.
+  // Quoted ones are checked whole (they may contain spaces) and then left out of the unquoted check.
+  const unquoted = command.replace(QUOTED_SLASH_ROOT, (_m, _q: string, p: string) => {
+    if (!isInside(root, resolve(root, p)) && (rootFolderExists(root, p) || KNOWN_ROOT_START.test(p))) found.push(p)
+    return ' '
+  })
+  for (const m of unquoted.matchAll(SLASH_ROOT)) {
+    if (!isInside(root, resolve(root, m[1])) && rootFolderExists(root, m[1])) found.push(m[1])
+  }
+  for (const m of unquoted.matchAll(SLASH_ROOT_FOLDER)) if (!isInside(root, resolve(root, m[1]))) found.push(m[1])
+  for (const m of command.matchAll(LONE_ROOT)) found.push(m[1])
+  const moves = MOVES_LOCATION.test(command)
+  for (const m of command.matchAll(VALUE_PARENT)) {
+    // `$pwd\dist\..\cache` is worked out when nothing moved the current folder (the project's, where the command runs).
+    const here = /^\$(?:pwd|\{pwd\})$/i.test(m[1]) && !moves
+    if (!here || !isInside(root, resolve(root, '.' + m[2] + m[3]))) found.push(m[0])
+  }
+  const lookup = command.match(PARENT_LOOKUP)
+  if (lookup) found.push(lookup[0])
+  const drive = resolve(root).slice(0, 1).toLowerCase()
+  for (const m of command.matchAll(DRIVE_RELATIVE)) {
+    const own = m[1].toLowerCase() === drive
+    // Only for a drive that is there (so `x ? b:c` in a one-liner is not one). On the project's own
+    // drive it goes from the project folder (where the command runs), unless the command moved.
+    if (!own && !driveExists(m[1])) continue
+    if (moves || !own || !isInside(root, resolve(root, m[2]))) found.push(`${m[1]}:${m[2]}`)
+  }
   const env = command.match(ENV_PATH)
   if (env) found.push(env[0].trim())
   return found

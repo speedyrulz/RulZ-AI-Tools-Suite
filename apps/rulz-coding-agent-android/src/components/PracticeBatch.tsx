@@ -15,6 +15,7 @@ import { CLOUD_BATCH_NOTE, RENTAL_NOTE } from '@shared/modes'
 import { cn, formatDuration, relativeTime } from '../lib/format'
 import { batchGate } from '../lib/modeLogic'
 import { activeModelId, useApp } from '../stores/app'
+import { useLink } from '../stores/link'
 import { useWorkspace } from '../stores/workspace'
 import { CloudBadge, modelLabel, RentalBadge } from './common'
 import { Badge, Button, Input, Spinner, Switch } from './ui'
@@ -78,8 +79,10 @@ export function useBatchState(
   const onProgressRef = useRef(onProgress)
   onProgressRef.current = onProgress
 
+  // The link coming back counts too: a batch that finished (or started) while the phone was cut off shows its real state.
+  const linked = useLink((l) => l.state.kind === 'connected')
   useEffect(() => {
-    if (!open) return
+    if (!open || !linked) return
     invoke('batch:state')
       .then((s) => {
         setState(s)
@@ -95,7 +98,7 @@ export function useBatchState(
           toast.error(friendlyReError(e))
         }
       })
-  }, [open])
+  }, [open, linked])
 
   useEffect(() => {
     return on('batch:changed', (next) => {
@@ -114,6 +117,31 @@ export function useBatchState(
 }
 
 /** Batch run form and live progress while a run is active. */
+/** "Tries per task": what is typed stays as typed, and is clamped to 1-10 when the box loses focus or Enter is pressed. */
+function AttemptsInput({ value, onCommit }: { value: number; onCommit: (n: number) => void }) {
+  const [draft, setDraft] = useState<string | null>(null)
+  const commit = (): void => {
+    if (draft === null) return
+    onCommit(Math.min(10, Math.max(1, parseInt(draft, 10) || 1)))
+    setDraft(null)
+  }
+  return (
+    <Input
+      type="number"
+      inputMode="numeric"
+      min={1}
+      max={10}
+      className="tabular-nums"
+      value={draft ?? String(value)}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') commit()
+      }}
+    />
+  )
+}
+
 export function BatchRunBox({
   tasks,
   family,
@@ -239,15 +267,7 @@ export function BatchRunBox({
         </label>
         <label className="block space-y-1">
           <span className="block text-[12px] text-muted">Tries per task</span>
-          <Input
-            type="number"
-            inputMode="numeric"
-            min={1}
-            max={10}
-            className="tabular-nums"
-            value={String(opts.attempts)}
-            onChange={(e) => set('attempts', Math.min(10, Math.max(1, parseInt(e.target.value, 10) || 1)))}
-          />
+          <AttemptsInput value={opts.attempts} onCommit={(n) => set('attempts', n)} />
         </label>
         <label className="block space-y-1">
           <span className="block text-[12px] text-muted">Minutes / task</span>
