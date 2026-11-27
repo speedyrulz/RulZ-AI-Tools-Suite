@@ -4,18 +4,20 @@ import { NavRail } from './components/shell/NavRail'
 import { TopBar } from './components/shell/TopBar'
 import { TooltipProvider } from './components/ui'
 import { EmptyPage } from './pages/EmptyPage'
+import { MergePage } from './pages/MergePage'
 import { ServerPage } from './pages/ServerPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { useApp, type Page } from './stores/app'
+import { useMerge } from './stores/merge'
 
 const EMPTY: Partial<Record<Page, { title: string; text: string }>> = {
-  merge: { title: 'Merge', text: 'Merging comes in a later version. Set up the ComfyUI connection on the Server page first.' },
   sweep: { title: 'Sweep', text: 'Sweeps come in a later version. Set up the ComfyUI connection on the Server page first.' },
   results: { title: 'Results', text: 'Results come in a later version. Nothing has been rendered yet.' },
   history: { title: 'History', text: 'History comes in a later version. Nothing has been merged yet.' }
 }
 
 function CurrentPage({ page }: { page: Page }) {
+  if (page === 'merge') return <MergePage />
   if (page === 'server') return <ServerPage />
   if (page === 'settings') return <SettingsPage />
   const e = EMPTY[page]
@@ -30,6 +32,8 @@ export function App() {
   const setTheme = useApp((s) => s.setTheme)
 
   useEffect(() => init(), [init])
+  // Merge jobs are followed for the whole session, also while another page is open.
+  useEffect(() => useMerge.getState().init(), [])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {

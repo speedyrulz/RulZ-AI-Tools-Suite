@@ -88,6 +88,11 @@ export class OwnServer extends EventEmitter {
     return { ...this.st }
   }
 
+  /** The running (or starting) launch's process record: distro and absolute base directory. Null before the start script printed it. */
+  record(): LaunchRecord | null {
+    return this.launch?.rec ?? null
+  }
+
   logTail(): string {
     return this.lines.length ? `${this.lines.join('\n')}\n${this.partial}` : this.partial
   }

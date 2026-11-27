@@ -1,7 +1,7 @@
 {
   "name": "rulz-model-merger",
   "productName": "RulZ Model Merger",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Merge checkpoints and LoRAs with ComfyUI and compare mixes with sample grids.",
   "main": "./out/main/index.js",
   "author": "RulZ",

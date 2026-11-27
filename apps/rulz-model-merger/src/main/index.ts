@@ -1,10 +1,12 @@
 import { join } from 'node:path'
 import { app, BrowserWindow, nativeTheme, shell } from 'electron'
+import type { MergeJob } from '@shared/merge'
 import type { ConnectionStatus, PreflightReport, ServerState, Theme } from '@shared/types'
 import { ComfyClient, probeServer } from './comfy/client'
 import { normalizeServerUrl } from './comfy/parse'
 import { broadcast, handle } from './ipc'
 import { listGpus } from './server/gpus'
+import { MergeRunner } from './merge/runner'
 import { OwnServer } from './server/ownServer'
 import { runPreflight } from './server/preflight'
 import { cleanupOldTempScripts, createWslRunner } from './server/wsl'
@@ -21,6 +23,7 @@ let quitting = false
 const wsl = createWslRunner()
 let settings!: SettingsStore
 let ownServer!: OwnServer
+let mergeRunner!: MergeRunner
 /** Servers the app did not start whose queue the user agreed to share, this session only. */
 const acceptedSharedQueues = new Set<string>()
 
@@ -131,6 +134,11 @@ function registerIpc(): void {
     if (!url) throw new Error('No ComfyUI server is connected.')
     return new ComfyClient(url).capabilities()
   })
+  handle('merge:inspect', (req) => mergeRunner.inspect(req))
+  handle('merge:start', (recipe) => mergeRunner.start(recipe))
+  handle('merge:cancel', (id) => mergeRunner.cancel(id))
+  handle('merge:jobs', () => mergeRunner.jobs())
+  handle('merge:moveToModels', (id) => mergeRunner.moveToModels(id))
   handle('shell:openExternal', async (url) => {
     if (/^https?:\/\//i.test(url)) await shell.openExternal(url)
   })
@@ -210,6 +218,16 @@ async function main(): Promise<void> {
     if (st.status === 'running' || st.status === 'stopped' || st.status === 'error') void refreshStatus()
   })
   ownServer.on('log', (text: string) => broadcast('server:log', { text }))
+
+  mergeRunner = new MergeRunner({
+    client: (url) => new ComfyClient(url),
+    wsl,
+    getConnection: () => connectionStatus(),
+    getOwnRecord: () => ownServer.record(),
+    ownSettings: () => settings.get().ownServer,
+    appVersion: app.getVersion()
+  })
+  mergeRunner.on('job', (job: MergeJob) => broadcast('merge:job', job))
 
   registerIpc()
   createWindow()
