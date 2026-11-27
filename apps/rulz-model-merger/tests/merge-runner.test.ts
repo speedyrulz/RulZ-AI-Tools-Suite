@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { DEFAULT_RECIPE, type MergeJob, type MergeRecipe } from '@shared/merge'
 import { DEFAULT_SETTINGS } from '@shared/types'
 import type { ComfyEventHandlers } from '../src/main/comfy/client'
-import { MergeRunner, URL_MODE_MESSAGE, type MergeClient, type MergeConnection } from '../src/main/merge/runner'
+import { MergeRunner, URL_MODE_MESSAGE, parseLoraNotLoaded, type MergeClient, type MergeConnection } from '../src/main/merge/runner'
 import type { WslResult, WslRunner } from '../src/main/server/wsl'
 
 const hdr = (keys: string[], metadata: Record<string, string> = {}): unknown => ({
@@ -29,6 +29,8 @@ vi.mock('../src/main/merge/inspect', () => ({
   describeModelFile: (name: string, header: { fileBytes: number } | null, error?: string) => ({ name, readable: !!header, error: error ?? null, sizeBytes: header?.fileBytes ?? null }),
   normalizeKeys: (h: { tensors: Record<string, unknown> }) => ({ prefix: '', keys: new Map(Object.entries(h.tensors)) }),
   blockNodeOptions: (...a: unknown[]) => blockOpts(...a),
+  describeLoraFile: (name: string, header: { fileBytes: number } | null, aHeader: unknown, error: string | null) => ({ name, readable: !!header, error, sizeBytes: header?.fileBytes ?? null, aHeader }),
+  isTextEncoderLoraKey: (k: string) => /lora_te|text_encoder/.test(k),
   checkMerge: (input: unknown) => ({ problems: checkProblems(), input })
 }))
 vi.mock('../src/main/merge/graph', () => ({
@@ -58,6 +60,8 @@ interface Fake {
   ownRecord: { distro: string; baseDir: string } | null
   runner: MergeRunner
   events: MergeJob[]
+  logListeners: Set<(text: string) => void>
+  emitLog: (text: string) => void
 }
 
 function setup(over: { conn?: Partial<MergeConnection>; own?: boolean; pollMs?: number } = {}): Fake {
@@ -113,12 +117,19 @@ function setup(over: { conn?: Partial<MergeConnection>; own?: boolean; pollMs?: 
       throw new Error('not used')
     }
   }
+  f.logListeners = new Set()
   f.runner = new MergeRunner({
     client: () => f.client,
     wsl: f.wsl,
     getConnection: async () => f.conn,
     getOwnRecord: () => f.ownRecord,
     ownSettings: () => DEFAULT_SETTINGS.ownServer,
+    onServerLog: (l) => {
+      f.logListeners.add(l)
+      return () => {
+        f.logListeners.delete(l)
+      }
+    },
     appVersion: '0.2.0',
     now: () => 1700000000000,
     newId: () => 'job-1',
@@ -129,6 +140,9 @@ function setup(over: { conn?: Partial<MergeConnection>; own?: boolean; pollMs?: 
     pollMs: over.pollMs ?? 3600000,
     findRetryMs: 1
   })
+  f.emitLog = (text) => {
+    for (const l of [...f.logListeners]) l(text)
+  }
   f.runner.on('job', (j: MergeJob) => f.events.push(j))
   return f
 }
@@ -203,7 +217,7 @@ describe('start: own server', () => {
     expect((f.client.openEvents as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]).toBeLessThan((f.client.queuePrompt as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
     const q = f.client.queued[0] as { extra: { extra_pnginfo: { modelmerger_recipe: { app: string; sourceHeaderSha256: unknown; serverVersion: string; appVersion: string } } } }
     const rec = q.extra.extra_pnginfo.modelmerger_recipe
-    expect(rec).toMatchObject({ app: 'RulZ Model Merger', appVersion: '0.2.0', serverVersion: '0.46.0', sourceHeaderSha256: { a: 'sha-2', b: 'sha-1', c: null } })
+    expect(rec).toMatchObject({ app: 'RulZ Model Merger', appVersion: '0.2.0', serverVersion: '0.46.0', sourceHeaderSha256: { a: 'sha-2', b: 'sha-1', c: null, loras: [] } })
 
     f.client.handlers!.onExecuting!({ promptId: 'p1', node: '2' })
     f.client.handlers!.onProgress!({ promptId: 'p1', node: '2', value: 3, max: 10 })
@@ -453,7 +467,7 @@ describe('start: URL server', () => {
   it('finishes with only the prefix known and no verify', async () => {
     const f = setup({ conn: { own: false, sharedQueueAccepted: true }, own: false })
     await f.runner.start(recipe)
-    expect(f.client.queued[0]).toMatchObject({ extra: { extra_pnginfo: { modelmerger_recipe: { sourceHeaderSha256: { a: null, b: null, c: null } } } } })
+    expect(f.client.queued[0]).toMatchObject({ extra: { extra_pnginfo: { modelmerger_recipe: { sourceHeaderSha256: { a: null, b: null, c: null, loras: [] } } } } })
     f.client.handlers!.onSuccess!('p1')
     await waitFor(() => f.runner.jobs()[0].status === 'done')
     expect(f.runner.jobs()[0].output).toEqual({
@@ -551,7 +565,7 @@ describe('moveToModels', () => {
 describe('inspect', () => {
   it('reads headers of a and b on the own server and reports free RAM', async () => {
     const f = setup()
-    const res = (await f.runner.inspect({ kind: 'diffusion', mode: 'weighted', a: 'a.safetensors', b: 'b.safetensors', c: null })) as unknown as {
+    const res = (await f.runner.inspect({ kind: 'diffusion', mode: 'weighted', a: 'a.safetensors', b: 'b.safetensors', c: null, loras: [] })) as unknown as {
       input: { a: { info: { readable: boolean } }; b: { info: { readable: boolean } }; c: unknown; ramFreeBytes: number | null }
     }
     expect(res.input.a.info.readable).toBe(true)
@@ -561,7 +575,7 @@ describe('inspect', () => {
   })
   it('turns an unreadable file into an error entry', async () => {
     const f = setup()
-    const res = (await f.runner.inspect({ kind: 'diffusion', mode: 'addDifference', a: 'a.safetensors', b: 'missing.safetensors', c: '../evil' })) as unknown as {
+    const res = (await f.runner.inspect({ kind: 'diffusion', mode: 'addDifference', a: 'a.safetensors', b: 'missing.safetensors', c: '../evil', loras: [] })) as unknown as {
       input: { b: { info: { readable: boolean; error: string } }; c: { info: { error: string } } }
     }
     expect(res.input.b.info.readable).toBe(false)
@@ -570,7 +584,7 @@ describe('inspect', () => {
   })
   it('does not read files on a URL server', async () => {
     const f = setup({ conn: { own: false }, own: false })
-    const res = (await f.runner.inspect({ kind: 'checkpoint', mode: 'weighted', a: 'a.safetensors', b: 'b.safetensors', c: null })) as unknown as {
+    const res = (await f.runner.inspect({ kind: 'checkpoint', mode: 'weighted', a: 'a.safetensors', b: 'b.safetensors', c: null, loras: [] })) as unknown as {
       input: { a: { info: { error: string } }; ramFreeBytes: null }
     }
     expect(res.input.a.info.error).toBe(URL_MODE_MESSAGE)
@@ -578,9 +592,164 @@ describe('inspect', () => {
   })
   it('caches object_info per URL', async () => {
     const f = setup()
-    const req = { kind: 'diffusion' as const, mode: 'weighted' as const, a: 'a.safetensors', b: 'b.safetensors', c: null }
+    const req = { kind: 'diffusion' as const, mode: 'weighted' as const, a: 'a.safetensors', b: 'b.safetensors', c: null, loras: [] }
     await f.runner.inspect(req)
     await f.runner.inspect(req)
     expect(f.client.objectInfo).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('parseLoraNotLoaded', () => {
+  it('finds both line forms and dedupes', () => {
+    const text = [
+      'got prompt',
+      'lora key not loaded: diffusion_model.a.lora_up.weight',
+      'NOT LOADED lora_unet_b.alpha',
+      'lora key not loaded: diffusion_model.a.lora_up.weight',
+      'unrelated line'
+    ].join('\n')
+    expect(parseLoraNotLoaded(text)).toEqual(['diffusion_model.a.lora_up.weight', 'lora_unet_b.alpha'])
+  })
+  it('handles Windows line endings and empty text', () => {
+    expect(parseLoraNotLoaded('x\r\nlora key not loaded: k1\r\nNOT LOADED k2\r\n')).toEqual(['k1', 'k2'])
+    expect(parseLoraNotLoaded('')).toEqual([])
+  })
+})
+
+describe('LoRAs', () => {
+  const lora = (name: string): MergeRecipe['loras'][number] => ({ name, strength: 1, clipStrength: 1 })
+  const L1 = `UNC:${MODELS}/loras/one.safetensors`
+  const loraRecipe = (over: Partial<MergeRecipe> = {}): MergeRecipe => ({ ...recipe, loras: [lora('one.safetensors'), lora('two.safetensors')], ...over })
+  const finish = async (f: Fake, keys = ['diffusion_model.x.weight', 'diffusion_model.y.weight']): Promise<MergeJob> => {
+    files.set(OUT_PATH, outHdr(keys))
+    f.outputs = ['merged_00001_.safetensors']
+    f.client.handlers!.onSuccess!('p1')
+    await waitFor(() => ['done', 'error'].includes(f.runner.jobs()[0].status))
+    return f.runner.jobs()[0]
+  }
+  beforeEach(() => {
+    files.set(L1, hdr(['k1', 'k2', 'k3']))
+  })
+
+  it('inspect in bake mode does not read B and reads the LoRA headers with A', async () => {
+    const f = setup()
+    const res = (await f.runner.inspect({ kind: 'diffusion', mode: 'bake', a: 'a.safetensors', b: 'missing.safetensors', c: null, loras: ['one.safetensors', 'two.safetensors'] })) as unknown as {
+      input: { a: { info: { readable: boolean } }; b: unknown; c: unknown; loras: Array<{ name: string; readable: boolean; error: string | null; aHeader: unknown }> }
+    }
+    expect(res.input.a.info.readable).toBe(true)
+    expect(res.input.b).toBeNull()
+    expect(res.input.c).toBeNull()
+    expect(res.input.loras.map((l) => [l.name, l.readable])).toEqual([['one.safetensors', true], ['two.safetensors', false]])
+    expect(res.input.loras[1].error).toMatch(/no such file/)
+    expect(res.input.loras[0].aHeader).toMatchObject({ headerSha256: 'sha-2' })
+  })
+  it('turns a LoRA outside the models folder into an error entry', async () => {
+    const f = setup()
+    const res = (await f.runner.inspect({ kind: 'diffusion', mode: 'bake', a: 'a.safetensors', b: '', c: null, loras: ['../evil'] })) as unknown as {
+      input: { loras: Array<{ readable: boolean; error: string }> }
+    }
+    expect(res.input.loras[0].readable).toBe(false)
+    expect(res.input.loras[0].error).toMatch(/not a name inside/)
+  })
+  it('inspect on a URL server gives unreadable LoRA infos with the URL message', async () => {
+    const f = setup({ conn: { own: false }, own: false })
+    const res = (await f.runner.inspect({ kind: 'diffusion', mode: 'weighted', a: 'a.safetensors', b: 'b.safetensors', c: null, loras: ['one.safetensors'] })) as unknown as {
+      input: { loras: Array<{ readable: boolean; error: string }> }
+    }
+    expect(res.input.loras).toMatchObject([{ readable: false, error: URL_MODE_MESSAGE }])
+  })
+
+  it('start stores the LoRA header hashes in recipe order (null when unreadable) and skips B in bake mode', async () => {
+    const f = setup()
+    files.delete(`UNC:${MODELS}/diffusion_models/b.safetensors`)
+    await f.runner.start(loraRecipe({ mode: 'bake', b: '' }))
+    const q = f.client.queued[0] as { extra: { extra_pnginfo: { modelmerger_recipe: { sourceHeaderSha256: unknown } } } }
+    expect(q.extra.extra_pnginfo.modelmerger_recipe.sourceHeaderSha256).toEqual({ a: 'sha-2', b: null, c: null, loras: ['sha-3', null] })
+  })
+  it('start refuses on check problems that include LoRAs', async () => {
+    checkProblems.mockReturnValue(['LoRA one is for another model.'])
+    const f = setup()
+    await expect(f.runner.start(loraRecipe())).rejects.toThrow('LoRA one is for another model.')
+    expect(f.client.queued).toHaveLength(0)
+    expect(f.logListeners.size).toBe(0)
+  })
+
+  it('collects not-loaded keys across split chunks and separates text-encoder keys for diffusion', async () => {
+    const f = setup()
+    await f.runner.start(loraRecipe())
+    expect(f.logListeners.size).toBe(1)
+    f.emitLog('lora key not loaded: diffusion_model.q.lora_up.we')
+    f.emitLog('ight\r\nlora key not loaded: lora_te1_x.lora_down.weight\nNOT LOADED diffusion_model.r.alpha\nlora key not loaded: diffusion_model.q.lora_up.weight\n')
+    f.emitLog('NOT LOADED text_encoder.y.weight')
+    const job = await finish(f)
+    expect(job.status).toBe('done')
+    expect(job.output!.verify).toMatchObject({
+      ok: false,
+      loraKeysNotLoaded: 2,
+      loraKeysNotLoadedSample: ['diffusion_model.q.lora_up.weight', 'diffusion_model.r.alpha'],
+      loraTextEncoderKeysSkipped: 2
+    })
+    expect(job.output!.verify!.message).toContain(' 2 LoRA weights were not applied (for example diffusion_model.q.lora_up.weight, diffusion_model.r.alpha); the LoRA may be for another model.')
+    expect(job.output!.verify!.message).toContain(' 2 text-encoder weights left out (a diffusion-model file has no text encoder).')
+    expect(f.logListeners.size).toBe(0)
+  })
+  it('counts text-encoder keys as not loaded for a checkpoint', async () => {
+    const f = setup()
+    files.set(`UNC:${MODELS}/checkpoints/a.safetensors`, hdr(['model.diffusion_model.x.weight']))
+    files.set(`UNC:${MODELS}/checkpoints/b.safetensors`, hdr(['model.diffusion_model.x.weight']))
+    await f.runner.start(loraRecipe({ kind: 'checkpoint' }))
+    f.emitLog('lora key not loaded: lora_te1_x.lora_down.weight\n')
+    const job = await finish(f, ['model.diffusion_model.x.weight'])
+    expect(job.output!.verify).toMatchObject({ loraKeysNotLoaded: 1, loraKeysNotLoadedSample: ['lora_te1_x.lora_down.weight'], loraTextEncoderKeysSkipped: 0, ok: false })
+  })
+  it('says all weights were applied when nothing was skipped', async () => {
+    const f = setup()
+    await f.runner.start(loraRecipe())
+    f.emitLog('some other line\n')
+    const job = await finish(f)
+    expect(job.output!.verify).toMatchObject({ ok: true, loraKeysNotLoaded: 0, loraKeysNotLoadedSample: [], loraTextEncoderKeysSkipped: 0 })
+    expect(job.output!.verify!.message).toMatch(/ LoRAs applied: all weights\.$/)
+  })
+  it('leaves the LoRA fields unknown without LoRAs', async () => {
+    const f = setup()
+    await f.runner.start(recipe)
+    expect(f.logListeners.size).toBe(0)
+    const job = await finish(f)
+    expect(job.output!.verify).toMatchObject({ loraKeysNotLoaded: null, loraKeysNotLoadedSample: [], loraTextEncoderKeysSkipped: 0 })
+  })
+  it('does not collect on a URL server', async () => {
+    const f = setup({ conn: { own: false }, own: false })
+    await f.runner.start(loraRecipe())
+    expect(f.logListeners.size).toBe(0)
+    f.client.handlers!.onSuccess!('p1')
+    await waitFor(() => f.runner.jobs()[0].status === 'done')
+    expect(f.runner.jobs()[0].output!.verify).toBeNull()
+  })
+
+  it('stops listening after an error, after cancel and when the prompt is lost', async () => {
+    const f = setup()
+    await f.runner.start(loraRecipe())
+    expect(f.logListeners.size).toBe(1)
+    f.client.handlers!.onError!({ promptId: 'p1', message: 'boom', nodeId: null })
+    expect(f.logListeners.size).toBe(0)
+
+    const g = setup()
+    await g.runner.start(loraRecipe())
+    expect(g.logListeners.size).toBe(1)
+    await g.runner.cancel('job-1')
+    expect(g.logListeners.size).toBe(0)
+
+    const h = setup({ pollMs: 10 })
+    await h.runner.start(loraRecipe())
+    h.client.queueState = { running: [], pending: [] }
+    await waitFor(() => h.runner.jobs()[0].status === 'error')
+    expect(h.logListeners.size).toBe(0)
+  })
+  it('stops listening when queueing fails', async () => {
+    const f = setup()
+    ;(f.client.queuePrompt as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('refused'))
+    await expect(f.runner.start(loraRecipe())).rejects.toThrow('refused')
+    expect(f.logListeners.size).toBe(0)
+    expect(f.client.closed).toBeGreaterThan(0)
   })
 })

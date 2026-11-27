@@ -1,8 +1,8 @@
 import { create } from 'zustand'
 import { toast } from 'sonner'
-import { DEFAULT_RECIPE, type MergeCheck, type MergeJob, type MergeRecipe } from '@shared/merge'
+import { DEFAULT_RECIPE, type LoraEntry, type MergeCheck, type MergeJob, type MergeRecipe } from '@shared/merge'
 import { call, errText, invoke } from '../lib/api'
-import { upsertJob } from '../lib/merge'
+import { loraNames, suggestOutputName, upsertJob } from '../lib/merge'
 
 interface MergeStore {
   recipe: MergeRecipe
@@ -12,8 +12,12 @@ interface MergeStore {
   checkError: string | null
   jobs: MergeJob[]
   starting: boolean
+  /** True once the user typed an output name; until then the name follows A and the LoRAs. */
+  nameTouched: boolean
   /** Changes the recipe; a change to kind, mode, A, B or C re-runs the check after a short pause. */
   setRecipe: (patch: Partial<MergeRecipe>) => void
+  /** Replaces the LoRA list with the result of `fn` (immutable helpers in lib/merge). */
+  patchLoras: (fn: (loras: LoraEntry[]) => LoraEntry[]) => void
   setBlock: (inputs: string[], value: number) => void
   resetBlocks: () => void
   runCheck: () => void
@@ -26,6 +30,7 @@ interface MergeStore {
 let checkSeq = 0
 let checkTimer: number | undefined
 const CHECK_KEYS: (keyof MergeRecipe)[] = ['kind', 'mode', 'a', 'b', 'c']
+const sameLoras = (x: MergeRecipe, y: MergeRecipe): boolean => loraNames(x.loras).join('|') === loraNames(y.loras).join('|')
 
 export const useMerge = create<MergeStore>((set, get) => ({
   recipe: { ...DEFAULT_RECIPE },
@@ -34,23 +39,40 @@ export const useMerge = create<MergeStore>((set, get) => ({
   checkError: null,
   jobs: [],
   starting: false,
+  nameTouched: false,
 
   setRecipe: (patch) => {
     const before = get().recipe
     let next: MergeRecipe = { ...before, ...patch }
     // Another kind has other file lists, and another block node has other inputs.
     if (patch.kind && patch.kind !== before.kind) {
-      next = { ...next, a: '', b: '', c: null, blockNode: null, blocks: {}, weightDtype: 'default' }
+      next = {
+        ...next,
+        a: '',
+        b: '',
+        c: null,
+        blockNode: null,
+        blocks: {},
+        weightDtype: 'default'
+      }
     }
     if (patch.blockNode !== undefined && patch.blockNode !== before.blockNode && patch.blocks === undefined) {
       next = { ...next, blocks: {} }
     }
-    set({ recipe: next })
-    if (CHECK_KEYS.some((k) => before[k] !== next[k])) {
+    let touched = get().nameTouched
+    if (patch.outputName !== undefined) touched = patch.outputName.trim() !== ''
+    else if (!touched && (before.a !== next.a || !sameLoras(before, next) || patch.kind)) next = { ...next, outputName: suggestOutputName(next) }
+    set({ recipe: next, nameTouched: touched })
+    if (CHECK_KEYS.some((k) => before[k] !== next[k]) || !sameLoras(before, next)) {
       // A new question makes the shown answer stale.
       set({ check: null, checkError: null })
       get().runCheck()
     }
+  },
+
+  patchLoras: (fn) => {
+    const loras = fn(get().recipe.loras)
+    if (loras !== get().recipe.loras) get().setRecipe({ loras })
   },
 
   setBlock: (inputs, value) => {
@@ -65,7 +87,7 @@ export const useMerge = create<MergeStore>((set, get) => ({
     window.clearTimeout(checkTimer)
     const seq = ++checkSeq
     const r = get().recipe
-    if (!r.a || !r.b || (r.mode === 'addDifference' && !r.c)) {
+    if (!r.a || (r.mode !== 'bake' && !r.b) || (r.mode === 'addDifference' && !r.c)) {
       set({ check: null, checking: false, checkError: null })
       return
     }
@@ -78,7 +100,8 @@ export const useMerge = create<MergeStore>((set, get) => ({
             mode: r.mode,
             a: r.a,
             b: r.b,
-            c: r.mode === 'addDifference' ? r.c : null
+            c: r.mode === 'addDifference' ? r.c : null,
+            loras: loraNames(r.loras)
           })
           if (seq !== checkSeq) return
           const cur = get().recipe
@@ -86,7 +109,12 @@ export const useMerge = create<MergeStore>((set, get) => ({
           if (cur.mode === 'blocks' && (!blockNode || !res.blockNodes.some((b) => b.node === blockNode))) {
             blockNode = res.suggestedBlockNode ?? res.blockNodes[0]?.node ?? null
           }
-          set({ check: res, checking: false, checkError: null, recipe: blockNode === cur.blockNode ? cur : { ...cur, blockNode, blocks: {} } })
+          set({
+            check: res,
+            checking: false,
+            checkError: null,
+            recipe: blockNode === cur.blockNode ? cur : { ...cur, blockNode, blocks: {} }
+          })
         } catch (e) {
           if (seq !== checkSeq) return
           set({ check: null, checking: false, checkError: errText(e) })

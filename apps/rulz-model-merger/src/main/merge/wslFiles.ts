@@ -5,10 +5,11 @@ import type { OwnServerSettings } from '@shared/types'
 import { bashPath, modelsPath } from '../server/scripts'
 import { shellQuote, type WslRunner } from '../server/wsl'
 
-export type ModelKind = 'checkpoint' | 'diffusion'
-export type ModelSubfolder = 'checkpoints' | 'diffusion_models'
+export type ModelKind = 'checkpoint' | 'diffusion' | 'lora'
+export type ModelSubfolder = 'checkpoints' | 'diffusion_models' | 'loras'
 
 export function subfolderOf(kind: ModelKind): ModelSubfolder {
+  if (kind === 'lora') return 'loras'
   return kind === 'checkpoint' ? 'checkpoints' : 'diffusion_models'
 }
 
@@ -19,7 +20,7 @@ export function toUncPath(distro: string, absWslPath: string): string {
   return `\\\\wsl.localhost\\${d}${rest.startsWith('\\') ? rest : `\\${rest}`}`
 }
 
-/** `<models>/<checkpoints|diffusion_models>/<name>`. Names may hold sub-folders; ".." and absolute names are refused. */
+/** `<models>/<checkpoints|diffusion_models|loras>/<name>`. Names may hold sub-folders; ".." and absolute names are refused. */
 export function sourcePath(modelsAbs: string, kind: ModelKind, name: string): string {
   const n = name.trim()
   if (!n) throw new Error('No model file name was given.')

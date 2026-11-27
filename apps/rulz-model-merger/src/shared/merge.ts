@@ -8,12 +8,29 @@
 //   diffusion model (after "diffusion_model."); the longest matching prefix sets that weight's share of model1.
 // - Save nodes write in the loaded weights' format; a quantized model is re-quantized to model1's format on save.
 // - extra_data.extra_pnginfo entries are written into the saved safetensors header as JSON strings.
+// - LoraLoaderModelOnly(model, lora_name, strength_model) / LoraLoader(model, clip, lora_name, strength_model,
+//   strength_clip) add the LoRA as a patch; the save nodes apply the patches before writing. A LoRA weight ComfyUI
+//   cannot map to the model is skipped with a log line "lora key not loaded: <key>" (or "NOT LOADED <key>").
 
 /** Where the sources come from: CheckpointLoaderSimple (models/checkpoints) or UNETLoader (models/diffusion_models). */
 export type MergeSourceKind = 'checkpoint' | 'diffusion'
 
-/** weighted: A*r + B*(1-r). addDifference: A + (B - C)*m. blocks: per-block share of A through a block merge node. */
-export type MergeMode = 'weighted' | 'addDifference' | 'blocks'
+/** weighted: A*r + B*(1-r). addDifference: A + (B - C)*m. blocks: per-block share of A through a block merge node.
+ *  bake: no merge, only A with the recipe's LoRAs applied. In the other modes the LoRAs are applied to the merge result. */
+export type MergeMode = 'weighted' | 'addDifference' | 'blocks' | 'bake'
+
+/** One LoRA baked into the result, applied in list order. */
+export interface LoraEntry {
+  /** Name exactly as the server lists it (lora_name choices). */
+  name: string
+  /** strength_model. The UI slider covers -2..2; values from -10 to 10 are accepted. */
+  strength: number
+  /** strength_clip, checkpoints only (diffusion-model files have no text encoder). */
+  clipStrength: number
+}
+
+/** Most LoRAs one recipe may bake. */
+export const MAX_LORAS = 10
 
 /** Checkpoint merges only: what happens to the text encoder. */
 export type ClipChoice = 'merge' | 'a' | 'b'
@@ -43,6 +60,8 @@ export interface MergeRecipe {
   weightDtype: UnetDtype
   /** File name stem; the save node adds _00001_.safetensors. Letters, digits, - _ . and spaces only. */
   outputName: string
+  /** LoRAs applied to the result in order. bake needs at least one; at most MAX_LORAS. */
+  loras: LoraEntry[]
 }
 
 export const DEFAULT_RECIPE: MergeRecipe = {
@@ -58,7 +77,8 @@ export const DEFAULT_RECIPE: MergeRecipe = {
   clip: 'merge',
   vae: 'a',
   weightDtype: 'default',
-  outputName: 'merged'
+  outputName: 'merged',
+  loras: []
 }
 
 /** What the app could read from one source file's safetensors header (own server only; files of a URL server are not reachable). */
@@ -77,6 +97,31 @@ export interface ModelFileInfo {
   quantLabel: string | null
   /** Prefix in front of the diffusion model's keys, e.g. "model.diffusion_model." or "". */
   keyPrefix: string
+}
+
+/** What the app could read from one LoRA's safetensors header (own server only). */
+export interface LoraFileInfo {
+  name: string
+  readable: boolean
+  error: string | null
+  sizeBytes: number | null
+  tensorCount: number
+  /** "LoRA", "LoKr", "LoHa", "DoRA", "mixed" or "unknown", from the key suffixes (lora_up/down, lora_A/B, lokr_w1, hada_w1, dora_scale). */
+  format: string
+  /** Rank of the first low-rank pair, null for LoKr/unknown. */
+  rank: number | null
+  /** comfy: "diffusion_model.<layer>"; kohya: "lora_unet_<layer_with_underscores>"; diffusers: "transformer.<diffusers name>"
+   *  (ComfyUI maps these per model, so the app cannot match them itself); unknown otherwise. */
+  keyStyle: 'comfy' | 'kohya' | 'diffusers' | 'unknown'
+  /** Number of modules the LoRA changes in the diffusion model. */
+  modules: number
+  /** Share of those modules that match a layer of model A by name, 0..1. null when A or the LoRA was not read, or the
+   *  key style is diffusers/unknown (then only ComfyUI's log after the bake tells). */
+  match: number | null
+  /** Modules for a text encoder (lora_te*, text_encoder*, te1_/te2_...). Skipped in a diffusion-model bake. */
+  textEncoderModules: number
+  /** Base model named in the metadata (ss_base_model, modelspec.architecture...), or null. */
+  baseModelHint: string | null
 }
 
 export interface BlockNodeOption {
@@ -104,6 +149,8 @@ export interface MergeCheck {
   /** Block merge nodes on the server, best match first. */
   blockNodes: BlockNodeOption[]
   suggestedBlockNode: string | null
+  /** One entry per requested LoRA, in request order. */
+  loras: LoraFileInfo[]
   /** Rough RAM the merge needs in WSL, and what is free there (own server only). */
   ramNeededBytes: number | null
   ramFreeBytes: number | null
@@ -118,6 +165,13 @@ export interface MergeVerify {
   missingKeys: number
   extraKeys: number
   recipeInHeader: boolean
+  /** LoRA weights ComfyUI skipped ("lora key not loaded"), text-encoder keys of a diffusion-model bake not counted.
+   *  null when not known (server by URL, or no LoRAs). */
+  loraKeysNotLoaded: number | null
+  /** Up to 5 of those keys. */
+  loraKeysNotLoadedSample: string[]
+  /** Text-encoder keys skipped because the bake target has no text encoder (diffusion-model file). */
+  loraTextEncoderKeysSkipped: number
   message: string
 }
 
@@ -157,6 +211,8 @@ export interface MergeInspectRequest {
   a: string
   b: string
   c: string | null
+  /** LoRA names to read, in recipe order. */
+  loras: string[]
 }
 
 /** The recipe stored in the safetensors header (key "modelmerger_recipe") and in the sidecar. */
@@ -169,5 +225,5 @@ export interface RecipeRecord {
   serverVersion: string | null
   recipe: MergeRecipe
   /** SHA-256 of each readable source's header bytes (identifies the file without hashing gigabytes). */
-  sourceHeaderSha256: { a: string | null; b: string | null; c: string | null }
+  sourceHeaderSha256: { a: string | null; b: string | null; c: string | null; loras: Array<string | null> }
 }

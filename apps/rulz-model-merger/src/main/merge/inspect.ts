@@ -1,5 +1,5 @@
 // Pure checks for a merge: what a safetensors header says about a model, and whether two or three files can be merged.
-import type { BlockNodeOption, MergeCheck, MergeMode, MergeSourceKind, ModelFileInfo } from '@shared/merge'
+import type { BlockNodeOption, LoraFileInfo, MergeCheck, MergeMode, MergeSourceKind, ModelFileInfo } from '@shared/merge'
 import type { SafetensorsHeader, SafetensorsTensor } from '../models/safetensors'
 
 const CHECKPOINT_PREFIX = 'model.diffusion_model.'
@@ -146,6 +146,212 @@ export function blockNodeOptions(objectInfo: Record<string, unknown>, aHeader: S
   return out
 }
 
+const BASE_MODEL_PREFIX = 'base_model.model.'
+const TE_PREFIXES = ['lora_te', 'text_encoder.', 'text_encoders.', 'text_model.', 'clip_l.', 'clip_g.', 't5xxl.', 'conditioner.']
+const TE_PATTERN = /^(te\d?\.|text_encoders?_\d+\.)/
+
+/** True for a LoRA key that belongs to a text encoder (lora_te*, text_encoder.*, te1.*, clip_l.*, t5xxl.*, ...). */
+export function isTextEncoderLoraKey(key: string): boolean {
+  const k = key.startsWith(BASE_MODEL_PREFIX) ? key.slice(BASE_MODEL_PREFIX.length) : key
+  return TE_PREFIXES.some((p) => k.startsWith(p)) || TE_PATTERN.test(k)
+}
+
+type LoraFormat = 'LoRA' | 'LoKr' | 'LoHa'
+// Longest suffixes first. rank: the suffix names a down / A matrix (its smaller dimension is the rank).
+const LORA_SUFFIXES: Array<{ suffix: string; fmt: LoraFormat | 'DoRA' | null; rank?: boolean }> = [
+  { suffix: '.lora_down.weight', fmt: 'LoRA', rank: true },
+  { suffix: '.lora_up.weight', fmt: 'LoRA' },
+  { suffix: '.lora_A.default.weight', fmt: 'LoRA', rank: true },
+  { suffix: '.lora_B.default.weight', fmt: 'LoRA' },
+  { suffix: '.lora_A.weight', fmt: 'LoRA', rank: true },
+  { suffix: '.lora_B.weight', fmt: 'LoRA' },
+  { suffix: '.lora.down.weight', fmt: 'LoRA', rank: true },
+  { suffix: '.lora.up.weight', fmt: 'LoRA' },
+  { suffix: '.lora_mid.weight', fmt: 'LoRA' },
+  { suffix: '.lokr_w1_a', fmt: 'LoKr' },
+  { suffix: '.lokr_w1_b', fmt: 'LoKr' },
+  { suffix: '.lokr_w2_a', fmt: 'LoKr' },
+  { suffix: '.lokr_w2_b', fmt: 'LoKr' },
+  { suffix: '.lokr_w1', fmt: 'LoKr' },
+  { suffix: '.lokr_w2', fmt: 'LoKr' },
+  { suffix: '.lokr_t2', fmt: 'LoKr' },
+  { suffix: '.hada_w1_a', fmt: 'LoHa' },
+  { suffix: '.hada_w1_b', fmt: 'LoHa' },
+  { suffix: '.hada_w2_a', fmt: 'LoHa' },
+  { suffix: '.hada_w2_b', fmt: 'LoHa' },
+  { suffix: '.hada_t1', fmt: 'LoHa' },
+  { suffix: '.hada_t2', fmt: 'LoHa' },
+  { suffix: '.dora_scale', fmt: 'DoRA' },
+  { suffix: '.alpha', fmt: null },
+  { suffix: '.diff_b', fmt: null },
+  { suffix: '.diff', fmt: null },
+  { suffix: '.w_norm', fmt: null },
+  { suffix: '.b_norm', fmt: null }
+]
+
+const COMFY_PREFIXES = ['model.diffusion_model.', 'diffusion_model.']
+const DIFFUSERS_PREFIXES = ['transformer.', 'unet.', BASE_MODEL_PREFIX]
+
+function loraKeyStyle(module: string): LoraFileInfo['keyStyle'] {
+  if (COMFY_PREFIXES.some((p) => module.startsWith(p))) return 'comfy'
+  if (module.startsWith('lora_unet_')) return 'kohya'
+  if (DIFFUSERS_PREFIXES.some((p) => module.startsWith(p))) return 'diffusers'
+  return 'unknown'
+}
+
+/** True when a LoRA module ("layers.0.proj.k") targets one part of a weight A stores fused ("layers.0.proj.qkv",
+ *  "attn.to_qkv", "ffn.up_gate"). ComfyUI maps such LoRA keys onto the fused weight when it loads them. */
+export function isFusedInto(module: string, children: Map<string, string[]>): boolean {
+  const dot = module.lastIndexOf('.')
+  if (dot < 0) return false
+  const parent = module.slice(0, dot)
+  const part = bare(module.slice(dot + 1))
+  if (!part) return false
+  for (const sibling of children.get(parent) ?? []) {
+    const pieces = bare(sibling).split('_').filter(Boolean)
+    if (pieces.length > 1 && pieces.includes(part)) return true
+    // "qkv" holds q, k and v.
+    if (pieces.length === 1 && part.length === 1 && /^[qkv]{2,3}$/.test(pieces[0]) && pieces[0].includes(part)) return true
+  }
+  return false
+}
+
+/** Module names of the parts a LoRA may train for each fused weight of A: "x.qkv" gives x.q, x.to_q, x.q_proj ... */
+export function fusedPartNames(children: Map<string, string[]>): string[] {
+  const out: string[] = []
+  for (const [parent, kids] of children) {
+    for (const kid of kids) {
+      const b = bare(kid)
+      const pieces = b.split('_').filter(Boolean)
+      let parts: string[] = []
+      if (pieces.length > 1) parts = pieces
+      else if (/^[qkv]{2,3}$/.test(b)) parts = b.split('')
+      for (const p of parts) out.push(`${parent}.${p}`, `${parent}.to_${p}`, `${parent}.${p}_proj`)
+    }
+  }
+  return out
+}
+
+function bare(name: string): string {
+  return name.replace(/^to_/, '').replace(/_proj$/, '')
+}
+
+export function describeLoraFile(
+  name: string,
+  header: SafetensorsHeader | null,
+  aHeader: SafetensorsHeader | null,
+  error: string | null
+): LoraFileInfo {
+  if (!header) {
+    return {
+      name,
+      readable: false,
+      error: error ?? 'The file was not read.',
+      sizeBytes: null,
+      tensorCount: 0,
+      format: 'unknown',
+      rank: null,
+      keyStyle: 'unknown',
+      modules: 0,
+      match: null,
+      textEncoderModules: 0,
+      baseModelHint: null
+    }
+  }
+  const formats = new Set<LoraFormat>()
+  let dora = false
+  let rank: number | null = null
+  const diffusionModules = new Set<string>()
+  const teModules = new Set<string>()
+  for (const [key, t] of Object.entries(header.tensors)) {
+    const hit = LORA_SUFFIXES.find((x) => key.endsWith(x.suffix))
+    if (!hit) continue
+    const module = key.slice(0, key.length - hit.suffix.length)
+    if (module === '') continue
+    if (hit.fmt === 'DoRA') dora = true
+    else if (hit.fmt) formats.add(hit.fmt)
+    if (hit.rank && rank === null && t.shape.length >= 2) rank = Math.min(t.shape[0], t.shape[1])
+    if (isTextEncoderLoraKey(module)) teModules.add(module)
+    else diffusionModules.add(module)
+  }
+  let format: string
+  if (formats.size === 0) format = 'unknown'
+  else if (formats.size > 1) format = 'mixed'
+  else format = [...formats][0]
+  if (dora && formats.size === 1 && formats.has('LoRA')) format = 'DoRA'
+
+  const styleCount = new Map<LoraFileInfo['keyStyle'], number>()
+  for (const m of diffusionModules) {
+    const st = loraKeyStyle(m)
+    styleCount.set(st, (styleCount.get(st) ?? 0) + 1)
+  }
+  let keyStyle: LoraFileInfo['keyStyle'] = 'unknown'
+  let best = 0
+  for (const st of ['comfy', 'kohya', 'diffusers', 'unknown'] as const) {
+    const n = styleCount.get(st) ?? 0
+    if (n > best) {
+      best = n
+      keyStyle = st
+    }
+  }
+
+  let match: number | null = null
+  if (aHeader && (keyStyle === 'comfy' || keyStyle === 'kohya') && diffusionModules.size > 0) {
+    const aKeys = [...normalizeKeys(aHeader).keys.keys()]
+    let hits = 0
+    // Weights of A per parent module, to find fused layers (q/k/v trained apart, stored as one qkv weight).
+    const children = new Map<string, string[]>()
+    for (const k of aKeys) {
+      if (!k.endsWith('.weight')) continue
+      const mod = k.slice(0, -'.weight'.length)
+      const dot = mod.lastIndexOf('.')
+      if (dot < 0) continue
+      const parent = mod.slice(0, dot)
+      children.set(parent, [...(children.get(parent) ?? []), mod.slice(dot + 1)])
+    }
+    if (keyStyle === 'comfy') {
+      const aSet = new Set(aKeys)
+      for (const m of diffusionModules) {
+        const prefix = COMFY_PREFIXES.find((p) => m.startsWith(p)) ?? ''
+        const x = m.slice(prefix.length)
+        if (aSet.has(`${x}.weight`) || aSet.has(x)) hits++
+        else if (isFusedInto(x, children)) hits++
+      }
+    } else {
+      const flatten = (s: string): string => s.replace(/\./g, '_')
+      const flat = new Set(aKeys.map((k) => flatten(k.endsWith('.weight') ? k.slice(0, -'.weight'.length) : k)))
+      // kohya names lose the dots, so the parts of fused weights are listed under their flattened names too.
+      for (const v of fusedPartNames(children)) flat.add(flatten(v))
+      for (const m of diffusionModules) if (flat.has(m.slice('lora_unet_'.length))) hits++
+    }
+    match = hits / diffusionModules.size
+  }
+
+  let baseModelHint: string | null = null
+  for (const k of ['ss_base_model', 'modelspec.architecture', 'ss_base_model_version', 'base_model']) {
+    const v = (header.metadata[k] ?? '').trim()
+    if (v !== '') {
+      baseModelHint = v.slice(0, 80)
+      break
+    }
+  }
+
+  return {
+    name,
+    readable: true,
+    error: null,
+    sizeBytes: header.fileBytes,
+    tensorCount: Object.keys(header.tensors).length,
+    format,
+    rank,
+    keyStyle,
+    modules: diffusionModules.size,
+    match,
+    textEncoderModules: teModules.size,
+    baseModelHint
+  }
+}
+
 interface Source {
   info: ModelFileInfo
   header: SafetensorsHeader | null
@@ -198,17 +404,19 @@ export function checkMerge(input: {
   c: Source | null
   objectInfo: Record<string, unknown>
   ramFreeBytes: number | null
+  loras: LoraFileInfo[]
 }): MergeCheck {
   const problems: string[] = []
   const warnings: string[] = []
   const { a, b, c, mode } = input
+  const bake = mode === 'bake'
   const needC = mode === 'addDifference'
   const named = (s: Source | null): boolean => !!s && s.info.name.trim() !== ''
 
   if (!named(a)) problems.push('Choose model A.')
-  if (!named(b)) problems.push('Choose model B.')
+  if (!bake && !named(b)) problems.push('Choose model B.')
   if (needC && !named(c)) problems.push('Difference mode needs a model C (the model subtracted from B).')
-  if (named(a) && named(b) && a!.info.name === b!.info.name) {
+  if (!bake && named(a) && named(b) && a!.info.name === b!.info.name) {
     problems.push('A and B are the same file. Choose two different models.')
   }
   if (needC && named(c) && named(a) && c!.info.name === a!.info.name) {
@@ -217,12 +425,12 @@ export function checkMerge(input: {
 
   const labelled: Array<[string, Source | null, boolean]> = [
     ['A', a, true],
-    ['B', b, true],
+    ['B', b, !bake],
     ['C', c, needC]
   ]
   const needed = labelled.filter(([, s, need]) => need && named(s))
   const readable = (s: Source | null): s is Source => !!s && s.info.readable && s.header !== null
-  let anyUnreadable = needed.length < (needC ? 3 : 2)
+  let anyUnreadable = needed.length < (bake ? 1 : needC ? 3 : 2)
   for (const [label, s] of needed) {
     if (!readable(s)) {
       anyUnreadable = true
@@ -231,7 +439,7 @@ export function checkMerge(input: {
     }
   }
 
-  if (readable(a) && readable(b)) comparePair('A', a.header!, 'B', b.header!, problems)
+  if (!bake && readable(a) && readable(b)) comparePair('A', a.header!, 'B', b.header!, problems)
   if (needC && readable(b) && readable(c)) comparePair('B', b.header!, 'C', c.header!, problems)
 
   // One warning per quantization label ("A and B are int8"), not one per source.
@@ -246,17 +454,54 @@ export function checkMerge(input: {
     const who = labels.length === 1 ? `${labels[0]} is` : `${labels.slice(0, -1).join(', ')} and ${labels[labels.length - 1]} are`
     warnings.push(`${who} ${q}: weights are merged, then saved as ${q} again, which adds a little loss. Merging the bf16 originals is best.`)
   }
-  if (readable(a) && readable(b) && formatName(a.info) !== formatName(b.info)) {
+  if (!bake && readable(a) && readable(b) && formatName(a.info) !== formatName(b.info)) {
     warnings.push(
       `A and B are stored differently (A: ${formatName(a.info)}, B: ${formatName(b.info)}); the result is saved in A's format.`
     )
   }
 
+  if (bake && input.loras.length === 0) problems.push('Add at least one LoRA to bake.')
+  for (const l of input.loras) {
+    if (!l.readable) {
+      anyUnreadable = true
+      const why = l.error ? ` (${l.error})` : ''
+      warnings.push(`${l.name} could not be read${why}, so it was not checked.`)
+      continue
+    }
+    if (l.modules === 0) {
+      // A checkpoint's LoraLoader can apply a text-encoder-only LoRA; a diffusion-model file has nothing for it.
+      if (input.kind === 'checkpoint' && l.textEncoderModules > 0) {
+        warnings.push(`${l.name} only changes the text encoder (${l.textEncoderModules} layers).`)
+      } else {
+        problems.push(`${l.name} has no layers for the diffusion model.`)
+      }
+      continue
+    }
+    if (l.match === null && (l.keyStyle === 'diffusers' || l.keyStyle === 'unknown')) {
+      warnings.push(
+        `${l.name} uses ${l.keyStyle === 'diffusers' ? 'diffusers' : 'unrecognised'} layer names, so the app cannot check it before baking. After the bake it reports any weights ComfyUI skipped.`
+      )
+    }
+    if (l.match === 0) {
+      problems.push(`${l.name} does not fit model A: none of its ${l.modules} layers are in A. It is probably for another model type.`)
+    } else if (l.match !== null && l.match < 0.9) {
+      warnings.push(`${l.name} fits only ${Math.round(l.match * 100)}% of model A's layers; the rest is skipped.`)
+    }
+    if (l.textEncoderModules > 0 && input.kind === 'diffusion') {
+      warnings.push(
+        `${l.name} also changes the text encoder (${l.textEncoderModules} layers); a diffusion-model file has none, so that part is left out.`
+      )
+    }
+  }
+
   const readableSources = needed.map(([, s]) => s).filter(readable)
+  const loraBytes = input.loras.filter((l) => l.readable).reduce((n, l) => n + (l.sizeBytes ?? 0), 0)
   let ramNeeded: number | null = null
   if (readableSources.length > 0) {
     const factor = readableSources.some((s) => s.info.quantized) ? RAM_FACTOR_QUANT : RAM_FACTOR_PLAIN
-    ramNeeded = Math.round(readableSources.reduce((n, s) => n + (s.info.sizeBytes ?? s.header!.fileBytes), 0) * factor)
+    ramNeeded = Math.round(
+      (readableSources.reduce((n, s) => n + (s.info.sizeBytes ?? s.header!.fileBytes), 0) + loraBytes) * factor
+    )
     if (input.ramFreeBytes !== null && ramNeeded > input.ramFreeBytes * 0.8) {
       const gib = (n: number): string => (n / 1024 ** 3).toFixed(1)
       warnings.push(
@@ -276,6 +521,7 @@ export function checkMerge(input: {
     warnings,
     blockNodes,
     suggestedBlockNode: best ? best.node : null,
+    loras: input.loras,
     ramNeededBytes: ramNeeded,
     ramFreeBytes: input.ramFreeBytes
   }
