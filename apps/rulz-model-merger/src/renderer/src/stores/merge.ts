@@ -16,6 +16,8 @@ interface MergeStore {
   nameTouched: boolean
   /** Changes the recipe; a change to kind, mode, A, B or C re-runs the check after a short pause. */
   setRecipe: (patch: Partial<MergeRecipe>) => void
+  /** Sets a whole recipe from outside (a value picked on the Grids page); the output name stays as it is in that recipe. */
+  replaceRecipe: (recipe: MergeRecipe) => void
   /** Replaces the LoRA list with the result of `fn` (immutable helpers in lib/merge). */
   patchLoras: (fn: (loras: LoraEntry[]) => LoraEntry[]) => void
   setBlock: (inputs: string[], value: number) => void
@@ -68,6 +70,11 @@ export const useMerge = create<MergeStore>((set, get) => ({
       set({ check: null, checkError: null })
       get().runCheck()
     }
+  },
+
+  replaceRecipe: (recipe) => {
+    set({ recipe, nameTouched: true, check: null, checkError: null })
+    get().runCheck()
   },
 
   patchLoras: (fn) => {

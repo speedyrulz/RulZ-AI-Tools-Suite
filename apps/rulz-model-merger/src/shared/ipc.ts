@@ -10,6 +10,7 @@ import type {
 } from './types'
 import type { MergeCheck, MergeInspectRequest, MergeJob, MergeRecipe } from './merge'
 import type { LoraMergeCheck, LoraMergeInspectRequest, LoraMergeJob, LoraMergeRecipe } from './loraMerge'
+import type { GridJob, GridRequest, GridTemplateInfo } from './grid'
 
 /** Request/response channels (renderer -> main). */
 export interface IpcInvoke {
@@ -50,6 +51,23 @@ export interface IpcInvoke {
   'loraMerge:jobs': () => LoraMergeJob[]
   /** LoRA names in <models>/loras (relative, forward slashes), read from disk; works without a running server. */
   'loraMerge:list': () => string[]
+  /** Reads and checks a template workflow (API-format JSON). With no path it opens a file dialog; null if cancelled. */
+  'grid:loadTemplate': (path?: string) => GridTemplateInfo | null
+  /** Starts a sample grid on the current server. Rejects when the request is invalid, the queue was not accepted, or a
+   *  grid is already running. */
+  'grid:start': (req: GridRequest) => GridJob
+  /** Stops the running grid: deletes its pending prompts and interrupts its running one (never other prompts). */
+  'grid:cancel': (gridId: string) => GridJob
+  /** Grids of this session and earlier ones (read from the grid folders), newest first. */
+  'grid:list': () => GridJob[]
+  /** One cell image as a data: URL (image/png or the type ComfyUI returned). */
+  'grid:image': (gridId: string, file: string) => string
+  /** Saves a PNG the renderer composed (data: URL) through a save dialog; returns the path, or null if cancelled. */
+  'grid:saveImage': (dataUrl: string, suggestedName: string) => string | null
+  /** Opens the grid's folder in Explorer. */
+  'grid:openFolder': (gridId: string) => void
+  /** Deletes a grid folder (moves it to the Recycle Bin). */
+  'grid:delete': (gridId: string) => void
 }
 
 /** Push channels (main -> renderer). */
@@ -59,6 +77,7 @@ export interface IpcEvents {
   'comfy:status': ConnectionStatus
   'merge:job': MergeJob
   'loraMerge:job': LoraMergeJob
+  'grid:job': GridJob
 }
 
 export type InvokeChannel = keyof IpcInvoke

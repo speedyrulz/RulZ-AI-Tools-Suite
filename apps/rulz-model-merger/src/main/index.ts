@@ -1,10 +1,12 @@
 import { join } from 'node:path'
-import { app, BrowserWindow, nativeTheme, shell } from 'electron'
+import { app, BrowserWindow, dialog, nativeTheme, shell } from 'electron'
+import type { GridJob } from '@shared/grid'
 import type { LoraMergeJob } from '@shared/loraMerge'
 import type { MergeJob } from '@shared/merge'
 import type { ConnectionStatus, PreflightReport, ServerState, Theme } from '@shared/types'
 import { ComfyClient, probeServer } from './comfy/client'
 import { normalizeServerUrl } from './comfy/parse'
+import { GridService } from './grid/service'
 import { broadcast, handle } from './ipc'
 import { LoraMergeService } from './loras/service'
 import loraWorkerPath from './loras/worker?modulePath'
@@ -28,6 +30,7 @@ let settings!: SettingsStore
 let ownServer!: OwnServer
 let mergeRunner!: MergeRunner
 let loraMerge!: LoraMergeService
+let grids!: GridService
 /** Servers the app did not start whose queue the user agreed to share, this session only. */
 const acceptedSharedQueues = new Set<string>()
 
@@ -148,6 +151,14 @@ function registerIpc(): void {
   handle('loraMerge:cancel', (id) => loraMerge.cancel(id))
   handle('loraMerge:jobs', () => loraMerge.jobs())
   handle('loraMerge:list', () => loraMerge.list())
+  handle('grid:loadTemplate', (path) => grids.loadTemplate(path))
+  handle('grid:start', (req) => grids.start(req))
+  handle('grid:cancel', (id) => grids.cancel(id))
+  handle('grid:list', () => grids.list())
+  handle('grid:image', (id, file) => grids.image(id, file))
+  handle('grid:saveImage', (dataUrl, name) => grids.saveImage(dataUrl, name))
+  handle('grid:openFolder', (id) => grids.openFolder(id))
+  handle('grid:delete', (id) => grids.delete(id))
   handle('shell:openExternal', async (url) => {
     if (/^https?:\/\//i.test(url)) await shell.openExternal(url)
   })
@@ -251,6 +262,29 @@ async function main(): Promise<void> {
     workerPath: loraWorkerPath
   })
   loraMerge.on('job', (job: LoraMergeJob) => broadcast('loraMerge:job', job))
+
+  grids = new GridService({
+    client: (url) => new ComfyClient(url),
+    getConnection: () => connectionStatus(),
+    appVersion: app.getVersion(),
+    gridsDir: join(app.getPath('userData'), 'grids'),
+    pickFile: async () => {
+      const opts = { title: 'Choose a ComfyUI workflow (API format)', properties: ['openFile' as const], filters: [{ name: 'Workflow JSON', extensions: ['json'] }] }
+      const r = mainWindow ? await dialog.showOpenDialog(mainWindow, opts) : await dialog.showOpenDialog(opts)
+      return r.canceled || r.filePaths.length === 0 ? null : r.filePaths[0]
+    },
+    pickSavePath: async (suggestedName) => {
+      const opts = { title: 'Save the grid image', defaultPath: suggestedName, filters: [{ name: 'PNG image', extensions: ['png'] }] }
+      const r = mainWindow ? await dialog.showSaveDialog(mainWindow, opts) : await dialog.showSaveDialog(opts)
+      return r.canceled || !r.filePath ? null : r.filePath
+    },
+    trashItem: (path) => shell.trashItem(path),
+    openPath: async (path) => {
+      const err = await shell.openPath(path)
+      if (err) throw new Error(err)
+    }
+  })
+  grids.on('job', (job: GridJob) => broadcast('grid:job', job))
 
   registerIpc()
   createWindow()

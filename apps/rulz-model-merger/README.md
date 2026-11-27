@@ -4,8 +4,8 @@ A Windows app for merging image models with ComfyUI: checkpoint with checkpoint,
 checkpoint, with sample grids at different mixes so you can compare the results before you save one. Part of the
 RulZ AI Tools family.
 
-**Version 0.4 merges checkpoints and diffusion models, bakes LoRAs into them, and merges LoRAs with LoRAs.** Sample
-grids come in the next version.
+**Version 0.5 merges checkpoints and diffusion models, bakes LoRAs into them, merges LoRAs with LoRAs, and renders
+sample grids of a merge at several values with your own ComfyUI workflow.**
 
 **[Download](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/releases)** (or install it from the [RulZ AI Tools Suite](https://github.com/speedyrulz/RulZ-AI-Tools-Suite) launcher, under **ComfyUI**) · **[Wiki](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/Model-Merger)**
 
@@ -104,6 +104,39 @@ Each LoRA gets a weight (the slider covers −2 to 2, the number box takes −10
 - LoRA files reached through a symbolic link with an absolute target cannot be read from Windows over
   `\\wsl.localhost\`; use a hard link or a copy in the models folder.
 
+## Sample grids
+
+The **Grids** page renders the merge set up on the Merge page at 2 to 8 values of one setting (the columns) for 1 to 4
+prompts (the rows), with the same seed in every image, so you can compare the values side by side. No model file is
+saved: each image builds the merge inside its own ComfyUI job.
+
+| Setting to vary | Mode on the Merge page |
+| --- | --- |
+| Ratio (share of A) | Weighted, or Per block for the blocks that have no value of their own |
+| Multiplier | Add difference |
+| Strength of one LoRA | Any mode with LoRAs, including Bake LoRAs |
+
+- **Your own workflow renders the images.** Pick a ComfyUI workflow saved in API format (in ComfyUI: Workflow >
+  Export (API)). The app replaces its model loader with the merge, writes your prompt into its positive prompt node
+  and your seed into its seed inputs, and keeps the rest: sampler, steps, size, text encoder, VAE, model patches. A
+  diffusion-model merge needs a workflow with a UNETLoader, a checkpoint merge one with a CheckpointLoaderSimple.
+- **Only what the image needs runs.** The app picks one image output (a SaveImage first) and leaves out every node that
+  output does not need: other outputs and previews, comparers, a second pass that only feeds a preview, and prompt
+  generators such as LLM or vision-API nodes, because the grid's prompt replaces their text. A model loader on a side
+  branch (for example a SAM 3 mask loader) stays as it is.
+- **Warnings** say what the app found and changed: where the prompt came from, LoRA loaders of the workflow that are
+  applied on top of the merge, a negative prompt that uses the same text field as the positive one, and the outputs
+  left out.
+- The images run one at a time, column by column, so the models of one column are loaded once. **Cancel** removes only
+  this grid's job from the queue or stops it while it runs (on a server you share, a job that is already running
+  finishes and its image is dropped).
+- **Results.** Each grid is kept in the app's data folder with its images, the workflow it used and a `grid.json` with
+  the recipe and values. **Save grid image** saves one PNG with the labels; **Use this value** sets the Merge page to
+  that column's value, keeping your output name. **Earlier grids** lists the saved ones; deleting one moves its folder
+  to the Recycle Bin.
+- **Speed** (RTX 4060 Ti, Krea 2 int8 at 1 megapixel and 8 steps, three LoRA strengths): 60 s for the first image
+  with model loading, about 40 s for each of the others.
+
 ## Requirements
 
 - Windows 10 or 11 with WSL 2 and a distro that has ComfyUI installed. The defaults are `Ubuntu-24.04` and
@@ -165,6 +198,7 @@ npm test
 | `src/main/settings.ts` | Settings file with defaults and checks. |
 | `src/main/comfy/` | ComfyUI client: HTTP, websocket events, parsing of `/system_stats` and `/object_info`. |
 | `src/main/merge/` | Merges: file checks, ComfyUI graphs, the job runner, moving files in WSL. |
+| `src/main/grid/` | Sample grids: reading and rewriting the workflow template, running the grid, its folder. |
 | `src/main/models/` | Reads the header of a `.safetensors` file. |
 | `src/main/server/` | The own server: WSL scripts, start and stop, checks before starting, GPUs, ports. |
 | `src/shared/` | Types and IPC channels shared by both sides. |
@@ -173,8 +207,9 @@ npm test
 
 ## Limits of this version
 
-- No sample grids yet.
-- Merging and baking have been run on the CPU only; neither has been tried on a GPU yet.
-- **Load my custom nodes** has not been tried with a real set of node packs yet.
+- Merging and baking have been run on the CPU only. A sample grid with a baked LoRA has run on a GPU (RTX 4060 Ti);
+  grids of ratio and multiplier sweeps have not been tried on a GPU yet.
+- The Grids page has been tested with 12 real workflows (Krea 2, Qwen-Image 2.1, FLUX.2 Klein); other workflow shapes
+  may not be read correctly, and the app then says what it could not find.
 - The own server runs bash without a login shell, so variables set in `~/.bashrc` (for example CUDA paths) are not
   read. ComfyUI on the CPU and on a GPU with the venv's own CUDA libraries does not need them.
