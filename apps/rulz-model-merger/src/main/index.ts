@@ -1,12 +1,14 @@
 import { join } from 'node:path'
 import { app, BrowserWindow, dialog, nativeTheme, shell } from 'electron'
 import type { GridJob } from '@shared/grid'
+import type { HistoryEntry } from '@shared/history'
 import type { LoraMergeJob } from '@shared/loraMerge'
 import type { MergeJob } from '@shared/merge'
 import type { ConnectionStatus, PreflightReport, ServerState, Theme } from '@shared/types'
 import { ComfyClient, probeServer } from './comfy/client'
 import { normalizeServerUrl } from './comfy/parse'
 import { GridService } from './grid/service'
+import { HistoryStore } from './history/store'
 import { broadcast, handle } from './ipc'
 import { LoraMergeService } from './loras/service'
 import loraWorkerPath from './loras/worker?modulePath'
@@ -31,6 +33,7 @@ let ownServer!: OwnServer
 let mergeRunner!: MergeRunner
 let loraMerge!: LoraMergeService
 let grids!: GridService
+let history!: HistoryStore
 /** Servers the app did not start whose queue the user agreed to share, this session only. */
 const acceptedSharedQueues = new Set<string>()
 
@@ -159,6 +162,18 @@ function registerIpc(): void {
   handle('grid:saveImage', (dataUrl, name) => grids.saveImage(dataUrl, name))
   handle('grid:openFolder', (id) => grids.openFolder(id))
   handle('grid:delete', (id) => grids.delete(id))
+  handle('grid:setFavourites', (id, cells) => grids.setFavourites(id, cells))
+  handle('history:list', async () => {
+    const entries: HistoryEntry[] = [...(await history.list())]
+    for (const job of await grids.list()) if (job.status !== 'running') entries.push({ kind: 'grid', job })
+    return entries.sort((a, b) => b.job.createdAt - a.job.createdAt)
+  })
+  handle('history:remove', async (kind, id) => {
+    if (kind !== 'merge' && kind !== 'loraMerge') throw new Error('Only merges and LoRA merges can be removed here.')
+    if (typeof id !== 'string' || id === '') throw new Error('That entry is not known.')
+    await history.remove(kind, id)
+    broadcast('history:changed', null)
+  })
   handle('shell:openExternal', async (url) => {
     if (/^https?:\/\//i.test(url)) await shell.openExternal(url)
   })
@@ -253,7 +268,23 @@ async function main(): Promise<void> {
     },
     appVersion: app.getVersion()
   })
-  mergeRunner.on('job', (job: MergeJob) => broadcast('merge:job', job))
+  history = new HistoryStore({ dir: app.getPath('userData') })
+  const FINAL = ['done', 'error', 'cancelled']
+  /** Keeps history.json in step with a merge or LoRA merge in a final status (also later updates such as
+   *  Move into models). The store ignores identical updates, so only real changes are broadcast. */
+  const recordFinal = (entry: { kind: 'merge'; job: MergeJob } | { kind: 'loraMerge'; job: LoraMergeJob }): void => {
+    if (!FINAL.includes(entry.job.status)) return
+    history
+      .record(entry)
+      .then((changed) => {
+        if (changed) broadcast('history:changed', null)
+      })
+      .catch(() => undefined)
+  }
+  mergeRunner.on('job', (job: MergeJob) => {
+    broadcast('merge:job', job)
+    recordFinal({ kind: 'merge', job })
+  })
 
   loraMerge = new LoraMergeService({
     wsl,
@@ -261,7 +292,10 @@ async function main(): Promise<void> {
     appVersion: app.getVersion(),
     workerPath: loraWorkerPath
   })
-  loraMerge.on('job', (job: LoraMergeJob) => broadcast('loraMerge:job', job))
+  loraMerge.on('job', (job: LoraMergeJob) => {
+    broadcast('loraMerge:job', job)
+    recordFinal({ kind: 'loraMerge', job })
+  })
 
   grids = new GridService({
     client: (url) => new ComfyClient(url),

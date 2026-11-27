@@ -1,4 +1,4 @@
-import { axisLabel, type GridJob } from '@shared/grid'
+import { axisLabel, gridRowLabel, type GridJob } from '@shared/grid'
 import { cellAt, gridDims, imageKey, layoutGrid, promptHeader } from '../../lib/grid'
 
 function loadImage(url: string): Promise<HTMLImageElement> {
@@ -86,7 +86,7 @@ export async function composeGridPng(job: GridJob, images: Record<string, string
   for (let r = 0; r < rows; r++) {
     const y = y0 + r * (L.cellH + L.gap)
     ctx.fillStyle = '#B4B4BC'
-    const lines = wrap(ctx, promptHeader(job.request.prompts[r] ?? '', 140), L.labelW - 12, Math.max(1, Math.floor(L.cellH / 26)))
+    const lines = wrap(ctx, promptHeader(gridRowLabel(job.request, r), 140), L.labelW - 12, Math.max(1, Math.floor(L.cellH / 26)))
     const top = y + L.cellH / 2 - ((lines.length - 1) * 26) / 2
     lines.forEach((ln, i) => ctx.fillText(ln, L.pad, top + i * 26))
     for (let c = 0; c < cols; c++) {

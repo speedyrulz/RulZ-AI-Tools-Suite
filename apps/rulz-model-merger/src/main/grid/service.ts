@@ -10,11 +10,16 @@ import { basename, join } from 'node:path'
 import type { ServerCapabilities } from '@shared/types'
 import {
   GRID_MAX_PROMPTS,
+  GRID_MAX_SEEDS,
   GRID_MAX_VALUES,
   GRID_MIN_VALUES,
   GRID_PROMPT_MAX,
+  gridCellPrompt,
+  gridCellSeed,
+  gridRowCount,
   recipeForValue,
   type GridCell,
+  type GridCellRef,
   type GridJob,
   type GridRecord,
   type GridRequest,
@@ -209,13 +214,29 @@ export class GridService extends EventEmitter {
       const i = axis.loraIndex
       if (i === null || !Number.isInteger(i) || i < 0 || i >= (recipe.loras ?? []).length) problems.push('Choose which LoRA to vary.')
     }
-    if (!Array.isArray(req.prompts) || req.prompts.length < 1 || req.prompts.length > GRID_MAX_PROMPTS) {
+    const kind: unknown = req.rowKind === undefined ? 'prompts' : req.rowKind
+    if (kind !== 'prompts' && kind !== 'seeds') {
+      problems.push('Unknown kind of rows.')
+    } else if (kind === 'seeds') {
+      if (!Array.isArray(req.prompts) || req.prompts.length !== 1) problems.push('Seed rows use exactly 1 prompt.')
+      else {
+        const p = req.prompts[0]
+        if (typeof p !== 'string' || p.trim() === '') problems.push('Every prompt needs text.')
+        else if (p.length > GRID_PROMPT_MAX) problems.push(`A prompt can have at most ${GRID_PROMPT_MAX} characters.`)
+      }
+      const seeds: unknown = req.seeds
+      if (!Array.isArray(seeds) || seeds.length < 1 || seeds.length > GRID_MAX_SEEDS) problems.push(`Use 1 to ${GRID_MAX_SEEDS} seeds.`)
+      else if (!seeds.every((s) => typeof s === 'number' && Number.isInteger(s) && s >= 0 && s <= MAX_SEED)) {
+        problems.push('Every seed must be a whole number from 0 to 9007199254740991.')
+      } else if (new Set(seeds).size !== seeds.length) problems.push('The seeds must all be different.')
+    } else if (!Array.isArray(req.prompts) || req.prompts.length < 1 || req.prompts.length > GRID_MAX_PROMPTS) {
       problems.push(`Use 1 to ${GRID_MAX_PROMPTS} prompts.`)
     } else {
       if (req.prompts.some((p) => typeof p !== 'string' || p.trim() === '')) problems.push('Every prompt needs text.')
       if (req.prompts.some((p) => typeof p === 'string' && p.length > GRID_PROMPT_MAX)) problems.push(`A prompt can have at most ${GRID_PROMPT_MAX} characters.`)
     }
-    if (!Number.isInteger(req.seed) || req.seed < 0 || req.seed > MAX_SEED) problems.push('The seed must be a whole number from 0 to 9007199254740991.')
+    // With seed rows the single `seed` is only kept for display.
+    if (kind !== 'seeds' && (!Number.isInteger(req.seed) || req.seed < 0 || req.seed > MAX_SEED)) problems.push('The seed must be a whole number from 0 to 9007199254740991.')
     return problems
   }
 
@@ -275,7 +296,7 @@ export class GridService extends EventEmitter {
     await writeFile(join(dir, 'template.json'), templateText, 'utf8')
 
     const cells: GridCell[] = []
-    for (let row = 0; row < req.prompts.length; row++) {
+    for (let row = 0; row < gridRowCount(req); row++) {
       for (let col = 0; col < req.axis.values.length; col++) {
         cells.push({ col, row, status: 'pending', file: null, error: null, seconds: null })
       }
@@ -464,7 +485,7 @@ export class GridService extends EventEmitter {
     try {
       let recipe = recipeForValue(job.request.recipe, axis, axis.values[cell.col])
       if (recipe.mode === 'blocks' && ctx.blockInputs) recipe = completeBlocks(recipe, ctx.blockInputs)
-      prompt = this.tpl().buildGridPrompt(ctx.template, ctx.info, recipe, job.request.prompts[cell.row], job.request.seed)
+      prompt = this.tpl().buildGridPrompt(ctx.template, ctx.info, recipe, gridCellPrompt(job.request, cell.row), gridCellSeed(job.request, cell.row))
     } catch (e) {
       fail((e as Error).message)
       return
@@ -689,6 +710,20 @@ export class GridService extends EventEmitter {
       const raw = JSON.parse(await readFile(join(this.d.gridsDir, folder, 'grid.json'), 'utf8')) as unknown
       const job = recOf(recOf(raw).job) as unknown as GridJob
       if (typeof job.id !== 'string' || job.id !== folder || !Array.isArray(job.cells) || typeof job.status !== 'string') return null
+      // The shape the pages rely on; a record that lacks it is skipped rather than shown broken.
+      const request = recOf(job.request)
+      if (
+        typeof job.createdAt !== 'number' ||
+        !Number.isFinite(job.createdAt) ||
+        job.request === null ||
+        typeof job.request !== 'object' ||
+        Object.keys(recOf(request.recipe)).length === 0 ||
+        !Array.isArray(recOf(request.axis).values) ||
+        !Array.isArray(request.prompts) ||
+        !job.cells.every((c) => c !== null && typeof c === 'object' && !Array.isArray(c))
+      ) {
+        return null
+      }
       if (job.status === 'running') {
         job.status = 'cancelled'
         cancelUnfinished(job)
@@ -738,6 +773,56 @@ export class GridService extends EventEmitter {
     if (!path) return null
     await writeFile(path, Buffer.from(b64, 'base64'))
     return path
+  }
+
+  /** Cells the grid really has, without duplicates, sorted by row then column. */
+  private cleanFavourites(job: GridJob, cells: GridCellRef[]): GridCellRef[] {
+    const cols = Array.isArray(job.request?.axis?.values) ? job.request.axis.values.length : 0
+    const rows = gridRowCount(job.request)
+    const seen = new Set<string>()
+    const out: GridCellRef[] = []
+    for (const c of Array.isArray(cells) ? cells : []) {
+      const col = (c as { col?: unknown } | null)?.col
+      const row = (c as { row?: unknown } | null)?.row
+      if (typeof col !== 'number' || typeof row !== 'number' || !Number.isInteger(col) || !Number.isInteger(row)) continue
+      if (col < 0 || col >= cols || row < 0 || row >= rows) continue
+      const key = `${row}:${col}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push({ col, row })
+    }
+    return out.sort((a, b) => a.row - b.row || a.col - b.col)
+  }
+
+  /** Saves the starred cells in grid.json and tells listeners (the 'job' event). Rejects for a running or unknown grid. */
+  async setFavourites(id: string, cells: GridCellRef[]): Promise<GridJob> {
+    const dir = await this.knownFolder(id)
+    const ctx = this.jobs.find((c) => c.job.id === id)
+    if (ctx) {
+      if (ctx.job.status === 'running') throw new Error('This grid is still running. Wait for it to finish first.')
+      ctx.job.favourites = this.cleanFavourites(ctx.job, cells)
+      await this.persist(ctx)
+      this.emitJob(ctx)
+      return structuredClone(ctx.job)
+    }
+    // A grid from an earlier session: rewrite its grid.json, keeping the rest of the record as it is.
+    const file = join(dir, 'grid.json')
+    let raw: Record<string, unknown>
+    try {
+      raw = recOf(JSON.parse(await readFile(file, 'utf8')))
+    } catch {
+      throw new Error('That grid is not known.')
+    }
+    const job = await this.readRecord(id)
+    if (!job) throw new Error('That grid is not known.')
+    job.favourites = this.cleanFavourites(job, cells)
+    const record = { ...raw, job }
+    const tmp = `${file}.tmp`
+    await writeFile(tmp, `${JSON.stringify(record, null, 2)}\n`, 'utf8')
+    await rename(tmp, file)
+    const out = structuredClone(job)
+    this.emit('job', out)
+    return structuredClone(out)
   }
 
   async openFolder(id: string): Promise<void> {

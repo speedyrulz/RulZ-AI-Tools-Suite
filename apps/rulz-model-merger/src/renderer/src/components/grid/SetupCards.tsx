@@ -1,11 +1,25 @@
 import { AlertTriangle, FileJson, Loader2, Plus, Shuffle, Trash2 } from 'lucide-react'
 import { useEffect } from 'react'
-import { GRID_MAX_PROMPTS, GRID_MAX_VALUES, GRID_MIN_VALUES, GRID_PROMPT_MAX } from '@shared/grid'
-import { AXIS_RANGE, axisOptions, cellCount, cellCountText, parseValues, recipeLines, recipeReadiness, resolveAxisOption, templateFit, valuesError, validSeed } from '../../lib/grid'
+import { GRID_MAX_PROMPTS, GRID_MAX_SEEDS, GRID_MAX_VALUES, GRID_MIN_VALUES, GRID_PROMPT_MAX, type GridRowKind } from '@shared/grid'
+import {
+  AXIS_RANGE,
+  axisOptions,
+  cellCount,
+  cellCountText,
+  parseValues,
+  recipeLines,
+  recipeReadiness,
+  resolveAxisOption,
+  rowCountOf,
+  seedsError,
+  templateFit,
+  valuesError,
+  validSeed
+} from '../../lib/grid'
 import { useApp } from '../../stores/app'
 import { useGrid } from '../../stores/grid'
 import { useMerge } from '../../stores/merge'
-import { Badge, Button, Card, Field, IconButton, Input, NumberInput } from '../ui'
+import { Badge, Button, Card, Field, IconButton, Input, NumberInput, Segmented } from '../ui'
 
 const SELECT_CLASS =
   'h-9 w-full rounded-lg border border-border bg-panel px-3 text-[13px] focus:border-accent focus:outline-none disabled:cursor-not-allowed disabled:opacity-45'
@@ -182,63 +196,138 @@ export function ValuesCard() {
   )
 }
 
+const ROW_OPTIONS: Array<{ value: GridRowKind; label: string }> = [
+  { value: 'prompts', label: 'Prompts' },
+  { value: 'seeds', label: 'Seeds' }
+]
+
+const PROMPT_AREA =
+  'min-h-20 w-full resize-y rounded-lg border border-border bg-panel px-3 py-2 text-[13px] placeholder:text-faint focus:border-accent focus:outline-none'
+
 export function PromptsCard() {
+  const rowKind = useGrid((s) => s.rowKind)
   const prompts = useGrid((s) => s.prompts)
   const seed = useGrid((s) => s.seed)
+  const seeds = useGrid((s) => s.seeds)
   const valuesText = useGrid((s) => s.valuesText)
+  const setRowKind = useGrid((s) => s.setRowKind)
   const setPrompt = useGrid((s) => s.setPrompt)
   const addPrompt = useGrid((s) => s.addPrompt)
   const removePrompt = useGrid((s) => s.removePrompt)
   const setSeed = useGrid((s) => s.setSeed)
   const rollSeed = useGrid((s) => s.rollSeed)
+  const setSeedAt = useGrid((s) => s.setSeedAt)
+  const addSeedRow = useGrid((s) => s.addSeedRow)
+  const removeSeedRow = useGrid((s) => s.removeSeedRow)
+  const rollSeeds = useGrid((s) => s.rollSeeds)
 
   const columns = parseValues(valuesText).values.length
-  const rows = prompts.map((p) => p.trim()).filter(Boolean).length
+  const rows = rowCountOf(rowKind, prompts, seeds)
+  const seedsErr = rowKind === 'seeds' ? seedsError(seeds) : null
+  const summary = (
+    <p className="text-xs text-faint tabular-nums">
+      {cellCountText(cellCount(columns, rows))} ({columns} columns x {rows} row{rows === 1 ? '' : 's'}). Each image renders like one image of your
+      workflow, on the GPU or CPU of the ComfyUI server.
+    </p>
+  )
   return (
     <Card
       title="Prompts"
-      description="Each prompt is one row. Every image uses the same seed, so the columns differ only by the value."
+      description={
+        rowKind === 'seeds'
+          ? 'One prompt, one row per seed. The columns differ only by the value, so the rows show how much the seed matters.'
+          : 'Each prompt is one row. Every image uses the same seed, so the columns differ only by the value.'
+      }
       actions={
-        <Button size="sm" disabled={prompts.length >= GRID_MAX_PROMPTS} onClick={addPrompt}>
-          <Plus size={14} />
-          Add prompt
-        </Button>
+        rowKind === 'seeds' ? (
+          <Button size="sm" disabled={seeds.length >= GRID_MAX_SEEDS} onClick={addSeedRow}>
+            <Plus size={14} />
+            Add seed
+          </Button>
+        ) : (
+          <Button size="sm" disabled={prompts.length >= GRID_MAX_PROMPTS} onClick={addPrompt}>
+            <Plus size={14} />
+            Add prompt
+          </Button>
+        )
       }
     >
       <div className="space-y-3">
-        {prompts.map((p, i) => (
-          <div key={i} className="flex items-start gap-2">
+        <Field label="Rows">
+          <Segmented label="Rows" value={rowKind} options={ROW_OPTIONS} onChange={setRowKind} />
+        </Field>
+        {rowKind === 'seeds' ? (
+          <>
             <textarea
-              aria-label={`Prompt ${i + 1}`}
+              aria-label="Prompt"
               rows={3}
               maxLength={GRID_PROMPT_MAX}
-              value={p}
-              onChange={(e) => setPrompt(i, e.target.value)}
-              placeholder={`Prompt ${i + 1}`}
-              className="min-h-20 w-full resize-y rounded-lg border border-border bg-panel px-3 py-2 text-[13px] placeholder:text-faint focus:border-accent focus:outline-none"
+              value={prompts[0] ?? ''}
+              onChange={(e) => setPrompt(0, e.target.value)}
+              placeholder="Prompt"
+              className={PROMPT_AREA}
             />
-            {prompts.length > 1 && (
-              <IconButton label={`Remove prompt ${i + 1}`} onClick={() => removePrompt(i)}>
-                <Trash2 size={14} />
-              </IconButton>
+            <div className="space-y-2">
+              {seeds.map((s, i) => (
+                <div key={i} className="flex items-end gap-2">
+                  <div className="w-56">
+                    <Field label={`Seed ${i + 1}`}>
+                      <NumberInput value={s} min={0} max={Number.MAX_SAFE_INTEGER} step={1} onCommit={(v) => setSeedAt(i, Math.floor(v))} />
+                    </Field>
+                  </div>
+                  {seeds.length > 1 && (
+                    <IconButton label={`Remove seed ${i + 1}`} onClick={() => removeSeedRow(i)}>
+                      <Trash2 size={14} />
+                    </IconButton>
+                  )}
+                </div>
+              ))}
+              <Button onClick={rollSeeds}>
+                <Shuffle size={16} />
+                Random
+              </Button>
+            </div>
+            {seedsErr && (
+              <p className="text-[13px] text-danger-text" role="alert">
+                {seedsErr}
+              </p>
             )}
-          </div>
-        ))}
-        <div className="flex flex-wrap items-end gap-3">
-          <div className="w-56">
-            <Field label="Seed" hint={validSeed(seed) ? undefined : 'Use a whole number from 0 up.'}>
-              <NumberInput value={seed} min={0} max={Number.MAX_SAFE_INTEGER} step={1} onCommit={(v) => setSeed(Math.floor(v))} />
-            </Field>
-          </div>
-          <Button onClick={rollSeed}>
-            <Shuffle size={16} />
-            Random
-          </Button>
-        </div>
-        <p className="text-xs text-faint tabular-nums">
-          {cellCountText(cellCount(columns, rows))} ({columns} columns x {rows} row{rows === 1 ? '' : 's'}). Each image renders like one image of
-          your workflow, on the GPU or CPU of the ComfyUI server.
-        </p>
+            {summary}
+          </>
+        ) : (
+          <>
+            {prompts.map((p, i) => (
+              <div key={i} className="flex items-start gap-2">
+                <textarea
+                  aria-label={`Prompt ${i + 1}`}
+                  rows={3}
+                  maxLength={GRID_PROMPT_MAX}
+                  value={p}
+                  onChange={(e) => setPrompt(i, e.target.value)}
+                  placeholder={`Prompt ${i + 1}`}
+                  className={PROMPT_AREA}
+                />
+                {prompts.length > 1 && (
+                  <IconButton label={`Remove prompt ${i + 1}`} onClick={() => removePrompt(i)}>
+                    <Trash2 size={14} />
+                  </IconButton>
+                )}
+              </div>
+            ))}
+            <div className="flex flex-wrap items-end gap-3">
+              <div className="w-56">
+                <Field label="Seed" hint={validSeed(seed) ? undefined : 'Use a whole number from 0 up.'}>
+                  <NumberInput value={seed} min={0} max={Number.MAX_SAFE_INTEGER} step={1} onCommit={(v) => setSeed(Math.floor(v))} />
+                </Field>
+              </div>
+              <Button onClick={rollSeed}>
+                <Shuffle size={16} />
+                Random
+              </Button>
+            </div>
+            {summary}
+          </>
+        )}
       </div>
     </Card>
   )

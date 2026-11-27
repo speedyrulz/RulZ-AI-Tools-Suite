@@ -1,14 +1,19 @@
-// Pure helpers for the Grids page (no React, no IPC): axes, values, prompts, labels, job merging, image cache, layout.
+// Pure helpers for the Sweep page (no React, no IPC): axes, values, prompts, labels, job merging, image cache, layout.
 import {
   GRID_MAX_PROMPTS,
+  GRID_MAX_SEEDS,
   GRID_MAX_VALUES,
   GRID_MIN_VALUES,
   GRID_PROMPT_MAX,
   axisLabel,
+  gridRowCount,
+  gridRowKind,
   type GridAxis,
   type GridAxisKind,
   type GridCell,
   type GridJob,
+  type GridRequest,
+  type GridRowKind,
   type GridStatus,
   type GridTemplateInfo
 } from '@shared/grid'
@@ -145,6 +150,123 @@ export function promptHeader(prompt: string, max = 60): string {
   return one.length > max ? `${one.slice(0, max - 1)}…` : one
 }
 
+// ---- seed rows ----
+
+/** Why the seed list cannot be used (seed rows), or null. */
+export function seedsError(seeds: number[]): string | null {
+  if (seeds.length === 0) return 'Give at least one seed.'
+  if (seeds.length > GRID_MAX_SEEDS) return `Use at most ${GRID_MAX_SEEDS} seeds.`
+  if (seeds.some((s) => !validSeed(s))) return 'Every seed must be a whole number from 0 up.'
+  if (new Set(seeds).size !== seeds.length) return 'Every seed must be different.'
+  return null
+}
+
+/** Why the rows cannot be used: prompt rows need 1 to 4 prompts, seed rows need one prompt and 1 to 4 seeds. */
+export function rowsError(kind: GridRowKind, prompts: string[], seeds: number[]): string | null {
+  if (kind === 'seeds') {
+    const pe = promptsError(prompts.slice(0, 1))
+    return pe ?? seedsError(seeds)
+  }
+  return promptsError(prompts)
+}
+
+/** Number of rows the form would give: valid prompts, or seeds. */
+export function rowCountOf(kind: GridRowKind, prompts: string[], seeds: number[]): number {
+  return kind === 'seeds' ? seeds.length : activePrompts(prompts).length
+}
+
+/** `count` distinct random seeds that are not in `exclude`. */
+export function randomSeeds(count: number, rand: () => number = Math.random, exclude: number[] = []): number[] {
+  const used = new Set(exclude)
+  const out: number[] = []
+  while (out.length < count) {
+    const s = randomSeed(rand)
+    if (used.has(s)) continue
+    used.add(s)
+    out.push(s)
+  }
+  return out
+}
+
+/** Adds one new distinct random seed (unchanged at GRID_MAX_SEEDS). */
+export function addSeed(seeds: number[], rand: () => number = Math.random): number[] {
+  if (seeds.length >= GRID_MAX_SEEDS) return seeds
+  return [...seeds, ...randomSeeds(1, rand, seeds)]
+}
+
+/** Removes seed i, never the last one. */
+export function removeSeed(seeds: number[], i: number): number[] {
+  if (seeds.length <= 1 || i < 0 || i >= seeds.length) return seeds
+  return seeds.filter((_, k) => k !== i)
+}
+
+export function setSeedAt(seeds: number[], i: number, value: number): number[] {
+  if (i < 0 || i >= seeds.length) return seeds
+  return seeds.map((s, k) => (k === i ? value : s))
+}
+
+/** "seed 5" for prompt rows, "seeds 5, 9" for seed rows. */
+export function seedText(req: GridRequest): string {
+  if (gridRowKind(req) === 'seeds') {
+    const seeds = req.seeds ?? []
+    return `seed${seeds.length === 1 ? '' : 's'} ${seeds.join(', ')}`
+  }
+  return `seed ${req.seed}`
+}
+
+export interface GridFormState {
+  recipe: MergeRecipe
+  axis: AxisOption
+  valuesText: string
+  rowKind: GridRowKind
+  prompts: string[]
+  seeds: number[]
+  seed: number
+  templatePath: string
+}
+
+/** The request the Start button sends (the caller has checked gridBlockReason). Seed rows send one prompt and the seeds. */
+export function buildGridRequest(s: GridFormState): GridRequest {
+  const axis = { ...s.axis.axis, values: parseValues(s.valuesText).values }
+  if (s.rowKind === 'seeds') {
+    const prompt = (s.prompts[0] ?? '').trim()
+    return { recipe: s.recipe, axis, rowKind: 'seeds', prompts: [prompt], seed: s.seeds[0] ?? s.seed, seeds: s.seeds.slice(), templatePath: s.templatePath }
+  }
+  return { recipe: s.recipe, axis, rowKind: 'prompts', prompts: activePrompts(s.prompts), seed: s.seed, templatePath: s.templatePath }
+}
+
+/** What the Sweep form holds after Reopen of a request. `seeds` is null when the request has none (the form keeps its own). */
+export interface GridFormFields {
+  axisKey: string
+  from: number
+  to: number
+  steps: number
+  valuesText: string
+  rowKind: GridRowKind
+  prompts: string[]
+  seeds: number[] | null
+  seed: number
+}
+
+export function formFromRequest(req: GridRequest): GridFormFields {
+  const values = req.axis.values
+  const kind = gridRowKind(req)
+  const seeds = kind === 'seeds' ? (req.seeds ?? []).slice(0, GRID_MAX_SEEDS) : null
+  const prompts = req.prompts.slice(0, kind === 'seeds' ? 1 : GRID_MAX_PROMPTS)
+  const d = AXIS_DEFAULT[req.axis.kind]
+  return {
+    axisKey: axisKeyOf(req.axis),
+    from: values[0] ?? d.from,
+    to: values[values.length - 1] ?? d.to,
+    steps: clampSteps(values.length),
+    valuesText: formatValues(values),
+    rowKind: kind,
+    prompts: prompts.length > 0 ? prompts : [''],
+    seeds: seeds && seeds.length > 0 ? seeds : null,
+    seed: kind === 'seeds' ? (seeds?.[0] ?? req.seed) : req.seed
+  }
+}
+
 // ---- template and recipe ----
 
 /** Why the template cannot render this recipe, or null. */
@@ -212,6 +334,9 @@ export interface GridBlockState {
   valuesText: string
   prompts: string[]
   seed: number
+  /** Absent means prompt rows. */
+  rowKind?: GridRowKind
+  seeds?: number[]
   grids: GridJob[]
   starting: boolean
 }
@@ -220,7 +345,7 @@ export function gridIsActive(status: GridStatus): boolean {
   return status === 'running'
 }
 
-/** Why Start grid is off, most useful reason first; null when it can start. */
+/** Why Start sweep is off, most useful reason first; null when it can start. */
 export function gridBlockReason(s: GridBlockState): string | null {
   if (s.grids.some((g) => gridIsActive(g.status))) return 'A grid is still running. Wait for it or cancel it.'
   if (!s.connected) return 'Connect to ComfyUI on the Server page first.'
@@ -233,9 +358,10 @@ export function gridBlockReason(s: GridBlockState): string | null {
   if (!s.axis) return 'The merge has nothing to vary. Use a ratio, a multiplier or a LoRA.'
   const ve = valuesError(s.axis.axis.kind, s.valuesText)
   if (ve) return ve
-  const pe = promptsError(s.prompts)
+  const kind = s.rowKind ?? 'prompts'
+  const pe = rowsError(kind, s.prompts, s.seeds ?? [])
   if (pe) return pe
-  if (!validSeed(s.seed)) return 'The seed must be a whole number from 0 up.'
+  if (kind === 'prompts' && !validSeed(s.seed)) return 'The seed must be a whole number from 0 up.'
   if (s.starting) return 'Starting.'
   return null
 }
@@ -289,7 +415,7 @@ export function cellAt(job: GridJob, col: number, row: number): GridCell | undef
 }
 
 export function gridDims(job: GridJob): { cols: number; rows: number } {
-  return { cols: job.request.axis.values.length, rows: job.request.prompts.length }
+  return { cols: job.request.axis.values.length, rows: gridRowCount(job.request) }
 }
 
 /** Fraction 0..1 of the running cell, null when unknown. */
@@ -300,10 +426,6 @@ export function cellFraction(p: GridJob['progress']): number | null {
 
 export function cellsDone(job: GridJob): number {
   return job.cells.filter((c) => c.status === 'done').length
-}
-
-export function gridTitle(job: GridJob): string {
-  return `${axisLabelShort(job)} · ${job.request.axis.values.length} x ${job.request.prompts.length}`
 }
 
 /** "Ratio", "Multiplier" or "<lora> strength" without a value. */

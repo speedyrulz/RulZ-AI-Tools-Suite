@@ -5,16 +5,9 @@ import { JobsCard } from '../components/merge/JobsCard'
 import { LorasCard } from '../components/merge/LorasCard'
 import { BakeOutputCard, MixCard, SourcesCard } from '../components/merge/RecipeCards'
 import { Button, Card, PageTitle, Tooltip } from '../components/ui'
-import { jobIsActive, validOutputName } from '../lib/merge'
+import { mergeStartReason } from '../lib/history'
 import { useApp } from '../stores/app'
 import { useMerge } from '../stores/merge'
-
-const NODES_BY_MODE = {
-  weighted: ['ModelMergeSimple'],
-  addDifference: ['ModelMergeSubtract', 'ModelMergeAdd'],
-  blocks: [],
-  bake: []
-} as const
 
 export function MergePage() {
   const status = useApp((s) => s.status)
@@ -59,23 +52,8 @@ export function MergePage() {
     )
   }
 
-  // Why the button is off, most useful reason first.
-  const busy = jobs.some((j) => jobIsActive(j.status))
-  const missingNodes = [...NODES_BY_MODE[recipe.mode]].filter((n) => caps.nodes[n] === false)
-  let reason: string | null = null
-  if (busy) reason = 'A merge of this app is still running. Wait for it or cancel it.'
-  else if (recipe.mode === 'bake' ? !recipe.a : !recipe.a || !recipe.b) reason = recipe.mode === 'bake' ? 'Choose A.' : 'Choose A and B.'
-  else if (recipe.mode === 'bake' && !recipe.loras.some((l) => l.name)) reason = 'Add at least one LoRA to bake.'
-  else if (recipe.loras.some((l) => !l.name)) reason = 'Pick a LoRA in every row or remove the empty ones.'
-  else if (recipe.mode === 'addDifference' && !recipe.c) reason = 'Choose C.'
-  else if (recipe.mode === 'blocks' && !recipe.blockNode) reason = 'Choose a block node.'
-  else if (!validOutputName(recipe.outputName)) reason = 'Give the output a valid name.'
-  else if (missingNodes.length > 0) reason = `This server has no ${missingNodes.join(' or ')} node.`
-  else if (checking) reason = 'The files are still being checked.'
-  else if (checkError) reason = `The files could not be checked: ${checkError}. Try again.`
-  else if (!check) reason = 'The files have not been checked yet.'
-  else if (check.problems.length > 0) reason = 'Fix the problems in the check first.'
-  else if (starting) reason = 'Starting.'
+  // Why the button is off, most useful reason first (shared with History's Re-run).
+  const reason = mergeStartReason({ recipe, connected, nodes: caps.nodes, jobs, check, checking, checkError, starting })
 
   const ready = !!recipe.a && (recipe.mode === 'bake' || !!recipe.b) && (recipe.mode !== 'addDifference' || !!recipe.c)
   const button = (
