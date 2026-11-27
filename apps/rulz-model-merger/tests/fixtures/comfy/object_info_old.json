@@ -1,0 +1,13 @@
+{
+  "CheckpointLoaderSimple": { "input": { "required": { "ckpt_name": [["sample-a.safetensors", "folder/sample-b.safetensors"], { "tooltip": "x" }] } } },
+  "UNETLoader": { "input": { "required": { "unet_name": [["unet-one.safetensors"]], "weight_dtype": [["default", "fp8_e4m3fn"]] } } },
+  "LoraLoader": { "input": { "required": { "model": ["MODEL"], "lora_name": [["lora-one.safetensors", "lora-two.safetensors"]], "strength_model": ["FLOAT", { "default": 1.0 }] } } },
+  "CLIPLoader": { "input": { "required": { "clip_name": [["te-one.safetensors"]] } } },
+  "VAELoader": { "input": { "required": { "vae_name": [["vae-one.safetensors"]] } } },
+  "ModelMergeSimple": { "input": { "required": { "model1": ["MODEL"], "model2": ["MODEL"], "ratio": ["FLOAT", {}] } } },
+  "ModelMergeBlocks": { "input": { "required": {} } },
+  "ModelMergeFluxTest": { "input": { "required": {} } },
+  "ModelMergeAlpha": { "input": { "required": {} } },
+  "KSampler": { "input": { "required": {} } },
+  "SaveImage": { "input": { "required": {} } }
+}

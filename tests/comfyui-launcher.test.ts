@@ -24,10 +24,10 @@ describe('RulZ ComfyUI Launcher', () => {
     expect(app.tagline.length).toBeLessThanOrEqual(72)
   })
 
-  it('has its category, listed last, and no other app uses it', () => {
+  it('has its category, listed last, shared only with the Model Merger', () => {
     expect(CATEGORIES[CATEGORIES.length - 1].name).toBe('ComfyUI')
     expect(app.category).toBe('ComfyUI')
-    expect(CATALOG.filter((a) => a.category === 'ComfyUI').map((a) => a.id)).toEqual(['comfyui-launcher'])
+    expect(CATALOG.filter((a) => a.category === 'ComfyUI').map((a) => a.id)).toEqual(['comfyui-launcher', 'model-merger'])
     // Every app's category is one the home page lists.
     for (const a of CATALOG) expect(CATEGORIES.map((c) => c.name)).toContain(a.category)
   })

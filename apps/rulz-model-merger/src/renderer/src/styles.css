@@ -1,0 +1,159 @@
+@import 'tailwindcss';
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --bg: #ffffff;
+  --panel: #f5f5f7;
+  --panel-2: #ebebef;
+  --hover: #e2e2e7;
+  --border: #d9d9de;
+  --border-strong: #c4c4cb;
+  --text: #111114;
+  --muted: #5f6068;
+  --faint: #68696f;
+  --accent: #ed000d;
+  --accent-hover: #c8000b;
+  --accent-soft: rgb(237 0 13 / 0.08);
+  --accent-fg: #ffffff;
+  --danger: #d4161c;
+  --warn: #a16207;
+  --ok: #15803d;
+  --code-bg: #f5f5f7;
+  --body: #2a2a30;
+  --link: #d0000b;
+  --accent-text: #c8000b;
+  --warn-text: #8a5300;
+  --danger-text: #b4000a;
+  --danger-bg: #fdecec;
+  --danger-border: #f5b8bb;
+  --danger-hover: #fbd8da;
+  --subtle: rgb(0 0 0 / 0.04);
+  --subtle-border: rgb(0 0 0 / 0.08);
+  --track: rgb(0 0 0 / 0.08);
+  --scrim: rgb(0 0 0 / 0.35);
+  --shadow: rgb(0 0 0 / 0.18);
+  --scroll: var(--border-strong);
+  color-scheme: light;
+}
+
+.dark {
+  --bg: #050505;
+  --panel: #0c0c0e;
+  --panel-2: #141417;
+  --hover: #1c1c21;
+  --border: #232328;
+  --border-strong: #34343b;
+  --text: #f2f2f3;
+  --muted: #a3a3ab;
+  --faint: #82828c;
+  --accent: #ed000d;
+  --accent-hover: #ff2633;
+  --accent-soft: rgb(237 0 13 / 0.13);
+  --accent-fg: #ffffff;
+  --danger: #ff5a5f;
+  --warn: #fbbf24;
+  --ok: #4ade80;
+  --code-bg: #0a0a0c;
+  --body: #d4d4d8;
+  --link: #ff5961;
+  --accent-text: #ff6b72;
+  --warn-text: #fcd679;
+  --danger-text: #ff8a8e;
+  --danger-bg: #3a0c0f;
+  --danger-border: #6b1418;
+  --danger-hover: #4a1014;
+  --subtle: rgb(255 255 255 / 0.06);
+  --subtle-border: rgb(255 255 255 / 0.08);
+  --track: rgb(255 255 255 / 0.08);
+  --scrim: rgb(0 0 0 / 0.7);
+  --shadow: rgb(0 0 0 / 0.9);
+  --scroll: var(--border-strong);
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-panel: var(--panel);
+  --color-panel-2: var(--panel-2);
+  --color-hover: var(--hover);
+  --color-border: var(--border);
+  --color-text: var(--text);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-track: var(--track);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-fg: var(--accent-fg);
+  --color-danger: var(--danger);
+  --color-warn: var(--warn);
+  --color-ok: var(--ok);
+  --color-code: var(--code-bg);
+  --color-border-strong: var(--border-strong);
+  --color-body: var(--body);
+  --color-link: var(--link);
+  --color-accent-text: var(--accent-text);
+  --color-danger-text: var(--danger-text);
+  --color-danger-bg: var(--danger-bg);
+  --color-danger-border: var(--danger-border);
+  --color-danger-hover: var(--danger-hover);
+  --color-warn-text: var(--warn-text);
+  --color-subtle: var(--subtle);
+  --color-subtle-border: var(--subtle-border);
+  --color-scrim: var(--scrim);
+  --font-display: 'Segoe UI Variable Display', 'Segoe UI', system-ui, sans-serif;
+  --font-sans: 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'Cascadia Code', 'Cascadia Mono', Consolas, ui-monospace, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scroll) transparent;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+/* Colour reset in the base layer, so utilities such as text-accent-fg on buttons still apply. */
+@layer base {
+  button,
+  input,
+  textarea,
+  select {
+    color: inherit;
+  }
+}
+
+/* In the base layer so utilities like focus-visible:outline-none can override it. */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
+

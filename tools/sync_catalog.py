@@ -33,6 +33,7 @@ APPS = {
     "hf-manager": ("RulZ-Huggingface-Manager", "assets/icon.png", "assets/icon.ico"),
     "trainer-optimizer": ("RulZ-AI-Trainer-Optimizer", "assets/icon.png", "assets/icon.ico"),
     "comfyui-launcher": ("RulZ-ComfyUI-Launcher", "rulz_comfy_launcher/assets/icon.png", "rulz_comfy_launcher/assets/icon.ico"),
+    "model-merger": ("rulz-model-merger", "build/icon.png", "build/icon.ico"),
 }
 
 IMAGE_REFS = [
