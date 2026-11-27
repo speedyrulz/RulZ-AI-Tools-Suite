@@ -307,6 +307,8 @@ export async function findProgram(name: string, root: string, env: NodeJS.Proces
       }
     }
   }
-  found.set(key, hit)
+  // A program that is not there is not remembered: it may be installed while the app runs.
+  if (hit) found.set(key, hit)
+  else found.delete(key)
   return hit
 }

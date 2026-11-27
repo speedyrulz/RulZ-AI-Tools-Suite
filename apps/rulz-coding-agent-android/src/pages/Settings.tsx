@@ -6,7 +6,8 @@ import { ApprovalChooser, ModelSelect, RentalGoneNote } from '../components/comm
 import { FolderPicker } from '../components/FolderPicker'
 import { ModelSettings } from '../components/ModelSettings'
 import { Button, Field, IconButton, Input, Switch, Textarea, TopBar } from '../components/ui'
-import { invoke, on } from '../lib/api'
+import { toast } from 'sonner'
+import { errorMessage, invoke, on } from '../lib/api'
 import { cn, relativeTime } from '../lib/format'
 import { isNative } from '../lib/native'
 import { useAlerts } from '../stores/alerts'
@@ -67,6 +68,8 @@ function ExtraTools() {
             setStarting(true)
             try {
               setInfo(await invoke('tools:start'))
+            } catch (e) {
+              toast.error(errorMessage(e))
             } finally {
               setStarting(false)
             }

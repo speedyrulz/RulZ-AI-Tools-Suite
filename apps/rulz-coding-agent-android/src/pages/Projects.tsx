@@ -4,7 +4,8 @@ import type { ProjectInfo } from '@shared/types'
 import { FolderPicker } from '../components/FolderPicker'
 import { LogoMark } from '../components/Logo'
 import { Button, IconButton, Input, TopBar } from '../components/ui'
-import { invoke } from '../lib/api'
+import { toast } from 'sonner'
+import { errorMessage, invoke } from '../lib/api'
 import { relativeTime } from '../lib/format'
 import { useApp } from '../stores/app'
 import { useLink } from '../stores/link'
@@ -114,7 +115,14 @@ export function Projects() {
                         </span>
                       </span>
                     </button>
-                    <IconButton label="Remove from this list (the folder is kept)" onClick={async () => setRecent(await invoke('projects:forget', p.path))}>
+                    <IconButton label="Remove from this list (the folder is kept)" onClick={async () => {
+                        try {
+                          setRecent(await invoke('projects:forget', p.path))
+                        } catch (e) {
+                          toast.error(errorMessage(e))
+                        }
+                      }}
+                    >
                       <X size={16} />
                     </IconButton>
                   </li>

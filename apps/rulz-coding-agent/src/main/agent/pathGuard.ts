@@ -73,6 +73,11 @@ export async function resolveInProject(
     const parts = [...rel.split('/'), ...realRel.split('/')].map((p) => p.toLowerCase().replace(/[. ]+$/, ''))
     if (parts.includes('.git')) throw new PathError('Files inside .git folders are managed by git and must not be edited directly.')
     if (rel === '') throw new PathError('Give a file path inside the project, not the project folder itself.')
+    for (const part of rel.split('/')) {
+      if (part.includes(':')) throw new PathError(`"${raw}" has a ":" in its name, which Windows uses for hidden file streams, so it can't be written. Use a plain file name.`)
+      if (/[. ]$/.test(part)) throw new PathError(`"${raw}" has a name ending in a dot or space, which Windows does not keep. Use a plain file name.`)
+      if (/^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i.test(part)) throw new PathError(`"${raw}" uses a name Windows keeps for devices (${part}), so it can't be written. Use another file name.`)
+    }
   }
   return { abs, rel }
 }

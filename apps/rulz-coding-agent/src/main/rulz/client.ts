@@ -10,6 +10,9 @@ export interface ServerConfig {
   apiKey: string
 }
 
+/** How long the server may stay silent before a turn is given up (milliseconds). Tests shorten these. */
+export const timeouts = { startMs: 30 * 60_000, streamIdleMs: 10 * 60_000, completeMs: 15 * 60_000 }
+
 /** RulZ LLM Suite records requests carrying this header as part of the named RE session. */
 export const RE_SESSION_HEADER = 'x-rulz-re-session'
 
@@ -212,7 +215,7 @@ export class RulzClient {
     return templateStringifiesArgs(this.props.get(model)?.chatTemplate) ? jsonifyToolCallArgs(valid) : valid
   }
 
-  /** One streamed /v1/chat/completions turn. */
+  /** One streamed /v1/chat/completions turn. Gives up when the server sends nothing for timeouts.streamIdleMs. */
   async streamTurn(
     body: { model: string; messages: WireMessage[]; tools?: unknown[]; [k: string]: unknown },
     signal: AbortSignal,
@@ -221,14 +224,46 @@ export class RulzClient {
     extra: Record<string, string> = {}
   ): Promise<TurnResult> {
     const { url, apiKey } = this.config()
+    // Our own controller, so an idle timeout can cut the connection without the caller's signal
+    // (which means "Stop") being set.
+    const link = new AbortController()
+    const onStop = (): void => link.abort()
+    if (signal.aborted) link.abort()
+    else signal.addEventListener('abort', onStop, { once: true })
+    try {
+      return await this.readTurn(url, apiKey, body, link, on, extra)
+    } finally {
+      signal.removeEventListener('abort', onStop)
+    }
+  }
+
+  private async readTurn(
+    url: string,
+    apiKey: string,
+    body: { model: string; messages: WireMessage[]; tools?: unknown[]; [k: string]: unknown },
+    link: AbortController,
+    on: StreamHandlers,
+    extra: Record<string, string>
+  ): Promise<TurnResult> {
+    // Waiting for the answer to start has its own, longer limit: the Suite may first load the model.
+    let noAnswer = false
+    const startTimer = setTimeout(() => {
+      noAnswer = true
+      link.abort()
+    }, timeouts.startMs)
     const res = await fetch(`${url}/v1/chat/completions`, {
       method: 'POST',
       headers: { ...headers(apiKey, true), ...extra },
       // return_progress: llama-server then streams prompt_progress chunks while it reads the prompt
       // (RulZ LLM Suite passes the body through unchanged), which onProgress turns into a percentage.
       body: JSON.stringify({ ...body, messages: this.prepareMessages(body.model, body.messages), stream: true, return_progress: true }),
-      signal
+      signal: link.signal
     })
+      .catch((e: unknown) => {
+        if (noAnswer) throw new Error('The server did not start answering for a long time. Check that RulZ LLM Suite (or the rented GPU) is still running, then try again.')
+        throw e
+      })
+      .finally(() => clearTimeout(startTimer))
     if (!res.ok || !res.body) {
       const text = await res.text()
       throw new ServerError(errorFromBody(res.status, text), res.status, errorCodeFromBody(text))
@@ -244,9 +279,24 @@ export class RulzClient {
     let cost: number | undefined
     let gen: GenTimings | undefined
     const reader = res.body.getReader()
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
+    try {
+      for (;;) {
+        let idle: NodeJS.Timeout | undefined
+        const stalled = new Promise<never>((_, reject) => {
+          idle = setTimeout(() => {
+            reject(new Error('The server stopped answering: nothing came in for a long time. Check that RulZ LLM Suite (or the rented GPU) is still running, then try again.'))
+            link.abort() // after the reject, so the race reports the timeout and not the abort
+          }, timeouts.streamIdleMs)
+        })
+        let chunk: Awaited<ReturnType<typeof reader.read>>
+        try {
+          chunk = await Promise.race([reader.read(), stalled])
+        } finally {
+          clearTimeout(idle)
+          stalled.catch(() => undefined)
+        }
+        const { done, value } = chunk
+        if (done) break
       for (const data of parser.push(decoder.decode(value, { stream: true }))) {
         if (data === '[DONE]') continue
         let json: unknown
@@ -272,6 +322,9 @@ export class RulzClient {
         if (info.cost !== undefined) cost = info.cost
         if (info.gen) gen = info.gen
       }
+    }
+    } finally {
+      reader.cancel().catch(() => undefined)
     }
     const baseline = gen && noDraftMsPerToken(gen)
     if (baseline) this.noDraftSpeed.set(body.model, baseline)
@@ -422,11 +475,17 @@ export class RulzClient {
     onCost?: (dollars: number) => void
   ): Promise<string> {
     const { url, apiKey } = this.config()
+    // A total limit, so a connection that goes quiet cannot hang a summary forever. The caller's own
+    // signal still aborts first and still reads as Stop (it is the caller's signal that is checked).
+    const limit = AbortSignal.timeout(timeouts.completeMs)
     const res = await fetch(`${url}/v1/chat/completions`, {
       method: 'POST',
       headers: { ...headers(apiKey, true), ...extra },
       body: JSON.stringify({ model, messages, max_tokens: maxTokens, stream: false, temperature: 0.3 }),
-      signal
+      signal: signal ? AbortSignal.any([signal, limit]) : limit
+    }).catch((e: unknown) => {
+      if (limit.aborted && !signal?.aborted) throw new Error('The server stopped answering while writing a summary. Check that RulZ LLM Suite (or the rented GPU) is still running, then try again.')
+      throw e
     })
     if (!res.ok) {
       const text = await res.text()

@@ -219,7 +219,7 @@ export function FileList() {
 }
 
 function DiffSheet({ task, file, onClose }: { task: TaskRecord; file: ChangedFile | null; onClose: () => void }) {
-  const project = useWorkspace((s) => s.project)
+  const projectPath = useWorkspace((s) => s.project?.path)
   const [diff, setDiff] = useState<FileDiff | null>(null)
   const [error, setError] = useState('')
   const [limit, setLimit] = useState(2000)
@@ -228,9 +228,16 @@ function DiffSheet({ task, file, onClose }: { task: TaskRecord; file: ChangedFil
     setLimit(2000)
     setDiff(null)
     setError('')
-    if (!file || !project) return
-    invoke('files:diff', project.path, task.id, file.path).then(setDiff, (e) => setError(errorMessage(e)))
-  }, [file, project, task.id])
+    if (!file || !projectPath) return
+    let cancelled = false
+    invoke('files:diff', projectPath, task.id, file.path).then(
+      (d) => !cancelled && setDiff(d),
+      (e) => !cancelled && setError(errorMessage(e))
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [file, projectPath, task.id])
 
   const lines = useMemo(() => {
     if (!diff || diff.binary || diff.tooLarge) return null

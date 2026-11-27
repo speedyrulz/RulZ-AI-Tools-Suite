@@ -31,6 +31,7 @@ export const SKIP_DIRS = new Set([
 const MAX_LIST_ENTRIES = 400
 const MAX_READ_BYTES = 2 * 1024 * 1024
 const MAX_READ_LINES = 2000
+const MAX_READ_CHARS = 100_000
 const MAX_SEARCH_FILE_BYTES = 1024 * 1024
 const MAX_SEARCH_HITS = 200
 const MAX_SCANNED = 50_000
@@ -59,6 +60,22 @@ export function nameMatcher(pattern: string): (name: string) => boolean {
   return (n) => re.test(n)
 }
 
+/** "a/{b,c}/*.{js,ts}" -> every combination ("a/b/*.js", ...); stops growing at 200 results. */
+function expandBraces(g: string): string[] {
+  const out: string[] = []
+  const walk = (s: string): void => {
+    if (out.length >= 200) return
+    const m = s.match(/^(.*?)\{([^{}]*)\}(.*)$/)
+    if (!m) {
+      out.push(s)
+      return
+    }
+    for (const b of m[2].split(',')) walk(m[1] + b.trim() + m[3])
+  }
+  walk(g)
+  return out
+}
+
 /** Glob for search_text: "*.js", "src/**\/*.ts", or "*.{js,ts}". Matched against the relative path or the name. */
 export function globMatcher(glob: string | undefined): (rel: string) => boolean {
   if (!glob?.trim()) return () => true
@@ -66,10 +83,7 @@ export function globMatcher(glob: string | undefined): (rel: string) => boolean 
     .split(/,(?![^{]*\})/)
     .map((g) => g.trim())
     .filter(Boolean)
-    .flatMap((g) => {
-      const brace = g.match(/^(.*)\{([^}]+)\}(.*)$/)
-      return brace ? brace[2].split(',').map((b) => brace[1] + b.trim() + brace[3]) : [g]
-    })
+    .flatMap((g) => expandBraces(g))
   const res = alts.map((g) => {
     const body = g
       .replace(/\\/g, '/')
@@ -109,7 +123,7 @@ async function readDir(dir: string): Promise<Dirent[]> {
 }
 
 /** Walks the project breadth-first, skipping generated folders. */
-async function* walkFiles(start: string): AsyncGenerator<{ abs: string; entry: Dirent }> {
+async function* walkFiles(start: string, skipped?: { folders: number; capped: boolean }): AsyncGenerator<{ abs: string; entry: Dirent }> {
   let level = [start]
   let scanned = 0
   while (level.length) {
@@ -122,10 +136,17 @@ async function* walkFiles(start: string): AsyncGenerator<{ abs: string; entry: D
         continue
       }
       for (const entry of entries) {
-        if (++scanned > MAX_SCANNED) return
+        if (++scanned > MAX_SCANNED) {
+          if (skipped) skipped.capped = true
+          return
+        }
         const abs = join(dir, entry.name)
         yield { abs, entry }
-        if (entry.isDirectory() && !entry.isSymbolicLink() && !SKIP_DIRS.has(entry.name.toLowerCase())) next.push(abs)
+        if (entry.isDirectory() && !entry.isSymbolicLink()) {
+          if (SKIP_DIRS.has(entry.name.toLowerCase())) {
+            if (skipped) skipped.folders++
+          } else next.push(abs)
+        }
       }
     }
     level = next
@@ -226,6 +247,7 @@ export async function searchText(
   const needle = args.query.toLowerCase()
   const inGlob = globMatcher(typeof args.glob === 'string' ? args.glob : undefined)
   const hits: string[] = []
+  const skipped = { big: 0, binary: 0, folders: 0, capped: false }
 
   /** One file's matching lines (at most MAX_SEARCH_HITS). */
   const searchFile = async (abs: string): Promise<string[]> => {
@@ -234,12 +256,18 @@ export async function searchText(
     let buf: Buffer
     try {
       const st = await fs.stat(abs)
-      if (st.size > MAX_SEARCH_FILE_BYTES) return []
+      if (st.size > MAX_SEARCH_FILE_BYTES) {
+        skipped.big++
+        return []
+      }
       buf = await fs.readFile(abs)
     } catch {
       return []
     }
-    if (looksBinary(buf)) return []
+    if (looksBinary(buf)) {
+      skipped.binary++
+      return []
+    }
     const found: string[] = []
     const lines = buf.toString('utf8').split(/\r?\n/)
     for (let i = 0; i < lines.length && found.length < MAX_SEARCH_HITS; i++) {
@@ -264,7 +292,7 @@ export async function searchText(
   if (st.isFile()) await searchBatch([target.abs])
   else {
     let batch: string[] = []
-    for await (const { abs, entry } of walkFiles(target.abs)) {
+    for await (const { abs, entry } of walkFiles(target.abs, skipped)) {
       if (!entry.isFile()) continue
       batch.push(abs)
       if (batch.length < SEARCH_BATCH) continue
@@ -274,9 +302,20 @@ export async function searchText(
     }
     if (batch.length && hits.length < MAX_SEARCH_HITS) await searchBatch(batch)
   }
-  if (!hits.length) return ok(`"${args.query}" was not found.`)
+  // Files too big to search, and a stopped scan, are always told. Binary files and generated folders
+  // (node_modules, .git) are skipped on purpose, so they are only told when nothing was found.
+  const notSearched = (all: boolean): string[] =>
+    [
+      skipped.big ? `${skipped.big} over ${formatSize(MAX_SEARCH_FILE_BYTES)}` : '',
+      all && skipped.binary ? `${skipped.binary} not text` : '',
+      all && skipped.folders ? `${skipped.folders} generated folder${skipped.folders === 1 ? '' : 's'} such as node_modules or .git` : ''
+    ].filter(Boolean)
+  const note = (all: boolean): string =>
+    (notSearched(all).length ? `\n(Not searched: ${notSearched(all).join('; ')}.)` : '') +
+    (skipped.capped ? `\n(The search stopped after ${MAX_SCANNED.toLocaleString('en-US')} files and folders, so some files were not searched. Narrow it with "path" or "glob".)` : '')
+  if (!hits.length) return ok(`"${args.query}" was not found.${note(true)}`)
   const more = hits.length >= MAX_SEARCH_HITS ? `\n(Showing the first ${MAX_SEARCH_HITS} matches.)` : ''
-  return ok(hits.join('\n') + more)
+  return ok(hits.join('\n') + more + note(false))
 }
 
 export async function readFile(
@@ -297,16 +336,35 @@ export async function readFile(
     if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop()
     const total = lines.length
     const start = clampInt(args.start_line, 1, 1, Math.max(1, total))
-    const end = clampInt(args.end_line, Math.min(total, start + MAX_READ_LINES - 1), start, Math.min(total, start + MAX_READ_LINES - 1))
+    let end = clampInt(args.end_line, Math.min(total, start + MAX_READ_LINES - 1), start, Math.min(total, start + MAX_READ_LINES - 1))
     if (!buf.length) return ok(`${target.rel} is empty.`)
     const width = String(end).length
-    const body = lines
-      .slice(start - 1, end)
-      .map((l, i) => `${String(start + i).padStart(width)}| ${l}`)
-      .join('\n')
+    // Lines are capped, and so are characters: one minified line can be megabytes long.
+    const fmt = (n: number): string => n.toLocaleString('en-US')
+    let cut = ''
+    let used = 0
+    const picked: string[] = []
+    for (let n = start; n <= end; n++) {
+      let l = lines[n - 1]
+      if (used + l.length > MAX_READ_CHARS && picked.length) {
+        end = n - 1
+        // The "More below" line that follows says where to go on.
+        cut = `\n(Cut at about ${fmt(MAX_READ_CHARS)} characters.)`
+        break
+      }
+      if (l.length > MAX_READ_CHARS) {
+        cut = `\n(Line ${n} is ${fmt(l.length)} characters long and was cut after ${fmt(MAX_READ_CHARS)}. Use search_text to find what you need in it.)`
+        l = l.slice(0, MAX_READ_CHARS)
+        end = n
+      }
+      used += l.length
+      picked.push(`${String(n).padStart(width)}| ${l}`)
+      if (cut && end === n) break
+    }
+    const body = picked.join('\n')
     const range = start === 1 && end === total ? `${total} lines` : `lines ${start}-${end} of ${total}`
     const more = end < total ? `\n(More below: read again with start_line ${end + 1}.)` : ''
-    return ok(`${target.rel} (${range}; the "N| " line numbers are not part of the file)\n${body}${more}`)
+    return ok(`${target.rel} (${range}; the "N| " line numbers are not part of the file)\n${body}${cut}${more}`)
   } catch (e) {
     return fail(explain(e, target?.rel ?? String(args.path ?? '')))
   }
@@ -330,7 +388,9 @@ export async function writeFile(root: string, args: { path?: unknown; content?: 
       return true
     }, () => false)
     await fs.mkdir(dirname(target.abs), { recursive: true })
-    await fs.writeFile(target.abs, content, 'utf8')
+    // Keep a CRLF file CRLF when the new text has only LF, as edit_file does.
+    const crlf = existed && !content.includes('\r\n') && (await fs.readFile(target.abs, 'utf8')).includes('\r\n')
+    await fs.writeFile(target.abs, crlf ? content.replace(/\n/g, '\r\n') : content, 'utf8')
     const lines = content ? content.split('\n').length - (content.endsWith('\n') ? 1 : 0) : 0
     return ok(`${existed ? 'Updated' : 'Created'} ${target.rel} (${lines} lines).`, [{ path: target.rel, change: existed ? 'changed' : 'created' }])
   } catch (e) {
