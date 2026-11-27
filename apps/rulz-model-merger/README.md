@@ -58,6 +58,8 @@ folder, with text encoder and VAE).
   `models/checkpoints/merged/`, so ComfyUI lists it. An existing file is never overwritten; the new one gets `-2`,
   `-3`... instead.
 - **Cancel** removes only this merge from the queue or stops it while it runs, also on a server you share.
+
+![The Merge page with a weighted merge and its checks (made-up files)](docs/screenshots/04-merge-dark.png)
 - One merge runs at a time. On the CPU a merge of two 5 GB models takes about three minutes.
 
 ## Baking LoRAs
@@ -76,6 +78,8 @@ text-encoder strength.
   Text-encoder weights in a diffusion-model bake are counted apart, because a diffusion-model file has no text encoder.
   On a server reached by URL this check is not possible, and the app says so.
 - The LoRA files and their header hashes are stored in the recipe with the saved file.
+
+![Bake LoRAs with two LoRAs and the fit check (made-up files)](docs/screenshots/05-bake-dark.png)
 
 ## Merging LoRAs
 
@@ -103,6 +107,8 @@ Each LoRA gets a weight (the slider covers −2 to 2, the number box takes −10
 - **Speed** (CPU, two MOSS LoRAs of rank 32 with 252 layers): exact merge 11 s, shrink to rank 32 about 25 s.
 - LoRA files reached through a symbolic link with an absolute target cannot be read from Windows over
   `\\wsl.localhost\`; use a hard link or a copy in the models folder.
+
+![The LoRA merge page shrinking three LoRAs to rank 32 (made-up files)](docs/screenshots/06-lora-merge-dark.png)
 
 ## Sample grids
 
@@ -136,6 +142,10 @@ saved: each image builds the merge inside its own ComfyUI job.
   to the Recycle Bin.
 - **Speed** (RTX 4060 Ti, Krea 2 int8 at 1 megapixel and 8 steps, three LoRA strengths): 60 s for the first image
   with model loading, about 40 s for each of the others.
+
+| Dark | Light |
+| --- | --- |
+| ![A finished 4 × 2 ratio grid (made-up files, drawn sample images)](docs/screenshots/07-grid-dark.png) | ![The same grid in light mode](docs/screenshots/08-grid-light.png) |
 
 ## Requirements
 
