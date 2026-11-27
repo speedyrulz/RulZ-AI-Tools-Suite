@@ -8,10 +8,12 @@ import logging
 import posixpath
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import unquote
 
 from nicegui import app, events, run, ui
+from nicegui.elements.markdown import prepare_content
 
 from .. import config, hub, vast
 from ..jobs import Job
@@ -40,11 +42,19 @@ MOD_TIP_BUCKET = "The file's own date (its last change before the upload), or el
 
 log = logging.getLogger(__name__)
 
-_temp_downloads: list[Path] = []
+_temp_downloads: list[tuple[Path, float]] = []
+
+
+def _sweep_downloads(now: float) -> None:
+    # Remove entries individually so concurrent worker appends are never lost.
+    for entry in _temp_downloads[:]:
+        if now - entry[1] >= 6 * 60 * 60:
+            hub.cleanup_temp(entry[0])
+            _temp_downloads.remove(entry)
 
 
 def _cleanup_temp_downloads() -> None:
-    for p in _temp_downloads:
+    for p, _ in _temp_downloads:
         hub.cleanup_temp(p)
 
 
@@ -56,6 +66,19 @@ async def _sweep_old_temp() -> None:
 
 app.on_startup(_sweep_old_temp)
 app.on_shutdown(_cleanup_temp_downloads)
+
+
+MARKDOWN_EXTRAS = ['fenced-code-blocks', 'tables']
+
+
+def _render_markdown(text: str) -> bool:
+    return len(text.encode('utf-8')) <= 200 * 1024
+
+
+def _warm_markdown(text: str) -> None:
+    """Convert in a worker thread into NiceGUI's cache, so ui.markdown finds it there instead of converting on the
+    event loop. The call must match ui.markdown's own exactly: lru_cache keys ``extras=`` apart from a positional."""
+    prepare_content(text, extras=' '.join(MARKDOWN_EXTRAS))
 
 
 def _suffix(name: str) -> str:
@@ -646,6 +669,7 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
     async def upload_from_browser() -> None:
         tmp = Path(tempfile.mkdtemp(prefix='rulz-hf-up-'))
         staged: dict[str, Path] = {}
+        pending = {'count': 0}
         dest_folder = state['folder']
 
         with ui.dialog() as dialog, ui.card().classes('rulz-card w-[640px] max-w-[95vw] gap-3'):
@@ -659,10 +683,21 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                 target = tmp / filename
                 await e.file.save(target)
                 staged[filename] = target
+                pending['count'] = max(0, pending['count'] - 1)
                 count.set_text(f'{len(staged)} file(s) ready')
                 go.set_enabled(True)
 
-            ui.upload(multiple=True, auto_upload=True, on_upload=on_upload,
+            def on_begin_upload(_e) -> None:
+                pending['count'] += 1
+
+            async def continue_upload() -> None:
+                n = pending['count']
+                if n and not await confirm('Uploads in progress',
+                                           f'{n} file(s) are still uploading. Continue without them?'):
+                    return
+                dialog.submit(True)
+
+            ui.upload(multiple=True, auto_upload=True, on_upload=on_upload, on_begin_upload=on_begin_upload,
                       label='Drop files here or click +').props('flat bordered color=primary').classes('w-full rulz-drop')
             ui.label('For very large files (several GB) or whole folders use "Files or folders from this computer" '
                      'instead: it reads directly from disk without copying through the browser.') \
@@ -671,7 +706,7 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                 count = ui.label('No files yet').classes('text-sm rulz-muted')
                 ui.space()
                 ui.button('Cancel', on_click=lambda: dialog.submit(False)).props('flat')
-                go = ui.button('Continue', icon='arrow_forward', on_click=lambda: dialog.submit(True))
+                go = ui.button('Continue', icon='arrow_forward', on_click=continue_upload)
                 go.disable()
         ok = await dialog
         if not ok or not staged:
@@ -724,12 +759,16 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                 run_btn = ui.button('Run sync', icon='sync')
                 run_btn.disable()
 
-        plan_state: dict = {'file': None}
+        plan_state: dict = {'file': None, 'ticket': 0}
 
         def patterns(v: str | None) -> list[str]:
             return [p.strip() for p in (v or '').split(',') if p.strip()]
 
         def invalidate() -> None:
+            plan_state['ticket'] += 1
+            preview_btn.props(remove='loading')
+            if plan_state['file']:
+                shutil.rmtree(Path(plan_state['file']).parent, ignore_errors=True)
             plan_state['file'] = None
             run_btn.disable()
             result_box.clear()
@@ -745,16 +784,24 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
             if dir_toggle.value == 'up' and not Path(local_dir).is_dir():
                 notify_error(f'Local folder not found: {local_dir}')
                 return
+            invalidate()
+            ticket = plan_state['ticket']
             plan_file = str(Path(tempfile.mkdtemp(prefix='rulz-hf-plan-')) / 'plan.jsonl')
             preview_btn.props('loading')
             try:
                 plan = await run.io_bound(fs.sync, local_dir, remote.value or '', dir_toggle.value, delete.value,
                                           patterns(include.value), patterns(exclude.value), plan_file)
             except Exception as e:  # noqa: BLE001
-                notify_error(e)
+                shutil.rmtree(Path(plan_file).parent, ignore_errors=True)
+                if ticket == plan_state['ticket']:
+                    notify_error(e)
                 return
             finally:
-                preview_btn.props(remove='loading')
+                if ticket == plan_state['ticket']:
+                    preview_btn.props(remove='loading')
+            if ticket != plan_state['ticket']:
+                shutil.rmtree(Path(plan_file).parent, ignore_errors=True)
+                return
             s = plan.summary()
             result_box.clear()
             with result_box:
@@ -778,12 +825,15 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                 else:
                     ui.label('Everything is already in sync.').classes('rz-ok')
             plan_state['file'] = plan_file if ops else None
+            if not ops:
+                shutil.rmtree(Path(plan_file).parent, ignore_errors=True)
             run_btn.set_enabled(bool(ops))
 
         def do_run() -> None:
             plan_file = plan_state['file']
             if not plan_file:
                 return
+            plan_state['file'] = None  # the job owns the plan from here
             dialog.submit(None)
             down = dir_toggle.value == 'down'
             from ..platform_utils import to_local_path
@@ -799,6 +849,7 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
         preview_btn.on_click(do_preview)
         run_btn.on_click(do_run)
         await dialog
+        invalidate()
 
     async def push_folder_dialog() -> None:
         with ui.dialog() as dialog, ui.card().classes('rulz-card w-[680px] max-w-[95vw] gap-3'):
@@ -849,12 +900,15 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
             return
         label = entries[0].name if len(entries) == 1 else f'{len(entries)} items'
         if via_browser:
+            _sweep_downloads(time.time())
+
             def work(job: Job):
-                return fs.download_to_temp(entries, job)
+                result = fs.download_to_temp(entries, job)
+                _temp_downloads.append((result[0], time.time()))
+                return result
 
             def deliver(job: Job) -> None:
                 path, filename = job.result
-                _temp_downloads.append(path)
                 ui.download.file(path, filename)
                 job.result = None
             run_job(f'Prepare {label} for the browser', work, icon='download',
@@ -1094,14 +1148,20 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
         dark = config.get().dark_mode != 'light'
         lang = LANGUAGE.get(suffix) or ('Markdown' if entry.name.lower().startswith('readme') else None)
         editor_state: dict = {'editor': None}
+        markdown_text = _strip_front_matter(content) if lang == 'Markdown' else ''
+        render_markdown = lang == 'Markdown' and _render_markdown(markdown_text)
+        if render_markdown:
+            await run.io_bound(_warm_markdown, markdown_text)
 
         def show_view() -> None:
             body.clear()
             with body:
-                if lang == 'Markdown':
+                if render_markdown:
                     with ui.column().classes('w-full p-6 max-w-[900px] mx-auto'):
-                        ui.markdown(_strip_front_matter(content), extras=['fenced-code-blocks', 'tables'])
+                        ui.markdown(markdown_text, extras=MARKDOWN_EXTRAS)
                 else:
+                    if lang == 'Markdown':
+                        ui.label('Large Markdown file shown as plain text.').classes('text-sm rulz-muted')
                     pretty = content
                     if suffix == '.json':
                         try:
