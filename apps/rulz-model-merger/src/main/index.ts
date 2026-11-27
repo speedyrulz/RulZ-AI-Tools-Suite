@@ -1,10 +1,13 @@
 import { join } from 'node:path'
 import { app, BrowserWindow, nativeTheme, shell } from 'electron'
+import type { LoraMergeJob } from '@shared/loraMerge'
 import type { MergeJob } from '@shared/merge'
 import type { ConnectionStatus, PreflightReport, ServerState, Theme } from '@shared/types'
 import { ComfyClient, probeServer } from './comfy/client'
 import { normalizeServerUrl } from './comfy/parse'
 import { broadcast, handle } from './ipc'
+import { LoraMergeService } from './loras/service'
+import loraWorkerPath from './loras/worker?modulePath'
 import { listGpus } from './server/gpus'
 import { MergeRunner } from './merge/runner'
 import { OwnServer } from './server/ownServer'
@@ -24,6 +27,7 @@ const wsl = createWslRunner()
 let settings!: SettingsStore
 let ownServer!: OwnServer
 let mergeRunner!: MergeRunner
+let loraMerge!: LoraMergeService
 /** Servers the app did not start whose queue the user agreed to share, this session only. */
 const acceptedSharedQueues = new Set<string>()
 
@@ -139,6 +143,11 @@ function registerIpc(): void {
   handle('merge:cancel', (id) => mergeRunner.cancel(id))
   handle('merge:jobs', () => mergeRunner.jobs())
   handle('merge:moveToModels', (id) => mergeRunner.moveToModels(id))
+  handle('loraMerge:inspect', (req) => loraMerge.inspect(req))
+  handle('loraMerge:start', (recipe) => loraMerge.start(recipe))
+  handle('loraMerge:cancel', (id) => loraMerge.cancel(id))
+  handle('loraMerge:jobs', () => loraMerge.jobs())
+  handle('loraMerge:list', () => loraMerge.list())
   handle('shell:openExternal', async (url) => {
     if (/^https?:\/\//i.test(url)) await shell.openExternal(url)
   })
@@ -234,6 +243,14 @@ async function main(): Promise<void> {
     appVersion: app.getVersion()
   })
   mergeRunner.on('job', (job: MergeJob) => broadcast('merge:job', job))
+
+  loraMerge = new LoraMergeService({
+    wsl,
+    settings: () => settings.get().ownServer,
+    appVersion: app.getVersion(),
+    workerPath: loraWorkerPath
+  })
+  loraMerge.on('job', (job: LoraMergeJob) => broadcast('loraMerge:job', job))
 
   registerIpc()
   createWindow()

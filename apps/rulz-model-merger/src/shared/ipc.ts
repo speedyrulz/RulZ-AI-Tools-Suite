@@ -9,6 +9,7 @@ import type {
   ServerState
 } from './types'
 import type { MergeCheck, MergeInspectRequest, MergeJob, MergeRecipe } from './merge'
+import type { LoraMergeCheck, LoraMergeInspectRequest, LoraMergeJob, LoraMergeRecipe } from './loraMerge'
 
 /** Request/response channels (renderer -> main). */
 export interface IpcInvoke {
@@ -40,6 +41,15 @@ export interface IpcInvoke {
   'merge:jobs': () => MergeJob[]
   /** Own server only: moves the saved file and its sidecar into <models>/<checkpoints|diffusion_models>/merged/ without overwriting. */
   'merge:moveToModels': (jobId: string) => MergeJob
+  /** Reads the input LoRAs' headers from <models>/loras (WSL, own-server settings) and checks they can be merged. */
+  'loraMerge:inspect': (req: LoraMergeInspectRequest) => LoraMergeCheck
+  /** Starts a LoRA merge in the app (worker thread). Rejects when the recipe is invalid or a merge is running. */
+  'loraMerge:start': (recipe: LoraMergeRecipe) => LoraMergeJob
+  'loraMerge:cancel': (jobId: string) => LoraMergeJob
+  /** LoRA merges of this session, newest first. */
+  'loraMerge:jobs': () => LoraMergeJob[]
+  /** LoRA names in <models>/loras (relative, forward slashes), read from disk; works without a running server. */
+  'loraMerge:list': () => string[]
 }
 
 /** Push channels (main -> renderer). */
@@ -48,6 +58,7 @@ export interface IpcEvents {
   'server:log': ServerLogEvent
   'comfy:status': ConnectionStatus
   'merge:job': MergeJob
+  'loraMerge:job': LoraMergeJob
 }
 
 export type InvokeChannel = keyof IpcInvoke

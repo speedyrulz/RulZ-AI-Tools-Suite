@@ -1,4 +1,4 @@
-import { Grid3x3, History, Images, Merge, Server, Settings } from 'lucide-react'
+import { Grid3x3, History, Images, Layers, Merge, Server, Settings } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { cn } from '../../lib/format'
 import { useApp, type Page } from '../../stores/app'
@@ -12,6 +12,7 @@ interface Item {
 
 const TOP: Item[] = [
   { page: 'merge', label: 'Merge', icon: <Merge size={16} /> },
+  { page: 'loras', label: 'LoRA merge', icon: <Layers size={16} /> },
   { page: 'sweep', label: 'Sweep', icon: <Grid3x3 size={16} /> },
   { page: 'results', label: 'Results', icon: <Images size={16} /> },
   { page: 'history', label: 'History', icon: <History size={16} /> }
