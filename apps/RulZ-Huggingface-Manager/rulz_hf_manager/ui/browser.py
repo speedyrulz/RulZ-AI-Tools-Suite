@@ -474,6 +474,8 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
         ui.timer(0.05, refresh, once=True)
         ui.timer(0.3, load_summary, once=True)
 
+    once = OnceGuard()  # a double click must open one preview / start one download
+
     async def open_entry(row: dict) -> None:
         if row['is_dir']:
             await navigate(row['path'])
@@ -492,7 +494,8 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
         elif action == 'rename':
             await rename_entry(entry)
         elif action == 'download':
-            start_download([entry], via_browser=False)
+            if once.acquire(('download', entry.path), hold=1.5):
+                start_download([entry], via_browser=False)
         elif action == 'delete':
             await delete_entries([entry])
     table.on('row_action', row_action)
@@ -553,7 +556,8 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
         notify_ok(f'Branch "{name_}" created')
         ui.navigate.to(browse_url(kind, repo_id, '', name_))
 
-    async def load_history() -> None:
+    async def load_history() -> bool:
+        """True when the commits are shown, False when loading failed (the error was notified)."""
         history_box.clear()
         with history_box:
             ui.spinner().classes('self-center my-6')
@@ -562,7 +566,7 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
         except Exception as e:  # noqa: BLE001
             history_box.clear()
             notify_error(e)
-            return
+            return False
         history_box.clear()
         base = hub.web_url(kind, repo_id)
         rows = [{**c, 'date_str': fmt_date(c['date']), 'ago': fmt_ago(c['date']), 'url': f'{base}/commit/{c["id"]}'}
@@ -579,14 +583,19 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                   {{ props.row.short }}</a></q-td>''')
             t.add_slot('body-cell-ago', r'''<q-td :props="props"><span :title="props.row.date_str">
                 {{ props.row.ago }}</span></q-td>''')
+        return True
 
     if not is_bucket:
-        loaded_history = {'done': False}
+        loaded_history = {'done': False, 'loading': False}
 
         async def on_tab(e: events.ValueChangeEventArguments) -> None:
-            if e.value == 'history' and not loaded_history['done']:
-                loaded_history['done'] = True
-                await load_history()
+            if e.value == 'history' and not loaded_history['done'] and not loaded_history['loading']:
+                loaded_history['loading'] = True
+                try:
+                    # Done only once it worked: after a failure the next visit to the tab tries again.
+                    loaded_history['done'] = await load_history()
+                finally:
+                    loaded_history['loading'] = False
         panels.on_value_change(on_tab)
 
     # ======================================================================== folder ops
@@ -669,7 +678,7 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
     async def upload_from_browser() -> None:
         tmp = Path(tempfile.mkdtemp(prefix='rulz-hf-up-'))
         staged: dict[str, Path] = {}
-        pending = {'count': 0}
+        tally = UploadTally()
         dest_folder = state['folder']
 
         with ui.dialog() as dialog, ui.card().classes('rulz-card w-[640px] max-w-[95vw] gap-3'):
@@ -681,24 +690,35 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                 if filename in staged:
                     ui.notify(f'"{filename}" was already dropped: the newer one replaces it', type='warning')
                 target = tmp / filename
-                await e.file.save(target)
+                tally.saving += 1
+                try:
+                    await e.file.save(target)
+                finally:
+                    tally.saving -= 1
                 staged[filename] = target
-                pending['count'] = max(0, pending['count'] - 1)
                 count.set_text(f'{len(staged)} file(s) ready')
                 go.set_enabled(True)
 
-            def on_begin_upload(_e) -> None:
-                pending['count'] += 1
-
             async def continue_upload() -> None:
-                n = pending['count']
+                n = tally.pending
                 if n and not await confirm('Uploads in progress',
                                            f'{n} file(s) are still uploading. Continue without them?'):
                     return
                 dialog.submit(True)
 
-            ui.upload(multiple=True, auto_upload=True, on_upload=on_upload, on_begin_upload=on_begin_upload,
-                      label='Drop files here or click +').props('flat bordered color=primary').classes('w-full rulz-drop')
+            uploader = ui.upload(multiple=True, auto_upload=True, on_upload=on_upload,
+                                 label='Drop files here or click +').props('flat bordered color=primary') \
+                .classes('w-full rulz-drop')
+            # NiceGUI's on_begin_upload fires when a request arrives and nothing tells it when one fails or is
+            # aborted: count from the uploader's own client events instead.
+            uploader.on('uploading', tally.uploading, args=[])
+            uploader.on('uploaded', tally.settled, args=[])
+            uploader.on('failed', tally.settled, args=[])
+            uploader.on('finish', tally.finished, args=[])
+            # Removing a file that is still uploading aborts its request, but QUploader then sends neither
+            # 'uploaded' nor 'failed' (the file has left its list): count those from 'removed'.
+            uploader.on('removed', lambda e: tally.removed(e.args),
+                        js_handler='(files) => emit(files.filter(f => f.__status === "uploading").length)')
             ui.label('For very large files (several GB) or whole folders use "Files or folders from this computer" '
                      'instead: it reads directly from disk without copying through the browser.') \
                 .classes('text-xs rulz-muted')
@@ -1002,20 +1022,30 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
 
     async def copy_to_dialog() -> None:
         sel = selected_entries()
-        if not sel:
-            return
-        ident = None
+        if not sel or not once.acquire('copy_to'):
+            return  # nothing chosen, or the dialog is already being prepared / open
         try:
-            ident = await run.io_bound(hub.whoami)
-        except Exception:  # noqa: BLE001
-            pass
+            await copy_to_dialog_now(sel)
+        finally:
+            once.release('copy_to', hold=0.0)
+
+    async def copy_to_dialog_now(sel: list[hub.Entry]) -> None:
+        ident = None
         options: list[str] = []
-        if ident:
+        n = ui.notification('Loading your repos and buckets...', spinner=True, timeout=None)
+        try:
             try:
-                rows = await run.io_bound(hub.list_namespace, ident.name)
-                options = sorted(f'{r.kind}:{r.id}' for r in rows)
+                ident = await run.io_bound(hub.whoami)
             except Exception:  # noqa: BLE001
-                options = []
+                pass
+            if ident:
+                try:
+                    rows = await run.io_bound(hub.list_namespace, ident.name)
+                    options = sorted(f'{r.kind}:{r.id}' for r in rows)
+                except Exception:  # noqa: BLE001
+                    options = []
+        finally:
+            n.dismiss()
         with ui.dialog() as dialog, ui.card().classes('rulz-card w-[620px] max-w-[95vw] gap-3'):
             ui.label(f'Copy {len(sel)} item(s) to another repo or bucket').classes('text-lg font-semibold')
             ui.label('Copies run on the Hub servers (no download/upload) whenever possible. '
@@ -1094,6 +1124,14 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
 
     # ======================================================================== preview / edit
     async def preview(entry: hub.Entry) -> None:
+        if not once.acquire(('preview', entry.path)):
+            return  # the same file is already opening
+        try:
+            await preview_now(entry)
+        finally:
+            once.release(('preview', entry.path))
+
+    async def preview_now(entry: hub.Entry) -> None:
         suffix = _suffix(entry.name)
         image = suffix in IMAGE_EXT
         text = is_text_file(entry.name)
@@ -1112,7 +1150,7 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
             return
         n = ui.notification(f'Loading {entry.name}...', spinner=True, timeout=None)
         try:
-            data = await run.io_bound(fs.read_bytes, entry.path)
+            data, parent_sha = await run.io_bound(_read_for_preview, fs, entry.path)
         except Exception as e:  # noqa: BLE001
             notify_error(e)
             return
@@ -1152,6 +1190,8 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
         render_markdown = lang == 'Markdown' and _render_markdown(markdown_text)
         if render_markdown:
             await run.io_bound(_warm_markdown, markdown_text)
+        # Indenting a few MB of JSON takes about a second: not on the event loop.
+        shown = await run.io_bound(_pretty_json, content) if suffix == '.json' and not render_markdown else content
 
         def show_view() -> None:
             body.clear()
@@ -1162,13 +1202,7 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                 else:
                     if lang == 'Markdown':
                         ui.label('Large Markdown file shown as plain text.').classes('text-sm rulz-muted')
-                    pretty = content
-                    if suffix == '.json':
-                        try:
-                            pretty = json.dumps(json.loads(content), indent=2, ensure_ascii=False)
-                        except ValueError:
-                            pass
-                    viewer = ui.codemirror(pretty, language=lang, theme='githubDark' if dark else 'githubLight',
+                    viewer = ui.codemirror(shown, language=lang, theme='githubDark' if dark else 'githubLight',
                                            line_wrapping=True).classes('w-full h-full').style('min-height: 100%')
                     viewer.disable()
 
@@ -1202,6 +1236,11 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                 with ui.dialog() as cd, ui.card().classes('rulz-card w-[520px] gap-3'):
                     ui.label('Save changes').classes('text-lg font-semibold')
                     m, p = commit_fields(fs, message)
+                    if not parent_sha:
+                        # The commit lookup failed when the file was opened: say so instead of saving unprotected.
+                        ui.label('Could not check which commit this file was opened from, so this save cannot '
+                                 'detect a change someone made on the Hub meanwhile and may overwrite it.') \
+                            .classes('text-sm rz-err')
                     with ui.row().classes('w-full justify-end gap-2'):
                         ui.button('Cancel', on_click=lambda: cd.submit(False)).props('flat')
                         ui.button('Commit', icon='save', on_click=lambda: cd.submit(True))
@@ -1210,7 +1249,9 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                 message, create_pr = (m.value if m else '') or message, bool(p.value) if p else False
             save_btn.props('loading')
             try:
-                await run.io_bound(fs.write_bytes, entry.path, new_data, message, create_pr)
+                # Repos: refuse to overwrite a commit made since this file was opened (buckets have no commits).
+                await run.io_bound(fs.write_bytes, entry.path, new_data, message, create_pr,
+                                   **({'parent_commit': parent_sha} if parent_sha and not is_bucket else {}))
             except Exception as e:  # noqa: BLE001
                 notify_error(e)
                 return
@@ -1252,6 +1293,77 @@ def encode_text(text: str, encoding: str, newline: str) -> bytes:
     if newline != '\n':
         text = text.replace('\n', newline)
     return text.encode(encoding)
+
+
+class OnceGuard:
+    """Ignore a second start of the same thing (a double click) while the first is still running, or for a moment
+    after it ended: the second click of a double click arrives after the first handler's first await."""
+
+    def __init__(self) -> None:
+        self._until: dict = {}
+
+    def acquire(self, key, hold: float | None = None, now: float | None = None) -> bool:
+        """True when the caller may go on. With ``hold`` the key stays taken that many seconds; without, until
+        ``release``."""
+        now = time.monotonic() if now is None else now
+        until = self._until.get(key, 0.0)
+        if until is None or until > now:
+            return False
+        self._until[key] = None if hold is None else now + hold
+        return True
+
+    def release(self, key, hold: float = 0.6, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        self._until[key] = now + hold  # a short grace period covers the second click of a double click
+        for k in [k for k, u in self._until.items() if u is not None and u <= now]:
+            del self._until[k]
+
+
+class UploadTally:
+    """How many browser uploads Continue would leave behind: requests the browser still has open (counted from the
+    uploader's own client events, so a failed or aborted request is not counted) plus files being saved to disk."""
+
+    def __init__(self) -> None:
+        self.sending = 0
+        self.saving = 0
+
+    @property
+    def pending(self) -> int:
+        return self.sending + self.saving
+
+    def uploading(self) -> None:  # QUploader 'uploading': one request left the browser
+        self.sending += 1
+
+    def settled(self) -> None:  # QUploader 'uploaded' or 'failed': that request is over
+        self.sending = max(0, self.sending - 1)
+
+    def finished(self) -> None:  # QUploader 'finish': no request is open any more (also after a removed file)
+        self.sending = 0
+
+    def removed(self, n) -> None:  # QUploader 'removed': n of the removed files were still uploading (aborted)
+        if isinstance(n, (list, tuple)):
+            n = n[0] if n else 0
+        self.sending = max(0, self.sending - int(n or 0))
+
+
+def _pretty_json(text: str) -> str:
+    """Indented JSON for the viewer (the text itself when it does not parse). A few MB take about a second."""
+    try:
+        return json.dumps(json.loads(text), indent=2, ensure_ascii=False)
+    except ValueError:
+        return text
+
+
+def _read_for_preview(fs, path: str) -> tuple[bytes, str | None]:
+    """The file's bytes and, for a repo, the commit they came from (the sha is taken first: when the branch moves
+    meanwhile, the saved parent is older than the content and the Hub refuses the save, not overwrites)."""
+    sha = None
+    if getattr(fs, 'kind', 'bucket') != 'bucket':
+        try:
+            sha = fs.revision_sha()
+        except Exception:  # noqa: BLE001  (no sha: save as before, without a parent check)
+            sha = None
+    return fs.read_bytes(path), sha
 
 
 def _local_total(sources: list) -> int:
