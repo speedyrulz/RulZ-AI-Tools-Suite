@@ -33,6 +33,7 @@ PAYLOAD = ''
 STATE = os.path.join(os.path.expanduser('~'), '.rulz-hf')
 JOBS = os.path.join(STATE, 'jobs')
 HUB_REQUIREMENT = 'huggingface_hub[hf_xet]>=2.4,<3'
+PIP_TIMEOUT = 15 * 60  # a stuck pip must not hold the install lock forever
 FINAL = ('done', 'error', 'cancelled', 'stopped')
 COMFY_DIRS = ('checkpoints', 'diffusion_models', 'unet', 'loras', 'text_encoders', 'clip', 'vae', 'clip_vision',
               'controlnet', 'upscale_models', 'embeddings', 'model_patches', 'style_models', 'audio_encoders')
@@ -357,6 +358,28 @@ def cmd_watch(p: dict) -> None:
         time.sleep(interval)
 
 
+def _marker_text(path):
+    """The requirement recorded in the install marker, or '' when there is no marker yet."""
+    try:
+        with open(path, encoding='utf-8') as handle:
+            return handle.read().strip()
+    except OSError:
+        return ''
+
+
+def _pip(cmd):
+    """Run pip. TimeoutExpired becomes the same RuntimeError as a failed install, so the lock is released."""
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=PIP_TIMEOUT)
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout if isinstance(exc.stdout, bytes) else b''
+        tail = output.decode(errors='replace').strip().splitlines()[-6:]
+        detail = 'timed out after %d minutes' % (PIP_TIMEOUT // 60)
+        if tail:
+            detail += '\n' + '\n'.join(tail)
+        raise RuntimeError('Could not install huggingface_hub on the instance:\n' + detail)
+
+
 # ------------------------------------------------------------------------------------------------ the runner
 
 class Runner:
@@ -438,17 +461,17 @@ class Runner:
     def hub(self):
         pylib = os.path.join(STATE, 'pylib-py%d%d' % sys.version_info[:2])
         marker = os.path.join(pylib, '.rulz-ok')
-        if not os.path.exists(marker):
+        # Two transfers started close together must not run pip into the same folder at once: the second waits
+        # here, then reads the marker the first one left (the requirement it installed).
+        if _marker_text(marker) != HUB_REQUIREMENT:
             os.makedirs(STATE, exist_ok=True)
-            # Two transfers started close together on a fresh instance must not run pip into the same folder at
-            # once: the second waits here, then finds the marker the first one left.
             with open(pylib + '.lock', 'w') as lock:
                 try:
                     import fcntl  # noqa: PLC0415  (POSIX only; the instance is Linux)
                     fcntl.flock(lock, fcntl.LOCK_EX)
                 except (ImportError, OSError):
                     pass
-                if not os.path.exists(marker):
+                if _marker_text(marker) != HUB_REQUIREMENT:
                     self.install_hub(pylib, marker)
         sys.path.insert(0, pylib)
         import huggingface_hub  # noqa: PLC0415
@@ -458,16 +481,16 @@ class Runner:
         self.write(state='installing', message='Installing huggingface_hub on the instance (once)...')
         cmd = [sys.executable, '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check',
                '--no-warn-script-location', '--upgrade', '--target', pylib, HUB_REQUIREMENT]
-        done = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        done = _pip(cmd)
         if done.returncode != 0:
-            ensure = subprocess.run([sys.executable, '-m', 'ensurepip', '--upgrade'],
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            done = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) \
-                if ensure.returncode == 0 else done
+            ensure = _pip([sys.executable, '-m', 'ensurepip', '--upgrade'])
+            if ensure.returncode == 0:
+                done = _pip(cmd)
         if done.returncode != 0:
             tail = done.stdout.decode(errors='replace').strip().splitlines()[-6:]
             raise RuntimeError('Could not install huggingface_hub on the instance:\n' + '\n'.join(tail))
-        open(marker, 'w').close()
+        with open(marker, 'w', encoding='utf-8') as handle:
+            handle.write(HUB_REQUIREMENT)
 
     # ---- one file
     @staticmethod
@@ -531,8 +554,11 @@ class Runner:
                     self.fetch(hf, api, item)
                     break
                 except Exception as e:  # noqa: BLE001
-                    fatal = type(e).__name__ in ('RepositoryNotFoundError', 'GatedRepoError', 'EntryNotFoundError',
-                                                 'RevisionNotFoundError', 'RemoteEntryNotFoundError', 'ValueError')
+                    # 401/403 (bad or missing token, no access) will not start working on a retry.
+                    status = getattr(getattr(e, 'response', None), 'status_code', None)
+                    fatal = status in (401, 403) or type(e).__name__ in (
+                        'RepositoryNotFoundError', 'GatedRepoError', 'EntryNotFoundError',
+                        'RevisionNotFoundError', 'RemoteEntryNotFoundError', 'ValueError')
                     if fatal or attempt == 3:
                         with self.lock:
                             self.failed.append({'file': label, 'error': '%s: %s' % (type(e).__name__, str(e)[:400])})

@@ -174,6 +174,10 @@ def friendly_error(e: BaseException) -> str:
             return 'Your token was rejected (401). Check it in Settings.'
         if status == 403:
             return 'Permission denied (403). Your token may be read-only or lack access to this namespace.'
+        if status == 412:
+            # huggingface_hub 2.5 has no dedicated class for this: a stale parentCommit comes back as
+            # HfHubHTTPError with HTTP 412 (see hf_raise_for_status).
+            return 'This file changed on the Hub since it was opened. Reopen it.'
         if status == 429:
             return 'Rate limited by the Hub (429). Wait a minute and try again.'
         first = (server_msg or str(e)).strip().splitlines()[0] if (server_msg or str(e)).strip() else ''
@@ -611,7 +615,13 @@ class RemoteFS:
     def read_bytes(self, path: str) -> bytes:
         raise NotImplementedError
 
-    def write_bytes(self, path: str, data: bytes, message: str, create_pr: bool = False) -> Any:
+    def revision_sha(self) -> str | None:
+        """Commit this revision points at now. None for a bucket, which has no commits."""
+        return None
+
+    def write_bytes(self, path: str, data: bytes, message: str, create_pr: bool = False,
+                    parent_commit: str | None = None) -> Any:
+        # Buckets have no commits: parent_commit is accepted and ignored. Repos override this.
         return self.upload([(data, path)], message, create_pr)
 
     def copy_to(self, entries: list[Entry], dest_kind: str, dest_id: str, dest_folder: str,
@@ -639,7 +649,9 @@ class RemoteFS:
                 if job:
                     job.set(message='Downloading from bucket...')
                 files = self.expand(entries)
-                self.api.download_bucket_files(self.repo_id, files=[(f.raw or f.path, local_target(Path(tmp), f.path))
+                # Paths, not the BucketFile from the listing: huggingface_hub 2.5 applies
+                # raise_on_missing_files only to string paths, and a saved object is downloaded by its old hash.
+                self.api.download_bucket_files(self.repo_id, files=[(f.path, local_target(Path(tmp), f.path))
                                                                     for f in files], raise_on_missing_files=True)
                 if job:
                     job.set(message='Committing to repository...')
@@ -767,14 +779,21 @@ class RepoFS(RemoteFS):
             found.update(x.path for x in infos)
         return found
 
-    def _commit(self, ops: list, message: str, create_pr: bool) -> Any:
+    def _commit(self, ops: list, message: str, create_pr: bool, parent_commit: str | None = None) -> Any:
+        # Only a save that names the commit it was opened against sends parent_commit. Other commits stay as they were.
+        extra = {'parent_commit': parent_commit} if parent_commit is not None else {}
         return self.api.create_commit(self.repo_id, ops, commit_message=message, repo_type=self.kind,
-                                      revision=self.revision, create_pr=create_pr)
+                                      revision=self.revision, create_pr=create_pr, **extra)
 
     def upload(self, items, message, create_pr=False):
         ops = [CommitOperationAdd(path_in_repo=dest, path_or_fileobj=src if isinstance(src, bytes) else str(src))
                for src, dest in items]
         return self._commit(ops, message, create_pr)
+
+    def write_bytes(self, path: str, data: bytes, message: str, create_pr: bool = False,
+                    parent_commit: str | None = None) -> Any:
+        ops = [CommitOperationAdd(path_in_repo=path, path_or_fileobj=data)]
+        return self._commit(ops, message, create_pr, parent_commit)
 
     _PUSH_IGNORE = ['.git/*', '.cache/huggingface/*']
 
@@ -843,6 +862,10 @@ class RepoFS(RemoteFS):
                                    local_dir=local_dir, allow_patterns=patterns,
                                    tqdm_class=job_tqdm(job) if job else None)
         return local_dir
+
+    def revision_sha(self) -> str:
+        """Commit sha this revision points at now. A preview passes it back as ``parent_commit`` on save."""
+        return self.api.repo_info(self.repo_id, repo_type=self.kind, revision=self.revision, expand=['sha']).sha
 
     def read_bytes(self, path):
         with tempfile.TemporaryDirectory(prefix='rulz-hf-', ignore_cleanup_errors=True) as tmp:
@@ -942,7 +965,8 @@ class BucketFS(RemoteFS):
         local_dir.mkdir(parents=True, exist_ok=True)
         if job:
             job.set(message=f'{len(files)} file(s), {human_size(sum(f.size or 0 for f in files))}')
-        self.api.download_bucket_files(self.repo_id, files=[(f.raw or f.path, local_target(local_dir, f.path))
+        # Paths, not the BucketFile from the listing: raise_on_missing_files only checks string paths.
+        self.api.download_bucket_files(self.repo_id, files=[(f.path, local_target(local_dir, f.path))
                                                             for f in files], raise_on_missing_files=True)
         return local_dir
 

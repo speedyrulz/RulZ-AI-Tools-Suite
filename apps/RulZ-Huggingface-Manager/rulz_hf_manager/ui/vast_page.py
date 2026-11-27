@@ -41,6 +41,110 @@ async def gather_in(element: ui.element, *coros) -> list:
     return await asyncio.gather(*(inside(c) for c in coros))
 
 
+ACTIVE_STATES = {'running', 'installing', 'starting', 'queued'}
+
+
+def transfer_shape(st: dict) -> tuple:
+    """Everything that decides which elements a transfer's card has. Progress, counts and the like are not in it:
+    they change every refresh and are updated in place (``TransferCards.show``)."""
+    s = st.get('state') or '?'
+    total = st.get('bytes_total') or 0
+    return (st.get('id'), s, st.get('title'), bool(total and s != 'done'), bool(s == 'installing' and st.get('message')),
+            st.get('error') or '', tuple((f['file'], f['error']) for f in (st.get('failed') or [])[:3]))
+
+
+def transfer_progress(st: dict) -> float:
+    total = st.get('bytes_total') or 0
+    done = (st.get('bytes_done') or 0) + (st.get('partial') or 0)
+    return min(1.0, done / total) if total else 0.0
+
+
+def transfer_line(st: dict) -> str:
+    s = st.get('state') or '?'
+    total = st.get('bytes_total') or 0
+    done = (st.get('bytes_done') or 0) + (st.get('partial') or 0)
+    bits = [f'{st.get("files_done", 0)}/{st.get("files_total", 0)} files',
+            f'{hub.human_size(done)} of {hub.human_size(total)}' if total else '']
+    if s == 'running' and (st.get('speed') or 0) > 1024:
+        bits.append(f'{hub.human_size(st["speed"])}/s')
+    if st.get('skipped'):
+        bits.append(f'{st["skipped"]} already there')
+    if st.get('started') and st.get('finished'):
+        bits.append(fmt_duration(st['finished'] - st['started']))
+    return ' | '.join(b for b in bits if b) + f'  ->  {st.get("dest")}'
+
+
+class TransferCards:
+    """The transfer cards of the vast.ai page. ``show`` is called every few seconds while a transfer runs: it rebuilds
+    the cards only when a transfer appeared, went away or changed state (a rebuild every time would replace a
+    Cancel or Follow button under the pointer); otherwise it updates the bars and texts in place."""
+
+    def __init__(self, box: ui.element, follow, cancel, retry, forget) -> None:
+        self.box, self.actions = box, (follow, cancel, retry, forget)
+        self.shape: tuple | None = None
+        self.refs: dict = {}
+
+    def reset(self) -> None:
+        self.shape = None
+        self.refs = {}
+
+    def show(self, jobs: list[dict]) -> bool:
+        """Show the transfers; True when the cards were rebuilt."""
+        shape = tuple(transfer_shape(st) for st in jobs)
+        if shape == self.shape:
+            for st in jobs:
+                ref = self.refs.get(st.get('id'), {})
+                if ref.get('bar') is not None:
+                    ref['bar'].set_value(transfer_progress(st))
+                ref['line'].set_text(transfer_line(st))
+                if ref.get('msg') is not None:
+                    ref['msg'].set_text(st.get('message') or '')
+            return False
+        self.shape, self.refs = shape, {}
+        self.box.clear()
+        with self.box:
+            for st in jobs:
+                self._card(st)
+        return True
+
+    def _card(self, st: dict) -> None:
+        follow, cancel, retry, forget = self.actions
+        s = st.get('state') or '?'
+        icon, color = STATE_LOOK.get(s, ('help', 'grey'))
+        total = st.get('bytes_total') or 0
+        ref = self.refs[st.get('id')] = {}
+        with ui.column().classes('w-full gap-1 rz-box p-3'):
+            with ui.row().classes('w-full items-center gap-2 no-wrap'):
+                if s in ACTIVE_STATES:
+                    ui.spinner(size='sm', color='primary')
+                else:
+                    ui.icon(icon, color=color)
+                ui.label(st.get('title') or st.get('id')).classes('font-medium ellipsis flex-1')
+                ui.label(s).classes('text-xs uppercase rulz-muted')
+                if s in ACTIVE_STATES:
+                    ui.button('Follow', icon='visibility', on_click=lambda: follow(
+                        st['id'], f'To vast.ai: {st.get("title") or st["id"]}')).props('flat dense no-caps size=sm') \
+                        .tooltip('Show its progress in the Activity panel')
+                    ui.button('Cancel', icon='block', on_click=lambda: cancel(st)) \
+                        .props('flat dense no-caps size=sm color=negative')
+                else:
+                    if s in {'error', 'stopped', 'cancelled'}:
+                        ui.button('Retry', icon='replay', on_click=lambda: retry(st)) \
+                            .props('flat dense no-caps size=sm').tooltip('Resume: files already there are skipped')
+                    ui.button(icon='delete_outline', on_click=lambda: forget(st)) \
+                        .props('flat round dense size=sm').tooltip('Remove from this list (files stay)')
+            if total and s not in {'done'}:
+                ref['bar'] = ui.linear_progress(value=transfer_progress(st), show_value=False) \
+                    .props('rounded size=6px')
+            ref['line'] = ui.label(transfer_line(st)).classes('text-xs rulz-muted rulz-mono ellipsis')
+            if s == 'installing' and st.get('message'):
+                ref['msg'] = ui.label(st['message']).classes('text-xs rulz-muted')
+            if st.get('error'):
+                ui.label(st['error']).classes('text-xs rz-err whitespace-pre-line')
+            for f in (st.get('failed') or [])[:3]:
+                ui.label(f'{f["file"]}: {f["error"]}').classes('text-xs rz-err rulz-mono ellipsis')
+
+
 def add_to_basket(sources: list[vast.Source]) -> None:
     added = 0
     for s in sources:
@@ -49,6 +153,14 @@ def add_to_basket(sources: list[vast.Source]) -> None:
             added += 1
     ui.notify(f'Added {added} to the vast.ai transfer list ({len(BASKET)} in it)' if added
               else 'Already in the vast.ai transfer list', type='positive' if added else 'info')
+
+
+def remove_from_basket(source: vast.Source) -> None:
+    # A different tab may already have removed this exact item.
+    for i, item in enumerate(BASKET):
+        if item is source:
+            del BASKET[i]
+            break
 
 
 async def instance_info(force: bool = False) -> dict | None:
@@ -448,7 +560,7 @@ def follow_job(job_id: str, title: str, conn: vast.Conn | None = None) -> Job:
 @ui.page('/vast')
 async def vast_page() -> None:
     settings = config.get()
-    state: dict = {'instances': [], 'jobs': [], 'busy': False}
+    state: dict = {'instances': [], 'jobs': [], 'jobs_ticket': 0, 'search_ticket': 0}
 
     with frame('vast'):
         ui.label('vast.ai').classes('rz-page-title')
@@ -574,6 +686,8 @@ async def vast_page() -> None:
                 ui.space()
                 ui.button(icon='refresh', on_click=lambda: load_jobs()).props('flat round').tooltip('Refresh')
             jobs_box = ui.column().classes('w-full gap-2')
+            cards = TransferCards(jobs_box, follow_job, lambda st: cancel(st), lambda st: retry(st),
+                                  lambda st: forget(st))
 
     # ======================================================================== instance
     def render_attached(info: dict | None = None, error: str = '') -> None:
@@ -618,6 +732,8 @@ async def vast_page() -> None:
 
     def detach() -> None:
         vast.save_attached(None)
+        state['jobs_ticket'] += 1
+        state['jobs'] = []
         _info.update(conn=None, info=None)
         render_attached()
         render_instances()
@@ -749,6 +865,8 @@ async def vast_page() -> None:
             notify_error('Could not add:\n' + '\n'.join(bad[:5]))
 
     async def search() -> None:
+        state['search_ticket'] += 1
+        ticket = state['search_ticket']
         q = (find.value or '').strip()
         results.clear()
         if not q:
@@ -765,8 +883,11 @@ async def vast_page() -> None:
         try:
             found = await run.io_bound(query)
         except Exception as e:  # noqa: BLE001
-            results.clear()
-            notify_error(e)
+            if ticket == state['search_ticket']:
+                results.clear()
+                notify_error(e)
+            return
+        if ticket != state['search_ticket']:
             return
         results.clear()
         with results:
@@ -797,7 +918,7 @@ async def vast_page() -> None:
             if not BASKET:
                 ui.label('Nothing yet.').classes('text-sm rulz-muted')
                 return
-            for n, s in enumerate(list(BASKET)):
+            for s in list(BASKET):
                 with ui.row().classes('w-full items-center gap-2 no-wrap rz-box px-3 py-1'):
                     ui.icon(hub.KIND_ICON[s.kind]).classes('rz-kind-icon')
                     ui.label(s.label).classes('rulz-mono text-sm ellipsis flex-1')
@@ -805,7 +926,7 @@ async def vast_page() -> None:
                         ui.badge(s.revision).classes('rz-badge')
                     ui.button(icon='folder_open', on_click=lambda s=s: ui.navigate.to(
                         browse_url(s.kind, s.repo_id, rev=s.revision))).props('flat round dense size=sm')
-                    ui.button(icon='close', on_click=lambda n=n: (BASKET.pop(n), render_basket())) \
+                    ui.button(icon='close', on_click=lambda s=s: (remove_from_basket(s), render_basket())) \
                         .props('flat round dense size=sm').tooltip('Remove')
 
     async def send_basket() -> None:
@@ -817,79 +938,48 @@ async def vast_page() -> None:
 
     # ======================================================================== remote jobs
     def render_jobs(error: str = '') -> None:
+        if vast.attached() and not error and state['jobs']:
+            cards.show(state['jobs'])
+            return
+        cards.reset()
         jobs_box.clear()
         with jobs_box:
             if not vast.attached():
                 ui.label('Attach an instance to see its transfers.').classes('text-sm rulz-muted')
-                return
-            if error:
+            elif error:
                 ui.label(error).classes('text-sm rz-err')
-                return
-            if not state['jobs']:
+            else:
                 ui.label('No transfers on this instance yet.').classes('text-sm rulz-muted')
-                return
-            for st in state['jobs']:
-                job_card(st)
-
-    def job_card(st: dict) -> None:
-        s = st.get('state') or '?'
-        icon, color = STATE_LOOK.get(s, ('help', 'grey'))
-        total = st.get('bytes_total') or 0
-        done = (st.get('bytes_done') or 0) + (st.get('partial') or 0)
-        with ui.column().classes('w-full gap-1 rz-box p-3'):
-            with ui.row().classes('w-full items-center gap-2 no-wrap'):
-                if s in {'running', 'installing', 'starting', 'queued'}:
-                    ui.spinner(size='sm', color='primary')
-                else:
-                    ui.icon(icon, color=color)
-                ui.label(st.get('title') or st.get('id')).classes('font-medium ellipsis flex-1')
-                ui.label(s).classes('text-xs uppercase rulz-muted')
-                if s in {'running', 'installing', 'starting', 'queued'}:
-                    ui.button('Follow', icon='visibility', on_click=lambda: follow_job(
-                        st['id'], f'To vast.ai: {st.get("title") or st["id"]}')).props('flat dense no-caps size=sm') \
-                        .tooltip('Show its progress in the Activity panel')
-                    ui.button('Cancel', icon='block', on_click=lambda: cancel(st)) \
-                        .props('flat dense no-caps size=sm color=negative')
-                else:
-                    if s in {'error', 'stopped', 'cancelled'}:
-                        ui.button('Retry', icon='replay', on_click=lambda: retry(st)) \
-                            .props('flat dense no-caps size=sm').tooltip('Resume: files already there are skipped')
-                    ui.button(icon='delete_outline', on_click=lambda: forget(st)) \
-                        .props('flat round dense size=sm').tooltip('Remove from this list (files stay)')
-            if total and s not in {'done'}:
-                ui.linear_progress(value=min(1.0, done / total), show_value=False).props('rounded size=6px')
-            bits = [f'{st.get("files_done", 0)}/{st.get("files_total", 0)} files',
-                    f'{hub.human_size(done)} of {hub.human_size(total)}' if total else '']
-            if s == 'running' and (st.get('speed') or 0) > 1024:
-                bits.append(f'{hub.human_size(st["speed"])}/s')
-            if st.get('skipped'):
-                bits.append(f'{st["skipped"]} already there')
-            if st.get('started') and st.get('finished'):
-                bits.append(fmt_duration(st['finished'] - st['started']))
-            ui.label(' | '.join(b for b in bits if b) + f'  ->  {st.get("dest")}').classes('text-xs rulz-muted '
-                                                                                         'rulz-mono ellipsis')
-            if s == 'installing' and st.get('message'):
-                ui.label(st['message']).classes('text-xs rulz-muted')
-            if st.get('error'):
-                ui.label(st['error']).classes('text-xs rz-err whitespace-pre-line')
-            for f in (st.get('failed') or [])[:3]:
-                ui.label(f'{f["file"]}: {f["error"]}').classes('text-xs rz-err rulz-mono ellipsis')
 
     async def load_jobs() -> None:
-        if not vast.attached():
+        state['jobs_ticket'] += 1
+        ticket = state['jobs_ticket']
+        conn = vast.attached()
+        if not conn:
+            state['jobs'] = []
             render_jobs()
             return
-        if state['busy']:
-            return
-        state['busy'] = True
+        # The same instance by identity, not by every field: a reconnect after a restart (new port or route)
+        # saves a different Conn for the same instance, and its jobs must not be dropped.
+        def still_attached() -> bool:
+            now = vast.attached()
+            return now is not None and now.key == conn.key
+        if state.get('jobs_conn') != conn.key:
+            state['jobs_conn'] = conn.key
+            state['jobs'] = []
+            render_jobs()
+        state['jobs_inflight'] = ticket  # the newest request; an older one still hanging does not count
         try:
-            r = await run.io_bound(lambda: vast.remote().call('jobs', timeout=45))
-            state['jobs'] = r.get('jobs', [])
-            render_jobs()
+            r = await run.io_bound(lambda: vast.Remote(conn).call('jobs', timeout=45))
+            if ticket == state['jobs_ticket'] and still_attached():
+                state['jobs'] = r.get('jobs', [])
+                render_jobs()
         except Exception as e:  # noqa: BLE001
-            render_jobs(str(e))
+            if ticket == state['jobs_ticket'] and still_attached():
+                render_jobs(str(e))
         finally:
-            state['busy'] = False
+            if state.get('jobs_inflight') == ticket:
+                state['jobs_inflight'] = None
 
     async def cancel(st: dict) -> None:
         if not await confirm('Cancel this transfer?', st.get('title') or '', ok_label='Cancel transfer',
@@ -1050,7 +1140,9 @@ async def vast_page() -> None:
             notify_error(e)
 
     async def auto_refresh() -> None:
-        if any(j.get('state') in {'running', 'installing', 'starting', 'queued'} for j in state['jobs']):
+        if state.get('jobs_inflight') is not None and state['jobs_inflight'] == state['jobs_ticket']:
+            return  # a slow instance: do not stack a new ssh call every 5 s behind the one still running
+        if any(j.get('state') in ACTIVE_STATES for j in state['jobs']):
             await load_jobs()
 
     async def init() -> None:

@@ -216,19 +216,54 @@ async def open_location(text: str) -> None:
 JOBS_SHOWN = 60  # the drawer lists the newest jobs; older ones stay in memory until "Clear finished"
 
 
-def _job_list() -> None:
+def _shown_jobs() -> tuple[list[Job], int]:
+    """The jobs the drawer lists (running first, then the rest, newest first) and how many exist in all."""
+    jobs = list(manager.jobs)
+    shown = [j for j in jobs if j.active] + [j for j in jobs if not j.active]
+    return sorted(shown[:JOBS_SHOWN], key=lambda j: -j.id), len(jobs)
+
+
+def _job_shape(job: Job) -> tuple:
+    """Everything that decides which elements a job's card has. Progress, elapsed time and the message text are
+    not in it: they change every tick and are updated in place (see ``_update_job_cards``)."""
+    result_dir = job.status == 'done' and isinstance(job.result, Path) and job.result.is_dir()
+    return (job.id, job.status, job.title, bool(job.started), job.progress is None,
+            bool(job.message or job.detail), job.error, str(job.result) if result_dir else '')
+
+
+def _jobs_shape() -> tuple:
+    shown, total = _shown_jobs()
+    return (total if total > JOBS_SHOWN else 0, tuple(_job_shape(j) for j in shown))
+
+
+def _update_job_cards(refs: dict) -> None:
+    """Refresh the changing texts and bars of the cards built by ``_job_list`` without rebuilding any element."""
+    for job in _shown_jobs()[0]:
+        ref = refs.get(job.id)
+        if not ref:
+            continue
+        if ref.get('time') is not None:
+            ref['time'].set_text(fmt_duration(job.elapsed) if job.started else 'queued')
+        if ref.get('bar') is not None and job.progress is not None:
+            ref['bar'].set_value(job.progress)
+        if ref.get('msg') is not None:
+            ref['msg'].set_text(' / '.join(x for x in (job.message, job.detail) if x))
+
+
+def _job_list(refs: dict | None = None) -> None:
+    refs = {} if refs is None else refs
+    refs.clear()
     if not manager.jobs:
         with ui.column().classes('w-full items-center py-10 rulz-muted'):
             ui.icon('inbox', size='lg')
             ui.label('No activity yet')
         return
-    jobs = list(manager.jobs)
-    shown = [j for j in jobs if j.active] + [j for j in jobs if not j.active]
-    if len(shown) > JOBS_SHOWN:
-        shown = shown[:JOBS_SHOWN]
-        ui.label(f'Showing the newest {JOBS_SHOWN} of {len(jobs)}. "Clear finished" tidies up.') \
+    shown, total = _shown_jobs()
+    if total > JOBS_SHOWN:
+        ui.label(f'Showing the newest {JOBS_SHOWN} of {total}. "Clear finished" tidies up.') \
             .classes('text-xs rulz-muted')
-    for job in sorted(shown, key=lambda j: -j.id):
+    for job in shown:
+        ref = refs[job.id] = {}
         with ui.card().classes('w-full rulz-card rz-job p-3 gap-1').props('flat'):
             with ui.row().classes('w-full items-center no-wrap gap-2'):
                 if job.status == 'running':
@@ -239,14 +274,16 @@ def _job_list() -> None:
                     ui.icon('check_circle' if job.status == 'done' else 'error',
                             color='positive' if job.status == 'done' else 'negative')
                 ui.label(job.title).classes('text-sm font-medium flex-1 ellipsis')
-                ui.label(fmt_duration(job.elapsed) if job.started else 'queued').classes('text-xs rulz-muted')
+                ref['time'] = ui.label(fmt_duration(job.elapsed) if job.started else 'queued') \
+                    .classes('text-xs rulz-muted')
             if job.status == 'running':
                 if job.progress is not None:
-                    ui.linear_progress(value=job.progress, show_value=False).props('rounded size=6px')
+                    ref['bar'] = ui.linear_progress(value=job.progress, show_value=False).props('rounded size=6px')
                 else:
                     ui.linear_progress(show_value=False).props('indeterminate rounded size=6px')
             if job.message or job.detail:
-                ui.label(' / '.join(x for x in (job.message, job.detail) if x)).classes('text-xs rulz-muted ellipsis')
+                ref['msg'] = ui.label(' / '.join(x for x in (job.message, job.detail) if x)) \
+                    .classes('text-xs rulz-muted ellipsis')
             if job.error:
                 ui.label(job.error).classes('text-xs rz-err whitespace-pre-line')
             if job.status == 'done' and isinstance(job.result, Path) and job.result.is_dir():
@@ -273,7 +310,8 @@ def frame(active: str = '') -> Iterator[PageLook]:
                 .props('flat dense no-caps size=sm').classes('rz-icon-btn')
             ui.button(icon='close', on_click=drawer.hide, color=None).props('flat round dense').classes('rz-icon-btn')
         jobs_view = ui.refreshable(_job_list)
-        jobs_view()
+        job_refs: dict = {}
+        jobs_view(job_refs)
 
     with ui.header().classes('rz-header'):
         with ui.row().classes('rz-header-row items-center gap-2 no-wrap'):
@@ -307,7 +345,7 @@ def frame(active: str = '') -> Iterator[PageLook]:
                 ui.tooltip('Switch between the dark and the light look')
             avatar_slot = ui.row().classes('items-center')
 
-    state = {'version': -1, 'active': 0, 'shown': -1}
+    state = {'version': -1, 'active': 0, 'shown': -1, 'shape': None}
 
     def tick() -> None:
         version, n = manager.version, manager.active_count
@@ -322,7 +360,14 @@ def frame(active: str = '') -> Iterator[PageLook]:
         # transfer reports progress): only while the drawer is open. Opening it catches up at the next tick.
         if drawer.value and (state['shown'] != version or n):
             state['shown'] = version
-            jobs_view.refresh()  # also keeps the elapsed time of running jobs ticking
+            # Rebuild only when a job was added, removed or changed what its card shows; otherwise just update the
+            # progress bars and texts (a rebuild every tick also replaces a button under the pointer).
+            shape = _jobs_shape()
+            if shape != state['shape']:
+                state['shape'] = shape
+                jobs_view.refresh()
+            else:
+                _update_job_cards(job_refs)
     ui.timer(0.7, tick)
 
     async def load_identity() -> None:
