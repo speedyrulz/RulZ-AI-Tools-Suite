@@ -179,7 +179,7 @@ export class OwnServer extends EventEmitter {
   /** True while the recorded process is running; also true when WSL cannot be asked, because then it is not confirmed gone. */
   private async isAlive(rec: LaunchRecord): Promise<boolean> {
     const r = await this.d.wsl.run(rec.distro, buildAliveScript(rec.pid, this.identity(rec)), { timeoutMs: 10000 })
-    if (r.code === null) return true
+    if (r.code !== 0) return true // the alive script always ends with `true`, so a failure is WSL/bash, not "gone"
     return r.stdout.includes('RULZ_ALIVE')
   }
 
@@ -278,13 +278,18 @@ export class OwnServer extends EventEmitter {
     return { ok: true, message: '' }
   }
 
-  start(port: number): Promise<ServerState> {
+  /** Take this before any await that precedes start(): a stop() or dispose() after it cancels that start. */
+  beginStart(): number {
+    return this.stopTicket
+  }
+
+  /** `ticket` from beginStart(); `expected` = the settings that were checked, refused if they changed since. */
+  start(port: number, ticket: number = this.stopTicket, expected?: OwnServerSettings): Promise<ServerState> {
     const status = this.st.status
     if (status !== 'stopped' && status !== 'error') {
       return Promise.reject(new Error(`The server cannot be started while it is ${status}.`))
     }
-    const ticket = this.stopTicket
-    const run = this.enqueue(() => this.doStart(port, ticket))
+    const run = this.enqueue(() => this.doStart(port, ticket, expected))
     return run.then(async (r) => {
       if (r.cancelled) await this.stopDone
       return r.cancelled ? this.state() : r.state
@@ -325,12 +330,15 @@ export class OwnServer extends EventEmitter {
     return this.state()
   }
 
-  private async doStart(port: number, ticket: number): Promise<{ state: ServerState; cancelled: boolean }> {
+  private async doStart(port: number, ticket: number, expected?: OwnServerSettings): Promise<{ state: ServerState; cancelled: boolean }> {
     if (ticket !== this.stopTicket) return { state: this.state(), cancelled: true }
     if (this.st.status !== 'stopped' && this.st.status !== 'error') {
       throw new Error(`The server cannot be started while it is ${this.st.status}.`)
     }
     const s: OwnServerSettings = JSON.parse(JSON.stringify(this.d.settings())) as OwnServerSettings
+    if (expected && JSON.stringify(expected) !== JSON.stringify(s)) {
+      throw new Error('The server settings changed while they were checked; start again.')
+    }
     const url = `http://127.0.0.1:${port}`
     const launch: Launch = { settings: s, port, url, child: null, exited: true, waiters: [], rec: null, markBuf: '', cancelled: false }
     this.launch = launch

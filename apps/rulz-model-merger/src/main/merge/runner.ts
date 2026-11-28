@@ -132,6 +132,8 @@ export class MergeRunner extends EventEmitter {
   private starting = false
   private moving = new Set<string>()
   private infoCache = new Map<string, { at: number; data: Record<string, unknown> }>()
+  /** Bumped by clearObjectInfoCache: a request that was already under way then does not refill the cache. */
+  private infoGen = 0
   private seq = 0
 
   constructor(private readonly d: MergeRunnerDeps) {
@@ -148,12 +150,19 @@ export class MergeRunner extends EventEmitter {
     return (this.d.toUnc ?? toUncPath)(distro, p)
   }
 
+  /** Forget the cached node lists, for example after the app's own server was restarted (it may have other nodes now). */
+  clearObjectInfoCache(): void {
+    this.infoCache.clear()
+    this.infoGen++
+  }
+
   private async objectInfo(url: string, client: MergeClient): Promise<Record<string, unknown>> {
     const ttl = this.d.objectInfoTtlMs ?? 60_000
     const hit = this.infoCache.get(url)
     if (hit && this.now() - hit.at < ttl) return hit.data
+    const gen = this.infoGen
     const data = await client.objectInfo()
-    this.infoCache.set(url, { at: this.now(), data })
+    if (gen === this.infoGen) this.infoCache.set(url, { at: this.now(), data })
     return data
   }
 
@@ -251,7 +260,8 @@ export class MergeRunner extends EventEmitter {
     if (problems.length) throw new Error(problems.join(' '))
     // ComfyUI rejects a block node with a missing FLOAT input: fill the ones the recipe left out with its ratio.
     if (recipe.mode === 'blocks' && blockInputs) recipe = completeBlocks(recipe, blockInputs)
-    const graph = buildMergeGraph(recipe)
+    const jobId = this.newId()
+    const graph = buildMergeGraph(recipe, { jobId })
 
     const slash = graph.filenamePrefix.lastIndexOf('/')
     const stem = slash >= 0 ? graph.filenamePrefix.slice(slash + 1) : graph.filenamePrefix
@@ -264,7 +274,6 @@ export class MergeRunner extends EventEmitter {
     let aHeader: SafetensorsHeader | null = null
     const sides: Record<'a' | 'b' | 'c', { info: ModelFileInfo; header: SafetensorsHeader | null } | null> = { a: null, b: null, c: null }
     const before = new Set<string>()
-    const jobId = this.newId()
     if (record) {
       const modelsAbs = await resolveModelsDir(this.d.wsl, record.distro, this.d.ownSettings())
       const names: Array<[string | null, 'a' | 'b' | 'c']> = [
@@ -564,7 +573,7 @@ export class MergeRunner extends EventEmitter {
     const aKeys = normalizeKeys(ctx.aHeader).keys
     // Buffers (such as rope.bands) are not saved by ComfyUI and are rebuilt on load; only weights, biases and
     // quantization data count as missing.
-    const isReal = (k: string): boolean => /.(weight|bias)$/.test(k) || k.includes('scale') || k.includes('comfy_quant')
+    const isReal = (k: string): boolean => /\.(weight|bias)$/.test(k) || k.includes('scale') || k.includes('comfy_quant')
     let missing = 0
     const buffers: string[] = []
     for (const k of aKeys.keys()) {
@@ -594,10 +603,12 @@ export class MergeRunner extends EventEmitter {
       // Never the whole queue, never /free: only this app's prompt id. Do both, because the prompt may have started
       // between a look at the queue and the delete; /interrupt with a prompt id only stops that prompt when it runs.
       const errors: Error[] = []
+      let deleteError: Error | null = null
       try {
         await ctx.client.deletePending([promptId])
       } catch (e) {
-        errors.push(e as Error)
+        deleteError = e as Error
+        errors.push(deleteError)
       }
       try {
         await ctx.client.interrupt(promptId)
@@ -605,6 +616,17 @@ export class MergeRunner extends EventEmitter {
         errors.push(e as Error)
       }
       if (errors.length === 2) throw errors[0]
+      if (deleteError) {
+        // Interrupt with an id does nothing for a prompt that is still waiting: it would stay queued and run later
+        // untracked. Only go on when the queue shows it is gone.
+        let waiting: boolean
+        try {
+          waiting = (await ctx.client.queue()).pending.includes(promptId)
+        } catch (e) {
+          throw new Error(`The merge could not be cancelled: ${deleteError.message} (and the queue could not be read: ${(e as Error).message}).`)
+        }
+        if (waiting) throw new Error(`The merge could not be cancelled: ${deleteError.message} It is still waiting in the server queue.`)
+      }
     }
     if (!TERMINAL.has(job.status)) {
       job.status = 'cancelled'

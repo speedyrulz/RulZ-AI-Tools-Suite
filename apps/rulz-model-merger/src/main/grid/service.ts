@@ -121,6 +121,8 @@ export class GridService extends EventEmitter {
   private jobs: Ctx[] = []
   private starting = false
   private infoCache = new Map<string, { at: number; data: Record<string, unknown> }>()
+  /** Bumped by clearObjectInfoCache: a request that was already under way then does not refill the cache. */
+  private infoGen = 0
   private seq = 0
 
   constructor(private readonly d: GridServiceDeps) {
@@ -141,12 +143,19 @@ export class GridService extends EventEmitter {
     this.emit('job', structuredClone(ctx.job))
   }
 
+  /** Forget the cached node lists, for example after the app's own server was restarted (it may have other nodes now). */
+  clearObjectInfoCache(): void {
+    this.infoCache.clear()
+    this.infoGen++
+  }
+
   private async objectInfo(url: string, client: GridClient): Promise<Record<string, unknown>> {
     const ttl = this.d.objectInfoTtlMs ?? 60_000
     const hit = this.infoCache.get(url)
     if (hit && this.now() - hit.at < ttl) return hit.data
+    const gen = this.infoGen
     const data = await client.objectInfo()
-    this.infoCache.set(url, { at: this.now(), data })
+    if (gen === this.infoGen) this.infoCache.set(url, { at: this.now(), data })
     return data
   }
 
@@ -649,9 +658,11 @@ export class GridService extends EventEmitter {
         // On a server the app did not start, interrupt is never called (it is for the app's own server only): a prompt that
         // is already running there is left to finish and its result is ignored.
         const errors: Error[] = []
+        let deleteFailed = false
         try {
           await ctx.client.deletePending([promptId])
         } catch (e) {
+          deleteFailed = true
           errors.push(e as Error)
         }
         if (ctx.job.own) {
@@ -661,13 +672,16 @@ export class GridService extends EventEmitter {
             errors.push(e as Error)
           }
         }
-        if (errors.length === (ctx.job.own ? 2 : 1)) {
+        // A failed delete with a working interrupt (own server) also looks at the queue: interrupt with an id does
+        // nothing for a prompt that is still waiting, which would then run later untracked.
+        if (deleteFailed) {
           // Nothing worked: fine when the prompt is no longer waiting (gone, or on a shared server already running),
           // otherwise the caller hears about it.
           let settled = false
           try {
             const q = await ctx.client.queue()
-            settled = !q.pending.includes(promptId) && (ctx.job.own ? !q.running.includes(promptId) : true)
+            const allFailed = errors.length === (ctx.job.own ? 2 : 1)
+            settled = !q.pending.includes(promptId) && (allFailed && ctx.job.own ? !q.running.includes(promptId) : true)
           } catch {
             settled = false
           }

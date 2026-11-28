@@ -153,6 +153,18 @@ export function parseLoraLayers(header: SafetensorsHeader): {
     }
   }
   if (layers.size === 0) note('it has no LoRA layers (no matching up and down weights)')
+  const used = new Set<string>()
+  for (const layer of layers.values()) {
+    used.add(layer.down)
+    used.add(layer.up)
+    if (layer.alpha !== null) used.add(layer.alpha)
+  }
+  for (const key of keys) {
+    if (!used.has(key) && !key.endsWith('.alpha')) {
+      note(`its tensor ${key} is not part of an up/down pair, so it cannot be merged`)
+      break
+    }
+  }
   let family: Family = firstFamily ?? 'updown'
   let best = 0
   for (const [f, n] of familyCount) {

@@ -72,12 +72,16 @@ export async function readSafetensorsHeader(path: string, opts?: { maxHeaderByte
         typeof t !== 'object' ||
         typeof t.dtype !== 'string' ||
         !Array.isArray(shape) ||
-        !shape.every((d) => typeof d === 'number') ||
+        !shape.every((d) => Number.isSafeInteger(d) && d >= 0) ||
         !Array.isArray(offs) ||
         offs.length !== 2 ||
-        !offs.every((d) => typeof d === 'number')
+        !offs.every((d) => Number.isSafeInteger(d) && d >= 0) ||
+        offs[0] > offs[1]
       ) {
         throw new Error(`Bad safetensors header: tensor "${key}" has no dtype, shape and data_offsets.`)
+      }
+      if (offs[1] > fileBytes - 8 - headerBytes) {
+        throw new Error(`Bad safetensors header: tensor "${key}" points outside the file's data (the file may be cut short).`)
       }
       tensors[key] = { dtype: t.dtype, shape: shape as number[], offsets: [offs[0] as number, offs[1] as number] }
     }

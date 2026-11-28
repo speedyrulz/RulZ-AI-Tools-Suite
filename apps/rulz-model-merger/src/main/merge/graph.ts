@@ -198,17 +198,23 @@ function buildSubgraph(
   return { graph: { nodes: prompt, model: out.model, clip: out.clip, vae }, add }
 }
 
-export function buildMergeGraph(recipe: MergeRecipe): BuiltGraph {
+/**
+ * `jobId` goes into the save node as an extra input. ComfyUI's cache key covers every key of a node's inputs (and
+ * ignores keys the node does not declare), but not extra_pnginfo: without it a repeat of the same recipe is served from
+ * the cache, the save node does not run and no file is written.
+ */
+export function buildMergeGraph(recipe: MergeRecipe, opts: { jobId?: string } = {}): BuiltGraph {
+  const unique: Record<string, unknown> = opts.jobId ? { rulz_job_id: opts.jobId } : {}
   const { graph, add } = buildSubgraph(recipe, '')
   const name = sanitizeOutputName(recipe.outputName)
   if (recipe.kind !== 'checkpoint') {
     const subfolder = 'diffusion_models'
     const filenamePrefix = `${subfolder}/${name}`
-    add('ModelSave', { model: graph.model, filename_prefix: filenamePrefix })
+    add('ModelSave', { model: graph.model, filename_prefix: filenamePrefix, ...unique })
     return { prompt: graph.nodes, saveNode: 'ModelSave', outputSubfolder: subfolder, filenamePrefix }
   }
   const subfolder = 'checkpoints'
   const filenamePrefix = `${subfolder}/${name}`
-  add('CheckpointSave', { model: graph.model, clip: graph.clip, vae: graph.vae, filename_prefix: filenamePrefix })
+  add('CheckpointSave', { model: graph.model, clip: graph.clip, vae: graph.vae, filename_prefix: filenamePrefix, ...unique })
   return { prompt: graph.nodes, saveNode: 'CheckpointSave', outputSubfolder: subfolder, filenamePrefix }
 }

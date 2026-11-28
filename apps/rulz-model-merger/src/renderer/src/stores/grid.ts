@@ -85,6 +85,32 @@ interface GridStore {
 const fetching = new Set<string>()
 let templateSeq = 0
 
+/** Grids whose images are kept besides the selected one; the rest are dropped (each image is a full PNG as base64). */
+const MAX_CACHED_GRIDS = 3
+/** Grid ids, most recently used (an image was added for it) first. */
+const recentGrids: string[] = []
+
+/** The cache with one more image; the grid it belongs to becomes the most recently used and the images of grids
+ *  beyond the newest MAX_CACHED_GRIDS (the selected grid excepted) are dropped. Shown grids reload what they miss. */
+/** Marks a grid as just used (shown, selected or its cached images read), without dropping anything yet. */
+function touchGrid(gridId: string): void {
+  const at = recentGrids.indexOf(gridId)
+  if (at === 0) return
+  if (at > 0) recentGrids.splice(at, 1)
+  recentGrids.unshift(gridId)
+  recentGrids.length = Math.min(recentGrids.length, MAX_CACHED_GRIDS)
+}
+
+function addImage(images: Record<string, string>, selectedId: string | null, gridId: string, key: string, url: string): Record<string, string> {
+  touchGrid(gridId)
+  const keep = new Set(recentGrids)
+  if (selectedId) keep.add(selectedId)
+  const next: Record<string, string> = {}
+  for (const [k, v] of Object.entries(images)) if (keep.has(k.slice(0, k.indexOf('/')))) next[k] = v
+  next[key] = url
+  return next
+}
+
 export const useGrid = create<GridStore>((set, get) => ({
   template: null,
   loadingTemplate: false,
@@ -215,7 +241,10 @@ export const useGrid = create<GridStore>((set, get) => ({
     }
   },
 
-  select: (selectedId) => set({ selectedId }),
+  select: (selectedId) => {
+    touchGrid(selectedId)
+    set({ selectedId })
+  },
 
   loadList: async () => {
     const list = await call('grid:list')
@@ -227,11 +256,15 @@ export const useGrid = create<GridStore>((set, get) => ({
 
   ensureImage: async (gridId, file) => {
     const key = imageKey(gridId, file)
-    if (key in get().images || fetching.has(key)) return
+    if (key in get().images) {
+      touchGrid(gridId)
+      return
+    }
+    if (fetching.has(key)) return
     fetching.add(key)
     try {
       const url = await invoke('grid:image', gridId, file)
-      if (get().grids.some((g) => g.id === gridId)) set({ images: { ...get().images, [key]: url } })
+      if (get().grids.some((g) => g.id === gridId)) set({ images: addImage(get().images, get().selectedId, gridId, key, url) })
     } catch {
       // The cell shows its image as unavailable; opening the grid again retries.
     } finally {
@@ -241,10 +274,13 @@ export const useGrid = create<GridStore>((set, get) => ({
 
   fetchImageNow: async (gridId, file) => {
     const key = imageKey(gridId, file)
-    if (key in get().images) return true
+    if (key in get().images) {
+      touchGrid(gridId)
+      return true
+    }
     try {
       const url = await invoke('grid:image', gridId, file)
-      set({ images: { ...get().images, [key]: url } })
+      set({ images: addImage(get().images, get().selectedId, gridId, key, url) })
       return true
     } catch {
       return false
