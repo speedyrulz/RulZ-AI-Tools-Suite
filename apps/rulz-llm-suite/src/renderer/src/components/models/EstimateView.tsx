@@ -72,6 +72,14 @@ export function EstimateView({ estimate }: { estimate: MemoryEstimate | null }) 
           ))}
         </div>
       )}
+      {estimate.scratch && estimate.scratch.overflowGpu !== null && (
+        <p className="mt-2 text-xs text-danger">
+          Prompt scratch buffer {formatBytes(estimate.scratch.bytes)} on GPU{estimate.scratch.overflowGpu} won't fit.
+          {estimate.scratch.suggestedUbatch !== null
+            ? ` Micro-batch ${estimate.scratch.suggestedUbatch} would.`
+            : ' No smaller micro-batch would help.'}
+        </p>
+      )}
     </div>
   )
 }

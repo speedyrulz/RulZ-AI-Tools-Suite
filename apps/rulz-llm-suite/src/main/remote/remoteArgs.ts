@@ -24,6 +24,8 @@ export interface RemoteArgsInput {
   paths: RemotePaths
   /** The draft this load uses (as InstanceManager's draftFor chooses it). */
   draft?: SidecarFile
+  /** The rental's GPUs with their free memory, when known (Inkling loop models with an automatic split use it). */
+  gpus?: { index: number; freeBytes: number }[]
 }
 
 /** Settings of the local server that name this PC; refused in the extra arguments. */
@@ -55,10 +57,11 @@ export function extraArgsProblem(text: string): string | undefined {
 /**
  * llama-server arguments for a rental. Left out: threads (the instance has its own cores), the memory lock, the main
  * GPU index of a single-GPU setting (a local number), and the model's file paths on this PC. A custom tensor split is
- * kept. Throws a sentence for settings that cannot work there (a local chat template file, local paths in the extra
- * arguments, a projector or draft that is not on the instance).
+ * kept (converted for Inkling loop models, see shared/loopSplit.ts). Throws a sentence for settings that cannot work
+ * there (a local chat template file, local paths in the extra arguments, a projector or draft that is not on the
+ * instance).
  */
-export function buildRemoteArgs({ model, config, port, alias, paths, draft }: RemoteArgsInput): string[] {
+export function buildRemoteArgs({ model, config, port, alias, paths, draft, gpus }: RemoteArgsInput): string[] {
   if (config.chatTemplateFile.trim()) {
     throw new Error('A chat template file on this PC cannot be used on a rental. Clear it in the load settings (the model\'s own template is used) or put the template text in the model.')
   }
@@ -78,7 +81,7 @@ export function buildRemoteArgs({ model, config, port, alias, paths, draft }: Re
     else throw new Error('The draft model is not on the instance. Set the model up there again.')
   }
   const remoteModel: ModelEntry = { ...model, path: paths.main, files: [paths.main], mmproj, draft: useDraft, draftSidecar: undefined }
-  const args = buildServerArgs({ model: remoteModel, config: cfg, port: 0, alias, adapters: paths.adapters.map((path) => ({ path })) })
+  const args = buildServerArgs({ model: remoteModel, config: cfg, port: 0, alias, adapters: paths.adapters.map((path) => ({ path })), gpus })
 
   const at = args.indexOf('--port')
   if (at >= 0) args[at + 1] = String(port)

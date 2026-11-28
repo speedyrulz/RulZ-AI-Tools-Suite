@@ -280,6 +280,7 @@ async function main(): Promise<void> {
     getDefaults,
     unloadPreviousOnLoad: () => settings.get().unloadPreviousOnLoad,
     estimate,
+    gpus: (cfg) => freeMemory(cfg).gpus ?? [],
     getAdapter: (id) => library.getAdapter(id),
     pidFile: join(userData, 'running-pids.json'),
     onChange: (list) => broadcast('instances:changed', list),

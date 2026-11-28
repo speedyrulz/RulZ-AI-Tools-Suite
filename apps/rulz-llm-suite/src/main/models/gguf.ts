@@ -278,6 +278,15 @@ function swaWindow(arch: string, window: number | undefined, blocks: number | un
   }
 }
 
+/** The loop keys of an inkling2_loop file; undefined when any of them is missing. */
+function loopInfo(a: (k: string) => unknown): GgufInfo['loop'] {
+  const start = num(a('loop.start'))
+  const end = num(a('loop.end'))
+  const count = num(a('loop.count'))
+  if (start === undefined || end === undefined || count === undefined) return undefined
+  return { start, end, count, varying: a('loop.varying') === true }
+}
+
 export function toGgufInfo(kv: Record<string, unknown>, fileName: string, hasNextn = false, expertBytes?: number[]): GgufInfo {
   const arch = typeof kv['general.architecture'] === 'string' ? (kv['general.architecture'] as string) : 'unknown'
   const a = (k: string): unknown => kv[`${arch}.${k}`]
@@ -310,6 +319,9 @@ export function toGgufInfo(kv: Record<string, unknown>, fileName: string, hasNex
     expertBytesByLayer: expertBytes?.length ? expertBytes : undefined,
     slidingWindow: swaWindow(arch, num(a('attention.sliding_window')), blockCount),
     slidingWindowFraction,
+    slidingWindowPattern: Array.isArray(pattern) && pattern.length ? pattern.map(Boolean) : undefined,
+    vocabSize: num(a('vocab_size')),
+    loop: loopInfo(a),
     hasChatTemplate: typeof kv['tokenizer.chat_template'] === 'string',
     mtpLayers: hasNextn ? num(a('nextn_predict_layers')) || undefined : undefined,
     adapterType: str('adapter.type'),

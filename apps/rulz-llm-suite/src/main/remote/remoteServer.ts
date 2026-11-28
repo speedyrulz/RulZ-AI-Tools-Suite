@@ -120,7 +120,7 @@ async function startRemote(deps: RemoteLauncherDeps, live: Registry, rentalId: n
   const base = `${check.root}/models/${slug}`
   const paths = remotePaths(base, files, launch.adapters)
   const draft = deps.draftFor(launch.model, launch.config)
-  const args = buildRemoteArgs({ model: launch.model, config: launch.config, port: PORT_PLACEHOLDER, alias: launch.alias, paths, draft })
+  const args = buildRemoteArgs({ model: launch.model, config: launch.config, port: PORT_PLACEHOLDER, alias: launch.alias, paths, draft, gpus: check.gpus.map((g) => ({ index: g.index, freeBytes: Math.max(0, g.totalMiB - g.usedMiB) * 1048576 })) })
   const used = files.map((f) => check.complete.find((c) => c.name === f.name) as CompleteEntry)
   const hash = serverHash(tag, args, used)
 

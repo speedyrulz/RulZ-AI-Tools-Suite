@@ -62,6 +62,8 @@ export interface InstanceManagerDeps {
   getDefaults: (id: string, mode?: AppMode) => LoadConfig
   unloadPreviousOnLoad: () => boolean
   estimate: (model: ModelEntry, config: LoadConfig) => MemoryEstimate | null
+  /** This PC's GPUs with their free memory, for splits LLM Suite works out itself (Inkling loop models). */
+  gpus?: (config: LoadConfig) => { index: number; freeBytes: number }[]
   /** An adapter file by id, for the adapters a load config names. */
   getAdapter?: (id: string) => AdapterEntry | undefined
   pidFile: string
@@ -381,7 +383,7 @@ export class InstanceManager {
     this.checkDisposed()
     const instanceId = randomUUID()
     const { loaded: adapters, notes: adapterNotes } = resolveAdapters(cfg.adapters ?? [], this.deps.getAdapter ?? (() => undefined))
-    const args = buildServerArgs({ model, config: cfg, port, alias: model.name, adapters })
+    const args = buildServerArgs({ model, config: cfg, port, alias: model.name, adapters, gpus: this.deps.gpus?.(cfg) })
     const handle = startLocalServer({
       exe,
       args,

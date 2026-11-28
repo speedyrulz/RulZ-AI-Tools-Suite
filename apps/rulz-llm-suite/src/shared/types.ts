@@ -565,6 +565,12 @@ export interface GgufInfo {
   slidingWindow?: number
   /** Share of layers using sliding-window attention (their KV cache is capped at the window). */
   slidingWindowFraction?: number
+  /** Per-layer sliding-window flags (true = sliding window) when the GGUF lists them; the loop layout needs them per layer. */
+  slidingWindowPattern?: boolean[]
+  /** Output vocabulary size (<arch>.vocab_size); sizes the logits scratch buffer of Inkling models. */
+  vocabSize?: number
+  /** inkling2_loop: layers [start, end) are run `count` times; llama.cpp keeps a KV cache slot for every pass. */
+  loop?: { start: number; end: number; count: number; varying: boolean }
   hasChatTemplate: boolean
   /** Built-in multi-token-prediction layers (nextn), usable as a draft without a separate file. */
   mtpLayers?: number
@@ -674,6 +680,28 @@ export interface MemoryEstimate {
   cpuExpertBytes: number
   /** LoRA adapter weights included in the totals (0 when none). */
   adapterBytes: number
+  /** Inkling models: the prompt scratch buffer (relative-position bias) that is part of the GPU numbers. */
+  scratch?: ScratchEstimate
+  /** Inkling loop models: the --tensor-split LLM Suite passes so the weights land as the settings say. */
+  loopSplit?: LoopSplitInfo
+}
+
+export interface ScratchEstimate {
+  /** The scratch buffer of the GPU that overflows, else the largest one on a GPU (all of it when GPUs are unknown). */
+  bytes: number
+  /** Micro-batch size the estimate used. */
+  ubatch: number
+  /** The GPU whose scratch buffer does not fit although its weights do; null when none. */
+  overflowGpu: number | null
+  /** Largest micro-batch (512, 256, 128, 64, 32) below the used one with which every GPU fits; null when none does or none is needed. */
+  suggestedUbatch: number | null
+}
+
+export interface LoopSplitInfo {
+  /** The value after --tensor-split. */
+  passed: string
+  /** The weight split the user asked for (or free memory gives), in whole percents per GPU. */
+  percents: number[]
 }
 
 export interface GpuEstimate {

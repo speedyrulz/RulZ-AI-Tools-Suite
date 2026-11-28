@@ -1,4 +1,5 @@
 import { effectiveKvTypes } from '@shared/kv'
+import { planLoopSplit } from '@shared/loopSplit'
 import type { LoadConfig, ModelEntry } from '@shared/types'
 import { splitArgs } from './process'
 
@@ -17,10 +18,12 @@ export interface ServerArgsInput {
   alias: string
   /** LoRA adapters to load, in llama-server id order. */
   adapters?: { path: string }[]
+  /** The GPUs in llama.cpp's device order with their free memory, when known. Inkling loop models with an automatic split use it. */
+  gpus?: { index: number; freeBytes: number }[]
 }
 
 /** Turns a LoadConfig into llama-server arguments. Unset values are left to llama.cpp (incl. --fit). */
-export function buildServerArgs({ model, config: c, port, alias, adapters = [] }: ServerArgsInput): string[] {
+export function buildServerArgs({ model, config: c, port, alias, adapters = [], gpus }: ServerArgsInput): string[] {
   const args = [
     '--model', model.path,
     '--host', '127.0.0.1',
@@ -45,7 +48,10 @@ export function buildServerArgs({ model, config: c, port, alias, adapters = [] }
   const rules = overrideTensorRules(c.overrideTensors)
   if (rules.length) args.push('--override-tensor', rules.join(','))
 
-  if (c.splitMode === 'single') args.push('--split-mode', 'none', '--main-gpu', String(c.mainGpu))
+  // Inkling loop models: llama.cpp splits cache slots, not weights, so the split is converted (see shared/loopSplit.ts).
+  const loop = planLoopSplit(model.info, c, gpus)
+  if (loop) args.push('--split-mode', 'layer', '--tensor-split', loop.split)
+  else if (c.splitMode === 'single') args.push('--split-mode', 'none', '--main-gpu', String(c.mainGpu))
   else if (c.splitMode === 'custom' && c.tensorSplit.trim()) {
     args.push('--split-mode', 'layer', '--tensor-split', c.tensorSplit.replace(/\s+/g, ''))
   }

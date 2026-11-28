@@ -192,6 +192,11 @@ export function LoadSettingsForm({
           {config.splitMode === 'custom' && gpus.length > 1 && (
             <GpuSplit gpus={gpus} split={config.tensorSplit} estimate={estimate} onChange={(s) => set('tensorSplit', s)} />
           )}
+          {estimate?.loopSplit && (
+            <p className="text-[11px] text-faint">
+              Inkling loop model: llama.cpp gets {estimate.loopSplit.passed} so the weights split {estimate.loopSplit.percents.join('/')}.
+            </p>
+          )}
         </Field>
       )}
 
