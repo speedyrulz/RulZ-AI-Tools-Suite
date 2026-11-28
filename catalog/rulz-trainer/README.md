@@ -910,6 +910,15 @@ dequantize path silently; a kernel error at run time logs one warning and falls 
 padded to 17 when a call has 16 tokens or fewer, because `torch._int_mm` refuses smaller M. In the WebUI these
 are *int8 layers compute* and *int8 backward* in the model section.
 
+Since 4.9.0 the `int8` backward's matmul and rescale are one fused triton kernel, which reads the stored int8 weight
+as it is (no transposed copy per call). Its output is bit-identical to the `torch._int_mm` path. Measured on an
+RTX 5090 (Krea 2 layer shapes at 1 and 2 MP): 17.2 -> 13.8 ms for that part of the backward. In a Krea 2 Raw
+int8_convrot run at 1 MP with every block checkpointed, a step went from 1.42 to 1.34 s (-5.6%) and the peak memory
+from 16.61 to 16.38 GB, with the same loss. In that run the `int8` backward was already faster than `bf16` (1.59 s per
+step). The same kernel for the exact `bf16` backward was measured too and not used: it was 14% slower than cuBLAS, and
+widening the weight takes only about 5% of that backward. `RULZ_INT8_GRAD_TRITON=0` turns the fused kernel off; if it
+fails at run time, one warning is logged and the `torch._int_mm` path is used for the rest of the run.
+
 ### nvfp4 compute: native FP4 on Blackwell (`nvfp4_matmul`)
 
 nvfp4 layers multiply on the **FP4 tensor cores** of Blackwell GPUs (RTX 50, compute capability 12.x; B200 10.x)

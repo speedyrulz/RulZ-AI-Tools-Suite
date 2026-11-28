@@ -515,3 +515,90 @@ def test_out_of_memory_in_a_triton_kernel_keeps_triton_on(monkeypatch):
     with pytest.raises(torch.OutOfMemoryError):
         Q.quantize_act_int8(torch.randn(4, 32, device="cuda"))
     assert Q.USE_TRITON  # a launch failure switches triton off for the process; an OOM must not
+
+
+# ---------------------------------------------------------------- fused int8 backward GEMM
+
+class _FakeCudaTensor(torch.Tensor):
+    """CPU tensor that reports is_cuda, so the dispatch in w8a8_backward_x can be tested without a GPU."""
+
+    @property
+    def is_cuda(self):
+        return True
+
+
+def _int8_grad_reference(g_i8, g_scale, qdata, dtype):
+    # the exact int32 product without cuBLAS (its int8 kernel refuses some shapes, e.g. 17 x 72 x 40): every sum here
+    # is below 127 * 127 * 8192 < 2**53, so float64 is exact; then the same rescale as the unfused path
+    y_i32 = (g_i8.double() @ qdata.double()).to(torch.int32)
+    if g_i8.shape[1] % 8 == 0 and qdata.shape[1] % 16 == 0:  # where cuBLAS takes it, it must agree as well
+        assert torch.equal(y_i32, Q._int_mm_padded(g_i8, qdata.t().contiguous().t()))
+    return Q._rescale(y_i32, g_scale, None, dtype)
+
+
+@fused_cuda
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("m,n,k", [(1, 64, 128), (16, 256, 512), (17, 72, 40), (1001, 1000, 776), (300, 3072, 8192)])
+def test_int8_grad_mm_triton_matches_int_mm(m, n, k, dtype):
+    torch.manual_seed(0)
+    g = torch.randn(m, n, device="cuda").to(dtype)
+    q = torch.randint(-127, 128, (n, k), dtype=torch.int8, device="cuda")
+    g_i8, g_scale = Q.quantize_act_int8(g)
+    out = Q._int8_grad_mm_triton(g_i8, g_scale, q, dtype)
+    assert out.dtype == dtype and out.shape == (m, k)
+    assert torch.equal(out, _int8_grad_reference(g_i8, g_scale, q, dtype)), (m, n, k, dtype)
+    assert Q._int8_grad_mm_triton(g_i8[:0], g_scale[:0], q, dtype).shape == (0, k)
+
+
+@fused_cuda
+@pytest.mark.parametrize("fmt", ["int8", "int8_convrot"])
+@pytest.mark.parametrize("m", [7, 333])
+def test_w8a8_backward_x_fused_int8_matches_unfused(monkeypatch, fmt, m):
+    torch.manual_seed(0)
+    qw = Q.quantize_weight((torch.randn(512, 1024) * 0.02).to("cuda"), fmt)
+    g = torch.randn(m, 512, device="cuda", dtype=torch.bfloat16)
+    monkeypatch.setattr(Q, "USE_TRITON_INT8_GRAD", True)
+    fused = Q.w8a8_backward_x(g, qw, "int8")
+    assert Q.USE_TRITON_INT8_GRAD
+    monkeypatch.setattr(Q, "USE_TRITON_INT8_GRAD", False)
+    assert torch.equal(fused, Q.w8a8_backward_x(g, qw, "int8"))
+
+
+@pytest.mark.parametrize("fmt", ["int8", "int8_convrot"])
+def test_int8_grad_kernel_failure_flips_only_its_own_flag(monkeypatch, fmt):
+    torch.manual_seed(0)
+    qw = Q.quantize_weight(torch.randn(64, 256) * 0.02, fmt)
+    g = torch.randn(5, 64, dtype=torch.bfloat16).as_subclass(_FakeCudaTensor)
+    ref = Q.w8a8_backward_x(g.as_subclass(torch.Tensor), qw, "int8")  # real CPU tensor: always the unfused path
+    calls = []
+
+    def boom(*a, **k):
+        calls.append(1)
+        raise RuntimeError("simulated triton failure")
+
+    monkeypatch.setattr(Q, "_int8_grad_mm_triton", boom, raising=False)
+    monkeypatch.setattr(Q, "USE_TRITON_INT8_GRAD", True)
+    monkeypatch.setattr(Q, "USE_TRITON", True)
+    monkeypatch.setattr(Q, "quantize_act_int8", Q._quantize_act_int8_eager)  # no GPU kernels for the fake tensor
+    monkeypatch.setattr(Q, "_rescale_triton", lambda *a: Q._rescale_eager(*a), raising=False)
+    out = Q.w8a8_backward_x(g, qw, "int8")
+    assert calls == [1]
+    assert Q.USE_TRITON_INT8_GRAD is False and Q.USE_TRITON is True
+    assert torch.equal(out.as_subclass(torch.Tensor), ref)
+    Q.w8a8_backward_x(g, qw, "int8")
+    assert calls == [1]  # switched off once, no retry
+
+
+def test_int8_grad_kernel_out_of_memory_passes_through(monkeypatch):
+    qw = Q.quantize_weight(torch.randn(64, 256) * 0.02, "int8")
+    g = torch.randn(5, 64, dtype=torch.bfloat16).as_subclass(_FakeCudaTensor)
+
+    def oom(*a, **k):
+        raise torch.OutOfMemoryError("CUDA out of memory (test)")
+
+    monkeypatch.setattr(Q, "_int8_grad_mm_triton", oom, raising=False)
+    monkeypatch.setattr(Q, "USE_TRITON_INT8_GRAD", True)
+    monkeypatch.setattr(Q, "quantize_act_int8", Q._quantize_act_int8_eager)
+    with pytest.raises(torch.OutOfMemoryError):
+        Q.w8a8_backward_x(g, qw, "int8")
+    assert Q.USE_TRITON_INT8_GRAD  # an OOM is not a kernel problem
