@@ -5,7 +5,8 @@ transformers>=5.3
 accelerate>=1.10
 safetensors>=0.6
 huggingface_hub>=0.30
-Pillow>=10
+Pillow>=13.0.0; python_version >= "3.11"  # 13.0 fixes the slow PNG eXIf parse (GHSA-g4qv-2jxx-769h)
+Pillow>=10; python_version < "3.11"  # (13.0 needs Python 3.11)
 pyyaml>=6
 nicegui>=3  # the upload events webui.py reads (e.file, e.files) are NiceGUI 3's
 bitsandbytes>=0.45
