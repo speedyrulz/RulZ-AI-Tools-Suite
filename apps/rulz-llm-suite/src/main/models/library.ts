@@ -181,7 +181,7 @@ async function walk(dir: string, depth: number, out: { path: string; size: numbe
 }
 
 /** Bump when GgufInfo gains fields or its derivation changes, so cached metadata is re-read. */
-const CACHE_VERSION = 5
+const CACHE_VERSION = 6
 
 interface CacheEntry {
   v?: number

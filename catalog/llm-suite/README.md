@@ -28,6 +28,7 @@ Discover/downloads, RAG and a CLI are planned.
   on the GPU) and custom tensor overrides (`--override-tensor`), single-GPU or split across GPUs, flash attention, KV cache quantization, threads, batch sizes, mmap/mlock, chat template override and
   extra arguments; per-model saved defaults; memory estimate with a fits/partial/likely-OOM verdict; load progress;
   live server log; several models loaded at once.
+  - **Inkling 2 Mini (loop model) GPU split** (0.39.0): llama.cpp divides this model's cache slots, not its weights, over the GPUs, so a plain `--tensor-split 55,45` puts every layer on the first GPU. LLM Suite converts your split (or, with two or more GPUs and an automatic split, the free memory of each GPU) so the weights land as the percentages say, and shows the value it passes under **GPUs**. Inkling models also need a large prompt scratch buffer that grows with context length and micro-batch size; the memory estimate counts it and, when it does not fit, says which micro-batch (512 down to 32) would. Your settings are never changed for you.
   - **Settings per mode** (0.33.0): each model can have its own load settings, sampling and system prompt for Chat,
     Coding (0.35.0, used by RulZ Coding Agent), Reverse engineering, Adventure and Writing (**My Models**, pick a model, **Settings for**). Anything a mode leaves
     out stays as it is without it. The load dialog has **Load for** and, for a mode, its **Own sampling** (0.34.1).
