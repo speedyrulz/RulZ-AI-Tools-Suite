@@ -77,6 +77,21 @@ describe('GGUF loop keys', () => {
     expect(layerPhys(shape, 36)).toBe(6)
     expect(layerPhys(shape, 47)).toBe(17)
   })
+
+  it('ignores loop keys that are not whole numbers or far out of range', () => {
+    const bad = (loop: { start: number; end: number; count: number }, blockCount = 24) =>
+      loopShape({ ...info, blockCount, loop: { ...loop, varying: false } })
+    expect(bad({ start: 6, end: 18, count: 1e9 })).toBeNull()
+    expect(bad({ start: 6, end: 18, count: 2.5 })).toBeNull()
+    expect(bad({ start: 0.5, end: 18, count: 3 })).toBeNull()
+    expect(bad({ start: 0, end: 4000, count: 64 }, 4000)).toBeNull()
+    expect(bad({ start: 0, end: 24, count: 1e9 }, Infinity)).toBeNull()
+    expect(bad({ start: 6, end: 18, count: 3 })).toEqual(shape)
+    // Such a model then gets the ordinary estimate and its split is passed unchanged.
+    const m: ModelEntry = { ...loopModel, info: { ...info, loop: { start: 6, end: 18, count: 1e9, varying: false } } }
+    const e = estimateMemory(m, cfg({ contextLength: 4096, splitMode: 'custom', tensorSplit: '55,45' }), { vramBytes: 29 * GiB, ramBytes: 32 * GiB, gpus: gpus2 })
+    expect(e.loopSplit).toBeUndefined()
+  })
 })
 
 describe('placement mirror of llama.cpp', () => {

@@ -16,13 +16,22 @@ export interface LoopShape {
   nSlot: number
 }
 
-/** The loop layout of an inkling2_loop model; null for every other model. */
+/** Limits on the loop keys read from a GGUF; anything beyond them is treated as no loop layout. */
+const MAX_LAYERS = 4096
+const MAX_LOOP_COUNT = 64
+const MAX_SLOTS = 16384
+
+/** The loop layout of an inkling2_loop model; null for every other model or for values out of range. */
 export function loopShape(info: GgufInfo | null | undefined): LoopShape | null {
   if (!info || info.architecture !== 'inkling2_loop' || !info.loop || !info.blockCount) return null
   const { start, end, count } = info.loop
   const nPhys = info.blockCount
+  // The values come from the model file: a broken or hostile one must not make the estimate loop billions of times.
+  const whole = (n: number): boolean => Number.isSafeInteger(n)
+  if (![nPhys, start, end, count].every(whole) || nPhys > MAX_LAYERS || count > MAX_LOOP_COUNT) return null
   if (!(end > start) || start < 0 || end > nPhys || count < 1) return null
-  return { nPhys, start, end, count, nSlot: nPhys + (count - 1) * (end - start) }
+  const nSlot = nPhys + (count - 1) * (end - start)
+  return nSlot > MAX_SLOTS ? null : { nPhys, start, end, count, nSlot }
 }
 
 /** The physical layer whose weights cache slot `il` uses (layer_phys in inkling2-loop.cpp). */
