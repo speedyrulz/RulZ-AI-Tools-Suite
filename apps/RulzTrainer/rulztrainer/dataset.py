@@ -138,12 +138,54 @@ def describe_sides(cfg: TrainConfig) -> str:
     return ", ".join(f"{side_to_mp(s):g} MP" for s in cfg.training_sides())
 
 
+def png_has_exif_chunk(path) -> bool:
+    """True when a PNG file has an eXIf chunk ahead of its first IDAT (only the chunk headers are read, the pixel data
+    is skipped). Pillow's open() reads eXIf only up to the first IDAT (a later one only after load()), so this is
+    exactly when Pillow would find the Orientation without decoding. A text chunk that can carry one (ImageMagick's
+    "Raw profile type exif", XMP) counts as well. An eXIf chunk after the pixel data (rare) is not looked for: such a
+    picture is read as upright. Unreadable or odd files: True (Pillow decides)."""
+    try:
+        with open(path, "rb") as f:
+            if f.read(8) != b"\x89PNG\r\n\x1a\n":
+                return True
+            while True:
+                head = f.read(8)
+                if len(head) < 8:
+                    return False
+                n, kind = int.from_bytes(head[:4], "big"), head[4:]
+                if kind == b"eXIf":
+                    return True
+                if kind in (b"IDAT", b"IEND"):
+                    return False
+                if kind in (b"tEXt", b"zTXt", b"iTXt"):  # ImageMagick's raw EXIF profile and XMP's tiff:Orientation
+                    keyword = f.read(min(n, 80)).split(b"\0", 1)[0]
+                    if keyword in (b"Raw profile type exif", b"Raw profile type APP1", b"XML:com.adobe.xmp"):
+                        return True
+                    f.seek(n - min(n, 80) + 4, 1)
+                    continue
+                f.seek(n + 4, 1)  # data + crc
+    except OSError:
+        return True
+
+
+def exif_orientation(im, path=None) -> int:
+    """The EXIF Orientation of an opened picture (1 when there is none). For a PNG without an eXIf chunk before its
+    pixel data Pillow's getexif() would decode the whole picture (~30x slower), so the answer is 1 without asking it;
+    every other file goes to getexif() as before."""
+    try:
+        if getattr(im, "format", None) == "PNG" and path is not None and not png_has_exif_chunk(path):
+            return 1
+        return im.getexif().get(0x0112, 1)
+    except Exception:  # noqa: BLE001
+        return 1
+
+
 def upright_header(path: Path) -> tuple[int, int, bool]:
     """(width, height, transparent?) as ImageOps.exif_transpose turns the picture, from the header alone: transposing
     decodes the whole image, which a scan of every training photo at every start does not need."""
     with Image.open(path) as im:
         w, h = im.size
-        if im.getexif().get(0x0112, 1) in (5, 6, 7, 8):  # Orientation: the rotations by 90 degrees
+        if exif_orientation(im, path) in (5, 6, 7, 8):  # Orientation: the rotations by 90 degrees
             w, h = h, w
         return w, h, has_alpha(im)
 
@@ -472,20 +514,53 @@ def scan_reg(cfg: TrainConfig) -> list[Item]:
     return items
 
 
-def reg_quotas(sizes: dict, subject: int, per_epoch: int) -> dict:
-    """How many regularisation pictures each size bucket gives an epoch. sizes: {bucket: its regularisation pictures};
-    subject: the subject pictures an epoch trains (repeats counted); per_epoch: reg_per_epoch (-1 = as many as
-    `subject`, 0 = all of them, N = that many; never more than there are). Each bucket gives a fixed share by its size
-    (largest remainders first, so the shares add up to the count): an epoch has the same number of steps every time."""
+def quota_parts(sizes: dict, subject: int, per_epoch: int) -> tuple[dict, dict, int]:
+    """(whole, fractions, extra): the whole part of each bucket's share of the epoch's count, the fractional part of
+    each share, and how many leftover places (the fractions add up to it) the epoch still has to give out.
+    sizes: {bucket: its pictures}; subject: the subject pictures an epoch trains (repeats counted); per_epoch: -1 =
+    as many as `subject`, 0 = all of them, N = that many; never more than there are."""
     total = sum(sizes.values())
     want = total if per_epoch == 0 else min(total, max(0, subject if per_epoch < 0 else per_epoch))
     if want >= total:
-        return dict(sizes)
+        return dict(sizes), {k: 0.0 for k in sizes}, 0
     raw = {k: want * n / total for k, n in sizes.items()}
-    quota = {k: int(v) for k, v in raw.items()}
-    for k in sorted(sizes, key=lambda k: raw[k] - quota[k], reverse=True)[:want - sum(quota.values())]:
-        quota[k] += 1
+    whole = {k: int(v) for k, v in raw.items()}
+    return whole, {k: raw[k] - whole[k] for k in sizes}, want - sum(whole.values())
+
+
+def draw_quota(whole: dict, fractions: dict, extra: int, rng: random.Random) -> dict:
+    """One epoch's quotas: every bucket keeps its whole part and the `extra` leftover places go to buckets by a
+    systematic draw over the fractional parts (each fraction is below 1, so a bucket gets at most one), so over many
+    epochs each bucket gets its fair share and the epoch's total stays the same."""
+    quota = dict(whole)
+    total = sum(fractions.values())
+    if extra <= 0 or total <= 0:
+        return quota
+    step = total / extra
+    pos, cum, given = rng.random() * step, 0.0, 0
+    for k, f in fractions.items():
+        cum += f
+        if pos < cum and given < extra and f > 0:
+            quota[k] += 1
+            given += 1
+            pos += step
+    for k in sorted(fractions, key=lambda k: fractions[k], reverse=True):  # floating-point shortfall at the end
+        if given >= extra:
+            break
+        if quota[k] == whole[k] and fractions[k] > 0:
+            quota[k] += 1
+            given += 1
     return quota
+
+
+def reg_quotas(sizes: dict, subject: int, per_epoch: int) -> dict:
+    """How many regularisation pictures each size bucket gives an epoch, as one fixed split: each bucket its whole
+    part, the leftover places to the largest remainders (so the shares add up to the count). The batcher itself
+    draws those leftover places anew each epoch (draw_quota), so a bucket worth under one picture still trains."""
+    whole, fractions, extra = quota_parts(sizes, subject, per_epoch)
+    for k in sorted(sizes, key=lambda k: fractions[k], reverse=True)[:extra]:
+        whole[k] += 1
+    return whole
 
 
 def _clip_item(p: Path, cfg: TrainConfig, spec, root: Path, cache: Path, tag: str, frames: int, arch) -> Item | None:
@@ -846,12 +921,14 @@ class BucketBatcher:
 
     Regularisation pictures (Item.reg) are queued apart: an epoch takes reg_per_epoch of them (reg_quotas: each size
     bucket its share), the next ones of a shuffled pass through the bucket, so every picture of the folder comes up
-    before any comes up again, and never twice in one epoch. They batch with the subject's pictures of their size,
+    before any comes up again, and never twice in one epoch. A bucket's share has a whole part and a fraction; the
+    leftover places of the fractions are drawn anew each epoch (draw_quota, from a generator seeded by the run's
+    seed), so a bucket worth under one picture still comes up, in proportion, over the epochs. They batch with the subject's pictures of their size,
     and the sampling weights (the curriculum, the loss watch's exclusions) never touch them.
 
     dataset_samples ({dataset folder: N}, N above 0): a dataset's items (repeats counted) come up at most N times per
-    epoch, a fresh draw each epoch from the batcher's seeded generator. Each size bucket gives a fixed share of the N
-    (reg_quotas), so every epoch has the same number of items and steps."""
+    epoch, a fresh draw each epoch from the batcher's seeded generator. Each size bucket gives its share of the N (the whole part
+    fixed, the leftover places drawn per epoch like the regularisation shares): the epoch's total is always the same."""
 
     def __init__(self, items: list[Item], batch_size: int, seed: int, reg_per_epoch: int = -1,
                  dataset_samples: dict[str, int] | None = None):
@@ -870,6 +947,7 @@ class BucketBatcher:
             self.buckets.setdefault((it.width, it.height, it.frames), []).extend([it] * max(1, int(it.repeats or 1)))
         # dataset_samples: per dataset and size bucket, how many of its entries an epoch keeps
         self.cap_quota: dict[tuple, int] = {}
+        self._cap_parts: dict[str, tuple[dict, dict, int]] = {}
         self.capped: set[str] = set()
         for ds, n in (dataset_samples or {}).items():
             if int(n or 0) <= 0:
@@ -879,6 +957,7 @@ class BucketBatcher:
             if sum(sizes.values()) <= int(n):
                 continue  # every item fits: nothing to draw
             self.capped.add(ds)
+            self._cap_parts[ds] = quota_parts(sizes, 0, int(n))
             for k, q in reg_quotas(sizes, 0, int(n)).items():
                 self.cap_quota[(k, ds)] = q
         self.bucket_sizes = {k: len(v) - sum(sum(1 for it in v if it.dataset == ds) - self.cap_quota[(k, ds)]
@@ -891,6 +970,10 @@ class BucketBatcher:
                                             for ds in sorted(self.capped)})
         self.reg_quota = reg_quotas({k: len(v) for k, v in self.reg_buckets.items()},
                                     sum(self.bucket_sizes.values()), int(reg_per_epoch))
+        self._reg_parts = quota_parts({k: len(v) for k, v in self.reg_buckets.items()},
+                                      sum(self.bucket_sizes.values()), int(reg_per_epoch))
+        # a generator of its own for the leftover places, so the shuffles' stream stays the one it always was
+        self._quota_rng = random.Random(f"{seed}:quota")
         self._reg_decks: dict[tuple[int, int], list[Item]] = {}  # the rest of each bucket's current pass
         if self.reg_buckets:
             log.info("Regularisation buckets: %s", {f"{k[0]}x{k[1]}": f"{self.reg_quota[k]} of {len(v)} per epoch"
@@ -955,6 +1038,8 @@ class BucketBatcher:
         if total <= 0:
             return []
         n = len(group) if n is None else n
+        if n <= 0:  # (a capped dataset's bucket can draw no place this epoch)
+            return []
         step = total / n
         pos = self.rng.random() * step
         out, cum = [], 0.0
@@ -967,8 +1052,18 @@ class BucketBatcher:
         out += [last] * (n - len(out))  # floating-point shortfall at the very end
         return out
 
+    def _draw_quotas(self) -> None:
+        """This epoch's quotas: the whole parts, plus the leftover places drawn by the quota generator."""
+        for ds in sorted(self._cap_parts):
+            if self._cap_parts[ds][2]:
+                for k, q in draw_quota(*self._cap_parts[ds], self._quota_rng).items():
+                    self.cap_quota[(k, ds)] = q
+        if self.reg_buckets and self._reg_parts[2]:
+            self.reg_quota = draw_quota(*self._reg_parts, self._quota_rng)
+
     def epoch(self):
         batches = []
+        self._draw_quotas()
         # the subject's buckets in their own order, then the sizes only regularisation pictures have (none: the
         # shuffles below draw exactly as they did before there was a regularisation dataset)
         for key in list(self.buckets) + [k for k in self.reg_buckets if k not in self.buckets]:
