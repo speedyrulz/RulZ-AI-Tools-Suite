@@ -19,6 +19,9 @@ rescale) are single fused triton kernels when triton imports (triton-windows on 
 grouped Hadamard rotation of the activations is folded into the quantization kernel as well (tensor-core dot
 against the cached H, rotated values stay in registers). Otherwise the eager PyTorch versions run (bf16 matmul
 rotation, two/three-pass elementwise). The choice is made once at import (RULZ_W8A8_TRITON=0 forces eager).
+The int8 backward ("int8" mode) additionally runs its GEMM + rescale as one fused triton kernel (int8 tensor-core
+dot against the stored weight, scaled and stored in the grad dtype; bit-identical to torch._int_mm + rescale);
+RULZ_INT8_GRAD_TRITON=0 turns off just that kernel.
 """
 from __future__ import annotations
 
@@ -361,6 +364,8 @@ if os.environ.get("RULZ_W8A8_TRITON", "1") != "0":
     except Exception as _e:  # noqa: BLE001  (not installed, or a broken wheel for this torch)
         log.debug("triton unavailable (%s: %s); W8A8 uses eager elementwise kernels", type(_e).__name__, _e)
 USE_TRITON = HAS_TRITON  # flipped off on the first launch failure (see _disable_triton)
+# The fused int8 backward GEMM has its own switch, so a failure there leaves the proven kernels on.
+USE_TRITON_INT8_GRAD = HAS_TRITON and os.environ.get("RULZ_INT8_GRAD_TRITON", "1") != "0"
 
 if HAS_TRITON:
 
@@ -468,6 +473,69 @@ if HAS_TRITON:
             _rescale_kernel[(m, _ceil_div(n, block))](y_i32, rs, cs, out, n, y_i32.stride(0), out.stride(0),
                                                       HAS_COL=col_scale is not None, BLOCK_N=block,
                                                       num_warps=4)
+        return out
+
+    def _int8_grad_configs():
+        out = []
+        for bm, bk, bn, w, s in [(128, 128, 64, 8, 3), (128, 128, 32, 4, 4), (128, 256, 64, 8, 3),
+                                 (256, 128, 64, 8, 3), (64, 128, 64, 4, 4), (128, 64, 64, 4, 4),
+                                 (64, 256, 32, 4, 4), (128, 128, 128, 8, 2)]:
+            out.append(triton.Config({"BM": bm, "BK": bk, "BN": bn, "GROUP_M": 8}, num_warps=w, num_stages=s))
+        return out
+
+    # Keyed on a power-of-two bucket of M (M_KEY), not on M: training sees many token counts and must not re-tune
+    # for each. The kernel itself is correct for any M whatever config is picked.
+    @triton.autotune(configs=_int8_grad_configs(), key=["M_KEY", "N", "K"])
+    @triton.jit
+    def _i8_grad_mm_kernel(g_ptr, q_ptr, gs_ptr, o_ptr, M, N, K, M_KEY, sgm, sqn, som,
+                           BM: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr, GROUP_M: tl.constexpr):
+        """o[M, K] = (g8[M, N] @ q[N, K]) (int32 accumulate) * gs[M], stored as o's dtype."""
+        pid = tl.program_id(0)
+        num_m = tl.cdiv(M, BM)
+        num_k = tl.cdiv(K, BK)
+        group = GROUP_M * num_k
+        gid = pid // group
+        first_m = gid * GROUP_M
+        size_m = tl.minimum(num_m - first_m, GROUP_M)
+        pm = first_m + (pid % group) % size_m
+        pk = (pid % group) // size_m
+        rm = (pm * BM + tl.arange(0, BM)).to(tl.int64)
+        rk = pk * BK + tl.arange(0, BK)
+        rn = tl.arange(0, BN)
+        acc = tl.zeros((BM, BK), dtype=tl.int32)
+        for n0 in range(0, N, BN):
+            n = n0 + rn
+            g = tl.load(g_ptr + rm[:, None] * sgm + n[None, :], mask=(rm[:, None] < M) & (n[None, :] < N), other=0)
+            q = tl.load(q_ptr + n[:, None].to(tl.int64) * sqn + rk[None, :],
+                        mask=(n[:, None] < N) & (rk[None, :] < K), other=0)
+            acc = tl.dot(g, q, acc, out_dtype=tl.int32)
+        gs = tl.load(gs_ptr + rm, mask=rm < M, other=0.0)
+        out = acc.to(tl.float32) * gs[:, None]
+        tl.store(o_ptr + rm[:, None] * som + rk[None, :], out.to(o_ptr.dtype.element_ty),
+                 mask=(rm[:, None] < M) & (rk[None, :] < K))
+
+    @torch.compiler.disable
+    def _int8_grad_mm_triton(g_i8: torch.Tensor, g_scale: torch.Tensor, qdata: torch.Tensor, dtype) -> torch.Tensor:
+        """(g_i8 [M, N] @ qdata [N, K]) in int32, times g_scale [M, 1], as one kernel; returns [M, K] in `dtype`."""
+        if g_i8.stride(1) != 1:
+            g_i8 = g_i8.contiguous()
+        if qdata.stride(1) != 1:
+            qdata = qdata.contiguous()
+        m, n = g_i8.shape
+        k = qdata.shape[1]
+        if qdata.shape[0] != n:
+            raise ValueError(f"qdata must be [{n}, K], got {tuple(qdata.shape)}")
+        out = torch.empty((m, k), dtype=dtype, device=g_i8.device)
+        if m == 0 or k == 0:
+            return out
+        gs = g_scale.reshape(-1)
+        if gs.numel() != m or gs.dtype != torch.float32:
+            raise ValueError(f"g_scale must hold {m} fp32 values, got {tuple(g_scale.shape)} {g_scale.dtype}")
+        gs = gs.contiguous()
+        with _on_device(g_i8.device):
+            grid = lambda meta: (triton.cdiv(m, meta["BM"]) * triton.cdiv(k, meta["BK"]),)  # noqa: E731
+            _i8_grad_mm_kernel[grid](g_i8, qdata, gs, out, m, n, k, triton.next_power_of_2(m),
+                                     g_i8.stride(0), qdata.stride(0), out.stride(0))
         return out
 
     @triton.jit
@@ -681,6 +749,14 @@ def _disable_triton(stage: str, exc: Exception) -> None:
                     stage, type(exc).__name__, exc)
 
 
+def _disable_int8_grad_triton(exc: Exception) -> None:
+    global USE_TRITON_INT8_GRAD
+    if USE_TRITON_INT8_GRAD:
+        USE_TRITON_INT8_GRAD = False
+        log.warning("triton int8 backward kernel failed (%s: %s); int8 backward uses torch._int_mm + rescale",
+                    type(exc).__name__, exc)
+
+
 def quantize_act_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-token symmetric int8 of a [M, K] float tensor: returns (int8 [M, K], fp32 scale [M, 1]).
 
@@ -775,8 +851,17 @@ def w8a8_backward_x(grad2d: torch.Tensor, qw: "QuantWeight", mode: str) -> torch
     if mode == "int8":
         g = grad2d * qw.scale.t().to(grad2d.dtype)  # fold the per-output-row weight scale into grad_out
         g_i8, g_scale = quantize_act_int8(g)
-        w_nk = qw.qdata.t().contiguous().t()  # logical [N, K] in the layout the int8 kernel is fast for
-        gx = _rescale(_int_mm_padded(g_i8, w_nk), g_scale, None, grad2d.dtype)  # [M, K], rotated basis
+        gx = None
+        if USE_TRITON_INT8_GRAD and grad2d.is_cuda:  # one fused kernel: int8 GEMM + per-token rescale
+            try:
+                gx = _int8_grad_mm_triton(g_i8, g_scale, qw.qdata, grad2d.dtype)
+            except torch.OutOfMemoryError:  # never a kernel problem: the caller frees memory and retries
+                raise
+            except Exception as e:  # noqa: BLE001
+                _disable_int8_grad_triton(e)
+        if gx is None:
+            w_nk = qw.qdata.t().contiguous().t()  # logical [N, K] in the layout the int8 kernel is fast for
+            gx = _rescale(_int_mm_padded(g_i8, w_nk), g_scale, None, grad2d.dtype)  # [M, K], rotated basis
     else:  # exact: widen the stored (rotated) weight to the grad dtype; no inverse rotation of the weight
         w_rot = torch.empty(qw.qdata.shape, dtype=grad2d.dtype, device=grad2d.device)
         torch.mul(qw.qdata, qw.scale, out=w_rot)
