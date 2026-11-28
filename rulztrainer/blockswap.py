@@ -32,6 +32,8 @@ from torch import nn
 
 log = logging.getLogger("rulztrainer")
 
+PIN_HEADROOM_GB = 4.0  # RAM that must stay free after pinning (pinned memory cannot be paged out)
+
 
 def _frozen_tensors(block: nn.Module):
     """(module, name, is_buffer, tensor) of every frozen tensor of a block: parameters without requires_grad, and
@@ -78,14 +80,25 @@ class BlockSwap:
         self.max_inflight = max(1, int(max_inflight))
         self.inflight: collections.deque = collections.deque()  # events of swapped blocks the GPU may still be running
         self.bytes = 0
+        self.pinned = False  # whether the swapped blocks' weights ended up in page-locked memory
+        self.pinned_bytes = 0
         self.hooks = []
+        can_pin = bool(pin and self.cuda) and self._enough_ram_to_pin()
+        pin_failed = False
         for i in self.indices:
             block = model.layers[i]
             rows = []
             for mod, name, is_buf, t in list(_frozen_tensors(block)):
                 cpu = t.detach().to("cpu")
-                if pin and self.cuda:
-                    cpu = cpu.pin_memory()
+                if can_pin and not pin_failed:
+                    try:
+                        cpu = cpu.pin_memory()
+                        self.pinned_bytes += cpu.numel() * cpu.element_size()
+                    except RuntimeError:  # no pinned memory left: pageable works, just slower to copy
+                        pin_failed = True
+                        log.warning("Block swap: pinning failed after %.1f GB (no page-locked memory left); the rest "
+                                    "of the swapped weights stay in ordinary memory (copies to the GPU are slower)",
+                                    self.pinned_bytes / 1e9)
                 _set(mod, name, is_buf, cpu)
                 rows.append((mod, name, is_buf, cpu))
                 self.bytes += cpu.numel() * cpu.element_size()
@@ -93,9 +106,44 @@ class BlockSwap:
             block._rz_swap_index = i
             self.hooks.append(block.register_forward_pre_hook(self._pre))
             self.hooks.append(block.register_forward_hook(self._post))
+        self.pinned = self.pinned_bytes > 0 and not pin_failed
+        if can_pin and not pin_failed:
+            log.info("Block swap: %.1f GB of swapped weights pinned (page-locked)", self.pinned_bytes / 1e9)
         self._place_rest()
         if self.cuda:
             torch.cuda.empty_cache()
+
+    def _enough_ram_to_pin(self) -> bool:
+        """Pinned memory cannot be paged out, so pin only when its size plus PIN_HEADROOM_GB stays free (on a 32 GB
+        laptop pinning took free RAM to 0.2 GB, and pinning with RAM nearly full fails). Counts the RAM pinning newly
+        takes: tensors on the GPU (or a disk map) are copied into new RAM; tensors already in CPU RAM are re-copied
+        into pinned memory, and a block's pageable originals are only let go once the whole block is done, so they add at
+        most the largest block's CPU tensors while pinning runs."""
+        new = 0
+        biggest_cpu = 0  # a block's pageable originals are held until the whole block is pinned
+        total = 0
+        for i in self.indices:
+            block_cpu = 0
+            for _, _, _, t in _frozen_tensors(self.model.layers[i]):
+                n = t.numel() * t.element_size()
+                total += n
+                if t.device.type == "cpu":
+                    block_cpu += n
+                else:
+                    new += n
+            biggest_cpu = max(biggest_cpu, block_cpu)
+        need = new + biggest_cpu + int(PIN_HEADROOM_GB * 2 ** 30)
+        try:
+            import psutil
+            free = psutil.virtual_memory().available
+        except Exception:  # cannot tell: keep the old behaviour (pin, with the RuntimeError fallback)
+            return True
+        if free >= need:
+            return True
+        log.warning("Block swap: not pinning the %.1f GB of swapped weights (%.1f GB of RAM needed incl. %.0f GB "
+                    "headroom, %.1f GB free); they stay in ordinary memory (copies to the GPU are slower)",
+                    total / 1e9, need / 1e9, PIN_HEADROOM_GB, free / 1e9)
+        return False
 
     @torch.no_grad()
     def _place_rest(self) -> None:

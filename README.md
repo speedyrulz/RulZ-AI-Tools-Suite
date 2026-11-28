@@ -1127,6 +1127,13 @@ files (and the ones it resumed from): a job name used again no longer makes each
 higher-numbered files, and a fresh run leaves an earlier run's files alone. The WebUI's *Checkpoints to keep* field is
 in Saving & samples.
 
+**What a saved file's metadata says (since 4.7.0).** Every LoRA, LoKr and extracted fine-tune file carries the
+standard kohya `ss_*` training keys (`ss_seed`, `ss_learning_rate`, `ss_lr_scheduler`, `ss_optimizer`,
+`ss_max_train_steps`, `ss_batch_size_per_device`, `ss_gradient_accumulation_steps`, `ss_resolution`,
+`ss_training_comment`) and the run's settings as `rulztrainer_config`, with the private parts left out: folders and
+file paths, prompts, captions, trigger and class words, and anything named like a token, key or URL. Before 4.7.0 the
+whole config went in, so a shared file showed the folders it was trained from and its prompts.
+
 ## Weight average (`lora_ema`)
 
 At batch size 1 each step pulls the LoRA toward the image it just saw, so a checkpoint carries the tail of the
@@ -3304,7 +3311,7 @@ compared a LoRA with and without one, so treat it as something to try, not as a 
 |---|---|---|
 | `reg_dir` | empty (off) | The folder, its sub-folders included. |
 | `reg_weight` | 1.0 | Loss weight of its pictures. 1 trains them as firmly as the subject's; lower makes them a lighter anchor. |
-| `reg_per_epoch` | -1 | How many of them an epoch trains on: -1 as many as the subject's pictures (repeats and crops counted), 0 all of them, N that many. Never more than the folder holds. |
+| `reg_per_epoch` | -1 | How many of them an epoch trains on: -1 as many as the subject's pictures (repeats and crops counted), 0 all of them, N that many. Never more than the folder holds. Each size bucket keeps the whole part of its share; the places left over are drawn again each epoch (since 4.7.0), so a bucket worth less than one picture still trains, in proportion. Before 4.7.0 such a bucket never trained. |
 
 - **The pictures.** Real pictures, not ones the model made (those teach it its own mistakes). Every picture needs a
   caption that describes it; the run stops at the start, before anything loads, and names the pictures without one.
@@ -4916,6 +4923,11 @@ first N DiT blocks in system RAM (pinned) and streams each block's weights to th
 nvfp4 data, scales, biases and norms. The next block is copied in on a side CUDA stream while the current one computes.
 Frozen weights never change, so nothing is copied back. The LoRA adapters, the rest of the model and the activations
 stay on the GPU.
+
+- **Pinned only when RAM allows (since 4.7.0).** Pinned memory cannot be paged out, so the blocks are pinned only when
+  the RAM they newly take plus 4 GB stays free; otherwise, or when pinning fails part way, they stay in ordinary
+  memory (copies to the GPU are slower) and the log says so with the numbers. The start line shows how much was
+  pinned.
 
 - **Why it needs gradient checkpointing.** In training it relies on checkpointing: a checkpointed block keeps no
   weights for its backward, its recomputation streams them in again, and they go once that block's backward is done.

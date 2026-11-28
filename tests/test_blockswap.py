@@ -159,6 +159,63 @@ def test_logsnr_timesteps():
         TrainConfig(timestep_sampling="logsnr", logsnr_std=0).validate()
 
 
+class _Mem:
+    def __init__(self, available):
+        self.available = available
+
+
+def _pin_setup(monkeypatch, available, fail_on=None, device="cuda:0"):
+    """A BlockSwap built on CPU tensors with a fake 'cuda' device: pin_memory is counted (and may raise), no GPU used."""
+    import psutil
+
+    calls = []
+
+    def fake_pin(self, *a, **k):
+        calls.append(1)
+        if fail_on is not None and len(calls) == fail_on:
+            raise RuntimeError("cudaHostAlloc failed: out of memory")
+        return self.clone()
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", fake_pin)
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: _Mem(available))
+    monkeypatch.setattr(BlockSwap, "_place_rest", lambda self: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    m = Tiny()
+    bs = BlockSwap(m, range(3), device, prefetch=False)
+    return bs, calls
+
+
+def _swapped_rows(bs):
+    return [cpu for rows in bs.entries.values() for _, _, _, cpu in rows]
+
+
+def test_pins_when_plenty_of_ram(monkeypatch):
+    bs, calls = _pin_setup(monkeypatch, 64 * 2**30)
+    assert len(calls) == len(_swapped_rows(bs)) > 3
+    assert bs.pinned and bs.pinned_bytes == bs.bytes > 0
+
+
+def test_does_not_pin_when_ram_is_short(monkeypatch, caplog):
+    with caplog.at_level("WARNING", logger="rulztrainer"):
+        bs, calls = _pin_setup(monkeypatch, 2**30)  # 1 GB free < the 4 GB headroom
+    assert calls == [] and not bs.pinned and bs.pinned_bytes == 0 and bs.bytes > 0
+    assert len([r for r in caplog.records if "not pinning" in r.getMessage()]) == 1
+
+
+def test_pin_failure_keeps_the_rest_pageable(monkeypatch, caplog):
+    with caplog.at_level("WARNING", logger="rulztrainer"):
+        bs, calls = _pin_setup(monkeypatch, 64 * 2**30, fail_on=3)
+    assert len(calls) == 3  # it stopped trying after the failure
+    assert not bs.pinned and 0 < bs.pinned_bytes < bs.bytes
+    assert len(_swapped_rows(bs)) > 3 and bs.bytes > 0
+    assert len([r for r in caplog.records if "pinning failed" in r.getMessage()]) == 1
+
+
+def test_no_pin_without_cuda(monkeypatch):
+    bs, calls = _pin_setup(monkeypatch, 64 * 2**30, device="cpu")
+    assert not bs.cuda and calls == [] and not bs.pinned
+
+
 def test_the_block_prefetched_next_follows_the_pass_turning_round():
     """A forward runs the swapped blocks up, its recomputation runs them down: the turn (the last block twice) and a
     new forward after a recomputation that stopped above block 0 prefetch the block that really comes next."""

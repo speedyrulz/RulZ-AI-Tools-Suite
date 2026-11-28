@@ -26,6 +26,7 @@ from . import history
 from . import lora as lora_mod
 from . import profiling
 from . import race as race_mod
+from .savemeta import base_model_name, kohya_training_keys, public_config, public_overrides
 from . import weightnoise
 from .ema import LoraEMA
 from . import quant as Q
@@ -668,6 +669,25 @@ def current_lr(optimizer, scheduler) -> float:
     if hasattr(optimizer, "get_avg_learning_rate"):
         return float(optimizer.get_avg_learning_rate())
     return float(scheduler.get_last_lr()[0])
+
+
+LR_READ_EVERY = 20
+
+
+class LearningRateReader:
+    """Cache expensive self-tuning optimizer reads; refresh on requested log steps."""
+    def __init__(self):
+        self.optimizer = None
+        self.value = None
+        self.last_read = None
+
+    def read(self, optimizer, scheduler, step, force=False):
+        if (not hasattr(optimizer, "get_avg_learning_rate") or optimizer is not self.optimizer
+                or self.last_read is None or step - self.last_read >= LR_READ_EVERY or force):
+            self.value = current_lr(optimizer, scheduler)
+            self.optimizer = optimizer
+            self.last_read = step
+        return self.value
 
 
 BRAKE_EVERY = 20  # steps between reads of Automagic 4's brake (one GPU sync per param group)
@@ -1752,6 +1772,7 @@ class Trainer(RaceParallelMixin):
         start_step = step
         self.run_start_step = step  # what pruning counts as the run this one carries on (0: a fresh run)
         compute_done = 0  # optimizer steps of every configuration (a race trains several)
+        lr_reader = LearningRateReader()
         step_times: list[float] = []  # seconds per optimizer step, training only (no saves, samples or probes)
         self.recent_step_times = step_times  # (sweep_split sizes a sweep from them)
         profile_at = profiling.requested_step()
@@ -2112,7 +2133,7 @@ class Trainer(RaceParallelMixin):
                 optimizer.step()
                 phase = "stepped"
                 if self.ft is not None and cfg.finetune_anchor > 0:  # bounded drift: toward the original weights
-                    self.ft.pull_to_base(current_lr(optimizer, scheduler) * cfg.finetune_anchor)
+                    self.ft.pull_to_base(lr_reader.read(optimizer, scheduler, compute_done) * cfg.finetune_anchor)
                 if self.id_align_opt is not None and (cfg.id_align or cfg.body_align):
                     self.id_align_opt.step()
                 if step_lr_mult != 1.0:
@@ -2157,7 +2178,7 @@ class Trainer(RaceParallelMixin):
             done_steps = max(1, compute_done)
             total_steps = self.race.estimate["total"] if self.race is not None else cfg.steps - start_step
             eta = elapsed / done_steps * max(0, total_steps - compute_done)
-            lr_now = current_lr(optimizer, scheduler)
+            lr_now = lr_reader.read(optimizer, scheduler, compute_done)  # (Automagic: a real read every 20 steps)
             if effective_optimizer(cfg)[0] in AUTOMAGIC and not self._lr_floor_warned:
                 self._lr_floor_steps = self._lr_floor_steps + 1 if lr_at_floor(optimizer, lr_now) else 0
                 if self._lr_floor_steps >= LR_FLOOR_WARN_STEPS:
@@ -2508,8 +2529,9 @@ class Trainer(RaceParallelMixin):
         cfg = self.cfg
         ft = self.ft
         ranks = [int(r) for r in cfg.finetune_extract_ranks]
-        meta = {"ss_base_model": cfg.model_path if cfg.model_source == "hf" else Path(cfg.transformer_file).name,
-                "ss_steps": str(step), **arch_metadata(self.arch), "rulztrainer_config": cfg.to_dict(),
+        meta = {"ss_base_model": base_model_name(cfg),
+                "ss_steps": str(step), **arch_metadata(self.arch), **kohya_training_keys(cfg),
+                "rulztrainer_config": json.dumps(public_config(cfg)),
                 "rulztrainer_finetune": f"extracted at step {step}, cycle {ft.cycles}", "ss_blocks": cfg.lora_blocks or "all"}
         first = None
         t0 = time.time()
@@ -2563,18 +2585,19 @@ class Trainer(RaceParallelMixin):
         tag = self._file_tag()  # a race's training configuration while the race runs
         name = f"{cfg.job_name}{tag}.safetensors" if final else f"{cfg.job_name}{tag}_{step:06d}.safetensors"
         path = self.job_dir / name
-        meta = {"ss_base_model": cfg.model_path if cfg.model_source == "hf" else Path(cfg.transformer_file).name,
+        meta = {"ss_base_model": base_model_name(cfg),
                 "ss_network_dim": str({"lokr": cfg.lokr_factor, "oft": cfg.oft_block_size}.get(cfg.network_type,
                                                                                                cfg.lora_rank)),
                 "ss_network_alpha": str({"lokr": 1.0, "oft": cfg.oft_constraint}.get(cfg.network_type,
                                                                                       cfg.lora_alpha)),
                 "ss_steps": str(step), **arch_metadata(self.arch),
-                "rulztrainer_config": cfg.to_dict(), "ss_blocks": cfg.lora_blocks or "all"}
+                **kohya_training_keys(cfg), "rulztrainer_config": json.dumps(public_config(cfg)),
+                "ss_blocks": cfg.lora_blocks or "all"}
         if self.ema is not None:
             meta["rulztrainer_ema"] = f"{cfg.lora_ema:g}"
         if self.race is not None:
             v = self.race.active
-            meta["rulztrainer_race"] = f"{v.name}: {race_mod.format_overrides(v.overrides)}"
+            meta["rulztrainer_race"] = f"{v.name}: {race_mod.format_overrides(public_overrides(v.overrides))}"
         with self._averaged():
             lora_mod.save_lora(injected, path, metadata=meta, dtype=cfg.lora_save_dtype, fmt=self.arch.lora_format)
         log.info("Saved %s (%s)", path, cfg.lora_save_dtype)
@@ -3370,7 +3393,7 @@ class Trainer(RaceParallelMixin):
         path = self.job_dir / f"{cfg.job_name}_{v.name}_{'final' if finished else 'dropped'}.safetensors"
         meta = {"ss_network_dim": str({"lokr": v.factor, "oft": v.block}.get(v.kind, v.rank)),
                 "ss_network_alpha": str({"lokr": 1.0, "oft": v.constraint}.get(v.kind, v.alpha)),
-                **arch_metadata(self.arch), "rulztrainer_race": f"{v.name}: {race_mod.format_overrides(v.overrides)}",
+                **arch_metadata(self.arch), "rulztrainer_race": f"{v.name}: {race_mod.format_overrides(public_overrides(v.overrides))}",
                 "ss_steps": str(v.state.get("step", 0))}
         if v is self.race.active and not self.race_parallel:
             with self._averaged():
@@ -4272,8 +4295,8 @@ class Trainer(RaceParallelMixin):
         self.block_swap = BlockSwap(model, range(k), self.devices[0])
         model._rz_block_swap = self.block_swap  # set_extras_enabled resets its prefetch (rulztrainer.lora)
         log.info("Block swap: the frozen weights of blocks 0-%d (%d of %d) stay in RAM, %.1f GB pinned, and stream to "
-                 "%s as each block runs (prefetching the next)", k - 1, k, n, self.block_swap.bytes / 1e9,
-                 self.devices[0])
+                 "%s as each block runs (prefetching the next; %.1f GB swapped)", k - 1, k, n,
+                 self.block_swap.pinned_bytes / 1e9, self.devices[0], self.block_swap.bytes / 1e9)
 
     # ------------------------------------------------------------ LoRA Isolation (see isolation.py)
     def _isolation_prepare(self, cfg, items):

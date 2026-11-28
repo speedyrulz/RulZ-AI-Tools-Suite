@@ -31,12 +31,11 @@ def image_size(path) -> tuple[int, int]:
     """(width, height) as displayed: an EXIF rotation by 90 or 270 degrees swaps the stored size."""
     from PIL import Image
 
+    from .dataset import exif_orientation
+
     with Image.open(path) as im:
         w, h = im.size
-        try:
-            orient = im.getexif().get(0x0112, 1)
-        except Exception:  # noqa: BLE001
-            orient = 1
+        orient = exif_orientation(im, path)
     return (h, w) if orient in (5, 6, 7, 8) else (w, h)
 
 
