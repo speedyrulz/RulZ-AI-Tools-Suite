@@ -356,7 +356,8 @@ def test_an_adapter_that_cannot_be_counted_must_be_the_same_adapter():
 
 @pytest.mark.parametrize("other", [
     {"resolutions": [1.5]}, {"batch_size": 2}, {"gradient_checkpointing": False}, {"id_loss_weight": 0.1},
-    {"isolation": True, "trigger_word": "tok"}, {"activation_offload": True}, {"reward_steps": 50},
+    {"isolation": True, "trigger_word": "tok"}, {"activation_offload": True}, {"checkpoint_save_attention": True},
+    {"reward_steps": 50},
     {"multi_gpu": "model_split"}, {"finetune": True}, {"model_arch": "qwen_image21"},
 ])
 def test_a_run_with_other_settings_is_not_comparable(other):

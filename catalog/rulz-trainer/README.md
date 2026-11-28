@@ -1127,6 +1127,13 @@ files (and the ones it resumed from): a job name used again no longer makes each
 higher-numbered files, and a fresh run leaves an earlier run's files alone. The WebUI's *Checkpoints to keep* field is
 in Saving & samples.
 
+**What a saved file's metadata says (since 4.7.0).** Every LoRA, LoKr and extracted fine-tune file carries the
+standard kohya `ss_*` training keys (`ss_seed`, `ss_learning_rate`, `ss_lr_scheduler`, `ss_optimizer`,
+`ss_max_train_steps`, `ss_batch_size_per_device`, `ss_gradient_accumulation_steps`, `ss_resolution`,
+`ss_training_comment`) and the run's settings as `rulztrainer_config`, with the private parts left out: folders and
+file paths, prompts, captions, trigger and class words, and anything named like a token, key or URL. Before 4.7.0 the
+whole config went in, so a shared file showed the folders it was trained from and its prompts.
+
 ## Weight average (`lora_ema`)
 
 At batch size 1 each step pulls the LoRA toward the image it just saw, so a checkpoint carries the tail of the
@@ -2938,6 +2945,18 @@ most like the person. Each reward step:
   a probe that beats the best of both stages saves `<job>_reward_best.safetensors`, and early stop ends the stage.
   When the stage's last step was not probed (`probe_every` not dividing `reward_steps`, or larger than it), a closing
   probe scores the final LoRA, so the stage always ends with its likeness on the run's scale.
+- **Its own probe cadence and change readout (`reward_probe_every`, since 4.6.0):** 0 (default) leaves the stage on
+  `probe_every` as above. N > 0 probes after every N reward steps (1 = each step), even when `probe_every` is 0 (it
+  needs `face_refs` and/or `body_refs`), and those probes only watch: they never end the stage (the best checkpoint is
+  still kept, and the closing probe still runs when the last step was not probed). The stage takes a baseline as it
+  starts: the last probe is reused when it scored these very weights (taken at the step the stage starts from, such as
+  the first stage's closing probe or the step-0 probe of a `steps: 0` run), otherwise one probe runs after the weight
+  average went into the LoRA. After every probe the log gives one line, for example `Reward probe step 120: likeness
+  +2.3 points since the stage began (face +3.1, body -0.4), pictures changed 4.2%`: the likeness change in points on
+  the probes' scale, and the mean absolute pixel difference between each probe picture and the baseline picture of the
+  same prompt and seed, as a percentage of the 0-255 range (pairs of different size are skipped). The Monitor's
+  likeness section shows the last values as two readouts, and `status.json` keeps them as `reward_change`
+  (`[[step, points, picture %, face points, body points], ...]`).
 - **Measured cost:** Krea 2 (nvfp4, 16 GB RTX 4060 Ti), 4 pictures of 512 px at 4 denoising steps with guidance 5.5,
   2 trained moves per update: about 77 s per reward step (with a turbo LoRA at guidance 1 the guidance passes go).
 - **Alone:** `steps: 0` with a LoRA in `resume_from` runs only this stage, for example on a race winner's file (it
@@ -3292,7 +3311,7 @@ compared a LoRA with and without one, so treat it as something to try, not as a 
 |---|---|---|
 | `reg_dir` | empty (off) | The folder, its sub-folders included. |
 | `reg_weight` | 1.0 | Loss weight of its pictures. 1 trains them as firmly as the subject's; lower makes them a lighter anchor. |
-| `reg_per_epoch` | -1 | How many of them an epoch trains on: -1 as many as the subject's pictures (repeats and crops counted), 0 all of them, N that many. Never more than the folder holds. |
+| `reg_per_epoch` | -1 | How many of them an epoch trains on: -1 as many as the subject's pictures (repeats and crops counted), 0 all of them, N that many. Never more than the folder holds. Each size bucket keeps the whole part of its share; the places left over are drawn again each epoch (since 4.7.0), so a bucket worth less than one picture still trains, in proportion. Before 4.7.0 such a bucket never trained. |
 
 - **The pictures.** Real pictures, not ones the model made (those teach it its own mistakes). Every picture needs a
   caption that describes it; the run stops at the start, before anything loads, and names the pictures without one.
@@ -4760,7 +4779,7 @@ its header, so a file named `ponyDiffusionV6XL.safetensors` or `illustrious.safe
 **What is refused.** Picking SDXL greys these out in the WebUI (Train tab and Wizard) with the reason, and a config
 file that sets one stops the run at the start with a message naming the setting (since 3.26.0 both read one table,
 see [Settings a model cannot use](#settings-a-model-cannot-use)): `block_swap`, `multi_gpu: model_split`,
-`activation_offload`, `checkpoint_keep_blocks` above 0, `attn_localize`, `id_align`, `body_align`, `training_maps`,
+`activation_offload`, `checkpoint_save_attention`, `checkpoint_keep_blocks` above 0, `attn_localize`, `id_align`, `body_align`, `training_maps`,
 the `keel_fb` and `hull` optimizers, a Keel face gain above 0, `transformer_quant` or `sample_model_quant` other than
 auto, none, int8 or int8_convrot (so `nvfp4`), `compile_model: true`,
 `loss_type` other than mse, `loss_weighting: sigma_sqrt`, `finetune`, `network_type` other than lora, `dora`,
@@ -4897,6 +4916,30 @@ exactly those inputs; unlike torch's `save_on_cpu` the copy out does not stop th
 offloading. Needs gradient checkpointing. **Never run in a real training here:** compare the step time and peak VRAM
 with a run without it before relying on it.
 
+### Keep attention outputs (`checkpoint_save_attention`, experimental)
+
+With gradient checkpointing, `checkpoint_save_attention: true` keeps each checkpointed DiT block's attention kernel
+outputs using PyTorch selective activation checkpointing, so the backward recompute skips attention. Everything else
+is recomputed and gradients are exactly the same. It costs about tokens x hidden x 2 bytes per checkpointed block,
+plus a small logsumexp. Auto kept-block measurement (`checkpoint_keep_blocks: -1`) includes this memory. With
+`torch.compile`, each block gets a second compiled graph, so the first steps compile longer. Block-swapped blocks with
+`block_swap_compile` use plain checkpointing. This setting needs gradient checkpointing and does not support SDXL.
+It is opt-in and experimental.
+
+Measured in 4.8.0 on an RTX 5090, Krea 2 Raw int8_convrot, rank 32, batch 1, torch.compile on, one run each, same
+seed; the step time is the steady time per step near the end of the run:
+
+| Resolution | Kept blocks | Off | On | Peak VRAM off / on |
+|---|---|---|---|---|
+| 1 MP (4157 tokens) | auto (13 off, 12 on, of 28) | 1.43 s | 1.43 s | |
+| 1 MP | 0 (every block checkpointed) | 1.59 s | 1.55 s (-2.5%) | 16.5 / 17.8 GB |
+| 2 MP | 0 | 3.61 s | 3.40 s (-5.8%) | 19.1 / 21.7 GB |
+
+The losses matched at every step. The gain grows with the image size, because attention's share of a block grows with
+the token count. With `checkpoint_keep_blocks: -1` on a card with spare memory it gained nothing at 1 MP: the extra
+memory cost one kept block, which used up the time saved. So turn it on when most blocks are checkpointed (a large
+model, a 16 GB card, 2 MP and up), not by default.
+
 ### Block swap (`block_swap`)
 
 For a card the model does not fit, after musubi-tuner's block swap. `block_swap: N` keeps the frozen weights of the
@@ -4904,6 +4947,11 @@ first N DiT blocks in system RAM (pinned) and streams each block's weights to th
 nvfp4 data, scales, biases and norms. The next block is copied in on a side CUDA stream while the current one computes.
 Frozen weights never change, so nothing is copied back. The LoRA adapters, the rest of the model and the activations
 stay on the GPU.
+
+- **Pinned only when RAM allows (since 4.7.0).** Pinned memory cannot be paged out, so the blocks are pinned only when
+  the RAM they newly take plus 4 GB stays free; otherwise, or when pinning fails part way, they stay in ordinary
+  memory (copies to the GPU are slower) and the log says so with the numbers. The start line shows how much was
+  pinned.
 
 - **Why it needs gradient checkpointing.** In training it relies on checkpointing: a checkpointed block keeps no
   weights for its backward, its recomputation streams them in again, and they go once that block's backward is done.
@@ -5090,6 +5138,7 @@ The dry run lists every setting it changes and its value before. `--set key=valu
 | `block_swap_lokr` | the same for a LoKr (factor 8) | `--vram` |
 | `block_swap_compile` | `block_swap_compile` with `compile_model: true`, on at least 4 swapped blocks | triton on that machine |
 | `activation_offload` | [activation offloading](#activation-offloading-activation_offload-experimental-untested) | |
+| `checkpoint_save_attention` | [keep attention outputs](#keep-attention-outputs-checkpoint_save_attention-experimental) | |
 | `normuon` | `optimizer: normuon` | |
 | `oft_scaled_lr` | `oft_scaled_lr` on OFT blocks of 64, with `optimizer: adamw` (the self-tuning optimizers ignore it) | |
 | `oom_recovery` | [out-of-memory recovery](#when-something-goes-wrong): the run starts without gradient checkpointing so that it runs out of GPU memory, and the WebUI should start it again with it on | a card that holds the model without block swap |

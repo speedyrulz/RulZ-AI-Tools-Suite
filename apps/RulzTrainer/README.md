@@ -4779,7 +4779,7 @@ its header, so a file named `ponyDiffusionV6XL.safetensors` or `illustrious.safe
 **What is refused.** Picking SDXL greys these out in the WebUI (Train tab and Wizard) with the reason, and a config
 file that sets one stops the run at the start with a message naming the setting (since 3.26.0 both read one table,
 see [Settings a model cannot use](#settings-a-model-cannot-use)): `block_swap`, `multi_gpu: model_split`,
-`activation_offload`, `checkpoint_keep_blocks` above 0, `attn_localize`, `id_align`, `body_align`, `training_maps`,
+`activation_offload`, `checkpoint_save_attention`, `checkpoint_keep_blocks` above 0, `attn_localize`, `id_align`, `body_align`, `training_maps`,
 the `keel_fb` and `hull` optimizers, a Keel face gain above 0, `transformer_quant` or `sample_model_quant` other than
 auto, none, int8 or int8_convrot (so `nvfp4`), `compile_model: true`,
 `loss_type` other than mse, `loss_weighting: sigma_sqrt`, `finetune`, `network_type` other than lora, `dora`,
@@ -4915,6 +4915,30 @@ so saved-tensor hooks around the `checkpoint()` call (`checkpointing.checkpointe
 exactly those inputs; unlike torch's `save_on_cpu` the copy out does not stop the CPU. After OneTrainer's activation
 offloading. Needs gradient checkpointing. **Never run in a real training here:** compare the step time and peak VRAM
 with a run without it before relying on it.
+
+### Keep attention outputs (`checkpoint_save_attention`, experimental)
+
+With gradient checkpointing, `checkpoint_save_attention: true` keeps each checkpointed DiT block's attention kernel
+outputs using PyTorch selective activation checkpointing, so the backward recompute skips attention. Everything else
+is recomputed and gradients are exactly the same. It costs about tokens x hidden x 2 bytes per checkpointed block,
+plus a small logsumexp. Auto kept-block measurement (`checkpoint_keep_blocks: -1`) includes this memory. With
+`torch.compile`, each block gets a second compiled graph, so the first steps compile longer. Block-swapped blocks with
+`block_swap_compile` use plain checkpointing. This setting needs gradient checkpointing and does not support SDXL.
+It is opt-in and experimental.
+
+Measured in 4.8.0 on an RTX 5090, Krea 2 Raw int8_convrot, rank 32, batch 1, torch.compile on, one run each, same
+seed; the step time is the steady time per step near the end of the run:
+
+| Resolution | Kept blocks | Off | On | Peak VRAM off / on |
+|---|---|---|---|---|
+| 1 MP (4157 tokens) | auto (13 off, 12 on, of 28) | 1.43 s | 1.43 s | |
+| 1 MP | 0 (every block checkpointed) | 1.59 s | 1.55 s (-2.5%) | 16.5 / 17.8 GB |
+| 2 MP | 0 | 3.61 s | 3.40 s (-5.8%) | 19.1 / 21.7 GB |
+
+The losses matched at every step. The gain grows with the image size, because attention's share of a block grows with
+the token count. With `checkpoint_keep_blocks: -1` on a card with spare memory it gained nothing at 1 MP: the extra
+memory cost one kept block, which used up the time saved. So turn it on when most blocks are checkpointed (a large
+model, a 16 GB card, 2 MP and up), not by default.
 
 ### Block swap (`block_swap`)
 
@@ -5114,6 +5138,7 @@ The dry run lists every setting it changes and its value before. `--set key=valu
 | `block_swap_lokr` | the same for a LoKr (factor 8) | `--vram` |
 | `block_swap_compile` | `block_swap_compile` with `compile_model: true`, on at least 4 swapped blocks | triton on that machine |
 | `activation_offload` | [activation offloading](#activation-offloading-activation_offload-experimental-untested) | |
+| `checkpoint_save_attention` | [keep attention outputs](#keep-attention-outputs-checkpoint_save_attention-experimental) | |
 | `normuon` | `optimizer: normuon` | |
 | `oft_scaled_lr` | `oft_scaled_lr` on OFT blocks of 64, with `optimizer: adamw` (the self-tuning optimizers ignore it) | |
 | `oom_recovery` | [out-of-memory recovery](#when-something-goes-wrong): the run starts without gradient checkpointing so that it runs out of GPU memory, and the WebUI should start it again with it on | a card that holds the model without block swap |

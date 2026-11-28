@@ -9,13 +9,65 @@ FIBO / Krea 2 `_run`).
 with one and with three blocks kept and keeps as many of the last trained blocks as the free memory allows
 (Trainer._calibrate_checkpointing, choose_kept_blocks); a step that still runs out keeps fewer from then on. N keeps the
 last N trained blocks; 0 checkpoints every block.
+
+`checkpoint_save_attention` (selective activation checkpointing): a checkpointed block keeps the outputs of its
+scaled-dot-product-attention kernel and recomputes everything else, so the backward's recompute skips attention.
+Gradients are the same. A block compiled with torch.compile needs the checkpoint inside the compiled region (an eager
+selective checkpoint around a compiled block silently turns the compile off: dynamo does not run under its dispatch
+mode), so compile_save_attention compiles the whole checkpointed call into `block._rz_sac_call`. A compiled block
+without it (block swap's blocks, whose hooks must run eagerly) gets the plain checkpoint.
 """
 from __future__ import annotations
 
+import functools
 from typing import Iterable
 
+import torch
 from torch import nn
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
+
+_SDPA_NAMES = ("_scaled_dot_product_flash_attention", "_scaled_dot_product_efficient_attention",
+               "_scaled_dot_product_cudnn_attention", "_scaled_dot_product_flash_attention_for_cpu")
+
+
+def _sdpa_ops() -> set:
+    ops = set()
+    for name in _SDPA_NAMES:
+        op = getattr(torch.ops.aten, name, None)
+        if op is None:
+            continue
+        ops.add(op)
+        if hasattr(op, "default"):
+            ops.add(op.default)
+    return ops
+
+
+_SAVE_OPS = _sdpa_ops()
+
+
+def save_attention_policy(ctx, op, *args, **kwargs):
+    """Selective checkpoint policy: the attention kernels' outputs stay, everything else is recomputed."""
+    if op in _SAVE_OPS:
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def save_attention_context():
+    """The context_fn of a selective checkpoint that keeps the attention outputs."""
+    return create_selective_checkpoint_contexts(save_attention_policy)
+
+
+def sac_checkpoint(fn, *args):
+    """checkpoint(fn, *args), non-reentrant, with the attention outputs kept."""
+    return checkpoint(fn, *args, use_reentrant=False, context_fn=save_attention_context)
+
+
+def compile_save_attention(block: nn.Module, backend: str = "inductor"):
+    """Compile `block`'s selectively checkpointed call as one function and store it as block._rz_sac_call (checkpointed()
+    calls it). The block's own compile (block.compile, for kept blocks, samples and probes) is separate and stays: the
+    two graphs live side by side and neither recompiles the other."""
+    block._rz_sac_call = torch.compile(functools.partial(sac_checkpoint, block), backend=backend, dynamic=True)
+    return block._rz_sac_call
 
 GB = 1024 ** 3
 
@@ -23,12 +75,22 @@ GB = 1024 ** 3
 def checkpointed(owner: nn.Module, fn, *args):
     """checkpoint(fn, *args), non-reentrant, as every family's block runner calls it; with an ActivationOffload on
     `owner.activation_offload` (activation_offload: true, rulztrainer.actoffload) the inputs it saves for the backward
-    wait in RAM."""
+    wait in RAM; with `owner.save_attention` (checkpoint_save_attention) the attention outputs are kept too."""
     off = getattr(owner, "activation_offload", None)
+    if getattr(owner, "save_attention", False):
+        sac = getattr(fn, "_rz_sac_call", None)
+        if sac is not None:
+            run = sac
+        elif getattr(fn, "_rz_compiled", False):  # never an eager selective checkpoint around a compiled block
+            run = functools.partial(checkpoint, fn, use_reentrant=False)
+        else:
+            run = functools.partial(sac_checkpoint, fn)
+    else:
+        run = functools.partial(checkpoint, fn, use_reentrant=False)
     if off is None or not off.enabled:
-        return checkpoint(fn, *args, use_reentrant=False)
+        return run(*args)
     with off.hooks():
-        return checkpoint(fn, *args, use_reentrant=False)
+        return run(*args)
 
 
 def set_kept_blocks(model: nn.Module, indices: Iterable[int]) -> int:

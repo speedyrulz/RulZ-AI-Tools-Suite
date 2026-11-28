@@ -2411,6 +2411,7 @@ class Form:
             logsnr_mean=float(v("logsnr_mean")), logsnr_std=float(v("logsnr_std")),
             block_swap=int(v("block_swap") or 0), block_swap_compile=bool(v("block_swap_compile")),
             activation_offload=bool(v("activation_offload")),
+            checkpoint_save_attention=bool(v("checkpoint_save_attention")),
             clean_share=str(v("clean_share") or "").strip(),
             logit_mean=float(v("logit_mean")), logit_std=float(v("logit_std")), loss_weighting=v("loss_weighting"),
             loss_type=v("loss_type") or "mse",
@@ -14890,6 +14891,15 @@ def build_page(local: bool = True):
                                          "block's recomputation, so more blocks can keep their activations or fewer "
                                          "need swapping, for extra PCIe traffic. Experimental and untested in RulZ "
                                          "AI Trainer.")
+                            w["checkpoint_save_attention"] = ui.switch("Keep attention outputs (experimental)",
+                                                                        value=d.checkpoint_save_attention) \
+                                .bind_visibility_from(w["gradient_checkpointing"], "value") \
+                                .tooltip("Checkpointed blocks keep their attention outputs so recomputation skips "
+                                         "attention, using extra GPU memory. Auto kept-block measurement includes "
+                                         "this memory. Compiling takes longer; compiled block-swapped blocks use "
+                                         "plain checkpointing. Needs gradient checkpointing. Measured 6% faster "
+                                         "per step at 2 MP with every block checkpointed (Krea 2, RTX 5090); no gain "
+                                         "when most blocks are kept. Experimental.")
                         with advanced():
                             with fields():
                                 w["text_encoder_device"] = ui.select(["auto"] + gpus + ["cpu"], value="auto",

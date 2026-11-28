@@ -826,6 +826,9 @@ class TrainConfig:
     # checkpointed blocks' saved inputs wait in pinned RAM until the backward (experimental, untested; actoffload.py):
     # frees about tokens x hidden x 2 bytes per checkpointed block for more kept blocks or less block swap
     activation_offload: bool = False
+    # checkpointed blocks keep their attention kernel's outputs (selective activation checkpointing), so the backward's
+    # recompute skips attention; same gradients, more memory per checkpointed block (experimental, untested)
+    checkpoint_save_attention: bool = False
     split_plan: str = ""  # model_split: manual block plan e.g. "cuda:0=0-25;cuda:1=26-41"; empty = auto-balance
     parallel_jobs: bool = True  # multi_gpu: split samples, probes, latent/text caching and SAM 3 masks across the GPUs
     dp_balance: str = "auto"  # data_parallel batches per GPU and step by measured speed: off (lockstep) | auto (same
@@ -1825,6 +1828,9 @@ class TrainConfig:
                                  "stay on the GPU until the backward)")
         if self.activation_offload and not self.gradient_checkpointing:
             raise ValueError("activation_offload moves checkpointed blocks' inputs to RAM: it needs "
+                             "gradient_checkpointing")
+        if self.checkpoint_save_attention and not self.gradient_checkpointing:
+            raise ValueError("checkpoint_save_attention keeps checkpointed blocks' attention outputs: it needs "
                              "gradient_checkpointing")
         if self.timestep_sampling == "logsnr" and self.logsnr_std <= 0:
             raise ValueError("logsnr_std must be above 0")

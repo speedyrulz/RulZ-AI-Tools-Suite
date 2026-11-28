@@ -1570,6 +1570,12 @@ class Trainer(RaceParallelMixin):
                 self.act_offload.append(m.activation_offload)
             log.warning("activation_offload is experimental and untested: checkpointed blocks' inputs wait in pinned "
                         "RAM until the backward. Check the step time and peak VRAM against a run without it")
+        if cfg.checkpoint_save_attention and self.arch.supports_kept_blocks:
+            for m, _, _ in self.replicas:
+                m.save_attention = True
+            log.warning("checkpoint_save_attention is experimental: checkpointed blocks keep their "
+                        "attention outputs, so the backward's recompute skips attention. Check the step time and peak "
+                        "VRAM against a run without it")
         if self.ft is not None:
             params, optimizer, scheduler = self._finetune_setup(cfg, items)
         elif self.race_rows is None:
@@ -2761,14 +2767,22 @@ class Trainer(RaceParallelMixin):
             compiling.prepare(fall_back, shape_swaps)  # raised recompile limits, dynamo warnings in train.log
             blocks = [b for b in self.arch.compile_blocks(model) if not getattr(b, "_rz_tapped", False)]
             swapped = 0
+            sac = bool(getattr(model, "save_attention", False))
             for block in blocks:
+                block._rz_compiled = True  # checkpointed() never puts an eager selective checkpoint around it
                 if hasattr(block, "_rz_swap_index"):
                     # block swap's hooks (CUDA streams, events, weights swapped in and out) must run eagerly:
                     # block.compile() would trace them with the forward, so only the forward is compiled
                     block.forward = torch.compile(block.forward, backend="inductor", dynamic=True)
                     swapped += 1
                 else:
+                    # the block itself: kept blocks, samples and probes call it directly
                     block.compile(backend="inductor", dynamic=True)
+                    if sac:  # checkpointed training calls: the selective checkpoint inside its own compiled region
+                        ckpt.compile_save_attention(block)
+            if sac and swapped:
+                log.info("checkpoint_save_attention: %d block-swapped blocks use the plain checkpoint (their hooks "
+                         "run eagerly)", swapped)
             log.info("Compiled %d DiT blocks with torch.compile (first steps will be slow)%s", len(blocks),
                      f"; {swapped} swapped blocks: their forward only" if swapped else "")
             return True
@@ -2977,6 +2991,10 @@ class Trainer(RaceParallelMixin):
 
             if self.compiled:
                 measure(0)  # compile first: the peaks below are then the compiled blocks' own, not compilation's
+                if getattr(m, "save_attention", False):
+                    # checkpoint_save_attention: measure(0) only compiled the checkpointed graph (_rz_sac_call); a
+                    # kept block runs the block's own compiled graph, which would otherwise compile inside measure(1)
+                    measure(1)
             one, three = measure(1), measure(3)
             keep, notes = [], []
             for d in devices:
