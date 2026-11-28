@@ -43,6 +43,7 @@ def test_video_families_are_the_one_list():
 # every SDXL rule: (field, a forbidden value, the config's fields to set along with it)
 SDXL_BAD = [
     ("block_swap", 4, {}), ("multi_gpu", "model_split", {}), ("activation_offload", True, {}),
+    ("checkpoint_save_attention", True, {}),
     ("attn_localize", True, {"trigger_word": "sks"}), ("id_align", True, {}), ("body_align", True, {}),
     ("optimizer", "keel_fb", {}), ("optimizer", "hull", {"hull_rho": 0.01}),
     ("keel_face_gain", 0.5, {"optimizer": "keel"}), ("training_maps", True, {}), ("transformer_quant", "nvfp4", {}),

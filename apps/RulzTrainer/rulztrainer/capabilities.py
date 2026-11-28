@@ -96,6 +96,7 @@ _SDXL = [
     _forbid("multi_gpu", "the UNet cannot be split across GPUs here (use off or data_parallel)", "model_split",
             default="off"),
     _only("activation_offload", "diffusers' checkpointing is all or nothing", False),
+    _only("checkpoint_save_attention", "diffusers' checkpointing is all or nothing", False),
     _only("attn_localize", "it reads the transformer blocks' attention and states, which SDXL's UNet does not expose "
                            "that way", False),
     _only("id_align", "it reads the transformer blocks' attention and states, which SDXL's UNet does not expose "

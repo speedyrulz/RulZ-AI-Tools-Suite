@@ -16,7 +16,7 @@ def main():
     explicit = {'model_arch', 'model_source', 'model_path', 'models_dir', 'transformer_file',
                 'text_encoder_file', 'vae_file', 'tokenizer_path', 'attention_backend',
                 'gradient_checkpointing', 'checkpoint_keep_blocks', 'block_swap',
-                'block_swap_compile', 'activation_offload', 'device', 'multi_gpu',
+                'block_swap_compile', 'activation_offload', 'checkpoint_save_attention', 'device', 'multi_gpu',
                 'devices', 'dp_balance', 'compile_model', 'cache_dir', 'sample_model_path',
                 'sample_model_quant', 'text_encoder_device', 'split_plan', 'parallel_jobs',
                 'body_device', 'probe_device'}

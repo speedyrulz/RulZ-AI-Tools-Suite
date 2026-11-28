@@ -81,6 +81,7 @@ MESSAGES = {
                            'log.info("torch.compile %s (%s)", "on" if do_compile else "off", why)'],
     "activation_offload": ['"activation_offload is experimental and untested: checkpointed blocks',
                            '"Activation offload: %.2f GB of block inputs sent to RAM in step %d"'],
+    "checkpoint_save_attention": ['"checkpoint_save_attention is experimental: checkpointed blocks'],
     "normuon": ['"normuon is experimental and untested in RulZ AI Trainer"'],
     "oft_scaled_lr": ['"Scaled OFT (experimental): %s"', 'f"block {g[\'name\'][5:]} lr {g[\'lr\']:.2e}',
                       '"oft_scaled_lr is ignored with %s (it sets its own step sizes)"'],
@@ -319,6 +320,7 @@ LINES = {
                            "Compile stats (end of training): 30 frames compiled (30 ok), 28 graphs"],
     "activation_offload": ["activation_offload is experimental and untested: checkpointed blocks' inputs wait",
                            "Activation offload: 1.42 GB of block inputs sent to RAM in step 1"],
+    "checkpoint_save_attention": ["checkpoint_save_attention is experimental: checkpointed blocks keep their attention outputs"],
     "normuon": ["normuon is experimental and untested in RulZ AI Trainer"],
     "oft_scaled_lr": ["Scaled OFT (experimental): block 64 lr 7.01e-05 (300 layers)"],
     "oom_recovery": ["[oom recovery] try 1 of 3: the last try ran out of GPU memory at step 0; nothing saved yet"],
@@ -390,7 +392,7 @@ def test_every_case_passes_on_the_folder_a_good_run_leaves(tmp_path):
 
 def test_a_missing_log_line_fails_the_feature_and_says_which(tmp_path):
     manifest = planned(tmp_path)
-    for name in ("reg_dir", "normuon", "activation_offload", "relay_race_pick", "run_report", "oft_scaled_lr"):
+    for name in ("reg_dir", "normuon", "activation_offload", "checkpoint_save_attention", "relay_race_pick", "run_report", "oft_scaled_lr"):
         entry = entry_of(manifest, name)
         res = checkrun.evaluate(entry, make_job(tmp_path / "jobs", entry, lines=[]))
         assert res["verdict"] == "fail" and failed(res), name
@@ -686,7 +688,7 @@ def test_list_and_dry_run_queue_nothing(cli, tmp_path, capsys):
     assert checkrun.main(["queue", "--config", str(config), "--dry-run", "--vram", "16", "--reg-dir",
                           str(tmp_path / "reg"), "--tag", "dry"]) == 0
     out = capsys.readouterr().out
-    assert "dry run: nothing is queued" in out and "12 of 15 cases" in out
+    assert "dry run: nothing is queued" in out and "13 of 16 cases" in out
     assert out.count(": job check_dry_") >= 8  # a plan for at least eight cases
     assert "optimizer: \"normuon\"  (was \"adamw\")" in out and "steps: 30  (was 2000)" in out
     assert "block_swap: 12  (was 0)" in out and "h3_image_likeness: SKIPPED" in out

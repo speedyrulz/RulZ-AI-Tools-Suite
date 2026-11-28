@@ -90,6 +90,7 @@ EXTRAS = {"id_loss": lambda get: float(get("id_loss_weight", 0) or 0) > 0,
           "body_align": lambda get: bool(get("body_align", False)),
           "isolation": lambda get: bool(get("isolation", False)),
           "activation_offload": lambda get: bool(get("activation_offload", False)),
+          "checkpoint_save_attention": lambda get: bool(get("checkpoint_save_attention", False)),
           "reward": lambda get: int(get("reward_steps", 0) or 0) > 0}
 # What must agree for a row to be comparable (find); the block swap count and the adapter are adjusted for instead
 SAME_KEYS = ("family", "side", "batch_size", "gradient_checkpointing", "frames", "video_side", "extras")
