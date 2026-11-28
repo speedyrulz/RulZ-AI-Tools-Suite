@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import { toast } from 'sonner'
 import type { HistoryEntry } from '@shared/history'
-import { call } from '../lib/api'
+import { call, errText, invoke } from '../lib/api'
 import { gridBlockReason, resolveAxisOption } from '../lib/grid'
 import { entryId, mergeStartReason, onlyFavouritesChanged, rerunBlockReason, snapshotChanged, snapshotOf, sortEntries, type HistoryFilter } from '../lib/history'
 import { loraMergeBlockReason } from '../lib/loraMerge'
@@ -207,7 +207,13 @@ export const useHistory = create<HistoryStore>((set, get) => ({
   remove: async (e) => {
     if (e.kind === 'grid') return
     const id = entryId(e)
-    await call('history:remove', e.kind, e.job.id)
+    try {
+      await invoke('history:remove', e.kind, e.job.id)
+    } catch (err) {
+      // Keep the row: it is still in the history on disk.
+      toast.error(errText(err))
+      return
+    }
     set({ entries: get().entries.filter((x) => entryId(x) !== id) })
   },
 

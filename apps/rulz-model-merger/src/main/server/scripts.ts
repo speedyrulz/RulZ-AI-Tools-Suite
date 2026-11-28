@@ -81,9 +81,9 @@ export function buildStartScript(s: OwnServerSettings, port: number): string {
     add('RULZ_COMFY_ABS="$(pwd -P)"')
     add(`RULZ_YAML_PATH="$(printf '%s' "$RULZ_COMFY_ABS" | sed "s/'/''/g")"`)
     add(
-      `printf '%s\\n' 'rulz_custom_nodes:' "  base_path: '$RULZ_YAML_PATH'" '  custom_nodes: custom_nodes' > "$RULZ_BASE/extra_model_paths.yaml"`
+      `printf '%s\\n' 'rulz_custom_nodes:' "  base_path: '$RULZ_YAML_PATH'" '  custom_nodes: custom_nodes' > "$RULZ_BASE/rulz_extra_model_paths.yaml"`
     )
-    args.push('--extra-model-paths-config', '"$RULZ_BASE/extra_model_paths.yaml"')
+    args.push('--extra-model-paths-config', '"$RULZ_BASE/rulz_extra_model_paths.yaml"')
   }
   for (const a of s.extraArgs.split(/\s+/).filter(Boolean)) args.push(shellQuote(a))
   add(`RULZ_START="${START_TIME_OF('$$')}"`)

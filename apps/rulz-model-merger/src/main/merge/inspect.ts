@@ -365,7 +365,26 @@ function formatName(info: ModelFileInfo): string {
   return info.quantized ? (info.quantLabel ?? 'quantized') : 'unquantized'
 }
 
-function comparePair(la: string, a: SafetensorsHeader, lb: string, b: SafetensorsHeader, problems: string[]): void {
+const PACKED_DTYPES = new Set(['U8', 'U4', 'F4'])
+/** Quantization data next to a weight (weight_scale, weight_scale_2, input_scale, scale_weight, comfy_quant), not a
+ *  layer that merely has "scale" in its name (upscale.weight, scale_shift_table). */
+const QUANT_META_KEY = /(^|\.)(weight_scale(_2)?|input_scale|scale_weight|comfy_quant)$/
+
+/** Shapes that legitimately differ between storage formats, only when the two files are stored differently (checkMerge
+ *  allows mixed formats; the result is saved in A's format): quantization scales, and a packed 4-bit weight against a
+ *  wider dtype of the same layer (same leading dimensions, last one equal or halved by the packing). */
+function formatDependentShape(key: string, a: SafetensorsTensor, b: SafetensorsTensor, mixed: boolean): boolean {
+  if (!mixed) return false
+  if (QUANT_META_KEY.test(key)) return true
+  if (!key.endsWith('.weight') || a.dtype === b.dtype) return false
+  const [packed, wide] = PACKED_DTYPES.has(a.dtype) ? [a, b] : PACKED_DTYPES.has(b.dtype) ? [b, a] : [null, null]
+  if (!packed || !wide || packed.shape.length !== wide.shape.length || packed.shape.length === 0) return false
+  const last = packed.shape.length - 1
+  if (packed.shape.some((d, i) => i < last && d !== wide.shape[i])) return false
+  return packed.shape[last] === wide.shape[last] || packed.shape[last] * 2 === wide.shape[last]
+}
+
+function comparePair(la: string, a: SafetensorsHeader, lb: string, b: SafetensorsHeader, problems: string[], mixed: boolean): void {
   const ka = normalizeKeys(a).keys
   const kb = normalizeKeys(b).keys
   const smaller = Math.min(ka.size, kb.size)
@@ -380,6 +399,7 @@ function comparePair(la: string, a: SafetensorsHeader, lb: string, b: Safetensor
     const tb = kb.get(k)
     if (!tb) continue
     shared++
+    if (formatDependentShape(k, ta, tb, mixed)) continue
     if (ta.shape.length !== tb.shape.length || ta.shape.some((d, i) => d !== tb.shape[i])) {
       badCount++
       if (badShape.length < 3) badShape.push(k)
@@ -439,8 +459,8 @@ export function checkMerge(input: {
     }
   }
 
-  if (!bake && readable(a) && readable(b)) comparePair('A', a.header!, 'B', b.header!, problems)
-  if (needC && readable(b) && readable(c)) comparePair('B', b.header!, 'C', c.header!, problems)
+  if (!bake && readable(a) && readable(b)) comparePair('A', a.header!, 'B', b.header!, problems, formatName(a.info) !== formatName(b.info))
+  if (needC && readable(b) && readable(c)) comparePair('B', b.header!, 'C', c.header!, problems, formatName(b.info) !== formatName(c.info))
 
   // One warning per quantization label ("A and B are int8"), not one per source.
   const byLabel = new Map<string, string[]>()

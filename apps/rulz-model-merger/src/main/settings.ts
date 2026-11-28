@@ -66,6 +66,8 @@ export function normalizeSettings(raw: unknown): AppSettings {
 export class SettingsStore {
   private current: AppSettings = cloneDefaults()
   private queue: Promise<unknown> = Promise.resolve()
+  /** The file could not be read (not just missing): defaults are in memory only and the file is never overwritten. */
+  private readFailed = false
 
   constructor(private readonly file: string) {}
 
@@ -82,10 +84,13 @@ export class SettingsStore {
 
   private async loadNow(): Promise<AppSettings> {
     let text: string | null = null
+    // readFailed stays set for the rest of the session once a read failed, even if a later load finds no file.
     try {
       text = await fs.readFile(this.file, 'utf8')
-    } catch {
+    } catch (e) {
       text = null
+      // Only a missing file means "no settings yet". Any other error (locked, no access) keeps the file untouched.
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') this.readFailed = true
     }
     if (text === null) {
       this.current = cloneDefaults()
@@ -115,6 +120,8 @@ export class SettingsStore {
       if (patch.ownServer !== undefined) merged.ownServer = { ...prev.ownServer, ...patch.ownServer }
       // Readers see the new settings at once; a failed write puts the old ones back.
       this.current = normalizeSettings(merged)
+      // The app stays usable; changes last for this session only, so a real settings file is not replaced by defaults.
+      if (this.readFailed) return this.get()
       try {
         await this.write(this.current)
       } catch (e) {

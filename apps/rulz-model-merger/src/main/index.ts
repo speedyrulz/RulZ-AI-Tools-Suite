@@ -4,7 +4,7 @@ import type { GridJob } from '@shared/grid'
 import type { HistoryEntry } from '@shared/history'
 import type { LoraMergeJob } from '@shared/loraMerge'
 import type { MergeJob } from '@shared/merge'
-import type { ConnectionStatus, PreflightReport, ServerState, Theme } from '@shared/types'
+import type { ConnectionStatus, OwnServerSettings, PreflightReport, ServerState, Theme } from '@shared/types'
 import { ComfyClient, probeServer } from './comfy/client'
 import { normalizeServerUrl } from './comfy/parse'
 import { GridService } from './grid/service'
@@ -95,12 +95,12 @@ async function refreshStatus(): Promise<ConnectionStatus> {
   return status
 }
 
-async function preflight(): Promise<PreflightReport> {
+async function preflight(snapshot: OwnServerSettings = settings.get().ownServer): Promise<PreflightReport> {
   const gpus = await listGpus()
   const st = ownServer.state()
   return runPreflight({
     wsl,
-    settings: settings.get().ownServer,
+    settings: snapshot,
     listGpus: async () => gpus,
     probe: (url) => probeServer(url, gpus, { timeoutMs: 1000 }),
     ownRunning: st.status !== 'stopped' && st.status !== 'error',
@@ -109,13 +109,16 @@ async function preflight(): Promise<PreflightReport> {
 }
 
 async function startOwnServer(confirmed: string[]): Promise<ServerState> {
-  const report = await preflight()
+  // The ticket is taken before the checks: a Stop or quit while they run cancels this start.
+  const ticket = ownServer.beginStart()
+  const checked = settings.get().ownServer
+  const report = await preflight(checked)
   const blocks = report.issues.filter((i) => i.level === 'block')
   if (blocks.length) throw new Error(blocks.map((i) => i.message).join(' '))
   const unconfirmed = report.issues.filter((i) => i.level === 'confirm' && !confirmed.includes(i.code))
   if (unconfirmed.length) throw new Error(`Confirm first: ${unconfirmed.map((i) => i.message).join(' ')}`)
   if (report.port === null) throw new Error('No free port was found for the server.')
-  return ownServer.start(report.port)
+  return ownServer.start(report.port, ticket, checked)
 }
 
 function registerIpc(): void {
@@ -250,6 +253,11 @@ async function main(): Promise<void> {
   })
   ownServer.on('state', (st: ServerState) => {
     broadcast('server:state', st)
+    if (st.status === 'running' || st.status === 'stopped') {
+      // A restarted server can have other nodes and models, so the cached /object_info is stale.
+      mergeRunner.clearObjectInfoCache()
+      grids.clearObjectInfoCache()
+    }
     if (st.status === 'running' || st.status === 'stopped' || st.status === 'error') void refreshStatus()
   })
   ownServer.on('log', (text: string) => broadcast('server:log', { text }))
@@ -279,7 +287,7 @@ async function main(): Promise<void> {
       .then((changed) => {
         if (changed) broadcast('history:changed', null)
       })
-      .catch(() => undefined)
+      .catch((e) => console.error('Could not write the history entry:', e))
   }
   mergeRunner.on('job', (job: MergeJob) => {
     broadcast('merge:job', job)
